@@ -5,11 +5,8 @@ The server returns newest-first; we walk older pages by setting `endTime` to the
 `composetime` seen, then print oldest-first reusing the live-stream message renderer.
 """
 
-import contextlib
 import json
-import os
 import re
-import sys
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote
@@ -17,6 +14,7 @@ from urllib.parse import quote
 import httpx
 import structlog
 
+from ._io import emit, force_blocking_stdout
 from .config import Settings
 from .directory import Directory
 from .messages import print_resource, resource_to_record
@@ -89,12 +87,7 @@ async def dump_conversation(
     max_pages: int,
     jsonl: bool = False,
 ) -> None:
-    # The event loop / parent may hand us a non-blocking stdout; under pipe backpressure
-    # (e.g. `| jq`) that raises BlockingIOError mid-write and truncates. Force blocking here,
-    # inside the running loop, so a full pipe makes us wait for the reader instead of erroring.
-    with contextlib.suppress(OSError, ValueError):
-        os.set_blocking(sys.stdout.fileno(), True)
-
+    force_blocking_stdout()  # inside the running loop (see _io); guards `| jq` backpressure
     directory = Directory(settings)
     directory.set_token(skype_token)
     messages = fetch_history(settings, skype_token, thread_id, page_size, max_pages)
@@ -103,7 +96,6 @@ async def dump_conversation(
         if jsonl:
             # Full-detail metadata, every message (no printable filter), no media download.
             record = await resource_to_record(resource, directory)
-            sys.stdout.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            await emit(json.dumps(record, ensure_ascii=False, default=str) + "\n")
         else:
             await print_resource(resource, directory)
-    sys.stdout.flush()

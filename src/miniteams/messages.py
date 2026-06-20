@@ -10,12 +10,12 @@ import gzip
 import html
 import json
 import re
-import sys
 from typing import Any
 
 import structlog
 
 from . import attachments
+from ._io import emit
 from .directory import Directory
 
 log = structlog.get_logger()
@@ -101,7 +101,7 @@ async def _print_message(resource: dict[str, Any], directory: Directory) -> None
     )
     text = _strip_html(content) if msgtype == "RichText/Html" else content if msgtype == "Text" else ""
     suffix = (" " + " ".join(notes)) if notes else ""
-    print(f"[{when}] ({label}) {sender}: {text}{suffix}".rstrip(), flush=True)
+    await emit(f"[{when}] ({label}) {sender}: {text}{suffix}".rstrip() + "\n")
 
 
 async def print_resource(resource: dict[str, Any], directory: Directory) -> None:
@@ -179,9 +179,9 @@ async def _print_reactions(resource: dict[str, Any], emotions: list[Any], direct
         users = [str(u.get("mri", "")) for u in (emotion.get("users") or [])]
         added, removed = directory.reaction_diff(msg_id, key, users)
         for mri in added:
-            print(f"[{when}] ({label}) ↳ {emoji} {directory.name_for(mri)} reacted{ctx}", flush=True)
+            await emit(f"[{when}] ({label}) ↳ {emoji} {directory.name_for(mri)} reacted{ctx}\n")
         for mri in removed:
-            print(f"[{when}] ({label}) ↳ {emoji}✖ {directory.name_for(mri)} unreacted{ctx}", flush=True)
+            await emit(f"[{when}] ({label}) ↳ {emoji}✖ {directory.name_for(mri)} unreacted{ctx}\n")
 
 
 async def handle_delivery(req: dict[str, Any], directory: Directory, jsonl: bool = False) -> None:
@@ -201,8 +201,7 @@ async def handle_delivery(req: dict[str, Any], directory: Directory, jsonl: bool
 
     if jsonl:
         record = await event_to_record(obj, req, directory)
-        sys.stdout.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-        sys.stdout.flush()
+        await emit(json.dumps(record, ensure_ascii=False, default=str) + "\n")
         return
 
     resource = obj.get("resource") or {}
