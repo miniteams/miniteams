@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import os
 import sys
 from typing import Any
 
@@ -157,6 +158,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.log_level:
         settings.log_level = args.log_level
     setup_logging(settings.log_level)
+    # Some parents (uv, certain shells) hand us a non-blocking stdout; once the pipe fills
+    # (slow reader like `| jq`) a write raises BlockingIOError mid-stream and truncates bulk
+    # output (e.g. `dump --jsonl`). Force blocking so writes wait for the reader instead.
+    with contextlib.suppress(OSError, ValueError):
+        os.set_blocking(sys.stdout.fileno(), True)
 
     try:
         return int(args.func(settings, args))

@@ -5,7 +5,9 @@ The server returns newest-first; we walk older pages by setting `endTime` to the
 `composetime` seen, then print oldest-first reusing the live-stream message renderer.
 """
 
+import contextlib
 import json
+import os
 import re
 import sys
 from datetime import UTC, datetime
@@ -87,6 +89,12 @@ async def dump_conversation(
     max_pages: int,
     jsonl: bool = False,
 ) -> None:
+    # The event loop / parent may hand us a non-blocking stdout; under pipe backpressure
+    # (e.g. `| jq`) that raises BlockingIOError mid-write and truncates. Force blocking here,
+    # inside the running loop, so a full pipe makes us wait for the reader instead of erroring.
+    with contextlib.suppress(OSError, ValueError):
+        os.set_blocking(sys.stdout.fileno(), True)
+
     directory = Directory(settings)
     directory.set_token(skype_token)
     messages = fetch_history(settings, skype_token, thread_id, page_size, max_pages)

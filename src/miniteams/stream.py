@@ -10,8 +10,10 @@ on every reconnect, exponential backoff, re-register on `trouter.message_loss` a
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
+import sys
 import time
 from typing import Any
 
@@ -240,6 +242,11 @@ async def run_forever(settings: Settings, jsonl: bool = False) -> None:
     surl/session rotation are handled by simply reconnecting. Backoff grows on rapid failures
     and resets once a connection has been stable.
     """
+    # Force stdout blocking inside the running loop (parent/loop may hand us a non-blocking fd;
+    # under `--jsonl | jq` backpressure that would raise BlockingIOError mid-write). See dump.py.
+    with contextlib.suppress(OSError, ValueError):
+        os.set_blocking(sys.stdout.fileno(), True)
+
     directory = Directory(settings)  # caches survive reconnects; only the token is refreshed
     backoff = 1.0
     while True:
