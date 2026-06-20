@@ -1,0 +1,58 @@
+[project]
+name = "miniteams"
+version = "0.0.1"
+description = "Personal read-only CLI that streams live Microsoft Teams chat events via the Trouter real-time channel."
+requires-python = ">=3.14"
+dependencies = [
+    "msal>=1.31",
+    "httpx>=0.27",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "python-dotenv>=1.0",
+    "structlog>=24.4",
+    "websockets>=16.0",
+]
+
+[project.scripts]
+miniteams = "miniteams.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+    "mypy>=1.11",
+    "ruff>=0.6",
+    "pre-commit>=3.8",
+    "detect-secrets>=1.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/miniteams"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+
+[tool.mypy]
+python_version = "3.14"
+disallow_untyped_defs = true
+disallow_any_generics = true
+strict_optional = true
+warn_return_any = true
+
+# msal ships no type stubs
+[[tool.mypy.overrides]]
+module = ["msal.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+addopts = "-v --tb=short"

@@ -1,0 +1,220 @@
+"""Inbound delivery routing, body decode, and chat-message printing (handoff §5).
+
+Trouter delivers each event as a pseudo-HTTP request whose `body` is a stringified (and often
+gzip+base64-wrapped) JSON. Chat messages arrive on the `/messaging` endpoint as `EventMessage`
+notifications; everything else (presence, calls) is ignored for the MVP dump.
+"""
+
+import base64
+import gzip
+import html
+import json
+import re
+import sys
+from typing import Any
+
+import structlog
+
+from . import attachments
+from .directory import Directory
+
+log = structlog.get_logger()
+
+# messagetypes worth printing — skip Control/* (typing indicators, read receipts, …).
+_TEXT_TYPES = {"RichText/Html", "Text"}
+_MEDIA_TYPES = {
+    "RichText/Media_GenericFile",
+    "RichText/UriObject",
+    "RichText/Media_Card",
+    "RichText/Media_CallRecording",
+    "RichText/Media_LocalRecording",
+}
+_PRINTABLE = _TEXT_TYPES | _MEDIA_TYPES
+_TAG_RE = re.compile(r"<[^>]+>")
+_THREAD_RE = re.compile(r"/conversations/([^/]+)")
+
+# Teams reaction keys → emoji; unknown keys fall back to ":key:".
+_EMOJI = {
+    "like": "👍",
+    "heart": "❤️",
+    "laugh": "😆",
+    "surprised": "😮",
+    "sad": "😢",
+    "angry": "😡",
+    "yes": "✅",
+    "no": "❌",
+}
+
+
+def _gunzip_b64(data: str) -> str:
+    return gzip.decompress(base64.b64decode(data)).decode("utf-8")
+
+
+def _decode_body(req: dict[str, Any]) -> dict[str, Any] | None:
+    """Unwrap the three documented encodings (handoff §5) into the real payload object."""
+    body = req.get("body")
+    if not body:
+        return None
+    headers = {k.lower(): v for k, v in (req.get("headers") or {}).items()}
+    if headers.get("x-microsoft-skype-content-encoding") == "gzip":
+        body = _gunzip_b64(body)
+    obj = json.loads(body)
+    if isinstance(obj, dict):
+        if "cp" in obj:  # base64 → gunzip → real payload
+            obj = json.loads(_gunzip_b64(obj["cp"]))
+        elif "gp" in obj:  # base64 → parse directly
+            obj = json.loads(base64.b64decode(obj["gp"]).decode("utf-8"))
+    return obj if isinstance(obj, dict) else None
+
+
+def _strip_html(content: str) -> str:
+    return html.unescape(_TAG_RE.sub("", content)).strip()
+
+
+def _thread_id(resource: dict[str, Any]) -> str:
+    link = resource.get("conversationLink") or ""
+    match = _THREAD_RE.search(link)
+    if match:
+        return match.group(1)
+    return str(resource.get("to", ""))
+
+
+async def _print_message(resource: dict[str, Any], directory: Directory) -> None:
+    msgtype = resource.get("messagetype", "")
+    if msgtype not in _PRINTABLE:
+        log.debug("skipped_message", messagetype=msgtype)
+        return
+    sender_mri = resource.get("from", "")
+    sender = resource.get("imdisplayname")
+    directory.note_name(sender_mri, sender)  # feed the cache from free message metadata
+    sender = sender or directory.name_for(sender_mri)
+    when = resource.get("composetime") or resource.get("originalarrivaltime") or ""
+    label = await directory.label(_thread_id(resource))
+    content = resource.get("content", "")
+
+    notes = await attachments.process(
+        content,
+        msgtype,
+        directory.skype_token,
+        directory.settings.media_dir,
+        directory.settings.download_media,
+    )
+    text = _strip_html(content) if msgtype == "RichText/Html" else content if msgtype == "Text" else ""
+    suffix = (" " + " ".join(notes)) if notes else ""
+    print(f"[{when}] ({label}) {sender}: {text}{suffix}".rstrip(), flush=True)
+
+
+async def print_resource(resource: dict[str, Any], directory: Directory) -> None:
+    """Render one message resource — shared by the live stream and the history dump."""
+    await _print_message(resource, directory)
+
+
+async def event_to_record(obj: dict[str, Any], req: dict[str, Any], directory: Directory) -> dict[str, Any]:
+    """Full-detail JSONL record for one live stream event (max info, no media download)."""
+    resource = obj.get("resource") or {}
+    record: dict[str, Any] = {
+        "type": obj.get("type"),
+        "resourceType": obj.get("resourceType"),
+        "time": obj.get("time"),
+        # Trouter delivery envelope — the transport-level "tech stuff".
+        "delivery": {
+            "id": req.get("id"),
+            "method": req.get("method"),
+            "url": req.get("url"),
+            "headers": req.get("headers"),
+        },
+    }
+    if resource:
+        record["message"] = await resource_to_record(resource, directory)
+    else:
+        record["raw"] = obj
+    return record
+
+
+async def resource_to_record(resource: dict[str, Any], directory: Directory) -> dict[str, Any]:
+    """Full-detail structured record for JSONL output — keeps the raw resource verbatim."""
+    msgtype = resource.get("messagetype", "")
+    sender_mri = resource.get("from", "")
+    directory.note_name(sender_mri, resource.get("imdisplayname"))
+    content = resource.get("content", "")
+    props = resource.get("properties") or {}
+    thread_id = _thread_id(resource)
+    text = _strip_html(content) if msgtype == "RichText/Html" else content if msgtype == "Text" else ""
+    return {
+        "id": resource.get("id"),
+        "time": resource.get("composetime") or resource.get("originalarrivaltime"),
+        "thread_id": thread_id,
+        "thread_label": await directory.label(thread_id),
+        "sender_mri": sender_mri,
+        "sender": resource.get("imdisplayname") or directory.name_for(sender_mri),
+        "messagetype": msgtype,
+        "text": text,
+        "content_raw": content,
+        "attachments": attachments.extract(content, msgtype),
+        "reactions": props.get("emotions"),
+        # Surfaced technical identifiers (also present in `raw`, promoted for convenience).
+        "clientmessageid": resource.get("clientmessageid"),
+        "sequenceId": resource.get("sequenceId"),
+        "version": resource.get("version"),
+        "conversationid": resource.get("conversationid"),
+        "conversation_link": resource.get("conversationLink"),
+        "etag": resource.get("etag"),
+        "skypeeditedid": resource.get("skypeeditedid"),
+        "deletetime": props.get("deletetime"),
+        "properties": props,
+        "raw": resource,  # full server object, nothing dropped
+    }
+
+
+async def _print_reactions(resource: dict[str, Any], emotions: list[Any], directory: Directory) -> None:
+    msg_id = str(resource.get("id") or resource.get("clientmessageid") or "")
+    when = resource.get("composetime") or resource.get("originalarrivaltime") or ""
+    label = await directory.label(_thread_id(resource))
+    raw = resource.get("content") or ""
+    snippet = _strip_html(raw)[:40] if raw else ""
+    ctx = f' to "{snippet}"' if snippet else ""
+    for emotion in emotions:
+        key = emotion.get("key", "?")
+        emoji = _EMOJI.get(key, f":{key}:")
+        users = [str(u.get("mri", "")) for u in (emotion.get("users") or [])]
+        added, removed = directory.reaction_diff(msg_id, key, users)
+        for mri in added:
+            print(f"[{when}] ({label}) ↳ {emoji} {directory.name_for(mri)} reacted{ctx}", flush=True)
+        for mri in removed:
+            print(f"[{when}] ({label}) ↳ {emoji}✖ {directory.name_for(mri)} unreacted{ctx}", flush=True)
+
+
+async def handle_delivery(req: dict[str, Any], directory: Directory, jsonl: bool = False) -> None:
+    url = req.get("url", "")
+    endpoint = url.rsplit("/", 1)[-1]
+    if endpoint != "messaging":  # presence / call signaling — ignore for MVP
+        log.debug("delivery_ignored", endpoint=endpoint)
+        return
+    try:
+        obj = _decode_body(req)
+    except Exception as exc:  # noqa: BLE001 — never let one bad frame kill the stream
+        log.warning("decode_failed", error=str(exc))
+        return
+    if not obj or obj.get("type") != "EventMessage":
+        log.debug("non_event", type=obj.get("type") if obj else None)
+        return
+
+    if jsonl:
+        record = await event_to_record(obj, req, directory)
+        sys.stdout.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        sys.stdout.flush()
+        return
+
+    resource = obj.get("resource") or {}
+    resource_type = obj.get("resourceType")
+    if resource_type == "NewMessage":
+        await _print_message(resource, directory)
+    elif resource_type == "MessageUpdate":
+        # Reactions and edits both arrive as MessageUpdate; only reactions carry `emotions`.
+        emotions = (resource.get("properties") or {}).get("emotions")
+        if emotions is not None:
+            await _print_reactions(resource, emotions, directory)
+        else:
+            log.debug("message_edit", id=resource.get("id"))
+    else:
+        log.debug("ignored_resource", resource_type=resource_type)
