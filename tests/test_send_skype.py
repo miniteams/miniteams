@@ -1,0 +1,72 @@
+"""Outbound send + skype-token exchange (httpx mocked)."""
+
+from typing import Any
+
+import pytest
+
+from miniteams import send, skype
+from miniteams.config import Settings
+
+
+class _Resp:
+    def __init__(self, data: dict[str, Any], status: int = 200, content: bytes = b"{}") -> None:
+        self._data = data
+        self.status_code = status
+        self.content = content
+
+    def raise_for_status(self) -> None:
+        pass
+
+    def json(self) -> dict[str, Any]:
+        return self._data
+
+
+def test_send_message_builds_request(settings: Settings, monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_post(url: str, **kw: Any) -> _Resp:
+        captured["url"] = url
+        captured.update(kw)
+        return _Resp({}, status=201)
+
+    monkeypatch.setattr(send.httpx, "post", fake_post)
+    send.send_message(settings, "sk", "48:notes", "a<b\nc", "Me")
+
+    # thread id is url-encoded (`:` → %3A), matching the working dump path.
+    assert captured["url"].endswith("/v1/users/ME/conversations/48%3Anotes/messages")
+    assert captured["headers"]["X-Skypetoken"] == "sk"
+    body = captured["json"]
+    assert body["messagetype"] == "RichText/Html"
+    assert body["contenttype"] == "text"
+    assert body["content"] == "a&lt;b<br>c"  # escaped + newline→<br>
+    assert body["clientmessageid"].isdigit()
+    assert body["imdisplayname"] == "Me"
+
+
+def test_send_message_raises_on_error_envelope(settings: Settings, monkeypatch) -> None:
+    monkeypatch.setattr(
+        send.httpx, "post", lambda *a, **k: _Resp({"errorCode": 1, "message": "nope"}, content=b"{...}")
+    )
+    with pytest.raises(RuntimeError, match="send rejected"):
+        send.send_message(settings, "sk", "t", "x", "Me")
+
+
+def test_exchange_skype_token_tokens_shape(settings: Settings, monkeypatch) -> None:
+    monkeypatch.setattr(
+        skype.httpx,
+        "post",
+        lambda *a, **k: _Resp({"tokens": {"skypeToken": "ST", "expiresIn": 3600}, "region": "fr"}),
+    )
+    out = skype.exchange_skype_token(settings, "aad")
+    assert out == {"skype_token": "ST", "expires_in": 3600, "region": "fr"}
+
+
+def test_exchange_skype_token_legacy_shape(settings: Settings, monkeypatch) -> None:
+    monkeypatch.setattr(skype.httpx, "post", lambda *a, **k: _Resp({"skypeToken": {"skypetoken": "ST2"}}))
+    assert skype.exchange_skype_token(settings, "aad")["skype_token"] == "ST2"
+
+
+def test_exchange_skype_token_missing_raises(settings: Settings, monkeypatch) -> None:
+    monkeypatch.setattr(skype.httpx, "post", lambda *a, **k: _Resp({"nope": 1}))
+    with pytest.raises(RuntimeError, match="no skype token"):
+        skype.exchange_skype_token(settings, "aad")
