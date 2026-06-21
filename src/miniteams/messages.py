@@ -79,7 +79,7 @@ def _thread_id(resource: dict[str, Any]) -> str:
     return str(resource.get("to", ""))
 
 
-async def _print_message(resource: dict[str, Any], directory: Directory) -> None:
+async def _print_message(resource: dict[str, Any], directory: Directory, tag: str = "") -> None:
     msgtype = resource.get("messagetype", "")
     if msgtype not in _PRINTABLE:
         log.debug("skipped_message", messagetype=msgtype)
@@ -87,7 +87,7 @@ async def _print_message(resource: dict[str, Any], directory: Directory) -> None
     sender_mri = resource.get("from", "")
     sender = resource.get("imdisplayname")
     directory.note_name(sender_mri, sender)  # feed the cache from free message metadata
-    sender = sender or directory.name_for(sender_mri)
+    sender = sender or await directory.display(sender_mri)
     when = resource.get("composetime") or resource.get("originalarrivaltime") or ""
     label = await directory.label(_thread_id(resource))
     content = resource.get("content", "")
@@ -101,12 +101,45 @@ async def _print_message(resource: dict[str, Any], directory: Directory) -> None
     )
     text = _strip_html(content) if msgtype == "RichText/Html" else content if msgtype == "Text" else ""
     suffix = (" " + " ".join(notes)) if notes else ""
-    await emit(f"[{when}] ({label}) {sender}: {text}{suffix}".rstrip() + "\n")
+    await emit(f"[{when}] ({label}) {tag}{sender}: {text}{suffix}".rstrip() + "\n")
+
+
+async def _print_deleted(resource: dict[str, Any], directory: Directory) -> None:
+    when = (resource.get("properties") or {}).get("deletetime") or resource.get("composetime") or ""
+    label = await directory.label(_thread_id(resource))
+    sender = await directory.display(resource.get("from", ""))
+    await emit(f"[{when}] ({label}) 🗑 {sender} deleted a message\n")
 
 
 async def print_resource(resource: dict[str, Any], directory: Directory) -> None:
     """Render one message resource — shared by the live stream and the history dump."""
     await _print_message(resource, directory)
+
+
+async def emit_raw_delivery(req: dict[str, Any]) -> None:
+    """Emit one inbound delivery verbatim as NDJSON — every endpoint, decoded, no filtering."""
+    try:
+        body: Any = _decode_body(req)
+    except Exception as exc:  # noqa: BLE001 — keep the firehose flowing on a bad frame
+        body = {"_decode_error": str(exc), "_raw": req.get("body")}
+    record = {
+        "kind": "delivery",
+        "id": req.get("id"),
+        "method": req.get("method"),
+        "url": req.get("url"),
+        "headers": req.get("headers"),
+        "body": body,
+    }
+    await emit(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
+
+async def emit_raw_named(data: str) -> None:
+    """Emit a named Socket.IO event (trouter.connected, message_loss, …) as NDJSON."""
+    try:
+        payload: Any = json.loads(data)
+    except json.JSONDecodeError:
+        payload = data
+    await emit(json.dumps({"kind": "named", "event": payload}, ensure_ascii=False, default=str) + "\n")
 
 
 async def event_to_record(obj: dict[str, Any], req: dict[str, Any], directory: Directory) -> dict[str, Any]:
@@ -146,7 +179,7 @@ async def resource_to_record(resource: dict[str, Any], directory: Directory) -> 
         "thread_id": thread_id,
         "thread_label": await directory.label(thread_id),
         "sender_mri": sender_mri,
-        "sender": resource.get("imdisplayname") or directory.name_for(sender_mri),
+        "sender": resource.get("imdisplayname") or await directory.display(sender_mri),
         "messagetype": msgtype,
         "text": text,
         "content_raw": content,
@@ -179,9 +212,9 @@ async def _print_reactions(resource: dict[str, Any], emotions: list[Any], direct
         users = [str(u.get("mri", "")) for u in (emotion.get("users") or [])]
         added, removed = directory.reaction_diff(msg_id, key, users)
         for mri in added:
-            await emit(f"[{when}] ({label}) ↳ {emoji} {directory.name_for(mri)} reacted{ctx}\n")
+            await emit(f"[{when}] ({label}) ↳ {emoji} {await directory.display(mri)} reacted{ctx}\n")
         for mri in removed:
-            await emit(f"[{when}] ({label}) ↳ {emoji}✖ {directory.name_for(mri)} unreacted{ctx}\n")
+            await emit(f"[{when}] ({label}) ↳ {emoji}✖ {await directory.display(mri)} unreacted{ctx}\n")
 
 
 async def handle_delivery(req: dict[str, Any], directory: Directory, jsonl: bool = False) -> None:
@@ -209,11 +242,15 @@ async def handle_delivery(req: dict[str, Any], directory: Directory, jsonl: bool
     if resource_type == "NewMessage":
         await _print_message(resource, directory)
     elif resource_type == "MessageUpdate":
-        # Reactions and edits both arrive as MessageUpdate; only reactions carry `emotions`.
-        emotions = (resource.get("properties") or {}).get("emotions")
-        if emotions is not None:
-            await _print_reactions(resource, emotions, directory)
+        # MessageUpdate carries reactions (emotions), deletions (deletetime), or edits.
+        props = resource.get("properties") or {}
+        if props.get("emotions") is not None:
+            await _print_reactions(resource, props["emotions"], directory)
+        elif props.get("deletetime"):
+            await _print_deleted(resource, directory)
+        elif resource.get("skypeeditedid") or props.get("edittime"):
+            await _print_message(resource, directory, tag="✏ ")
         else:
-            log.debug("message_edit", id=resource.get("id"))
+            log.debug("message_update", id=resource.get("id"))
     else:
         log.debug("ignored_resource", resource_type=resource_type)

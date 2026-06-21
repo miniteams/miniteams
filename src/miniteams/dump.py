@@ -86,10 +86,11 @@ async def dump_conversation(
     page_size: int,
     max_pages: int,
     jsonl: bool = False,
+    bearer: str = "",
 ) -> None:
     force_blocking_stdout()  # inside the running loop (see _io); guards `| jq` backpressure
     directory = Directory(settings)
-    directory.set_token(skype_token)
+    directory.set_token(skype_token, bearer)
     messages = fetch_history(settings, skype_token, thread_id, page_size, max_pages)
     log.info("history_fetched", thread=thread_id, count=len(messages))
     for resource in messages:

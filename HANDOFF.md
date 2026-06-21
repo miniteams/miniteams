@@ -16,9 +16,10 @@ a live browser session rather than trusting a hardcoded guess.
 ## 0. Scope
 
 > **Update (post-MVP):** the items below marked "out of scope" were since implemented —
-> `send` (chatsvc REST), `dump` (history backfill via `/messages` time-windowed paging),
-> plus thread metadata, reactions and attachment download. This section documents the original
-> POC boundary; see `README.md` for the current feature set.
+> `send` (chatsvc REST), `update`/edit (PUT `.../messages/<id>` with `skypeeditedid`), `dump`
+> (history backfill via `/messages` time-windowed paging), plus thread metadata, reactions and
+> attachment download. This section documents the original POC boundary; see `README.md` for the
+> current feature set.
 
 **In scope (MVP):**
 - Interactive auth (browser auth-code+PKCE preferred; device-code as fallback).

@@ -24,6 +24,8 @@ _IMG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 _URIOBJ_RE = re.compile(r"<URIObject\b[^>]*>", re.IGNORECASE)
 _ATTR_RE = re.compile(r'([\w-]+)\s*=\s*"([^"]*)"')
 _CTYPE_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
+_VIEW_RE = re.compile(r"/views/[^/?#]+")
+_FULL_VIEW = "imgpsh_fullsize"  # full-resolution view (vs the bounded `imgo` Teams references)
 
 
 def _attrs(tag: str) -> dict[str, str]:
@@ -60,13 +62,29 @@ def extract(content: str, msgtype: str) -> list[dict[str, str]]:
     return items
 
 
-async def _download_image(client: httpx.AsyncClient, token: str, src: str, media_dir: Path) -> str:
-    resp = await client.get(src, headers={"Accept": "image/*"}, cookies={"skypetoken_asm": token})
+async def _fetch_image(client: httpx.AsyncClient, token: str, url: str, media_dir: Path, suffix: str) -> str:
+    resp = await client.get(url, headers={"Accept": "image/*"}, cookies={"skypetoken_asm": token})
     resp.raise_for_status()
     ext = _CTYPE_EXT.get((resp.headers.get("content-type") or "").split(";")[0], ".img")
-    dest = media_dir / f"{_object_id(src)}{ext}"
+    dest = media_dir / f"{_object_id(url)}{suffix}{ext}"
     dest.write_bytes(resp.content)
     return str(dest)
+
+
+async def _download_image(
+    client: httpx.AsyncClient, token: str, src: str, media_dir: Path
+) -> tuple[str, str | None]:
+    """Fetch the optimized view (as referenced) and the full-resolution view; return (optim, full)."""
+    optim = await _fetch_image(client, token, src, media_dir, suffix="")
+    full_url = _VIEW_RE.sub(f"/views/{_FULL_VIEW}", src)
+    if full_url == src:
+        return optim, None
+    try:
+        full = await _fetch_image(client, token, full_url, media_dir, suffix=".full")
+    except Exception as exc:  # noqa: BLE001 — full view may 404; the optimized one still stands
+        log.debug("full_image_failed", url=full_url, error=str(exc))
+        return optim, None
+    return optim, full
 
 
 async def _download_file(
@@ -106,8 +124,11 @@ async def process(content: str, msgtype: str, token: str, media_dir: Path, downl
                 continue
             try:
                 if kind == "image":
-                    img_path = await _download_image(client, token, url, media_dir)
-                    notes.append(f"[image → {img_path}]")
+                    optim_path, full_path = await _download_image(client, token, url, media_dir)
+                    # Show the local file:// (full-res when available) next to the original URL.
+                    primary = Path(full_path or optim_path).as_uri()
+                    extra = f" (optim {Path(optim_path).as_uri()})" if full_path else ""
+                    notes.append(f"[image: {url} → {primary}{extra}]")
                 else:
                     fpath, name, size = await _download_file(client, token, url, media_dir)
                     sz = f" ({size}B)" if size else ""

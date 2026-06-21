@@ -23,7 +23,7 @@ from ._io import force_blocking_stdout
 from .auth import acquire_aad_token
 from .config import Settings
 from .directory import Directory
-from .messages import handle_delivery
+from .messages import emit_raw_delivery, emit_raw_named, handle_delivery
 from .skype import exchange_skype_token
 from .trouter import common_query, get_or_create_epid, handshake, trouter_info
 
@@ -51,6 +51,7 @@ class TrouterClient:
         epid: str,
         directory: Directory,
         jsonl: bool = False,
+        raw: bool = False,
     ) -> None:
         self.settings = settings
         self.aad = aad
@@ -60,6 +61,7 @@ class TrouterClient:
         self.epid = epid
         self.directory = directory
         self.jsonl = jsonl
+        self.raw = raw
         self._count = 0
         self._last_register = 0.0
         # websockets' connection type churns across releases; keep it loose deliberately.
@@ -167,6 +169,8 @@ class TrouterClient:
         ]
 
     async def _on_named(self, data: str) -> None:
+        if self.raw:
+            await emit_raw_named(data)
         try:
             evt = json.loads(data)
         except json.JSONDecodeError:
@@ -175,7 +179,7 @@ class TrouterClient:
         if name == "trouter.message_loss":
             # Backend floods this until we re-register the messaging worker (handoff §M4).
             await self._maybe_reregister("message_loss")
-        else:
+        elif not self.raw:
             log.info("named_event", name=name)
 
     async def _on_delivery(self, data: str) -> None:
@@ -189,7 +193,10 @@ class TrouterClient:
         # Ack regardless of whether we print anything — missing acks cause redelivery/disconnect.
         ack = json.dumps({"id": msg_id, "status": 200, "body": ""}, separators=(",", ":"))
         await self._ws.send(f"3:::{ack}")
-        await handle_delivery(req, self.directory, self.jsonl)
+        if self.raw:
+            await emit_raw_delivery(req)  # every endpoint, decoded, no filtering
+        else:
+            await handle_delivery(req, self.directory, self.jsonl)
 
     async def _handle_frame(self, raw: str | bytes) -> None:
         frame = raw.decode() if isinstance(raw, bytes) else raw
@@ -234,7 +241,7 @@ class TrouterClient:
         log.info("ws_closed")
 
 
-async def run_forever(settings: Settings, jsonl: bool = False) -> None:
+async def run_forever(settings: Settings, jsonl: bool = False, raw: bool = False) -> None:
     """Re-establish a full session on every disconnect (handoff §M4).
 
     A fresh skype token / trouter info / handshake is minted per attempt, so token expiry and
@@ -249,12 +256,14 @@ async def run_forever(settings: Settings, jsonl: bool = False) -> None:
         try:
             aad = acquire_aad_token(settings)
             skype_token = exchange_skype_token(settings, aad["access_token"])["skype_token"]
-            directory.set_token(skype_token)
+            directory.set_token(skype_token, str(aad.get("id_token") or aad["access_token"]))
             epid = get_or_create_epid(settings)
             info = trouter_info(settings, skype_token, epid)
             session_id = handshake(settings, info, skype_token, epid)
             connected_at = time.monotonic()
-            await TrouterClient(settings, aad, skype_token, info, session_id, epid, directory, jsonl).run()
+            await TrouterClient(
+                settings, aad, skype_token, info, session_id, epid, directory, jsonl, raw
+            ).run()
         except asyncio.CancelledError:
             raise
         except BrokenPipeError:

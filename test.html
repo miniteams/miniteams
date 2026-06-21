@@ -1,0 +1,52 @@
+<!-- miniteams send torture test. Usage:
+       uv run miniteams send --file test.html --html            # → your Notes
+       uv run miniteams send --file test.html --html --thread 19:...@thread.v2
+     Watch how Teams renders it, and round-trip it back through `stream`/`dump`. -->
+<div><b>Bold</b>, <i>italic</i>, <u>underline</u>, <s>strike</s>, <code>inline code</code>.</div>
+<div>Entities: &amp; &lt; &gt; &quot; &#39; &copy; &reg; &mdash; &nbsp;gap&nbsp; &#x1F600; &#128512;</div>
+<div>Raw specials (should not break parsing): &lt;script&gt; a &amp; b &lt; c &gt; d "q" 'apos'</div>
+<div>Unicode: café naïve Москва 日本語 中文 한국어 emoji 👍🏽❤️🔥🧪🚀 math ∑∞≠√µ</div>
+<div dir="rtl">RTL: مرحبا بالعالم — שלום עולם — mixed 123 ABC</div>
+<div>Link: <a href="https://example.com/path?a=1&amp;b=2#frag">example.com with &amp; query</a></div>
+<div>Long unbroken token: ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789</div>
+<blockquote>Quoted text spanning<br>two lines, with <b>bold</b> inside.</blockquote>
+<ul>
+  <li>bullet one</li>
+  <li>bullet two
+    <ul><li>nested a</li><li>nested b</li></ul>
+  </li>
+</ul>
+<ol>
+  <li>first</li>
+  <li>second
+    <ol><li>2.1</li><li>2.2</li></ol>
+  </li>
+</ol>
+<div>Code blocks:</div>
+<pre><code>def f(x: int) -&gt; int:
+    if x &lt; 0 &amp;&amp; x &gt; -10:   # special chars in a code block
+        return x * 2
+    return x  &lt;&lt; 1
+</code></pre>
+<pre><code class="language-bash">grep -rn "foo" . | awk '{print $1}' &gt; out.txt &amp;&amp; cat &lt;&lt;'EOF'
+  "quoted" $VAR `backtick` 100% &amp; done
+EOF</code></pre>
+<pre><code class="language-json">{
+  "name": "miniteams",
+  "nested": {"a": [1, 2, 3], "b": "&lt;tag&gt; &amp; \"quotes\""},
+  "unicode": "café 日本語 👍"
+}</code></pre>
+<pre><code>// no-wrap stress: a single very long code line that should scroll, not wrap, in the renderer
+const veryLongIdentifierNameThatKeepsGoing = someFunction(argumentOne, argumentTwo, argumentThree, argumentFour, argumentFive);</code></pre>
+<div>Inline <code>code with &lt;brackets&gt; &amp; "quotes"</code> mid-sentence, then more text.</div>
+<div>Deeply nested: <span><span><span><b><i><u>deep</u></i></b></span></span></span></div>
+<div>Mention-like span: <span itemtype="http://schema.skype.com/Mention" itemid="0">@Someone</span></div>
+<div>Sanitization probes (Teams should neutralize these — the broken-image icon below is
+  EXPECTED: the bogus src renders a placeholder while the onerror handler is stripped):
+  <script>alert('xss')</script>
+  <img src="x" onerror="alert(1)" alt="broken-src probe (expected broken icon)">
+  <a href="javascript:alert(2)">js link</a>
+  <style>body{display:none}</style>
+</div>
+<table border="1"><tr><th>col1</th><th>col2</th></tr><tr><td>a</td><td>b</td></tr></table>
+<div>Trailing line with control-ish whitespace and a tab	between	words.</div>

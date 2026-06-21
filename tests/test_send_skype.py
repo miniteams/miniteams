@@ -43,6 +43,42 @@ def test_send_message_builds_request(settings: Settings, monkeypatch) -> None:
     assert body["imdisplayname"] == "Me"
 
 
+def test_send_message_html_mode_sends_raw(settings: Settings, monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_post(url: str, **kw: Any) -> _Resp:
+        captured.update(kw)
+        return _Resp({}, status=201)
+
+    monkeypatch.setattr(send.httpx, "post", fake_post)
+    send.send_message(settings, "sk", "48:notes", "<b>hi</b> & <i>x</i>", "Me", is_html=True)
+    assert captured["json"]["content"] == "<b>hi</b> & <i>x</i>"  # verbatim, not escaped
+
+
+def test_parse_message_link() -> None:
+    url = (
+        "https://teams.cloud.microsoft/l/message/48:notes/1781920776714"
+        "?context=%7B%22contextType%22%3A%22chat%22%7D"
+    )
+    assert send.parse_message_link(url) == ("48:notes", "1781920776714")
+    assert send.parse_message_link("just-an-id") is None
+
+
+def test_edit_message_puts_with_skypeeditedid(settings: Settings, monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_put(url: str, **kw: Any) -> _Resp:
+        captured["url"] = url
+        captured.update(kw)
+        return _Resp({}, status=200)
+
+    monkeypatch.setattr(send.httpx, "put", fake_put)
+    send.edit_message(settings, "sk", "48:notes", "1781920776714", "new <b>text</b>", is_html=True)
+    assert captured["url"].endswith("/conversations/48%3Anotes/messages/1781920776714")
+    assert captured["json"]["skypeeditedid"] == "1781920776714"
+    assert captured["json"]["content"] == "new <b>text</b>"
+
+
 def test_send_message_raises_on_error_envelope(settings: Settings, monkeypatch) -> None:
     monkeypatch.setattr(
         send.httpx, "post", lambda *a, **k: _Resp({"errorCode": 1, "message": "nope"}, content=b"{...}")

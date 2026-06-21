@@ -32,6 +32,9 @@ uv run miniteams --device-code login   # device-code fallback (often CA-blocked)
 uv run miniteams stream           # live: incoming messages, reactions, attachments
 uv run miniteams send "hello"     # send to your Notes (write-safe default)
 uv run miniteams send --thread 19:xxx@thread.v2 "hi"   # send to a conversation
+uv run miniteams send --file msg.txt              # body from a file (escaped)
+uv run miniteams send --file test.html --html     # raw RichText/Html (formatted)
+uv run miniteams update <msg-id-or-deep-link> "fixed text"   # edit a sent message
 uv run miniteams dump             # dump your Notes' full history (oldest → newest)
 uv run miniteams dump --thread 19:xxx@thread.v2        # dump a conversation
 uv run miniteams dump --jsonl > notes.jsonl            # full-detail JSON per line
@@ -40,8 +43,11 @@ uv run miniteams dump --jsonl > notes.jsonl            # full-detail JSON per li
 `dump --jsonl` emits one full-detail record per message (raw resource + resolved sender/thread
 + attachment refs + reactions), every message type, no media download — pipe-friendly.
 
-`stream` enriches each line with thread name + participants, downloads images/files to
-`~/.cache/miniteams/media/`, and prints reactions (`↳ 👍 Alice reacted`).
+`stream` enriches each line with thread name + participants, resolves MRIs → display names
+(cached in `~/.cache/miniteams/names.json`), downloads images/files to `~/.cache/miniteams/media/`
+(full-res + optimized, shown as `file://`), and renders reactions (`↳ 👍 Alice reacted`), edits
+(`✏ …`) and deletes (`🗑 …`). `stream --jsonl` = per-event JSON; `stream --raw` = full firehose
+NDJSON of every frame (all endpoints, presence/calls, named events), decoded.
 
 Tokens cache under `~/.config/miniteams/` (`0600`); re-runs are silent until the refresh
 token expires. Downloaded media lives under `~/.cache/miniteams/media/`.

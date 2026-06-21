@@ -69,12 +69,48 @@ def cmd_handshake(settings: Settings, args: argparse.Namespace) -> int:
 
 def cmd_send(settings: Settings, args: argparse.Namespace) -> int:
     """Send a message — defaults to your own Notes (write-safe target)."""
+    from pathlib import Path
+
     from .send import send_message
+
+    if args.file:
+        text = Path(args.file).read_text(encoding="utf-8")
+    elif args.text is not None:
+        text = args.text
+    else:
+        log.error("send_no_input", hint="provide TEXT or --file")
+        return 2
 
     aad, skype_token = _ensure_skype_token(settings)
     display_name = (aad.get("id_token_claims") or {}).get("name") or ""
-    send_message(settings, skype_token, args.thread, args.text, display_name)
+    send_message(settings, skype_token, args.thread, text, display_name, is_html=args.html)
     print(f"sent → {args.thread}", file=sys.stderr)
+    return 0
+
+
+def cmd_update(settings: Settings, args: argparse.Namespace) -> int:
+    """Edit a previously-sent message, identified by id or a Teams deep link."""
+    from pathlib import Path
+
+    from .send import edit_message, parse_message_link
+
+    link = parse_message_link(args.target)
+    if link:
+        thread_id, message_id = link
+    else:
+        thread_id, message_id = args.thread, args.target  # bare message id + --thread
+
+    if args.file:
+        text = Path(args.file).read_text(encoding="utf-8")
+    elif args.text is not None:
+        text = args.text
+    else:
+        log.error("update_no_input", hint="provide TEXT or --file")
+        return 2
+
+    _, skype_token = _ensure_skype_token(settings)
+    edit_message(settings, skype_token, thread_id, message_id, text, is_html=args.html)
+    print(f"edited → {thread_id}/{message_id}", file=sys.stderr)
     return 0
 
 
@@ -84,9 +120,12 @@ def cmd_dump(settings: Settings, args: argparse.Namespace) -> int:
 
     from .dump import dump_conversation
 
-    _, skype_token = _ensure_skype_token(settings)
+    aad, skype_token = _ensure_skype_token(settings)
+    bearer = str(aad.get("id_token") or aad["access_token"])
     asyncio.run(
-        dump_conversation(settings, skype_token, args.thread, args.page_size, args.max_pages, args.jsonl)
+        dump_conversation(
+            settings, skype_token, args.thread, args.page_size, args.max_pages, args.jsonl, bearer
+        )
     )
     return 0
 
@@ -98,7 +137,7 @@ def cmd_stream(settings: Settings, args: argparse.Namespace) -> int:
     from .stream import run_forever
 
     try:
-        asyncio.run(run_forever(settings, args.jsonl))
+        asyncio.run(run_forever(settings, args.jsonl, args.raw))
     except KeyboardInterrupt:
         log.info("interrupted")
     return 0
@@ -136,7 +175,13 @@ def main(argv: list[str] | None = None) -> int:
     p_dump.set_defaults(func=cmd_dump)
 
     p_send = sub.add_parser("send", help="send a message (default target: your Notes)")
-    p_send.add_argument("text", help="message text")
+    p_send.add_argument("text", nargs="?", help="message text (omit when using --file)")
+    p_send.add_argument("--file", help="read message body from this file instead of TEXT")
+    p_send.add_argument(
+        "--html",
+        action="store_true",
+        help="send content as raw RichText/Html (no escaping) for formatting",
+    )
     p_send.add_argument(
         "--thread",
         default=NOTES_THREAD,
@@ -144,9 +189,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_send.set_defaults(func=cmd_send)
 
+    p_update = sub.add_parser("update", help="edit a sent message (by id or Teams deep link)")
+    p_update.add_argument("target", help="message id, or a /l/message/<thread>/<id> Teams link")
+    p_update.add_argument("text", nargs="?", help="new message text (omit when using --file)")
+    p_update.add_argument("--file", help="read new body from this file instead of TEXT")
+    p_update.add_argument("--html", action="store_true", help="send content as raw RichText/Html")
+    p_update.add_argument(
+        "--thread",
+        default=NOTES_THREAD,
+        help="thread id when target is a bare message id (default: Notes to self)",
+    )
+    p_update.set_defaults(func=cmd_update)
+
     p_stream = sub.add_parser("stream", help="stream live incoming chat events (M2+)")
     p_stream.add_argument(
         "--jsonl", action="store_true", help="emit full-detail JSON per event (no media download)"
+    )
+    p_stream.add_argument(
+        "--raw",
+        action="store_true",
+        help="firehose NDJSON: every frame (all endpoints, presence/calls, named events), decoded",
     )
     p_stream.set_defaults(func=cmd_stream)
 

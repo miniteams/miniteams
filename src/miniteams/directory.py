@@ -9,6 +9,7 @@ Caches live for the process lifetime and survive reconnects (only the skype toke
 per session). Lookups never raise into the stream — a failed fetch degrades to the bare id.
 """
 
+import json
 from typing import Any
 from urllib.parse import quote
 
@@ -32,12 +33,30 @@ class Directory:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.skype_token = ""
+        self.bearer = ""  # AAD id_token, for the profile lookup (Bearer auth)
         self._threads: dict[str, dict[str, Any] | None] = {}
-        self._names: dict[str, str] = {}  # MRI → display name
+        self._names_path = settings.cache_dir / "names.json"
+        self._names: dict[str, str] = self._load_names()  # MRI → display name (persisted)
         self._reactions: dict[str, dict[str, set[str]]] = {}  # msg_id → {key → set(MRI)}
 
-    def set_token(self, skype_token: str) -> None:
+    def _load_names(self) -> dict[str, str]:
+        try:
+            loaded = json.loads(self._names_path.read_text())
+            return loaded if isinstance(loaded, dict) else {}
+        except OSError, ValueError:
+            return {}
+
+    def _save_names(self) -> None:
+        try:
+            self._names_path.parent.mkdir(parents=True, exist_ok=True)
+            self._names_path.write_text(json.dumps(self._names, ensure_ascii=False))
+        except OSError as exc:  # cache is best-effort; a write failure must not break the stream
+            log.debug("names_cache_save_failed", error=str(exc))
+
+    def set_token(self, skype_token: str, bearer: str = "") -> None:
         self.skype_token = skype_token
+        if bearer:
+            self.bearer = bearer
 
     def note_name(self, mri: str, name: str | None) -> None:
         if mri and name:
@@ -46,6 +65,39 @@ class Directory:
     def name_for(self, mri: str) -> str:
         # Strip the "8:orgid:" style prefix for an unresolved MRI.
         return self._names.get(mri) or mri.split(":")[-1]
+
+    async def _resolve(self, mris: list[str]) -> None:
+        """Batched MRI → display-name lookup; caches results (incl. negatives, to avoid refetch)."""
+        todo = sorted({m for m in mris if m and m not in self._names})
+        if not todo or not self.bearer:
+            return
+        headers = {
+            "Authorization": f"Bearer {self.bearer}",
+            "X-Skypetoken": self.skype_token,
+            "Content-Type": "application/json",
+            "User-Agent": self.settings.user_agent,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(self.settings.profiles_url, headers=headers, json=todo)
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:  # noqa: BLE001 — transient failure: leave uncached, retry later
+            log.debug("profile_resolve_failed", count=len(todo), error=str(exc))
+            return
+        for user in data.get("value") or data.get("resolvedUsers") or []:
+            self.note_name(user.get("mri", ""), user.get("displayName"))
+        # Negative-cache genuinely-unknown MRIs (lookup succeeded but returned no name) so we
+        # don't re-query them; transient failures above return early and stay retryable.
+        for mri in todo:
+            self._names.setdefault(mri, mri.split(":")[-1])
+        self._save_names()
+
+    async def display(self, mri: str) -> str:
+        """Resolve an MRI to a display name (cached); falls back to the stripped id."""
+        if mri not in self._names and self.bearer and mri.startswith("8:orgid:"):
+            await self._resolve([mri])
+        return self.name_for(mri)
 
     def reaction_diff(self, msg_id: str, key: str, users: list[str]) -> tuple[set[str], set[str]]:
         """Update stored reaction state for (msg_id, key); return (added_mris, removed_mris)."""
@@ -86,7 +138,13 @@ class Directory:
             mri = m.get("linkedMri") or _mri_from_userlink(m.get("userLink")) or m.get("mri") or ""
             name = m.get("friendlyName") or m.get("friendlyname") or ""
             self.note_name(mri, name)
-            members.append({"mri": mri, "name": name or self.name_for(mri), "role": m.get("role")})
+            members.append({"mri": mri, "name": name, "role": m.get("role")})
+
+        # Resolve roster members the thread didn't name (bare-guid MRIs) in one batched call.
+        await self._resolve([m["mri"] for m in members if not m["name"]])
+        for m in members:
+            m["name"] = m["name"] or self.name_for(m["mri"])
+        self._save_names()  # persist friendlyName-sourced names too
 
         topic = (data.get("properties") or {}).get("topic") or None
         return {"topic": topic, "members": members}

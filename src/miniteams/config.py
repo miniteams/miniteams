@@ -45,6 +45,12 @@ class Settings(BaseSettings):
 
     # --- chat-service metadata (libteams.h TEAMS_CONTACTS_HOST, TFW) ---
     contacts_host: str = "apac.ng.msg.teams.microsoft.com"
+    # Batched MRI → display-name lookup (teams_contacts.c TEAMS_PROFILES_PREFIX). Bearer id_token.
+    profiles_url: str = (
+        "https://teams.microsoft.com/api/mt/beta/users/fetchShortProfile"
+        "?isMailAddress=false&canBeSmtpAddress=false&enableGuest=true"
+        "&includeIBBarredUsers=true&skypeTeamsInfo=true&includeBots=true"
+    )
 
     # --- trouter / registrar (M1+) ---
     trouter_info_url: str = "https://go.trouter.teams.microsoft.com/v4/a"

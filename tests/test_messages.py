@@ -11,6 +11,8 @@ from miniteams.messages import (
     _print_reactions,
     _strip_html,
     _thread_id,
+    emit_raw_delivery,
+    emit_raw_named,
     event_to_record,
     handle_delivery,
     resource_to_record,
@@ -130,6 +132,61 @@ async def test_handle_delivery_prints_new_message(directory: Directory, capsys) 
 async def test_handle_delivery_ignores_non_messaging(directory: Directory, capsys) -> None:
     await handle_delivery({"url": "https://h/x/unifiedPresenceService", "body": "{}"}, directory)
     assert capsys.readouterr().out == ""
+
+
+async def test_emit_raw_delivery_includes_all_endpoints(capsys) -> None:
+    # a presence event (not /messaging) — raw mode emits it anyway, decoded
+    req = {
+        "id": 7,
+        "method": "POST",
+        "url": "https://h/x/unifiedPresenceService",
+        "headers": {"k": "v"},
+        "body": json.dumps({"availability": "Away"}),
+    }
+    await emit_raw_delivery(req)
+    rec = json.loads(capsys.readouterr().out)
+    assert rec["kind"] == "delivery"
+    assert rec["url"].endswith("/unifiedPresenceService")
+    assert rec["body"] == {"availability": "Away"}
+
+
+async def test_emit_raw_named(capsys) -> None:
+    await emit_raw_named('{"name":"trouter.connected","args":[{"ttl":1}]}')
+    rec = json.loads(capsys.readouterr().out)
+    assert rec == {"kind": "named", "event": {"name": "trouter.connected", "args": [{"ttl": 1}]}}
+
+
+async def test_handle_delivery_edit_marks_edited(directory: Directory, capsys) -> None:
+    body = {
+        "type": "EventMessage",
+        "resourceType": "MessageUpdate",
+        "resource": {
+            "messagetype": "Text",
+            "from": "8:o:u",
+            "imdisplayname": "Al",
+            "content": "fixed",
+            "conversationLink": NOTES_LINK,
+            "skypeeditedid": "1",
+        },
+    }
+    await handle_delivery({"url": "https://h/x/messaging", "body": json.dumps(body)}, directory)
+    out = capsys.readouterr().out
+    assert "✏" in out and "fixed" in out
+
+
+async def test_handle_delivery_delete_renders(directory: Directory, capsys) -> None:
+    body = {
+        "type": "EventMessage",
+        "resourceType": "MessageUpdate",
+        "resource": {
+            "from": "8:o:u",
+            "imdisplayname": "Al",
+            "conversationLink": NOTES_LINK,
+            "properties": {"deletetime": 123},
+        },
+    }
+    await handle_delivery({"url": "https://h/x/messaging", "body": json.dumps(body)}, directory)
+    assert "🗑" in capsys.readouterr().out
 
 
 async def test_handle_delivery_message_update_without_emotions_is_silent(
