@@ -32,6 +32,13 @@ def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _rate(n: int, start: float) -> float:
+    """Throughput (items/s) since `start`; the inter-page delay is included on purpose — this is
+    the effective recovery rate, the number an ETA should be built from."""
+    elapsed = time.monotonic() - start
+    return round(n / elapsed, 1) if elapsed > 0 else 0.0
+
+
 def _enumerate(settings: Settings, skype_token: str, include_all: bool) -> list[str]:
     targets: list[str] = []
     for page in fetch_conversations(settings, skype_token):
@@ -47,10 +54,20 @@ def _topup(settings: Settings, skype_token: str, thread_id: str, store: ChatStor
     known_newest = store.newest()
     if not known_newest:
         return 0  # empty store → backfill does the full pull; nothing to top up
-    added = 0
+    added = pages = 0
+    start = time.monotonic()
     for messages in iter_history_pages(settings, skype_token, thread_id, _PAGE_SIZE, 0):
         added += store.insert_page(messages)
+        pages += 1
         oldest_in_page = str(messages[-1].get("composetime", ""))  # newest-first → last is oldest
+        log.info(
+            "topup_progress",
+            thread=thread_id,
+            pages=pages,
+            new=added,
+            oldest=oldest_in_page[:19],
+            msgs_per_s=_rate(added, start),
+        )
         if oldest_in_page <= known_newest:
             break  # reached messages already stored — everything older is known
         time.sleep(_INTER_PAGE_DELAY)
@@ -61,9 +78,20 @@ def _backfill(settings: Settings, skype_token: str, thread_id: str, store: ChatS
     """Walk older than the oldest stored message until history is exhausted, then flag done."""
     oldest = store.oldest()
     end_before = _epoch_seconds(oldest) - 1 if oldest else None
-    added = 0
+    added = pages = 0
+    start = time.monotonic()
     for messages in iter_history_pages(settings, skype_token, thread_id, _PAGE_SIZE, 0, end_before):
         added += store.insert_page(messages)
+        pages += 1
+        oldest_in_page = str(messages[-1].get("composetime", ""))  # newest-first → last is oldest
+        log.info(
+            "backfill_progress",
+            thread=thread_id,
+            pages=pages,
+            new=added,
+            oldest=oldest_in_page[:19],
+            msgs_per_s=_rate(added, start),
+        )
         time.sleep(_INTER_PAGE_DELAY)
     # Loop drained naturally (short/empty page) — max_pages is 0, so this is a true end of history.
     index.mark_backfill_done(thread_id)
@@ -76,18 +104,28 @@ async def _download_media(store: ChatStore, skype_token: str) -> int:
     Runs after messages are committed, iterating stored data — so it is resumable (a crash mid-pass
     re-runs cheaply, skipping files already on disk) and never blocks message capture.
     """
-    fetched = 0
+    fetched = seen = 0
+    start = time.monotonic()
     for message in store.iter_messages():
         content = message.get("content") or ""
         msgtype = str(message.get("messagetype") or "")
         if not attachments.extract(content, msgtype):
             continue  # no attachment → don't even open a client
+        seen += 1
         try:
             notes = await attachments.process(content, msgtype, skype_token, store.media_dir, download=True)
         except Exception as exc:  # noqa: BLE001 — one message's media must not abort the pass
             log.debug("message_media_failed", id=message.get("id"), error=str(exc))
             continue
         fetched += sum(1 for n in notes if "→" in n)
+        if seen % 50 == 0:
+            log.info(
+                "media_progress",
+                thread=store.thread_id,
+                with_media=seen,
+                files=fetched,
+                files_per_s=_rate(fetched, start),
+            )
     return fetched
 
 
@@ -109,6 +147,7 @@ async def archive_chat(
         participants=(info or {}).get("members") or [],
     )
     store = ChatStore(data_dir, thread_id)
+    start = time.monotonic()
     try:
         new_top = _topup(settings, skype_token, thread_id, store)
         new_old = 0
@@ -123,6 +162,8 @@ async def archive_chat(
             new_recent=new_top,
             new_backfill=new_old,
             media=media,
+            duration_s=round(time.monotonic() - start, 1),
+            msgs_per_s=_rate(new_top + new_old, start),
         )
     finally:
         store.close()
