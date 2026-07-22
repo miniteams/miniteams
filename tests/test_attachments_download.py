@@ -1,5 +1,6 @@
 """Attachment download paths with a fake async httpx client."""
 
+from pathlib import Path
 from typing import Any
 
 from miniteams import attachments as A
@@ -142,3 +143,16 @@ async def test_stream_to_removes_partial_file_on_failure(settings: Settings) -> 
     except RuntimeError:
         pass
     assert not dest.exists()
+
+
+async def test_process_relative_media_dir_still_links(settings: Settings, monkeypatch, tmp_path) -> None:
+    """Regression: a relative media_dir must not break file:// URI building (Path.as_uri needs
+    absolute). The download note must still carry the '→ <local>' link, so archive counts it."""
+    monkeypatch.chdir(tmp_path)
+
+    def handler(url: str) -> _Resp:
+        return _Resp(content=b"IMG", headers={"content-type": "image/png"})
+
+    _patch_client(monkeypatch, handler)
+    notes = await A.process(IMG, "RichText/Html", "sk", Path("rel/media"), download=True)
+    assert any("→" in n for n in notes), notes

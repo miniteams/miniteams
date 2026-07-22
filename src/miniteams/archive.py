@@ -292,6 +292,9 @@ async def run_archive(
     download_media: bool = True,
     download_avatars: bool = True,
 ) -> None:
+    # Absolute: downloaded media paths are turned into file:// URIs (Path.as_uri), which rejects
+    # relative paths — a relative --data-dir would otherwise fail every attachment.
+    data_dir = data_dir.resolve()
     index = Index(data_dir)
     directory = Directory(settings)
     try:

@@ -174,8 +174,9 @@ async def process(
                 if kind == "image":
                     optim_path, full_path = await _download_image(client, token, url, media_dir)
                     # Show the local file:// (full-res when available) next to the original URL.
-                    primary = Path(full_path or optim_path).as_uri()
-                    extra = f" (optim {Path(optim_path).as_uri()})" if full_path else ""
+                    # resolve(): as_uri() rejects relative paths (a relative media_dir would 500).
+                    primary = Path(full_path or optim_path).resolve().as_uri()
+                    extra = f" (optim {Path(optim_path).resolve().as_uri()})" if full_path else ""
                     notes.append(f"[image: {url} → {primary}{extra}]")
                 else:
                     fpath, name, size = await _download_file(client, token, url, media_dir)
