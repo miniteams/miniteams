@@ -14,7 +14,8 @@ framing) and [`Gerenios/AADInternals`](https://github.com/Gerenios/AADInternals)
 ## Status
 
 Working. Auth (browser/device-code), live `stream` (messages, reactions, attachments,
-auto-reconnect), `dump` (history backfill, `--jsonl`), and `send` are all implemented.
+auto-reconnect), `chats` (recent conversations, date-window filter), `dump` (history backfill,
+`--jsonl`), and `send` are all implemented.
 See `HANDOFF.md` for the original milestone plan and protocol notes.
 
 ## Setup
@@ -27,9 +28,11 @@ uv sync
 ## Usage
 
 ```sh
-uv run miniteams login            # browser auth-code+PKCE, prints masked tokens
-uv run miniteams --device-code login   # device-code fallback (often CA-blocked)
+uv run miniteams login            # browser (FOCI seed), falls back to device-code; masked tokens
+uv run miniteams --device-code login   # force device-code flow (no browser)
 uv run miniteams stream           # live: incoming messages, reactions, attachments
+uv run miniteams chats            # 20 most recent private chats (id + last activity + names)
+uv run miniteams chats --since 2026-07-01 --until 2026-07-10   # activity window; --all, --jsonl
 uv run miniteams send "hello"     # send to your Notes (write-safe default)
 uv run miniteams send --thread 19:xxx@thread.v2 "hi"   # send to a conversation
 uv run miniteams send --file msg.txt              # body from a file (escaped)
@@ -46,8 +49,9 @@ uv run miniteams dump --jsonl > notes.jsonl            # full-detail JSON per li
 `stream` enriches each line with thread name + participants, resolves MRIs → display names
 (cached in `~/.cache/miniteams/names.json`), downloads images/files to `~/.cache/miniteams/media/`
 (full-res + optimized, shown as `file://`), and renders reactions (`↳ 👍 Alice reacted`), edits
-(`✏ …`) and deletes (`🗑 …`). `stream --jsonl` = per-event JSON; `stream --raw` = full firehose
-NDJSON of every frame (all endpoints, presence/calls, named events), decoded.
+(`✏ …`) and deletes (`🗑 …`). `--typing` adds `✍ is typing / stopped` indicators.
+`stream --jsonl` = per-event JSON; `stream --raw` = full firehose NDJSON of every frame (all
+endpoints, presence/calls, named events), decoded.
 
 Tokens cache under `~/.config/miniteams/` (`0600`); re-runs are silent until the refresh
 token expires. Downloaded media lives under `~/.cache/miniteams/media/`.

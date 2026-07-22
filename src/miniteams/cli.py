@@ -130,14 +130,32 @@ def cmd_dump(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_chats(settings: Settings, args: argparse.Namespace) -> int:
+    """List recent chats (default: private 1:1/group only), newest activity first."""
+    import asyncio
+
+    from .chats import list_chats, parse_when
+
+    since = parse_when(args.since) if args.since else None
+    until = parse_when(args.until, end=True) if args.until else None
+    aad, skype_token = _ensure_skype_token(settings)
+    bearer = str(aad.get("id_token") or aad["access_token"])
+    asyncio.run(list_chats(settings, skype_token, bearer, args.limit, since, until, args.all, args.jsonl))
+    return 0
+
+
 def cmd_stream(settings: Settings, args: argparse.Namespace) -> int:
     """Full chain → websocket → authenticate → register → stream, with auto-reconnect (M2-M4)."""
     import asyncio
 
     from .stream import run_forever
 
+    # Stream is long-running and often headless (server/SSH) where a localhost browser redirect
+    # can't complete; default the interactive fallback to device-code. A cached token still goes
+    # silent; `--device-code` is implied here.
+    settings.use_device_code = True
     try:
-        asyncio.run(run_forever(settings, args.jsonl, args.raw))
+        asyncio.run(run_forever(settings, args.jsonl, args.raw, args.typing))
     except KeyboardInterrupt:
         log.info("interrupted")
     return 0
@@ -151,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--device-code",
         action="store_true",
-        help="use device-code flow instead of browser (often CA-blocked)",
+        help="authenticate via device-code flow instead of the browser",
     )
     parser.add_argument("--log-level", default=None, help="override MINITEAMS_LOG_LEVEL")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -201,6 +219,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_update.set_defaults(func=cmd_update)
 
+    p_chats = sub.add_parser("chats", help="list recent private chats (newest activity first)")
+    p_chats.add_argument("--limit", type=int, default=20, help="max chats to list (0 = no limit)")
+    p_chats.add_argument("--since", help="ISO date/datetime — only chats with activity at/after")
+    p_chats.add_argument(
+        "--until", help="ISO date/datetime — only chats with activity before (date = whole day)"
+    )
+    p_chats.add_argument("--all", action="store_true", help="include channels and meeting chats too")
+    p_chats.add_argument("--jsonl", action="store_true", help="emit one JSON object per chat")
+    p_chats.set_defaults(func=cmd_chats)
+
     p_stream = sub.add_parser("stream", help="stream live incoming chat events (M2+)")
     p_stream.add_argument(
         "--jsonl", action="store_true", help="emit full-detail JSON per event (no media download)"
@@ -209,6 +237,9 @@ def main(argv: list[str] | None = None) -> int:
         "--raw",
         action="store_true",
         help="firehose NDJSON: every frame (all endpoints, presence/calls, named events), decoded",
+    )
+    p_stream.add_argument(
+        "--typing", action="store_true", help="show typing indicators (✍ is typing / stopped)"
     )
     p_stream.set_defaults(func=cmd_stream)
 
