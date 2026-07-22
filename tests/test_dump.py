@@ -15,6 +15,7 @@ def test_epoch_seconds_truncates_to_seconds() -> None:
 class _Resp:
     def __init__(self, data: dict[str, Any]) -> None:
         self._data = data
+        self.status_code = 200  # get_with_retry inspects this before returning
 
     def raise_for_status(self) -> None:
         pass

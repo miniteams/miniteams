@@ -18,6 +18,7 @@ from ._io import emit, force_blocking_stdout
 from .config import Settings
 from .directory import Directory
 from .dump import _TARGET_TYPE, fetch_history
+from .http import get_with_retry
 
 log = structlog.get_logger()
 
@@ -73,8 +74,7 @@ def fetch_conversations(settings: Settings, skype_token: str) -> Iterator[list[d
     }
     with httpx.Client(timeout=30.0, headers=headers) as client:
         for page in range(_MAX_PAGES):
-            resp = client.get(url)
-            resp.raise_for_status()
+            resp = get_with_retry(client, url)
             data = resp.json()
             conversations = data.get("conversations") or []
             log.debug("conversations_page", page=page + 1, count=len(conversations))

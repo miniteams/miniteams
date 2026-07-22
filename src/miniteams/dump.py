@@ -7,6 +7,7 @@ The server returns newest-first; we walk older pages by setting `endTime` to the
 
 import json
 import re
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote
@@ -17,6 +18,7 @@ import structlog
 from ._io import emit, force_blocking_stdout
 from .config import Settings
 from .directory import Directory
+from .http import get_with_retry
 from .messages import print_resource, resource_to_record
 
 log = structlog.get_logger()
@@ -33,6 +35,53 @@ def _epoch_seconds(composetime: str) -> int:
     return int(dt.timestamp())
 
 
+def iter_history_pages(
+    settings: Settings,
+    skype_token: str,
+    thread_id: str,
+    page_size: int,
+    max_pages: int,
+    end_before: int | None = None,
+) -> Iterator[list[dict[str, Any]]]:
+    """Yield raw message pages newest-first, walking older via a shrinking `endTime` window.
+
+    end_before: epoch seconds; None ⇒ no endTime on the first page (start from newest).
+    The caller may stop early (e.g. top-up once it overlaps known messages); the window only
+    advances between yields, so a page is fully surfaced before the next request is made.
+    """
+    base = f"https://{settings.contacts_host}/v1/users/ME/conversations/{quote(thread_id, safe='')}/messages"
+    headers = {
+        "X-Skypetoken": skype_token,
+        "User-Agent": settings.user_agent,
+        "Accept": "application/json; ver=1.0;",
+    }
+    page = 0
+    with httpx.Client(timeout=30.0, headers=headers) as client:
+        while True:
+            query = f"startTime=0000{f'&endTime={end_before}000' if end_before is not None else ''}"
+            # targetType pipes are sent unescaped (matches the reference client).
+            query += f"&pageSize={page_size}&view=msnp24Equivalent&targetType={_TARGET_TYPE}"
+            resp = get_with_retry(client, f"{base}?{query}")
+            messages = resp.json().get("messages") or []
+            if not messages:
+                return
+            page += 1
+            log.debug("history_page", page=page, count=len(messages))
+            yield messages
+            if len(messages) < page_size:
+                return
+            if max_pages and page >= max_pages:
+                log.info("history_truncated", pages=page, hint="raise max_pages for more")
+                return
+            oldest = _epoch_seconds(messages[-1].get("composetime", ""))  # newest-first → last
+            if oldest <= 0:
+                return
+            new_end = oldest - 1
+            if end_before is not None and new_end >= end_before:
+                return  # window not advancing — server ignored endTime; stop cleanly
+            end_before = new_end
+
+
 def fetch_history(
     settings: Settings,
     skype_token: str,
@@ -41,40 +90,9 @@ def fetch_history(
     max_pages: int,
     end_before: int | None = None,
 ) -> list[dict[str, Any]]:
-    base = f"https://{settings.contacts_host}/v1/users/ME/conversations/{quote(thread_id, safe='')}/messages"
-    headers = {
-        "X-Skypetoken": skype_token,
-        "User-Agent": settings.user_agent,
-        "Accept": "application/json; ver=1.0;",
-    }
     collected: list[dict[str, Any]] = []
-    # end_before: epoch seconds; None ⇒ no endTime on the first page (start from newest).
-    page = 0
-    with httpx.Client(timeout=30.0, headers=headers) as client:
-        while True:
-            query = f"startTime=0000{f'&endTime={end_before}000' if end_before is not None else ''}"
-            # targetType pipes are sent unescaped (matches the reference client).
-            query += f"&pageSize={page_size}&view=msnp24Equivalent&targetType={_TARGET_TYPE}"
-            resp = client.get(f"{base}?{query}")
-            resp.raise_for_status()
-            messages = resp.json().get("messages") or []
-            if not messages:
-                break
-            collected.extend(messages)
-            page += 1
-            log.debug("history_page", page=page, count=len(messages), total=len(collected))
-            if len(messages) < page_size:
-                break
-            if max_pages and page >= max_pages:
-                log.info("history_truncated", pages=page, hint="raise --max-pages for more")
-                break
-            oldest = _epoch_seconds(messages[-1].get("composetime", ""))  # newest-first → last
-            if oldest <= 0:
-                break
-            new_end = oldest - 1
-            if end_before is not None and new_end >= end_before:
-                break  # window not advancing — server ignored endTime; stop cleanly
-            end_before = new_end
+    for messages in iter_history_pages(settings, skype_token, thread_id, page_size, max_pages, end_before):
+        collected.extend(messages)
 
     # Page windows are second-granular and can overlap → de-dup by message id before emitting.
     unique: dict[str, dict[str, Any]] = {}

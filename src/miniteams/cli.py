@@ -144,6 +144,19 @@ def cmd_chats(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
+    """Build/refresh a resumable local archive of chats under data/ (see spec 001)."""
+    import asyncio
+    from pathlib import Path
+
+    from .archive import run_archive
+
+    aad, skype_token = _ensure_skype_token(settings)
+    bearer = str(aad.get("id_token") or aad["access_token"])
+    asyncio.run(run_archive(settings, skype_token, bearer, Path(args.data_dir), args.thread, args.all))
+    return 0
+
+
 def cmd_stream(settings: Settings, args: argparse.Namespace) -> int:
     """Full chain → websocket → authenticate → register → stream, with auto-reconnect (M2-M4)."""
     import asyncio
@@ -228,6 +241,12 @@ def main(argv: list[str] | None = None) -> int:
     p_chats.add_argument("--all", action="store_true", help="include channels and meeting chats too")
     p_chats.add_argument("--jsonl", action="store_true", help="emit one JSON object per chat")
     p_chats.set_defaults(func=cmd_chats)
+
+    p_archive = sub.add_parser("archive", help="build/refresh a resumable local chat archive")
+    p_archive.add_argument("--data-dir", default="data", help="archive root (default: ./data)")
+    p_archive.add_argument("--thread", help="archive only this conversation (skip enumeration)")
+    p_archive.add_argument("--all", action="store_true", help="include channels and meeting chats too")
+    p_archive.set_defaults(func=cmd_archive)
 
     p_stream = sub.add_parser("stream", help="stream live incoming chat events (M2+)")
     p_stream.add_argument(

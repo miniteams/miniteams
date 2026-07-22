@@ -10,3 +10,6 @@ __pycache__/
 htmlcov/
 dist/
 *.egg-info/
+
+# local archive (personal chat data — never commit)
+data/
