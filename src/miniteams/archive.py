@@ -287,7 +287,6 @@ async def archive_chat(
         media = await _download_media(store, skype_token, label) if download_media else 0
         avatars_n = await _download_avatars(store, info, skype_token, bearer) if download_avatars else 0
         index.touch(thread_id, _now_iso())
-        reached_start = _reached_start(store.oldest(), info.get("created_at"))
         log.info(
             "chat_archived",
             chat=label,
@@ -298,12 +297,14 @@ async def archive_chat(
             media=media,
             avatars=avatars_n,
             oldest=(store.oldest() or "")[:19],
-            reached_start=reached_start,  # True = backfill hit the thread's first message
+            # Positive-only completeness confirmation: True = oldest stored message reaches the
+            # thread's creation. False/None is NOT a problem — a thread can exist before its first
+            # message (meetings scheduled ahead of any chat); the real end-of-history guarantee is
+            # that the backfill drained to an empty page.
+            reached_start=_reached_start(store.oldest(), info.get("created_at")),
             duration_s=round(time.monotonic() - start, 1),
             msgs_per_s=_rate(new_top + new_old, start),
         )
-        if reached_start is False:
-            log.warning("backfill_may_be_incomplete", chat=label, thread=thread_id, oldest=store.oldest())
     finally:
         store.close()
 
