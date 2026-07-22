@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     # MSAL reserved scopes (openid/profile/offline_access) are added automatically,
     # so only the resource .default is listed here.
     oauth_scope: str = "https://api.spaces.skype.com/.default"
+    # The Teams client has no http://localhost redirect, so MSAL's loopback interactive flow
+    # fails (AADSTS50011). Seed the FOCI family refresh token with a localhost-registered public
+    # client (Azure CLI), then redeem it for the Teams scope via the Teams client_id (FOCI). The
+    # seed scope is one the auth client is allowed (Graph). Device-code uses the Teams client
+    # directly (no redirect). All three are FOCI family members.
+    auth_client_id: str = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"  # Azure CLI
+    seed_scope: str = "https://graph.microsoft.com/.default"
 
     # --- skype-token exchange (authsvc authz) ---
     authz_url: str = "https://teams.microsoft.com/api/authsvc/v1.0/authz"

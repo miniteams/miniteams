@@ -34,7 +34,12 @@ def _epoch_seconds(composetime: str) -> int:
 
 
 def fetch_history(
-    settings: Settings, skype_token: str, thread_id: str, page_size: int, max_pages: int
+    settings: Settings,
+    skype_token: str,
+    thread_id: str,
+    page_size: int,
+    max_pages: int,
+    end_before: int | None = None,
 ) -> list[dict[str, Any]]:
     base = f"https://{settings.contacts_host}/v1/users/ME/conversations/{quote(thread_id, safe='')}/messages"
     headers = {
@@ -43,7 +48,7 @@ def fetch_history(
         "Accept": "application/json; ver=1.0;",
     }
     collected: list[dict[str, Any]] = []
-    end_before: int | None = None  # epoch seconds; None ⇒ no endTime on the first page
+    # end_before: epoch seconds; None ⇒ no endTime on the first page (start from newest).
     page = 0
     with httpx.Client(timeout=30.0, headers=headers) as client:
         while True:
