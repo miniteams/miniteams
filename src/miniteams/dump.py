@@ -68,8 +68,9 @@ def iter_history_pages(
             page += 1
             log.debug("history_page", page=page, count=len(messages))
             yield messages
-            if len(messages) < page_size:
-                return
+            # Stop ONLY on a definitive end: an empty page (handled above) or a non-advancing
+            # window. A short page is NOT treated as the end — the time-windowed API can under-fill
+            # a window while older messages still exist, so keep walking until it returns nothing.
             if max_pages and page >= max_pages:
                 log.info("history_truncated", pages=page, hint="raise max_pages for more")
                 return

@@ -160,7 +160,13 @@ class Directory:
         props = data.get("properties") or {}
         topic = props.get("topic") or None
         # `picture` is `URL@<AMS url>` when the chat has a custom icon (see avatars.fetch_group_icon).
-        return {"topic": topic, "members": members, "picture": props.get("picture") or None}
+        # `createdat` (ms epoch) lets the archive confirm a backfill reached the very first message.
+        return {
+            "topic": topic,
+            "members": members,
+            "picture": props.get("picture") or None,
+            "created_at": props.get("createdat"),
+        }
 
     async def label(self, thread_id: str) -> str:
         """Human-readable thread label: topic · N, else roster names, else bare id."""

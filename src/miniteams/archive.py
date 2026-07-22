@@ -91,6 +91,20 @@ def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _reached_start(oldest_iso: str | None, created_at_ms: Any) -> bool | None:
+    """True if the oldest stored message is at/before the thread's creation time — i.e. the
+    backfill reached the very first message. None when createdat is unknown (can't tell)."""
+    if not oldest_iso:
+        return None
+    try:
+        created_s = int(created_at_ms) // 1000
+    except TypeError, ValueError:
+        return None  # createdat missing/garbage → completeness unknown
+    # createdat is the thread-creation event; the first message lands a beat later. Allow a
+    # small margin so "reached the start" isn't missed by that offset.
+    return _epoch_seconds(oldest_iso) <= created_s + 5
+
+
 def _rate(n: int, start: float) -> float:
     """Throughput (items/s) since `start`; the inter-page delay is included on purpose — this is
     the effective recovery rate, the number an ETA should be built from."""
@@ -273,6 +287,7 @@ async def archive_chat(
         media = await _download_media(store, skype_token, label) if download_media else 0
         avatars_n = await _download_avatars(store, info, skype_token, bearer) if download_avatars else 0
         index.touch(thread_id, _now_iso())
+        reached_start = _reached_start(store.oldest(), info.get("created_at"))
         log.info(
             "chat_archived",
             chat=label,
@@ -282,9 +297,13 @@ async def archive_chat(
             new_backfill=new_old,
             media=media,
             avatars=avatars_n,
+            oldest=(store.oldest() or "")[:19],
+            reached_start=reached_start,  # True = backfill hit the thread's first message
             duration_s=round(time.monotonic() - start, 1),
             msgs_per_s=_rate(new_top + new_old, start),
         )
+        if reached_start is False:
+            log.warning("backfill_may_be_incomplete", chat=label, thread=thread_id, oldest=store.oldest())
     finally:
         store.close()
 

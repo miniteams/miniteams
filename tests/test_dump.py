@@ -39,7 +39,8 @@ class _Client:
 
     def get(self, url: str) -> _Resp:
         self.calls.append(url)
-        return _Resp(self._pages.pop(0))
+        # Exhausted → empty page, mirroring the real API's end-of-history signal.
+        return _Resp(self._pages.pop(0) if self._pages else {"messages": []})
 
 
 def _msg(mid: str, ts: str) -> dict[str, Any]:
