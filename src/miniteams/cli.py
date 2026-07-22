@@ -149,19 +149,23 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
     import asyncio
     from pathlib import Path
 
-    from .archive import run_archive
+    from .archive import RefreshingToken, run_archive
+    from .auth import TokenSource
 
-    aad, skype_token = _ensure_skype_token(settings)
-    bearer = str(aad.get("id_token") or aad["access_token"])
+    # Acquire once (may prompt), then hand a self-refreshing provider to the run: a full-account
+    # archive outlives the ~45-min skype token, so it must be re-minted mid-run.
+    source = TokenSource(settings)
+    source.acquire()
+    provider = RefreshingToken(settings, source)
     asyncio.run(
         run_archive(
             settings,
-            skype_token,
-            bearer,
             Path(args.data_dir),
-            args.thread,
-            args.all,
+            token_provider=provider,
+            thread=args.thread,
+            include_all=args.all,
             download_media=not args.no_media,
+            download_avatars=not args.no_avatars,
         )
     )
     return 0
@@ -258,6 +262,9 @@ def main(argv: list[str] | None = None) -> int:
     p_archive.add_argument("--all", action="store_true", help="include channels and meeting chats too")
     p_archive.add_argument(
         "--no-media", action="store_true", help="skip downloading attachments (messages only)"
+    )
+    p_archive.add_argument(
+        "--no-avatars", action="store_true", help="skip downloading group icons / member avatars"
     )
     p_archive.set_defaults(func=cmd_archive)
 

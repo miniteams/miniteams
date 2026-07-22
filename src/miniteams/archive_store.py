@@ -47,19 +47,29 @@ class Index:
                 label TEXT NOT NULL DEFAULT '',
                 topic TEXT NOT NULL DEFAULT '',
                 participants TEXT NOT NULL DEFAULT '[]',
+                raw TEXT NOT NULL DEFAULT '{}',  -- full conversation object (lastMessage, version…)
                 backfill_done INTEGER NOT NULL DEFAULT 0,
                 last_fetch_at TEXT NOT NULL DEFAULT ''
             )"""
         )
+        # Migrate an index.db created before `raw` existed.
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(chats)")}
+        if "raw" not in cols:
+            self._db.execute("ALTER TABLE chats ADD COLUMN raw TEXT NOT NULL DEFAULT '{}'")
         self._db.commit()
 
     def upsert_chat(
-        self, thread_id: str, label: str = "", topic: str = "", participants: list[Any] | None = None
+        self,
+        thread_id: str,
+        label: str = "",
+        topic: str = "",
+        participants: list[Any] | None = None,
+        raw: dict[str, Any] | None = None,
     ) -> None:
         """Insert or refresh enumeration metadata; never touches backfill_done/last_fetch_at.
 
-        participants=None means "leave as stored" — enumeration doesn't know the roster;
-        it only lands once the per-chat thread info has been fetched.
+        participants/raw=None means "leave as stored" — enumeration doesn't know the roster,
+        and a single-thread run has no conversation object to store.
         """
         with self._db:
             self._db.execute(
@@ -70,11 +80,15 @@ class Index:
             if participants is not None:
                 sets.append("participants = ?")
                 values.append(json.dumps(participants, ensure_ascii=False))
+            if raw is not None:
+                sets.append("raw = ?")
+                values.append(json.dumps(raw, ensure_ascii=False))
             self._db.execute(f"UPDATE chats SET {', '.join(sets)} WHERE id = ?", (*values, thread_id))
 
     def chats(self) -> list[dict[str, Any]]:
         rows = self._db.execute(
-            "SELECT id, dir, label, topic, participants, backfill_done, last_fetch_at FROM chats ORDER BY id"
+            "SELECT id, dir, label, topic, participants, backfill_done, last_fetch_at, raw"
+            " FROM chats ORDER BY id"
         ).fetchall()
         return [
             {
@@ -85,6 +99,7 @@ class Index:
                 "participants": json.loads(r[4]),
                 "backfill_done": bool(r[5]),
                 "last_fetch_at": r[6],
+                "raw": json.loads(r[7]),
             }
             for r in rows
         ]

@@ -53,6 +53,12 @@ def _wire(monkeypatch, api: _FakeApi, convs: list[str]) -> None:
     monkeypatch.setattr(AR.Directory, "label", fake_label)
 
 
+async def _run(settings: Settings, data: Path, **kw: Any) -> None:
+    """run_archive with a static token and avatars off — the default for non-avatar tests."""
+    kw.setdefault("download_avatars", False)
+    await AR.run_archive(settings, data, token_provider=AR.StaticToken("sk", ""), **kw)
+
+
 def _stored_ids(data_dir: Path, thread_id: str) -> set[str]:
     store = ChatStore(data_dir, thread_id)
     ids = {r[0] for r in store._db.execute("SELECT id FROM messages").fetchall()}
@@ -69,7 +75,7 @@ async def test_full_run_stores_all_and_marks_done(settings: Settings, tmp_path, 
     )
     _wire(monkeypatch, api, [C1, C2])
     data = tmp_path / "data"
-    await AR.run_archive(settings, "sk", "", data)
+    await _run(settings, data)
 
     assert _stored_ids(data, C1) == {"a1", "a2"}
     assert _stored_ids(data, C2) == {"b1"}
@@ -90,7 +96,7 @@ async def test_resume_after_interrupt_no_gap_no_dup(settings: Settings, tmp_path
 
     api = _FakeApi({C1: full})
     _wire(monkeypatch, api, [C1])
-    await AR.run_archive(settings, "sk", "", data)
+    await _run(settings, data)
 
     assert _stored_ids(data, C1) == {"m1", "m2", "m3", "m4", "m5"}
     store = ChatStore(data, C1)
@@ -115,7 +121,7 @@ async def test_topup_stops_at_overlap(settings: Settings, tmp_path, monkeypatch)
 
     api = _FakeApi({C1: full})
     _wire(monkeypatch, api, [C1])
-    await AR.run_archive(settings, "sk", "", data)
+    await _run(settings, data)
 
     assert _stored_ids(data, C1) == {f"m{i}" for i in range(1, 11)}
     # Backfill must NOT run again (already done): every history call was a top-up (end_before=None).
@@ -126,7 +132,7 @@ async def test_new_chat_discovered_on_second_run(settings: Settings, tmp_path, m
     data = tmp_path / "data"
     api1 = _FakeApi({C1: [_msg("a1", "2026-07-01T09:00:00Z")]})
     _wire(monkeypatch, api1, [C1])
-    await AR.run_archive(settings, "sk", "", data)
+    await _run(settings, data)
 
     api2 = _FakeApi(
         {
@@ -135,7 +141,7 @@ async def test_new_chat_discovered_on_second_run(settings: Settings, tmp_path, m
         }
     )
     _wire(monkeypatch, api2, [C1, C2])  # C2 now present in enumeration
-    await AR.run_archive(settings, "sk", "", data)
+    await _run(settings, data)
 
     assert _stored_ids(data, C2) == {"b1"}
     index = Index(data)
@@ -154,7 +160,7 @@ async def test_one_failing_chat_does_not_abort_others(settings: Settings, tmp_pa
 
     _wire(monkeypatch, api, [C1, C2])
     monkeypatch.setattr(AR, "iter_history_pages", boom)
-    await AR.run_archive(settings, "sk", "", tmp_path / "data")
+    await _run(settings, tmp_path / "data")
 
     assert _stored_ids(tmp_path / "data", C2) == {"b1"}  # C1 failed, C2 still archived
 
@@ -167,13 +173,13 @@ def test_enumerate_scope_default_and_all(settings: Settings, monkeypatch) -> Non
         "19:ch@thread.tacv2",  # channel
     ]
     monkeypatch.setattr(AR, "fetch_conversations", lambda s, t: iter([[{"id": i} for i in ids]]))
-    default = AR._enumerate(settings, "sk", include_all=False)
+    default = [c["id"] for c in AR._enumerate(settings, "sk", include_all=False)]
     assert default == [
         "19:x@unq.gbl.spaces",
         "19:g@thread.v2",
         "19:meeting_abc@thread.v2",
     ]  # meetings in, channel out
-    assert AR._enumerate(settings, "sk", include_all=True) == ids  # --all takes everything
+    assert [c["id"] for c in AR._enumerate(settings, "sk", include_all=True)] == ids  # --all: everything
 
 
 def test_chat_dir_name_used_for_folder(settings: Settings, tmp_path) -> None:
@@ -224,7 +230,7 @@ async def test_media_downloaded_skipped_and_failure_nonfatal(
     monkeypatch.setattr(AR.attachments, "process", fake_process)
     api = _FakeApi({C1: []})
     _wire(monkeypatch, api, [C1])
-    await AR.run_archive(settings, "sk", "", data, download_media=True)
+    await _run(settings, data, download_media=True)
 
     # Called only for the two messages that actually carry an image (m2 text skipped).
     assert len(seen) == 2
@@ -261,5 +267,80 @@ async def test_no_media_skips_download(settings: Settings, tmp_path, monkeypatch
     monkeypatch.setattr(AR.attachments, "process", fake_process)
     api = _FakeApi({C1: []})
     _wire(monkeypatch, api, [C1])
-    await AR.run_archive(settings, "sk", "", data, download_media=False)
+    await _run(settings, data, download_media=False)
     assert not called
+
+
+async def test_raw_conversation_metadata_stored(settings: Settings, tmp_path, monkeypatch) -> None:
+    """Enumeration passes the full conversation object; index.db keeps it (lastMessage etc.)."""
+    conv = {"id": C1, "lastMessage": {"composetime": "2026-07-02T09:00:00Z", "content": "hi"}, "version": 42}
+    monkeypatch.setattr(
+        AR, "iter_history_pages", _FakeApi({C1: [_msg("a1", "2026-07-01T09:00:00Z")]}).iter_pages
+    )
+    monkeypatch.setattr(AR, "fetch_conversations", lambda s, tok: iter([[conv]]))
+
+    async def fake_thread(self, tid):  # noqa: ANN001
+        return {"topic": "T", "members": [], "picture": None}
+
+    async def fake_label(self, tid):  # noqa: ANN001
+        return "L"
+
+    monkeypatch.setattr(AR.Directory, "thread", fake_thread)
+    monkeypatch.setattr(AR.Directory, "label", fake_label)
+    data = tmp_path / "data"
+    await _run(settings, data)
+
+    (chat,) = Index(data).chats()
+    assert chat["raw"]["lastMessage"]["content"] == "hi"
+    assert chat["raw"]["version"] == 42
+
+
+async def test_avatars_group_icon_and_members(settings: Settings, tmp_path, monkeypatch) -> None:
+    """_download_avatars fetches the group icon (from properties.picture) + each member avatar."""
+    store = ChatStore(tmp_path / "data", C1)
+    info = {
+        "topic": "T",
+        "picture": "URL@https://asyncgw/objects/g1/views/avatar_fullsize",
+        "members": [{"mri": "8:orgid:x"}, {"mri": "8:orgid:y"}],
+    }
+    calls: list[str] = []
+
+    async def fake_group(client, pic, tok, adir):  # noqa: ANN001
+        calls.append(f"group:{pic}")
+        return str(adir / "group.jpg")
+
+    async def fake_user(client, mri, bearer, adir):  # noqa: ANN001
+        calls.append(f"user:{mri}")
+        return str(adir / f"{mri}.jpg")
+
+    monkeypatch.setattr(AR.avatars, "fetch_group_icon", fake_group)
+    monkeypatch.setattr(AR.avatars, "fetch_user_avatar", fake_user)
+    n = await AR._download_avatars(store, info, "sk", "bearer")
+    store.close()
+    assert n == 3  # 1 group + 2 members
+    assert calls[0].startswith("group:") and "user:8:orgid:x" in calls
+
+
+def test_refreshing_token_reexchanges_before_expiry(settings: Settings, monkeypatch) -> None:
+    """RefreshingToken re-mints once, caches until near expiry, then re-mints again."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(AR.time, "monotonic", lambda: clock["t"])
+    exchanges: list[int] = []
+
+    class _Src:
+        def refresh(self):
+            return {"access_token": "a", "id_token": "b"}
+
+    def fake_exchange(s, at):  # noqa: ANN001
+        exchanges.append(1)
+        return {"skype_token": f"sk{len(exchanges)}", "expires_in": 600}
+
+    monkeypatch.setattr(AR, "exchange_skype_token", fake_exchange)
+    prov = AR.RefreshingToken(settings, _Src())
+
+    assert prov.token() == "sk1"  # first call mints
+    assert prov.token() == "sk1"  # cached (well before expiry)
+    assert prov.bearer() == "b"
+    clock["t"] += 600  # past expiry - margin (600 - 300)
+    assert prov.token() == "sk2"  # re-minted
+    assert len(exchanges) == 2

@@ -157,8 +157,10 @@ class Directory:
             m["name"] = m["name"] or self.name_for(m["mri"])
         self._save_names()  # persist friendlyName-sourced names too
 
-        topic = (data.get("properties") or {}).get("topic") or None
-        return {"topic": topic, "members": members}
+        props = data.get("properties") or {}
+        topic = props.get("topic") or None
+        # `picture` is `URL@<AMS url>` when the chat has a custom icon (see avatars.fetch_group_icon).
+        return {"topic": topic, "members": members, "picture": props.get("picture") or None}
 
     async def label(self, thread_id: str) -> str:
         """Human-readable thread label: topic · N, else roster names, else bare id."""

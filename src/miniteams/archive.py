@@ -12,20 +12,77 @@ resumes with no gap and no duplicate — see `archive_store` for the storage inv
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, Protocol
 
+import httpx
 import structlog
 
-from . import attachments
+from . import attachments, avatars
 from .archive_store import ChatStore, Index
+from .auth import TokenSource
 from .chats import fetch_conversations, is_meeting, is_private
 from .config import Settings
 from .directory import Directory
 from .dump import _epoch_seconds, iter_history_pages
+from .skype import exchange_skype_token
 
 log = structlog.get_logger()
 
 _PAGE_SIZE = 100
 _INTER_PAGE_DELAY = 0.2  # politeness pause between history pages (seconds)
+
+
+class TokenProvider(Protocol):
+    """Supplies a currently-valid skype token + bearer; may refresh under the hood."""
+
+    def token(self) -> str: ...
+    def bearer(self) -> str: ...
+
+
+class StaticToken:
+    """A fixed token pair (short single-thread runs, tests) — never refreshes."""
+
+    def __init__(self, token: str, bearer: str = "") -> None:
+        self._token, self._bearer = token, bearer
+
+    def token(self) -> str:
+        return self._token
+
+    def bearer(self) -> str:
+        return self._bearer
+
+
+class RefreshingToken:
+    """Keeps the skype token + bearer live across a multi-hour run.
+
+    The skype token expires in ~45–60 min — far shorter than a full-account archive — so it is
+    re-minted (silent AAD refresh → re-exchange) a few minutes before expiry. A run that outlives
+    the AAD refresh token stops cleanly on `AuthExpired`; re-running resumes.
+    """
+
+    _MARGIN = 300.0  # re-mint this many seconds before the reported expiry
+
+    def __init__(self, settings: Settings, source: TokenSource) -> None:
+        self.settings, self.source = settings, source
+        self._token = self._bearer = ""
+        self._deadline = 0.0
+
+    def _ensure(self) -> None:
+        if time.monotonic() < self._deadline:
+            return
+        aad = self.source.refresh()  # silent-only; raises AuthExpired when the RT is dead
+        skype = exchange_skype_token(self.settings, aad["access_token"])
+        self._token = skype["skype_token"]
+        self._bearer = str(aad.get("id_token") or aad["access_token"])
+        self._deadline = time.monotonic() + float(skype.get("expires_in") or 3600) - self._MARGIN
+
+    def token(self) -> str:
+        self._ensure()
+        return self._token
+
+    def bearer(self) -> str:
+        self._ensure()
+        return self._bearer
 
 
 def _now_iso() -> str:
@@ -39,15 +96,18 @@ def _rate(n: int, start: float) -> float:
     return round(n / elapsed, 1) if elapsed > 0 else 0.0
 
 
-def _enumerate(settings: Settings, skype_token: str, include_all: bool) -> list[str]:
+def _enumerate(settings: Settings, skype_token: str, include_all: bool) -> list[dict[str, Any]]:
     """Archive scope: private chats (1:1 + groups) AND meeting chats by default; --all adds
-    channels and everything else. Broader than the `chats` browse view, which stays meeting-free."""
-    targets: list[str] = []
+    channels and everything else. Broader than the `chats` browse view, which stays meeting-free.
+
+    Returns the full conversation objects (not just ids) so their metadata — `lastMessage`,
+    `version`, … — is persisted verbatim in index.db."""
+    targets: list[dict[str, Any]] = []
     for page in fetch_conversations(settings, skype_token):
         for conv in page:
             thread_id = str(conv.get("id") or "")
             if thread_id and (include_all or is_private(thread_id) or is_meeting(thread_id)):
-                targets.append(thread_id)
+                targets.append(conv)
     return targets
 
 
@@ -131,22 +191,44 @@ async def _download_media(store: ChatStore, skype_token: str) -> int:
     return fetched
 
 
+async def _download_avatars(store: ChatStore, info: dict[str, Any], skype_token: str, bearer: str) -> int:
+    """Best-effort: group icon (from thread properties) + each member's profile picture."""
+    saved = 0
+    avatars_dir = store.dir / "avatars"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        picture = info.get("picture")
+        if picture and await avatars.fetch_group_icon(client, picture, skype_token, avatars_dir):
+            saved += 1
+        for member in info.get("members") or []:
+            if await avatars.fetch_user_avatar(client, member.get("mri", ""), bearer, avatars_dir):
+                saved += 1
+    return saved
+
+
 async def archive_chat(
     settings: Settings,
     skype_token: str,
+    bearer: str,
     thread_id: str,
     data_dir: Path,
     directory: Directory,
     index: Index,
+    conv: dict[str, Any] | None = None,
     download_media: bool = True,
+    download_avatars: bool = True,
 ) -> None:
-    info = await directory.thread(thread_id)  # topic + roster (best-effort, may be None)
+    directory.set_token(skype_token, bearer)
+    info = await directory.thread(thread_id) or {}  # topic + roster + picture (best-effort)
     label = await directory.label(thread_id)
+    # Store the full conversation object only when we have a real one (enumeration); a bare
+    # single-thread run carries just the id, which must not clobber richer stored metadata.
+    raw = conv if conv and len(conv) > 1 else None
     index.upsert_chat(
         thread_id,
         label=label,
-        topic=(info or {}).get("topic") or "",
-        participants=(info or {}).get("members") or [],
+        topic=info.get("topic") or "",
+        participants=info.get("members") or [],
+        raw=raw,
     )
     store = ChatStore(data_dir, thread_id)
     start = time.monotonic()
@@ -156,6 +238,7 @@ async def archive_chat(
         if not index.backfill_done(thread_id):
             new_old = _backfill(settings, skype_token, thread_id, store, index)
         media = await _download_media(store, skype_token) if download_media else 0
+        avatars_n = await _download_avatars(store, info, skype_token, bearer) if download_avatars else 0
         index.touch(thread_id, _now_iso())
         log.info(
             "chat_archived",
@@ -164,6 +247,7 @@ async def archive_chat(
             new_recent=new_top,
             new_backfill=new_old,
             media=media,
+            avatars=avatars_n,
             duration_s=round(time.monotonic() - start, 1),
             msgs_per_s=_rate(new_top + new_old, start),
         )
@@ -173,24 +257,36 @@ async def archive_chat(
 
 async def run_archive(
     settings: Settings,
-    skype_token: str,
-    bearer: str,
     data_dir: Path,
+    *,
+    token_provider: TokenProvider,
     thread: str | None = None,
     include_all: bool = False,
     download_media: bool = True,
+    download_avatars: bool = True,
 ) -> None:
     index = Index(data_dir)
     directory = Directory(settings)
-    directory.set_token(skype_token, bearer)
     try:
-        targets = [thread] if thread else _enumerate(settings, skype_token, include_all)
+        targets = [{"id": thread}] if thread else _enumerate(settings, token_provider.token(), include_all)
         log.info("archive_start", chats=len(targets), data_dir=str(data_dir))
-        for thread_id in targets:
+        for conv in targets:
+            thread_id = str(conv.get("id") or "")
+            if not thread_id:
+                continue
             # One failing chat must not abort the archive of the rest.
             try:
                 await archive_chat(
-                    settings, skype_token, thread_id, data_dir, directory, index, download_media
+                    settings,
+                    token_provider.token(),  # resolved per chat → picks up a mid-run token refresh
+                    token_provider.bearer(),
+                    thread_id,
+                    data_dir,
+                    directory,
+                    index,
+                    conv=conv,
+                    download_media=download_media,
+                    download_avatars=download_avatars,
                 )
             except Exception as exc:  # noqa: BLE001 — per-chat isolation; resumes next run
                 log.error("chat_archive_failed", thread=thread_id, error=str(exc))
