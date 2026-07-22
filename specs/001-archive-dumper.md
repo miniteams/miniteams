@@ -1,6 +1,6 @@
 # 001 — Archive dumper
 
-**Status**: draft
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-07-22
 

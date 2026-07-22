@@ -163,3 +163,86 @@ def test_chat_dir_name_used_for_folder(settings: Settings, tmp_path) -> None:
     store = ChatStore(tmp_path, "19:a/b@thread.v2")
     assert store.dir.name == chat_dir_name("19:a/b@thread.v2") == "19:a_b@thread.v2"
     store.close()
+
+
+async def test_media_downloaded_skipped_and_failure_nonfatal(
+    settings: Settings, tmp_path, monkeypatch
+) -> None:
+    """Media pass: process() is called per message with attachments into the chat's media/;
+    a message without attachments is skipped; a download failure never stops the loop."""
+    IMG = '<img itemtype="http://schema.skype.com/AMSImage" src="https://api.asm.skype.com/v1/objects/o9/views/imgo">'
+    data = tmp_path / "data"
+    pre = ChatStore(data, C1)
+    pre.insert_page(
+        [
+            {
+                "id": "m1",
+                "composetime": "2026-07-01T09:00:00Z",
+                "content": IMG,
+                "messagetype": "RichText/Media_AudioCallRecording",
+            },
+            {"id": "m2", "composetime": "2026-07-02T09:00:00Z", "content": "hi", "messagetype": "Text"},
+            {
+                "id": "m3",
+                "composetime": "2026-07-03T09:00:00Z",
+                "content": IMG,
+                "messagetype": "RichText/Media_AudioCallRecording",
+            },
+        ]
+    )
+    pre.close()
+    index = Index(data)
+    index.upsert_chat(C1)
+    index.mark_backfill_done(C1)
+    index.close()
+
+    seen: list[tuple[str, Path]] = []
+
+    async def fake_process(content, msgtype, token, media_dir, download):  # noqa: ANN001
+        seen.append((content, media_dir))
+        if len(seen) == 1:
+            raise RuntimeError("download boom")  # first one fails — must not abort
+        return ["[image: u → local]"]
+
+    monkeypatch.setattr(AR.attachments, "process", fake_process)
+    api = _FakeApi({C1: []})
+    _wire(monkeypatch, api, [C1])
+    await AR.run_archive(settings, "sk", "", data, download_media=True)
+
+    # Called only for the two messages that actually carry an image (m2 text skipped).
+    assert len(seen) == 2
+    assert all(md == pre.media_dir for _, md in seen)
+
+
+async def test_no_media_skips_download(settings: Settings, tmp_path, monkeypatch) -> None:
+    IMG = '<img itemtype="http://schema.skype.com/AMSImage" src="https://api.asm.skype.com/v1/objects/o1/views/imgo">'
+    data = tmp_path / "data"
+    pre = ChatStore(data, C1)
+    pre.insert_page(
+        [
+            {
+                "id": "m1",
+                "composetime": "2026-07-01T09:00:00Z",
+                "content": IMG,
+                "messagetype": "RichText/Media_AudioCallRecording",
+            }
+        ]
+    )
+    pre.close()
+    index = Index(data)
+    index.upsert_chat(C1)
+    index.mark_backfill_done(C1)
+    index.close()
+
+    called = False
+
+    async def fake_process(*a, **k):  # noqa: ANN002, ANN003
+        nonlocal called
+        called = True
+        return []
+
+    monkeypatch.setattr(AR.attachments, "process", fake_process)
+    api = _FakeApi({C1: []})
+    _wire(monkeypatch, api, [C1])
+    await AR.run_archive(settings, "sk", "", data, download_media=False)
+    assert not called

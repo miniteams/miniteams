@@ -153,7 +153,17 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
 
     aad, skype_token = _ensure_skype_token(settings)
     bearer = str(aad.get("id_token") or aad["access_token"])
-    asyncio.run(run_archive(settings, skype_token, bearer, Path(args.data_dir), args.thread, args.all))
+    asyncio.run(
+        run_archive(
+            settings,
+            skype_token,
+            bearer,
+            Path(args.data_dir),
+            args.thread,
+            args.all,
+            download_media=not args.no_media,
+        )
+    )
     return 0
 
 
@@ -246,6 +256,9 @@ def main(argv: list[str] | None = None) -> int:
     p_archive.add_argument("--data-dir", default="data", help="archive root (default: ./data)")
     p_archive.add_argument("--thread", help="archive only this conversation (skip enumeration)")
     p_archive.add_argument("--all", action="store_true", help="include channels and meeting chats too")
+    p_archive.add_argument(
+        "--no-media", action="store_true", help="skip downloading attachments (messages only)"
+    )
     p_archive.set_defaults(func=cmd_archive)
 
     p_stream = sub.add_parser("stream", help="stream live incoming chat events (M2+)")

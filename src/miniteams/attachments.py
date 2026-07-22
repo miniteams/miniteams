@@ -82,10 +82,22 @@ async def _stream_to(client: httpx.AsyncClient, url: str, token: str, dest: Path
         raise
 
 
+def _existing(media_dir: Path, stem: str) -> str | None:
+    """First already-downloaded file for this object id (any extension), else None."""
+    for match in media_dir.glob(f"{stem}.*"):
+        if not match.name.endswith(".part"):
+            return str(match)
+    return None
+
+
 async def _fetch_image(client: httpx.AsyncClient, token: str, url: str, media_dir: Path, suffix: str) -> str:
+    stem = f"{_object_id(url)}{suffix}"
+    cached = _existing(media_dir, stem)
+    if cached:
+        return cached  # skip re-download (archive re-runs, same object across messages)
     # Content-type is in the response headers (available before the body), so name the file after
     # a HEAD-cheap streamed GET. Write to a temp path first, then rename once the ext is known.
-    tmp = media_dir / f"{_object_id(url)}{suffix}.part"
+    tmp = media_dir / f"{stem}.part"
     headers = await _stream_to(client, url, token, tmp)
     ext = _CTYPE_EXT.get((headers.get("content-type") or "").split(";")[0], ".img")
     dest = media_dir / f"{_object_id(url)}{suffix}{ext}"
@@ -123,6 +135,8 @@ async def _download_file(
     if info.get("content_state") != "ready" or not view:
         return None, name, size  # not ready yet — surface the ref only
     dest = media_dir / name
+    if dest.exists():
+        return str(dest), name, size  # already downloaded — skip
     tmp = media_dir / f"{name}.part"
     await _stream_to(client, view, token, tmp)  # chunked: files can be arbitrarily large
     tmp.rename(dest)  # atomic: dest either absent or complete

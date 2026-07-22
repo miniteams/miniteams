@@ -9,6 +9,7 @@ an interrupted run loses at most the in-flight page.
 import json
 import re
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -152,6 +153,12 @@ class ChatStore:
         """Top-up overlap bound: composetime of the newest stored message."""
         row = self._db.execute("SELECT MAX(composetime) FROM messages").fetchone()
         return row[0] if row and row[0] else None
+
+    def iter_messages(self) -> Iterator[dict[str, Any]]:
+        """Yield every stored message (raw JSON), oldest first."""
+        cursor = self._db.execute("SELECT raw FROM messages ORDER BY composetime")
+        for (raw,) in cursor:
+            yield json.loads(raw)
 
     def count(self) -> int:
         return int(self._db.execute("SELECT COUNT(*) FROM messages").fetchone()[0])

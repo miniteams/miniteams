@@ -15,6 +15,7 @@ from pathlib import Path
 
 import structlog
 
+from . import attachments
 from .archive_store import ChatStore, Index
 from .chats import fetch_conversations, is_private
 from .config import Settings
@@ -69,6 +70,27 @@ def _backfill(settings: Settings, skype_token: str, thread_id: str, store: ChatS
     return added
 
 
+async def _download_media(store: ChatStore, skype_token: str) -> int:
+    """Best-effort pass: download every stored message's attachments at original quality.
+
+    Runs after messages are committed, iterating stored data — so it is resumable (a crash mid-pass
+    re-runs cheaply, skipping files already on disk) and never blocks message capture.
+    """
+    fetched = 0
+    for message in store.iter_messages():
+        content = message.get("content") or ""
+        msgtype = str(message.get("messagetype") or "")
+        if not attachments.extract(content, msgtype):
+            continue  # no attachment → don't even open a client
+        try:
+            notes = await attachments.process(content, msgtype, skype_token, store.media_dir, download=True)
+        except Exception as exc:  # noqa: BLE001 — one message's media must not abort the pass
+            log.debug("message_media_failed", id=message.get("id"), error=str(exc))
+            continue
+        fetched += sum(1 for n in notes if "→" in n)
+    return fetched
+
+
 async def archive_chat(
     settings: Settings,
     skype_token: str,
@@ -76,6 +98,7 @@ async def archive_chat(
     data_dir: Path,
     directory: Directory,
     index: Index,
+    download_media: bool = True,
 ) -> None:
     info = await directory.thread(thread_id)  # topic + roster (best-effort, may be None)
     label = await directory.label(thread_id)
@@ -91,6 +114,7 @@ async def archive_chat(
         new_old = 0
         if not index.backfill_done(thread_id):
             new_old = _backfill(settings, skype_token, thread_id, store, index)
+        media = await _download_media(store, skype_token) if download_media else 0
         index.touch(thread_id, _now_iso())
         log.info(
             "chat_archived",
@@ -98,6 +122,7 @@ async def archive_chat(
             total=store.count(),
             new_recent=new_top,
             new_backfill=new_old,
+            media=media,
         )
     finally:
         store.close()
@@ -110,6 +135,7 @@ async def run_archive(
     data_dir: Path,
     thread: str | None = None,
     include_all: bool = False,
+    download_media: bool = True,
 ) -> None:
     index = Index(data_dir)
     directory = Directory(settings)
@@ -120,7 +146,9 @@ async def run_archive(
         for thread_id in targets:
             # One failing chat must not abort the archive of the rest.
             try:
-                await archive_chat(settings, skype_token, thread_id, data_dir, directory, index)
+                await archive_chat(
+                    settings, skype_token, thread_id, data_dir, directory, index, download_media
+                )
             except Exception as exc:  # noqa: BLE001 — per-chat isolation; resumes next run
                 log.error("chat_archive_failed", thread=thread_id, error=str(exc))
         log.info("archive_done", chats=len(targets))

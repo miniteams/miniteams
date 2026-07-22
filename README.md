@@ -38,6 +38,9 @@ uv run miniteams send --thread 19:xxx@thread.v2 "hi"   # send to a conversation
 uv run miniteams send --file msg.txt              # body from a file (escaped)
 uv run miniteams send --file test.html --html     # raw RichText/Html (formatted)
 uv run miniteams update <msg-id-or-deep-link> "fixed text"   # edit a sent message
+uv run miniteams archive          # resumable local archive of all private chats under ./data
+uv run miniteams archive --thread 19:xxx@thread.v2     # archive one conversation
+uv run miniteams archive --no-media                    # messages only, skip attachments
 uv run miniteams dump             # dump your Notes' full history (oldest → newest)
 uv run miniteams dump --thread 19:xxx@thread.v2        # dump a conversation
 uv run miniteams dump --jsonl > notes.jsonl            # full-detail JSON per line
@@ -53,8 +56,14 @@ uv run miniteams dump --jsonl > notes.jsonl            # full-detail JSON per li
 `stream --jsonl` = per-event JSON; `stream --raw` = full firehose NDJSON of every frame (all
 endpoints, presence/calls, named events), decoded.
 
+`archive` builds a resumable local archive under `./data/`: `index.db` (chat metadata) plus
+one folder per conversation with a `messages.db` (every message as raw API JSON, keyed by id)
+and a `media/` folder (attachments at original quality). Interrupt anytime — re-running resumes
+from the oldest stored message, tops up new ones, and skips media already on disk. `data/` is
+gitignored (personal chat data).
+
 Tokens cache under `~/.config/miniteams/` (`0600`); re-runs are silent until the refresh
-token expires. Downloaded media lives under `~/.cache/miniteams/media/`.
+token expires. Downloaded media (from `stream`) lives under `~/.cache/miniteams/media/`.
 
 > **send writes to real chats as you.** Default target is `48:notes` (your own Notes), but
 > `--thread` can post anywhere. The rest of the tool is read-only.
