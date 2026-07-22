@@ -117,7 +117,7 @@ def _enumerate(settings: Settings, skype_token: str, include_all: bool) -> list[
     return targets
 
 
-def _topup(settings: Settings, skype_token: str, thread_id: str, store: ChatStore) -> int:
+def _topup(settings: Settings, skype_token: str, thread_id: str, store: ChatStore, label: str) -> int:
     """Fetch messages newer than what's stored; stop as soon as a page overlaps the stored top."""
     known_newest = store.newest()
     if not known_newest:
@@ -130,6 +130,7 @@ def _topup(settings: Settings, skype_token: str, thread_id: str, store: ChatStor
         oldest_in_page = str(messages[-1].get("composetime", ""))  # newest-first → last is oldest
         log.info(
             "topup_progress",
+            chat=label,
             thread=thread_id,
             pages=pages,
             new=added,
@@ -142,7 +143,9 @@ def _topup(settings: Settings, skype_token: str, thread_id: str, store: ChatStor
     return added
 
 
-def _backfill(settings: Settings, skype_token: str, thread_id: str, store: ChatStore, index: Index) -> int:
+def _backfill(
+    settings: Settings, skype_token: str, thread_id: str, store: ChatStore, index: Index, label: str
+) -> int:
     """Walk older than the oldest stored message until history is exhausted, then flag done."""
     oldest = store.oldest()
     end_before = _epoch_seconds(oldest) - 1 if oldest else None
@@ -154,6 +157,7 @@ def _backfill(settings: Settings, skype_token: str, thread_id: str, store: ChatS
         oldest_in_page = str(messages[-1].get("composetime", ""))  # newest-first → last is oldest
         log.info(
             "backfill_progress",
+            chat=label,
             thread=thread_id,
             pages=pages,
             new=added,
@@ -166,7 +170,7 @@ def _backfill(settings: Settings, skype_token: str, thread_id: str, store: ChatS
     return added
 
 
-async def _download_media(store: ChatStore, skype_token: str) -> int:
+async def _download_media(store: ChatStore, skype_token: str, label: str) -> int:
     """Best-effort pass: download every stored message's attachments at original quality.
 
     Runs after messages are committed, iterating stored data — so it is resumable (a crash mid-pass
@@ -209,6 +213,7 @@ async def _download_media(store: ChatStore, skype_token: str) -> int:
             if done % 50 == 0:
                 log.info(
                     "media_progress",
+                    chat=label,
                     thread=store.thread_id,
                     done=done,
                     of=len(targets),
@@ -247,6 +252,7 @@ async def archive_chat(
     directory.set_token(skype_token, bearer)
     info = await directory.thread(thread_id) or {}  # topic + roster + picture (best-effort)
     label = await directory.label(thread_id)
+    log.info("chat_start", chat=label, thread=thread_id)
     # Store the full conversation object only when we have a real one (enumeration); a bare
     # single-thread run carries just the id, which must not clobber richer stored metadata.
     raw = conv if conv and len(conv) > 1 else None
@@ -260,15 +266,16 @@ async def archive_chat(
     store = ChatStore(data_dir, thread_id)
     start = time.monotonic()
     try:
-        new_top = _topup(settings, skype_token, thread_id, store)
+        new_top = _topup(settings, skype_token, thread_id, store, label)
         new_old = 0
         if not index.backfill_done(thread_id):
-            new_old = _backfill(settings, skype_token, thread_id, store, index)
-        media = await _download_media(store, skype_token) if download_media else 0
+            new_old = _backfill(settings, skype_token, thread_id, store, index, label)
+        media = await _download_media(store, skype_token, label) if download_media else 0
         avatars_n = await _download_avatars(store, info, skype_token, bearer) if download_avatars else 0
         index.touch(thread_id, _now_iso())
         log.info(
             "chat_archived",
+            chat=label,
             thread=thread_id,
             total=store.count(),
             new_recent=new_top,
