@@ -38,7 +38,7 @@ uv run miniteams send --thread 19:xxx@thread.v2 "hi"   # send to a conversation
 uv run miniteams send --file msg.txt              # body from a file (escaped)
 uv run miniteams send --file test.html --html     # raw RichText/Html (formatted)
 uv run miniteams update <msg-id-or-deep-link> "fixed text"   # edit a sent message
-uv run miniteams archive          # resumable local archive of all private chats under ./data
+uv run miniteams archive          # resumable local archive of private chats + meetings under ./data
 uv run miniteams archive --thread 19:xxx@thread.v2     # archive one conversation
 uv run miniteams archive --no-media                    # messages only, skip attachments
 uv run miniteams dump             # dump your Notes' full history (oldest → newest)

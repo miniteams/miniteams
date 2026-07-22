@@ -159,6 +159,23 @@ async def test_one_failing_chat_does_not_abort_others(settings: Settings, tmp_pa
     assert _stored_ids(tmp_path / "data", C2) == {"b1"}  # C1 failed, C2 still archived
 
 
+def test_enumerate_scope_default_and_all(settings: Settings, monkeypatch) -> None:
+    ids = [
+        "19:x@unq.gbl.spaces",  # 1:1
+        "19:g@thread.v2",  # group
+        "19:meeting_abc@thread.v2",  # meeting
+        "19:ch@thread.tacv2",  # channel
+    ]
+    monkeypatch.setattr(AR, "fetch_conversations", lambda s, t: iter([[{"id": i} for i in ids]]))
+    default = AR._enumerate(settings, "sk", include_all=False)
+    assert default == [
+        "19:x@unq.gbl.spaces",
+        "19:g@thread.v2",
+        "19:meeting_abc@thread.v2",
+    ]  # meetings in, channel out
+    assert AR._enumerate(settings, "sk", include_all=True) == ids  # --all takes everything
+
+
 def test_chat_dir_name_used_for_folder(settings: Settings, tmp_path) -> None:
     store = ChatStore(tmp_path, "19:a/b@thread.v2")
     assert store.dir.name == chat_dir_name("19:a/b@thread.v2") == "19:a_b@thread.v2"

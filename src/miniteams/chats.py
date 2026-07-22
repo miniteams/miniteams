@@ -40,11 +40,16 @@ def _iso(dt: datetime) -> str:
     return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def is_meeting(thread_id: str) -> bool:
+    """Meeting-associated chat (the conversation attached to a Teams meeting)."""
+    return thread_id.startswith("19:meeting_")
+
+
 def is_private(thread_id: str) -> bool:
     """1:1 (@unq.gbl.spaces) and group chats (@thread.v2), excluding meeting chats/channels."""
     if "@unq.gbl.spaces" in thread_id:
         return True
-    return thread_id.endswith("@thread.v2") and not thread_id.startswith("19:meeting_")
+    return thread_id.endswith("@thread.v2") and not is_meeting(thread_id)
 
 
 def _version_iso(conv: dict[str, Any]) -> str:

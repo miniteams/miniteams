@@ -21,7 +21,8 @@ resumes exactly where it stopped and picks up new messages and new chats.
 ## Scope
 
 - New `archive` CLI command.
-- Phase 1 enumerate: upsert all chats (private by default, `--all` for channels/meetings) into
+- Phase 1 enumerate: upsert all chats (private 1:1/group + meeting chats by default, `--all` for
+  channels too) into
   `data/index.db` — id, label, topic, participants, last_fetch_at, backfill_done.
 - Per-chat backfill newest→oldest via `endTime` windowing (existing `fetch_history` machinery),
   one sqlite transaction per HTTP page, `INSERT OR IGNORE` on message id.

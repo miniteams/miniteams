@@ -17,7 +17,7 @@ import structlog
 
 from . import attachments
 from .archive_store import ChatStore, Index
-from .chats import fetch_conversations, is_private
+from .chats import fetch_conversations, is_meeting, is_private
 from .config import Settings
 from .directory import Directory
 from .dump import _epoch_seconds, iter_history_pages
@@ -40,11 +40,13 @@ def _rate(n: int, start: float) -> float:
 
 
 def _enumerate(settings: Settings, skype_token: str, include_all: bool) -> list[str]:
+    """Archive scope: private chats (1:1 + groups) AND meeting chats by default; --all adds
+    channels and everything else. Broader than the `chats` browse view, which stays meeting-free."""
     targets: list[str] = []
     for page in fetch_conversations(settings, skype_token):
         for conv in page:
             thread_id = str(conv.get("id") or "")
-            if thread_id and (include_all or is_private(thread_id)):
+            if thread_id and (include_all or is_private(thread_id) or is_meeting(thread_id)):
                 targets.append(thread_id)
     return targets
 
