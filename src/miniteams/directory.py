@@ -10,6 +10,7 @@ per session). Lookups never raise into the stream — a failed fetch degrades to
 """
 
 import json
+from collections import OrderedDict
 from typing import Any
 from urllib.parse import quote
 
@@ -22,6 +23,11 @@ log = structlog.get_logger()
 
 # MRI prefix → friendly label for special threads that have no real roster/topic.
 _SPECIAL_THREADS = {"48:notes": "Notes to self"}
+
+# Reaction state is per-message and `run_forever` runs indefinitely, so an unbounded dict leaks.
+# Diffs only need the *recent* messages' prior state; cap to an LRU window. A reaction landing on
+# an evicted message simply re-announces its current reactors as "added" — acceptable & rare.
+_REACTION_LRU_MAX = 4096
 
 
 def _mri_from_userlink(user_link: str | None) -> str:
@@ -37,7 +43,8 @@ class Directory:
         self._threads: dict[str, dict[str, Any] | None] = {}
         self._names_path = settings.cache_dir / "names.json"
         self._names: dict[str, str] = self._load_names()  # MRI → display name (persisted)
-        self._reactions: dict[str, dict[str, set[str]]] = {}  # msg_id → {key → set(MRI)}
+        # msg_id → {key → set(MRI)}; LRU-bounded (see _REACTION_LRU_MAX) to cap memory.
+        self._reactions: OrderedDict[str, dict[str, set[str]]] = OrderedDict()
 
     def _load_names(self) -> dict[str, str]:
         try:
@@ -101,9 +108,13 @@ class Directory:
 
     def reaction_diff(self, msg_id: str, key: str, users: list[str]) -> tuple[set[str], set[str]]:
         """Update stored reaction state for (msg_id, key); return (added_mris, removed_mris)."""
-        prev = self._reactions.setdefault(msg_id, {}).get(key, set())
+        keys = self._reactions.setdefault(msg_id, {})
+        self._reactions.move_to_end(msg_id)  # mark recently-active for the LRU
+        prev = keys.get(key, set())
         current = set(users)
-        self._reactions[msg_id][key] = current
+        keys[key] = current
+        while len(self._reactions) > _REACTION_LRU_MAX:
+            self._reactions.popitem(last=False)  # evict least-recently-active message
         return current - prev, prev - current
 
     async def thread(self, thread_id: str) -> dict[str, Any] | None:

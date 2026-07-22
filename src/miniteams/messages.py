@@ -217,7 +217,17 @@ async def _print_reactions(resource: dict[str, Any], emotions: list[Any], direct
             await emit(f"[{when}] ({label}) ↳ {emoji}✖ {await directory.display(mri)} unreacted{ctx}\n")
 
 
-async def handle_delivery(req: dict[str, Any], directory: Directory, jsonl: bool = False) -> None:
+async def _print_typing(resource: dict[str, Any], directory: Directory, started: bool) -> None:
+    when = resource.get("composetime") or resource.get("originalarrivaltime") or ""
+    label = await directory.label(_thread_id(resource))
+    who = await directory.display(resource.get("from", ""))
+    verb = "is typing…" if started else "stopped typing"
+    await emit(f"[{when}] ({label}) ✍ {who} {verb}\n")
+
+
+async def handle_delivery(
+    req: dict[str, Any], directory: Directory, jsonl: bool = False, typing: bool = False
+) -> None:
     url = req.get("url", "")
     endpoint = url.rsplit("/", 1)[-1]
     if endpoint != "messaging":  # presence / call signaling — ignore for MVP
@@ -240,6 +250,11 @@ async def handle_delivery(req: dict[str, Any], directory: Directory, jsonl: bool
     resource = obj.get("resource") or {}
     resource_type = obj.get("resourceType")
     if resource_type == "NewMessage":
+        msgtype = resource.get("messagetype", "")
+        if msgtype in ("Control/Typing", "Control/ClearTyping"):
+            if typing:
+                await _print_typing(resource, directory, started=msgtype == "Control/Typing")
+            return
         await _print_message(resource, directory)
     elif resource_type == "MessageUpdate":
         # MessageUpdate carries reactions (emotions), deletions (deletetime), or edits.

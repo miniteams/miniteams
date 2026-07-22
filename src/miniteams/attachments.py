@@ -62,12 +62,34 @@ def extract(content: str, msgtype: str) -> list[dict[str, str]]:
     return items
 
 
+async def _stream_to(client: httpx.AsyncClient, url: str, token: str, dest: Path) -> httpx.Headers:
+    # Stream to disk in chunks: a whole-body `.content` buffer spikes RSS by the full file size,
+    # and CPython rarely returns freed arenas to the OS — so one fat attachment pins RSS for the
+    # life of the (forever-running) stream. Chunked writes cap peak RAM at one chunk.
+    try:
+        async with client.stream(
+            "GET", url, headers={"Accept": "*/*"}, cookies={"skypetoken_asm": token}
+        ) as resp:
+            resp.raise_for_status()
+            with dest.open("wb") as fh:
+                async for chunk in resp.aiter_bytes(65536):
+                    fh.write(chunk)
+            return resp.headers
+    except BaseException:
+        # A truncated file is worse than none: it looks complete to any later
+        # skip-if-exists check. Never leave partial bytes behind.
+        dest.unlink(missing_ok=True)
+        raise
+
+
 async def _fetch_image(client: httpx.AsyncClient, token: str, url: str, media_dir: Path, suffix: str) -> str:
-    resp = await client.get(url, headers={"Accept": "image/*"}, cookies={"skypetoken_asm": token})
-    resp.raise_for_status()
-    ext = _CTYPE_EXT.get((resp.headers.get("content-type") or "").split(";")[0], ".img")
+    # Content-type is in the response headers (available before the body), so name the file after
+    # a HEAD-cheap streamed GET. Write to a temp path first, then rename once the ext is known.
+    tmp = media_dir / f"{_object_id(url)}{suffix}.part"
+    headers = await _stream_to(client, url, token, tmp)
+    ext = _CTYPE_EXT.get((headers.get("content-type") or "").split(";")[0], ".img")
     dest = media_dir / f"{_object_id(url)}{suffix}{ext}"
-    dest.write_bytes(resp.content)
+    tmp.rename(dest)
     return str(dest)
 
 
@@ -100,10 +122,10 @@ async def _download_file(
     view = info.get("view_location")
     if info.get("content_state") != "ready" or not view:
         return None, name, size  # not ready yet — surface the ref only
-    blob = await client.get(view, headers={"Accept": "*/*"}, cookies=cookies)
-    blob.raise_for_status()
     dest = media_dir / name
-    dest.write_bytes(blob.content)
+    tmp = media_dir / f"{name}.part"
+    await _stream_to(client, view, token, tmp)  # chunked: files can be arbitrarily large
+    tmp.rename(dest)  # atomic: dest either absent or complete
     return str(dest), name, size
 
 

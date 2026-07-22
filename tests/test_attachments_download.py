@@ -18,6 +18,17 @@ class _Resp:
     def json(self) -> Any:
         return self._data
 
+    # streaming-download support: `async with client.stream(...) as resp: async for c in resp.aiter_bytes()`
+    async def __aenter__(self) -> _Resp:
+        return self
+
+    async def __aexit__(self, *_: Any) -> bool:
+        return False
+
+    async def aiter_bytes(self, size: int = 65536) -> Any:
+        for i in range(0, len(self.content), size):
+            yield self.content[i : i + size]
+
 
 class _AsyncClient:
     def __init__(self, handler: Any) -> None:
@@ -31,6 +42,9 @@ class _AsyncClient:
 
     async def get(self, url: str, headers: Any = None, cookies: Any = None) -> _Resp:
         return self._handler(url)
+
+    def stream(self, method: str, url: str, headers: Any = None, cookies: Any = None) -> _Resp:
+        return self._handler(url)  # _Resp doubles as its own async context manager
 
 
 def _patch_client(monkeypatch, handler: Any) -> None:
@@ -106,3 +120,22 @@ async def test_process_file_not_ready_is_ref_only(settings: Settings, monkeypatc
     content = '<URIObject uri="https://api.asm.skype.com/v1/objects/f2">f</URIObject>'
     notes = await A.process(content, "RichText/Media_GenericFile", "sk", settings.media_dir, download=True)
     assert any("x.bin" in n and "→" not in n for n in notes)
+
+
+async def test_stream_to_removes_partial_file_on_failure(settings: Settings) -> None:
+    """A download failing mid-body must not leave truncated bytes that a later
+    skip-if-exists check would mistake for a complete file."""
+
+    class _BoomResp(_Resp):
+        async def aiter_bytes(self, size: int = 65536) -> Any:
+            yield b"partial"
+            raise RuntimeError("connection reset")
+
+    settings.media_dir.mkdir(parents=True, exist_ok=True)
+    dest = settings.media_dir / "victim.bin"
+    client = _AsyncClient(lambda url: _BoomResp(content=b"x"))
+    try:
+        await A._stream_to(client, "https://api.asm.skype.com/v1/objects/z", "sk", dest)  # type: ignore[arg-type]
+    except RuntimeError:
+        pass
+    assert not dest.exists()

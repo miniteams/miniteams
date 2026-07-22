@@ -20,7 +20,7 @@ import structlog
 import websockets
 
 from ._io import force_blocking_stdout
-from .auth import acquire_aad_token
+from .auth import AuthExpired, TokenSource
 from .config import Settings
 from .directory import Directory
 from .messages import emit_raw_delivery, emit_raw_named, handle_delivery
@@ -52,6 +52,7 @@ class TrouterClient:
         directory: Directory,
         jsonl: bool = False,
         raw: bool = False,
+        typing: bool = False,
     ) -> None:
         self.settings = settings
         self.aad = aad
@@ -62,6 +63,7 @@ class TrouterClient:
         self.directory = directory
         self.jsonl = jsonl
         self.raw = raw
+        self.typing = typing
         self._count = 0
         self._last_register = 0.0
         # websockets' connection type churns across releases; keep it loose deliberately.
@@ -196,7 +198,7 @@ class TrouterClient:
         if self.raw:
             await emit_raw_delivery(req)  # every endpoint, decoded, no filtering
         else:
-            await handle_delivery(req, self.directory, self.jsonl)
+            await handle_delivery(req, self.directory, self.jsonl, self.typing)
 
     async def _handle_frame(self, raw: str | bytes) -> None:
         frame = raw.decode() if isinstance(raw, bytes) else raw
@@ -241,7 +243,9 @@ class TrouterClient:
         log.info("ws_closed")
 
 
-async def run_forever(settings: Settings, jsonl: bool = False, raw: bool = False) -> None:
+async def run_forever(
+    settings: Settings, jsonl: bool = False, raw: bool = False, typing: bool = False
+) -> None:
     """Re-establish a full session on every disconnect (handoff §M4).
 
     A fresh skype token / trouter info / handshake is minted per attempt, so token expiry and
@@ -250,11 +254,15 @@ async def run_forever(settings: Settings, jsonl: bool = False, raw: bool = False
     """
     force_blocking_stdout()  # inside the running loop (see _io); guards `--jsonl | jq` backpressure
     directory = Directory(settings)  # caches survive reconnects; only the token is refreshed
+    # Authenticate ONCE up front (may prompt: device-code in stream mode). Reconnects then only
+    # refresh silently — never re-prompt — so a failed connect can't spin into endless logins.
+    tokens = TokenSource(settings)
+    tokens.acquire()
     backoff = 1.0
     while True:
         connected_at: float | None = None
         try:
-            aad = acquire_aad_token(settings)
+            aad = tokens.refresh()  # silent; raises AuthExpired when the refresh token is dead
             skype_token = exchange_skype_token(settings, aad["access_token"])["skype_token"]
             directory.set_token(skype_token, str(aad.get("id_token") or aad["access_token"]))
             epid = get_or_create_epid(settings)
@@ -262,13 +270,18 @@ async def run_forever(settings: Settings, jsonl: bool = False, raw: bool = False
             session_id = handshake(settings, info, skype_token, epid)
             connected_at = time.monotonic()
             await TrouterClient(
-                settings, aad, skype_token, info, session_id, epid, directory, jsonl, raw
+                settings, aad, skype_token, info, session_id, epid, directory, jsonl, raw, typing
             ).run()
         except asyncio.CancelledError:
             raise
         except BrokenPipeError:
             # Downstream reader (head/jq/…) closed stdout — stop, don't reconnect into a dead pipe.
             log.info("stdout_closed")
+            return
+        except AuthExpired as exc:
+            # Refresh token dead: reconnecting can't fix it and re-auth needs a prompt — stop
+            # cleanly so the user re-runs, rather than spinning the loop forever.
+            log.error("auth_expired", error=str(exc))
             return
         except Exception as exc:  # noqa: BLE001 — any other failure is recoverable via reconnect
             log.warning("stream_error", error=str(exc), error_type=type(exc).__name__)

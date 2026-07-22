@@ -156,6 +156,25 @@ async def test_emit_raw_named(capsys) -> None:
     assert rec == {"kind": "named", "event": {"name": "trouter.connected", "args": [{"ttl": 1}]}}
 
 
+async def test_typing_shown_only_when_enabled(directory: Directory, capsys) -> None:
+    body = {
+        "type": "EventMessage",
+        "resourceType": "NewMessage",
+        "resource": {
+            "messagetype": "Control/Typing",
+            "from": "8:o:u",
+            "imdisplayname": "Al",
+            "conversationLink": NOTES_LINK,
+        },
+    }
+    req = {"url": "https://h/x/messaging", "body": json.dumps(body)}
+    await handle_delivery(req, directory)  # typing=False → silent
+    assert capsys.readouterr().out == ""
+    await handle_delivery(req, directory, typing=True)
+    out = capsys.readouterr().out
+    assert "✍" in out and "is typing" in out
+
+
 async def test_handle_delivery_edit_marks_edited(directory: Directory, capsys) -> None:
     body = {
         "type": "EventMessage",
