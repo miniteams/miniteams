@@ -40,6 +40,9 @@ class _AsyncClient:
     async def __aexit__(self, *_: Any) -> bool:
         return False
 
+    async def aclose(self) -> None:  # process() now owns/closes the client explicitly
+        return None
+
     async def get(self, url: str, headers: Any = None, cookies: Any = None) -> _Resp:
         return self._handler(url)
 

@@ -143,8 +143,18 @@ async def _download_file(
     return str(dest), name, size
 
 
-async def process(content: str, msgtype: str, token: str, media_dir: Path, download: bool) -> list[str]:
-    """Return human annotations for the print line, downloading bytes when enabled."""
+async def process(
+    content: str,
+    msgtype: str,
+    token: str,
+    media_dir: Path,
+    download: bool,
+    client: httpx.AsyncClient | None = None,
+) -> list[str]:
+    """Return human annotations for the print line, downloading bytes when enabled.
+
+    Pass `client` to reuse a shared connection pool (archive downloads thousands of attachments
+    concurrently); when omitted a private client is opened for the call (live-stream path)."""
     items = extract(content, msgtype)
     notes: list[str] = []
     do_fetch = download and any(_downloadable(i["url"]) for i in items)
@@ -152,7 +162,9 @@ async def process(content: str, msgtype: str, token: str, media_dir: Path, downl
         media_dir.mkdir(parents=True, exist_ok=True)
         media_dir.chmod(0o700)
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    owns_client = client is None
+    client = client or httpx.AsyncClient(timeout=60.0)
+    try:
         for item in items:
             url, kind = item["url"], item["kind"]
             if not (download and _downloadable(url)):
@@ -172,6 +184,9 @@ async def process(content: str, msgtype: str, token: str, media_dir: Path, downl
             except Exception as exc:  # noqa: BLE001 — a failed download must not drop the message
                 log.debug("attachment_download_failed", kind=kind, url=url, error=str(exc))
                 notes.append(f"[{kind}: {url}]")
+    finally:
+        if owns_client:
+            await client.aclose()
 
     if msgtype == "RichText/Media_Card":
         notes.append("[card]")

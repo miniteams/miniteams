@@ -9,6 +9,7 @@ Resume state is the stored data itself (`ChatStore.oldest/newest`), so an interr
 resumes with no gap and no duplicate — see `archive_store` for the storage invariants.
 """
 
+import asyncio
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,6 +31,7 @@ log = structlog.get_logger()
 
 _PAGE_SIZE = 100
 _INTER_PAGE_DELAY = 0.2  # politeness pause between history pages (seconds)
+_MEDIA_CONCURRENCY = 8  # max concurrent attachment downloads per chat (429-friendly)
 
 
 class TokenProvider(Protocol):
@@ -103,11 +105,15 @@ def _enumerate(settings: Settings, skype_token: str, include_all: bool) -> list[
     Returns the full conversation objects (not just ids) so their metadata — `lastMessage`,
     `version`, … — is persisted verbatim in index.db."""
     targets: list[dict[str, Any]] = []
+    pages = seen = 0
     for page in fetch_conversations(settings, skype_token):
+        pages += 1
+        seen += len(page)
         for conv in page:
             thread_id = str(conv.get("id") or "")
             if thread_id and (include_all or is_private(thread_id) or is_meeting(thread_id)):
                 targets.append(conv)
+        log.info("enumerate_progress", pages=pages, scanned=seen, matched=len(targets))
     return targets
 
 
@@ -164,30 +170,51 @@ async def _download_media(store: ChatStore, skype_token: str) -> int:
     """Best-effort pass: download every stored message's attachments at original quality.
 
     Runs after messages are committed, iterating stored data — so it is resumable (a crash mid-pass
-    re-runs cheaply, skipping files already on disk) and never blocks message capture.
+    re-runs cheaply, skipping files already on disk) and never blocks message capture. Downloads run
+    over a bounded async pool sharing one connection pool; `_MEDIA_CONCURRENCY` caps in-flight
+    requests to stay polite (429-friendly).
     """
-    fetched = seen = 0
+    targets = [
+        m
+        for m in store.iter_messages()
+        if attachments.extract(m.get("content") or "", str(m.get("messagetype") or ""))
+    ]
+    if not targets:
+        return 0
+    fetched = done = 0
     start = time.monotonic()
-    for message in store.iter_messages():
-        content = message.get("content") or ""
-        msgtype = str(message.get("messagetype") or "")
-        if not attachments.extract(content, msgtype):
-            continue  # no attachment → don't even open a client
-        seen += 1
-        try:
-            notes = await attachments.process(content, msgtype, skype_token, store.media_dir, download=True)
-        except Exception as exc:  # noqa: BLE001 — one message's media must not abort the pass
-            log.debug("message_media_failed", id=message.get("id"), error=str(exc))
-            continue
-        fetched += sum(1 for n in notes if "→" in n)
-        if seen % 50 == 0:
-            log.info(
-                "media_progress",
-                thread=store.thread_id,
-                with_media=seen,
-                files=fetched,
-                files_per_s=_rate(fetched, start),
-            )
+    sem = asyncio.Semaphore(_MEDIA_CONCURRENCY)
+
+    async def _one(message: dict[str, Any], client: httpx.AsyncClient) -> int:
+        async with sem:  # cap concurrent downloads
+            try:
+                notes = await attachments.process(
+                    message.get("content") or "",
+                    str(message.get("messagetype") or ""),
+                    skype_token,
+                    store.media_dir,
+                    download=True,
+                    client=client,
+                )
+            except Exception as exc:  # noqa: BLE001 — one message's media must not abort the pass
+                log.debug("message_media_failed", id=message.get("id"), error=str(exc))
+                return 0
+            return sum(1 for n in notes if "→" in n)
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        tasks = [asyncio.create_task(_one(m, client)) for m in targets]
+        for task in asyncio.as_completed(tasks):
+            fetched += await task
+            done += 1
+            if done % 50 == 0:
+                log.info(
+                    "media_progress",
+                    thread=store.thread_id,
+                    done=done,
+                    of=len(targets),
+                    files=fetched,
+                    files_per_s=_rate(fetched, start),
+                )
     return fetched
 
 

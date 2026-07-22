@@ -221,7 +221,7 @@ async def test_media_downloaded_skipped_and_failure_nonfatal(
 
     seen: list[tuple[str, Path]] = []
 
-    async def fake_process(content, msgtype, token, media_dir, download):  # noqa: ANN001
+    async def fake_process(content, msgtype, token, media_dir, download, client=None):  # noqa: ANN001
         seen.append((content, media_dir))
         if len(seen) == 1:
             raise RuntimeError("download boom")  # first one fails — must not abort
