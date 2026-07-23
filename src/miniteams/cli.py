@@ -166,7 +166,8 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
             include_all=args.all,
             download_media=not args.no_media,
             download_avatars=not args.no_avatars,
-            verify_media=args.verify_media,
+            verify_media=args.verify_media or args.assets_only,
+            assets_only=args.assets_only,
         )
     )
     return 0
@@ -272,6 +273,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="re-check every message's assets against disk (even backfilled chats), "
         "downloading any that are missing",
+    )
+    p_archive.add_argument(
+        "--assets-only",
+        action="store_true",
+        help="fast recovery pass: only download missing assets for already-archived chats "
+        "(no history, no metadata, no avatars, no network enumeration)",
     )
     p_archive.set_defaults(func=cmd_archive)
 

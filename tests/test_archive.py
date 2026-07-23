@@ -409,3 +409,37 @@ async def test_verify_media_forces_pass_on_unchanged_chat(settings: Settings, tm
 
 async def _acount() -> int:
     return 0
+
+
+async def test_assets_only_downloads_media_no_history_no_avatars(settings, tmp_path, monkeypatch) -> None:
+    """--assets-only: media pass only, from the index, no topup/backfill/thread-fetch/avatars."""
+    data = tmp_path / "data"
+    pre = ChatStore(data, C1)
+    pre.insert_page([_msg("a1", "2026-07-01T09:00:00Z")])
+    pre.close()
+    index = Index(data)
+    index.upsert_chat(C1)
+    index.mark_backfill_done(C1)
+    index.close()
+
+    hist = []
+    monkeypatch.setattr(AR, "iter_history_pages", lambda *a, **k: hist.append(1) or iter([]))
+    enum = []
+    monkeypatch.setattr(AR, "fetch_conversations", lambda *a, **k: enum.append(1) or iter([]))
+    thread_fetched = []
+
+    async def fake_thread(self, tid):  # noqa: ANN001
+        thread_fetched.append(tid)
+        return {}
+
+    monkeypatch.setattr(AR.Directory, "thread", fake_thread)
+    media_ran = []
+    monkeypatch.setattr(AR, "_download_media", lambda *a, **k: media_ran.append(1) or _acount())
+    avatars_ran = []
+    monkeypatch.setattr(AR, "_download_avatars", lambda *a, **k: avatars_ran.append(1) or _acount())
+
+    await AR.run_archive(settings, data, token_provider=AR.StaticToken("sk", ""), assets_only=True)
+
+    assert media_ran == [1]  # media pass ran
+    assert hist == [] and enum == []  # no history, no network enumeration (used index)
+    assert thread_fetched == [] and avatars_ran == []  # no metadata, no avatars

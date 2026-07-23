@@ -277,9 +277,24 @@ async def archive_chat(
     download_media: bool = True,
     download_avatars: bool = True,
     verify_media: bool = False,
+    assets_only: bool = False,
     sp_token: Callable[[str], str | None] | None = None,
 ) -> None:
     directory.set_token(skype_token, bearer)
+    # Assets-only fast pass: no history, no metadata, no avatars — just re-scan already-stored
+    # messages and download any missing asset (skip-exists). For recovering media/transcripts
+    # over an existing archive without paying for a full re-run.
+    if assets_only:
+        store = ChatStore(data_dir, thread_id)
+        try:
+            if store.count():
+                media = await _download_media(store, skype_token, thread_id, sp_token)
+                index.touch(thread_id, _now_iso())
+                log.info("chat_assets", thread=thread_id, total=store.count(), media=media)
+        finally:
+            store.close()
+        return
+
     # Fast-skip on resume: enumeration carries the chat's last activity; if it's already
     # backfilled and that activity is at/before our newest stored message, nothing changed —
     # skip the thread fetch, the top-up probe, and the media/avatar rescan entirely.
@@ -351,6 +366,7 @@ async def run_archive(
     download_media: bool = True,
     download_avatars: bool = True,
     verify_media: bool = False,
+    assets_only: bool = False,
 ) -> None:
     # Absolute: downloaded media paths are turned into file:// URIs (Path.as_uri), which rejects
     # relative paths — a relative --data-dir would otherwise fail every attachment.
@@ -358,8 +374,14 @@ async def run_archive(
     index = Index(data_dir)
     directory = Directory(settings)
     try:
-        targets = [{"id": thread}] if thread else _enumerate(settings, token_provider.token(), include_all)
-        log.info("archive_start", chats=len(targets), data_dir=str(data_dir))
+        if thread:
+            targets: list[dict[str, Any]] = [{"id": thread}]
+        elif assets_only:
+            # Recover assets over what's already archived — no network enumeration needed.
+            targets = [{"id": c["id"]} for c in index.chats()]
+        else:
+            targets = _enumerate(settings, token_provider.token(), include_all)
+        log.info("archive_start", chats=len(targets), data_dir=str(data_dir), assets_only=assets_only)
         done = 0
         for conv in targets:
             thread_id = str(conv.get("id") or "")
@@ -392,6 +414,7 @@ async def run_archive(
                     download_media=download_media,
                     download_avatars=download_avatars,
                     verify_media=verify_media,
+                    assets_only=assets_only,
                     sp_token=token_provider.sharepoint_token,
                 )
             except Exception as exc:  # noqa: BLE001 — per-chat isolation; resumes next run
