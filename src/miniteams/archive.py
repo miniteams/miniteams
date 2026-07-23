@@ -20,7 +20,7 @@ import structlog
 
 from . import attachments, avatars
 from .archive_store import ChatStore, Index
-from .auth import TokenSource
+from .auth import AuthExpired, TokenSource
 from .chats import fetch_conversations, is_meeting, is_private, last_activity
 from .config import Settings
 from .directory import Directory
@@ -345,16 +345,30 @@ async def run_archive(
     try:
         targets = [{"id": thread}] if thread else _enumerate(settings, token_provider.token(), include_all)
         log.info("archive_start", chats=len(targets), data_dir=str(data_dir))
+        done = 0
         for conv in targets:
             thread_id = str(conv.get("id") or "")
             if not thread_id:
                 continue
+            # Resolve the token OUTSIDE the per-chat guard: a dead refresh token (AuthExpired) is
+            # fatal to the whole run — re-auth is needed — so stop loudly instead of cascading it
+            # into one "chat_archive_failed" per remaining chat and a uselessly "done" run.
+            try:
+                skype_token, bearer = token_provider.token(), token_provider.bearer()
+            except AuthExpired:
+                log.error(
+                    "archive_auth_expired",
+                    done=done,
+                    remaining=len(targets) - done,
+                    hint="re-run to resume from here",
+                )
+                break
             # One failing chat must not abort the archive of the rest.
             try:
                 await archive_chat(
                     settings,
-                    token_provider.token(),  # resolved per chat → picks up a mid-run token refresh
-                    token_provider.bearer(),
+                    skype_token,
+                    bearer,
                     thread_id,
                     data_dir,
                     directory,
@@ -366,6 +380,7 @@ async def run_archive(
                 )
             except Exception as exc:  # noqa: BLE001 — per-chat isolation; resumes next run
                 log.error("chat_archive_failed", thread=thread_id, error=str(exc))
-        log.info("archive_done", chats=len(targets))
+            done += 1
+        log.info("archive_done", chats=done, of=len(targets))
     finally:
         index.close()
