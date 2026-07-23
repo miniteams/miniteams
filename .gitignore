@@ -12,4 +12,8 @@ dist/
 *.egg-info/
 
 # local archive (personal chat data — never commit)
+# `data` is often a symlink to a NAS/large disk, so match the bare name too, not just `data/`.
+/data
+/_data
 data/
+_data/
