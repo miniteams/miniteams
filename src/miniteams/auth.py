@@ -160,10 +160,18 @@ class TokenSource:
         """Silent SharePoint token for `host` (e.g. `contoso-my.sharepoint.com`), redeemed on the
         Teams client via FOCI — no extra consent. Used to fetch meeting transcripts/recordings
         stored on OneDrive/SharePoint. Returns None if unavailable (never prompts)."""
+        return self._silent_scope(f"https://{host}/.default")
+
+    def graph_token(self) -> str | None:
+        """Silent Microsoft Graph token (FOCI, no consent). Used for the /shares API to fetch
+        SharePoint-hosted files shared into chats. Returns None if unavailable (never prompts)."""
+        return self._silent_scope("https://graph.microsoft.com/.default")
+
+    def _silent_scope(self, scope: str) -> str | None:
         accounts = self._teams.get_accounts()
         if not accounts:
             return None
-        result = self._teams.acquire_token_silent([f"https://{host}/.default"], account=accounts[0])
+        result = self._teams.acquire_token_silent([scope], account=accounts[0])
         _persist_cache(self._cache, self._cache_path)
         return result.get("access_token") if result else None
 

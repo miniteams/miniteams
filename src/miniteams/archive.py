@@ -41,6 +41,7 @@ class TokenProvider(Protocol):
     def token(self) -> str: ...
     def bearer(self) -> str: ...
     def sharepoint_token(self, host: str) -> str | None: ...
+    def graph_token(self) -> str | None: ...
 
 
 class StaticToken:
@@ -56,6 +57,9 @@ class StaticToken:
         return self._bearer
 
     def sharepoint_token(self, host: str) -> str | None:
+        return None
+
+    def graph_token(self) -> str | None:
         return None
 
 
@@ -93,6 +97,9 @@ class RefreshingToken:
 
     def sharepoint_token(self, host: str) -> str | None:
         return self.source.sharepoint_token(host)
+
+    def graph_token(self) -> str | None:
+        return self.source.graph_token()
 
 
 def _now_iso() -> str:
@@ -197,6 +204,7 @@ async def _download_media(
     skype_token: str,
     label: str,
     sp_token: Callable[[str], str | None] | None = None,
+    graph_token: Callable[[], str | None] | None = None,
 ) -> int:
     """Best-effort pass: download every stored message's attachments at original quality.
 
@@ -227,6 +235,7 @@ async def _download_media(
                     download=True,
                     client=client,
                     sp_token=sp_token,
+                    graph_token=graph_token,
                 )
             except Exception as exc:  # noqa: BLE001 — one message's media must not abort the pass
                 log.debug("message_media_failed", id=message.get("id"), error=str(exc))
@@ -279,6 +288,7 @@ async def archive_chat(
     verify_media: bool = False,
     assets_only: bool = False,
     sp_token: Callable[[str], str | None] | None = None,
+    graph_token: Callable[[], str | None] | None = None,
 ) -> None:
     directory.set_token(skype_token, bearer)
     # Assets-only fast pass: no history, no metadata, no avatars — just re-scan already-stored
@@ -288,7 +298,7 @@ async def archive_chat(
         store = ChatStore(data_dir, thread_id)
         try:
             if store.count():
-                media = await _download_media(store, skype_token, thread_id, sp_token)
+                media = await _download_media(store, skype_token, thread_id, sp_token, graph_token)
                 index.touch(thread_id, _now_iso())
                 log.info("chat_assets", thread=thread_id, total=store.count(), media=media)
         finally:
@@ -331,7 +341,9 @@ async def archive_chat(
         new_old = 0
         if not index.backfill_done(thread_id):
             new_old = _backfill(settings, skype_token, thread_id, store, index, label)
-        media = await _download_media(store, skype_token, label, sp_token) if download_media else 0
+        media = (
+            await _download_media(store, skype_token, label, sp_token, graph_token) if download_media else 0
+        )
         avatars_n = await _download_avatars(store, info, skype_token, bearer) if download_avatars else 0
         index.touch(thread_id, _now_iso())
         log.info(
@@ -416,6 +428,7 @@ async def run_archive(
                     verify_media=verify_media,
                     assets_only=assets_only,
                     sp_token=token_provider.sharepoint_token,
+                    graph_token=token_provider.graph_token,
                 )
             except Exception as exc:  # noqa: BLE001 — per-chat isolation; resumes next run
                 log.error("chat_archive_failed", thread=thread_id, error=str(exc))

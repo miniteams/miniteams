@@ -233,3 +233,70 @@ async def test_process_downloads_sp_transcript_with_bearer(settings: Settings, m
 async def test_process_sp_transcript_ref_only_without_token(settings: Settings) -> None:
     notes = await A.process(REC_SP, "RichText/Media_CallRecording", "sk", settings.media_dir, download=True)
     assert notes == [f"[transcript(sp): {SP}]"]  # no sp_token → ref only, no crash
+
+
+FILE_A = (
+    '<a itemtype="http://schema.skype.com/HyperLink/Files" '
+    'href="https://c.sharepoint.com/:x:/r/sites/RD/Shared/z.xlsx?d=w1&web=1">z.xlsx</a>'
+)
+VIDEO_A = '<a href="https://c.sharepoint.com/:v:/r/personal/x/rec.mp4?web=1">rec</a>'
+FOLDER_A = '<a href="https://c.sharepoint.com/:f:/r/sites/RD/Shared/Infras?web=1">folder</a>'
+
+
+def test_extract_sp_files_docs_only_no_video_no_folder() -> None:
+    items = A.extract(FILE_A + VIDEO_A + FOLDER_A, "RichText/Html")
+    sp = [i["url"] for i in items if i["kind"] == "sp_file"]
+    assert sp == ["https://c.sharepoint.com/:x:/r/sites/RD/Shared/z.xlsx?d=w1&web=1"]  # doc yes, :v:/:f: no
+
+
+async def test_process_downloads_sp_file_via_graph(settings: Settings, monkeypatch) -> None:
+    class _C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aclose(self):
+            return None
+
+        async def get(self, url, headers=None, **kw):
+            if url.endswith("/driveItem"):
+                return _Resp(data={"name": "z.xlsx", "file": {"mimeType": "x"}})
+            return _Resp(content=b"XLSXBYTES")  # /content
+
+        def json_get(self): ...
+
+    # _Resp.json returns _data; content path returns bytes
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
+    notes = await A.process(
+        FILE_A, "RichText/Html", "sk", settings.media_dir, download=True, graph_token=lambda: "GTOK"
+    )
+    assert (settings.media_dir / "z.xlsx").read_bytes() == b"XLSXBYTES"
+    assert any(n.startswith("[file:") and "→" in n for n in notes)
+
+
+async def test_process_sp_file_folder_is_ref_only(settings: Settings, monkeypatch) -> None:
+    class _C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aclose(self):
+            return None
+
+        async def get(self, url, headers=None, **kw):
+            return _Resp(data={"name": "Infras", "folder": {"childCount": 3}})  # no 'file' facet
+
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
+    notes = await A.process(
+        FOLDER_A.replace(":f:", ":x:"),
+        "RichText/Html",
+        "sk",
+        settings.media_dir,
+        download=True,
+        graph_token=lambda: "GTOK",
+    )
+    assert any(n.startswith("[file(sp):") for n in notes)  # folder → not downloaded

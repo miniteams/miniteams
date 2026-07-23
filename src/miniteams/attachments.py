@@ -7,6 +7,7 @@ whitelisted `api.asm.skype.com` / `*.asyncgw.teams.microsoft.com` hosts. Files n
 `GET <uri>/views/original/status` for metadata, then GET its `view_location` for the bytes.
 """
 
+import base64
 import hashlib
 import re
 from collections.abc import Callable
@@ -26,6 +27,12 @@ _IMG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 _URIOBJ_RE = re.compile(r"<URIObject\b[^>]*>", re.IGNORECASE)
 # Call-recording messages nest the transcript/video as <item type="amsTranscript" uri="…">.
 _ITEM_RE = re.compile(r"<item\b[^>]*>", re.IGNORECASE)
+# Shared files show up as <a itemtype=".../HyperLink/Files" href="…sharepoint.com/…">name</a>.
+_A_RE = re.compile(r"<a\b[^>]*>", re.IGNORECASE)
+_FILE_LINK = "http://schema.skype.com/HyperLink/Files"
+# SharePoint "open in <app>" path prefixes: :x: Excel, :w: Word, :p: PowerPoint, :b: PDF/other doc.
+# Downloadable single documents — EXCLUDES :v: (video, huge), :f: (folder), :u:/:o: (site/OneNote).
+_SP_DOC_PREFIX = re.compile(r"sharepoint\.com/:[xwpb]:/", re.IGNORECASE)
 _ATTR_RE = re.compile(r'([\w-]+)\s*=\s*"([^"]*)"')
 _CTYPE_EXT = {
     "image/png": ".png",
@@ -81,6 +88,15 @@ def extract(content: str, msgtype: str) -> list[dict[str, str]]:
             items.append({"kind": "transcript", "url": attrs["uri"]})
         elif attrs.get("type") == "onedriveForBusinessTranscript" and attrs.get("uri"):
             items.append({"kind": "sp_transcript", "url": attrs["uri"]})
+    # SharePoint-hosted documents shared into the chat (xls/ppt/pdf/doc) — fetched via Graph.
+    # Videos (:v:) and folders (:f:) are deliberately left out.
+    for tag in _A_RE.findall(content):
+        attrs = _attrs(tag)
+        href = attrs.get("href") or ""
+        if "sharepoint.com" not in href:
+            continue
+        if attrs.get("itemtype") == _FILE_LINK or _SP_DOC_PREFIX.search(href):
+            items.append({"kind": "sp_file", "url": href})
     return items
 
 
@@ -148,6 +164,37 @@ async def _download_sp_transcript(client: httpx.AsyncClient, url: str, bearer: s
     return str(dest)
 
 
+_GRAPH = "https://graph.microsoft.com/v1.0"
+
+
+async def _download_sp_file(
+    client: httpx.AsyncClient, url: str, graph_bearer: str, media_dir: Path
+) -> str | None:
+    """Fetch a SharePoint/OneDrive shared document via the Graph /shares API.
+
+    Returns the local path, or None when the share resolves to a non-file (folder/site/page).
+    Named by the driveItem's real filename; skip-if-exists on re-runs."""
+    # Graph share id: unpadded base64url of the sharing URL, prefixed "u!".
+    share = "u!" + base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+    hdr = {"Authorization": f"Bearer {graph_bearer}"}
+    meta = await client.get(f"{_GRAPH}/shares/{share}/driveItem", headers=hdr)
+    meta.raise_for_status()
+    info = meta.json()
+    if "file" not in info:  # folder / notebook / list item — not a single downloadable file
+        return None
+    name = _safe_name(str(info.get("name") or "file"))
+    dest = media_dir / name
+    if dest.exists():
+        return str(dest)  # skip re-download
+    media_dir.mkdir(parents=True, exist_ok=True)
+    resp = await client.get(f"{_GRAPH}/shares/{share}/driveItem/content", headers=hdr, follow_redirects=True)
+    resp.raise_for_status()
+    tmp = media_dir / f"{name}.part"
+    tmp.write_bytes(resp.content)
+    tmp.rename(dest)
+    return str(dest)
+
+
 async def _download_image(
     client: httpx.AsyncClient, token: str, src: str, media_dir: Path
 ) -> tuple[str, str | None]:
@@ -194,16 +241,18 @@ async def process(
     download: bool,
     client: httpx.AsyncClient | None = None,
     sp_token: Callable[[str], str | None] | None = None,
+    graph_token: Callable[[], str | None] | None = None,
 ) -> list[str]:
     """Return human annotations for the print line, downloading bytes when enabled.
 
     Pass `client` to reuse a shared connection pool (archive downloads thousands of attachments
     concurrently); when omitted a private client is opened for the call (live-stream path).
-    `sp_token(host)` supplies a SharePoint bearer so durable OneDrive transcripts can be fetched;
-    without it those items are surfaced as refs only."""
+    `sp_token(host)` supplies a SharePoint bearer for durable OneDrive transcripts; `graph_token()`
+    a Graph bearer for SharePoint-hosted shared documents. Without them those items are refs only."""
     items = extract(content, msgtype)
     notes: list[str] = []
-    do_fetch = download and any(_downloadable(i["url"]) or i["kind"] == "sp_transcript" for i in items)
+    _remote = {"sp_transcript", "sp_file"}
+    do_fetch = download and any(_downloadable(i["url"]) or i["kind"] in _remote for i in items)
     if do_fetch:
         media_dir.mkdir(parents=True, exist_ok=True)
         media_dir.chmod(0o700)
@@ -224,6 +273,21 @@ async def process(
                 except Exception as exc:  # noqa: BLE001 — best-effort; ref-only on failure
                     log.debug("sp_transcript_failed", url=url, error=str(exc))
                     notes.append(f"[transcript(sp): {url}]")
+                continue
+            if kind == "sp_file":
+                gtok = graph_token() if (download and graph_token) else None
+                if not gtok:
+                    notes.append(f"[file(sp): {url}]")
+                    continue
+                try:
+                    fpath = await _download_sp_file(client, url, gtok, media_dir)
+                    if fpath:
+                        notes.append(f"[file: {url} → {Path(fpath).resolve().as_uri()}]")
+                    else:
+                        notes.append(f"[file(sp): {url}]")  # folder/site/page — not a file
+                except Exception as exc:  # noqa: BLE001 — best-effort; ref-only on failure
+                    log.debug("sp_file_failed", url=url, error=str(exc))
+                    notes.append(f"[file(sp): {url}]")
                 continue
             if not (download and _downloadable(url)):
                 notes.append(f"[{kind}: {url}]")
