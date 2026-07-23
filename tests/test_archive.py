@@ -344,3 +344,33 @@ def test_refreshing_token_reexchanges_before_expiry(settings: Settings, monkeypa
     clock["t"] += 600  # past expiry - margin (600 - 300)
     assert prov.token() == "sk2"  # re-minted
     assert len(exchanges) == 2
+
+
+async def test_resume_skips_unchanged_chat(settings: Settings, tmp_path, monkeypatch) -> None:
+    """A backfilled chat whose enumeration lastMessage <= stored newest is skipped entirely:
+    no thread fetch, no history call, no media/avatar rescan."""
+    data = tmp_path / "data"
+    pre = ChatStore(data, C1)
+    pre.insert_page([_msg("a1", "2026-07-01T09:00:00Z")])
+    pre.close()
+    index = Index(data)
+    index.upsert_chat(C1)
+    index.mark_backfill_done(C1)
+    index.close()
+
+    hist_calls: list[str] = []
+    monkeypatch.setattr(AR, "iter_history_pages", lambda *a, **k: hist_calls.append("x") or iter([]))
+    conv = {"id": C1, "lastMessage": {"composetime": "2026-07-01T09:00:00Z"}}  # == stored newest
+    monkeypatch.setattr(AR, "fetch_conversations", lambda s, tok: iter([[conv]]))
+
+    thread_fetched = []
+
+    async def fake_thread(self, tid):  # noqa: ANN001
+        thread_fetched.append(tid)
+        return {"topic": "", "members": [], "picture": None}
+
+    monkeypatch.setattr(AR.Directory, "thread", fake_thread)
+    await _run(settings, data)
+
+    assert hist_calls == []  # no top-up / backfill request
+    assert thread_fetched == []  # thread metadata not even fetched

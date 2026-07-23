@@ -21,7 +21,7 @@ import structlog
 from . import attachments, avatars
 from .archive_store import ChatStore, Index
 from .auth import TokenSource
-from .chats import fetch_conversations, is_meeting, is_private
+from .chats import fetch_conversations, is_meeting, is_private, last_activity
 from .config import Settings
 from .directory import Directory
 from .dump import _epoch_seconds, iter_history_pages
@@ -264,6 +264,19 @@ async def archive_chat(
     download_avatars: bool = True,
 ) -> None:
     directory.set_token(skype_token, bearer)
+    # Fast-skip on resume: enumeration carries the chat's last activity; if it's already
+    # backfilled and that activity is at/before our newest stored message, nothing changed —
+    # skip the thread fetch, the top-up probe, and the media/avatar rescan entirely.
+    if conv and index.backfill_done(thread_id):
+        probe = ChatStore(data_dir, thread_id)
+        newest, last = probe.newest(), last_activity(conv)
+        probe.close()
+        # Second granularity is enough for "unchanged"; sub-second arrivals are caught next run.
+        if newest and last and _epoch_seconds(last) <= _epoch_seconds(newest):
+            log.info("chat_unchanged", thread=thread_id, newest=newest[:19])
+            index.touch(thread_id, _now_iso())
+            return
+
     info = await directory.thread(thread_id) or {}  # topic + roster + picture (best-effort)
     label = await directory.label(thread_id)
     log.info("chat_start", chat=label, thread=thread_id)
