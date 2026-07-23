@@ -156,6 +156,17 @@ class TokenSource:
             )
         return result
 
+    def sharepoint_token(self, host: str) -> str | None:
+        """Silent SharePoint token for `host` (e.g. `contoso-my.sharepoint.com`), redeemed on the
+        Teams client via FOCI — no extra consent. Used to fetch meeting transcripts/recordings
+        stored on OneDrive/SharePoint. Returns None if unavailable (never prompts)."""
+        accounts = self._teams.get_accounts()
+        if not accounts:
+            return None
+        result = self._teams.acquire_token_silent([f"https://{host}/.default"], account=accounts[0])
+        _persist_cache(self._cache, self._cache_path)
+        return result.get("access_token") if result else None
+
 
 def acquire_aad_token(settings: Settings) -> dict[str, Any]:
     """One-shot acquisition for non-streaming commands (dump/send)."""

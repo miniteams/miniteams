@@ -11,6 +11,7 @@ resumes with no gap and no duplicate — see `archive_store` for the storage inv
 
 import asyncio
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -39,6 +40,7 @@ class TokenProvider(Protocol):
 
     def token(self) -> str: ...
     def bearer(self) -> str: ...
+    def sharepoint_token(self, host: str) -> str | None: ...
 
 
 class StaticToken:
@@ -52,6 +54,9 @@ class StaticToken:
 
     def bearer(self) -> str:
         return self._bearer
+
+    def sharepoint_token(self, host: str) -> str | None:
+        return None
 
 
 class RefreshingToken:
@@ -85,6 +90,9 @@ class RefreshingToken:
     def bearer(self) -> str:
         self._ensure()
         return self._bearer
+
+    def sharepoint_token(self, host: str) -> str | None:
+        return self.source.sharepoint_token(host)
 
 
 def _now_iso() -> str:
@@ -184,7 +192,12 @@ def _backfill(
     return added
 
 
-async def _download_media(store: ChatStore, skype_token: str, label: str) -> int:
+async def _download_media(
+    store: ChatStore,
+    skype_token: str,
+    label: str,
+    sp_token: Callable[[str], str | None] | None = None,
+) -> int:
     """Best-effort pass: download every stored message's attachments at original quality.
 
     Runs after messages are committed, iterating stored data — so it is resumable (a crash mid-pass
@@ -213,6 +226,7 @@ async def _download_media(store: ChatStore, skype_token: str, label: str) -> int
                     store.media_dir,
                     download=True,
                     client=client,
+                    sp_token=sp_token,
                 )
             except Exception as exc:  # noqa: BLE001 — one message's media must not abort the pass
                 log.debug("message_media_failed", id=message.get("id"), error=str(exc))
@@ -263,6 +277,7 @@ async def archive_chat(
     download_media: bool = True,
     download_avatars: bool = True,
     verify_media: bool = False,
+    sp_token: Callable[[str], str | None] | None = None,
 ) -> None:
     directory.set_token(skype_token, bearer)
     # Fast-skip on resume: enumeration carries the chat's last activity; if it's already
@@ -301,7 +316,7 @@ async def archive_chat(
         new_old = 0
         if not index.backfill_done(thread_id):
             new_old = _backfill(settings, skype_token, thread_id, store, index, label)
-        media = await _download_media(store, skype_token, label) if download_media else 0
+        media = await _download_media(store, skype_token, label, sp_token) if download_media else 0
         avatars_n = await _download_avatars(store, info, skype_token, bearer) if download_avatars else 0
         index.touch(thread_id, _now_iso())
         log.info(
@@ -377,6 +392,7 @@ async def run_archive(
                     download_media=download_media,
                     download_avatars=download_avatars,
                     verify_media=verify_media,
+                    sp_token=token_provider.sharepoint_token,
                 )
             except Exception as exc:  # noqa: BLE001 — per-chat isolation; resumes next run
                 log.error("chat_archive_failed", thread=thread_id, error=str(exc))

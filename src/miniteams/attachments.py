@@ -7,7 +7,9 @@ whitelisted `api.asm.skype.com` / `*.asyncgw.teams.microsoft.com` hosts. Files n
 `GET <uri>/views/original/status` for metadata, then GET its `view_location` for the bytes.
 """
 
+import hashlib
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -70,11 +72,15 @@ def extract(content: str, msgtype: str) -> list[dict[str, str]]:
         if url:
             items.append({"kind": "file", "url": url})
     # Meeting-recording transcript (the video item is intentionally left out — huge, and the
-    # SharePoint "Play" link in the same message already preserves the recording).
+    # SharePoint "Play" link in the same message already preserves the recording). Two sources:
+    # `amsTranscript` (fast-expiring AMS copy, skype-token) and `onedriveForBusinessTranscript`
+    # (durable SharePoint copy, needs a SharePoint bearer) — capture both, dedup on download.
     for tag in _ITEM_RE.findall(content):
         attrs = _attrs(tag)
         if attrs.get("type") == "amsTranscript" and attrs.get("uri"):
             items.append({"kind": "transcript", "url": attrs["uri"]})
+        elif attrs.get("type") == "onedriveForBusinessTranscript" and attrs.get("uri"):
+            items.append({"kind": "sp_transcript", "url": attrs["uri"]})
     return items
 
 
@@ -117,6 +123,27 @@ async def _fetch_image(client: httpx.AsyncClient, token: str, url: str, media_di
     headers = await _stream_to(client, url, token, tmp)
     ext = _CTYPE_EXT.get((headers.get("content-type") or "").split(";")[0], ".img")
     dest = media_dir / f"{_object_id(url)}{suffix}{ext}"
+    tmp.rename(dest)
+    return str(dest)
+
+
+async def _download_sp_transcript(client: httpx.AsyncClient, url: str, bearer: str, media_dir: Path) -> str:
+    """Fetch a meeting transcript from SharePoint/OneDrive with a SharePoint bearer.
+
+    Named by a hash of the URL (no stable object id like AMS); skip-if-exists on re-runs."""
+    stem = f"sp-{hashlib.sha1(url.split('?')[0].encode()).hexdigest()[:16]}.transcript"
+    cached = _existing(media_dir, stem)
+    if cached:
+        return cached
+    media_dir.mkdir(parents=True, exist_ok=True)
+    resp = await client.get(
+        url, headers={"Authorization": f"Bearer {bearer}", "Accept": "*/*"}, follow_redirects=True
+    )
+    resp.raise_for_status()
+    ext = _CTYPE_EXT.get((resp.headers.get("content-type") or "").split(";")[0], ".vtt")
+    dest = media_dir / f"{stem}{ext}"
+    tmp = media_dir / f"{stem}.part"
+    tmp.write_bytes(resp.content)  # transcripts are small text
     tmp.rename(dest)
     return str(dest)
 
@@ -166,14 +193,17 @@ async def process(
     media_dir: Path,
     download: bool,
     client: httpx.AsyncClient | None = None,
+    sp_token: Callable[[str], str | None] | None = None,
 ) -> list[str]:
     """Return human annotations for the print line, downloading bytes when enabled.
 
     Pass `client` to reuse a shared connection pool (archive downloads thousands of attachments
-    concurrently); when omitted a private client is opened for the call (live-stream path)."""
+    concurrently); when omitted a private client is opened for the call (live-stream path).
+    `sp_token(host)` supplies a SharePoint bearer so durable OneDrive transcripts can be fetched;
+    without it those items are surfaced as refs only."""
     items = extract(content, msgtype)
     notes: list[str] = []
-    do_fetch = download and any(_downloadable(i["url"]) for i in items)
+    do_fetch = download and any(_downloadable(i["url"]) or i["kind"] == "sp_transcript" for i in items)
     if do_fetch:
         media_dir.mkdir(parents=True, exist_ok=True)
         media_dir.chmod(0o700)
@@ -183,6 +213,18 @@ async def process(
     try:
         for item in items:
             url, kind = item["url"], item["kind"]
+            if kind == "sp_transcript":
+                bearer = sp_token(urlsplit(url).hostname or "") if (download and sp_token) else None
+                if not bearer:
+                    notes.append(f"[transcript(sp): {url}]")
+                    continue
+                try:
+                    path = await _download_sp_transcript(client, url, bearer, media_dir)
+                    notes.append(f"[transcript: {url} → {Path(path).resolve().as_uri()}]")
+                except Exception as exc:  # noqa: BLE001 — best-effort; ref-only on failure
+                    log.debug("sp_transcript_failed", url=url, error=str(exc))
+                    notes.append(f"[transcript(sp): {url}]")
+                continue
             if not (download and _downloadable(url)):
                 notes.append(f"[{kind}: {url}]")
                 continue

@@ -42,6 +42,7 @@ uv run miniteams archive          # resumable local archive of private chats + m
 uv run miniteams archive --thread 19:xxx@thread.v2     # archive one conversation
 uv run miniteams archive --no-media                    # messages only, skip attachments
 uv run miniteams archive --verify-media                # re-check every asset on disk, fetch missing
+                                                       # (recovers old transcripts from SharePoint too)
 uv run miniteams dump             # dump your Notes' full history (oldest → newest)
 uv run miniteams dump --thread 19:xxx@thread.v2        # dump a conversation
 uv run miniteams dump --jsonl > notes.jsonl            # full-detail JSON per line

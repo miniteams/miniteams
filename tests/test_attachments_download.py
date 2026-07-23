@@ -184,3 +184,52 @@ async def test_process_downloads_transcript(settings: Settings, monkeypatch) -> 
     notes = await A.process(REC, "RichText/Media_CallRecording", "sk", settings.media_dir, download=True)
     assert (settings.media_dir / "rec1.transcript.vtt").read_bytes() == b"WEBVTT\n\nhi"
     assert any(n.startswith("[transcript:") and "→" in n for n in notes)
+
+
+SP = "https://contoso-my.sharepoint.com/personal/x/_api/v2.1/drives/b!abc/items/01ABC?foo=bar"
+REC_SP = (
+    '<URIObject type="Video.2/CallRecording.1" uri="">'
+    f'<item type="onedriveForBusinessTranscript" uri="{SP}" /></URIObject>'
+)
+
+
+def test_extract_pulls_sharepoint_transcript() -> None:
+    items = A.extract(REC_SP, "RichText/Media_CallRecording")
+    assert any(i["kind"] == "sp_transcript" and i["url"] == SP for i in items)
+
+
+async def test_process_downloads_sp_transcript_with_bearer(settings: Settings, monkeypatch) -> None:
+    seen_auth = {}
+
+    class _C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aclose(self):
+            return None
+
+        async def get(self, url, headers=None, cookies=None, **kw):
+            seen_auth["hdr"] = headers
+            return _Resp(content=b"WEBVTT\n\nsp", headers={"content-type": "text/vtt"})
+
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
+    notes = await A.process(
+        REC_SP,
+        "RichText/Media_CallRecording",
+        "sk",
+        settings.media_dir,
+        download=True,
+        sp_token=lambda host: f"SPTOK::{host}",
+    )
+    assert any(n.startswith("[transcript:") and "→" in n for n in notes)
+    assert seen_auth["hdr"]["Authorization"] == "Bearer SPTOK::contoso-my.sharepoint.com"
+    files = list(settings.media_dir.glob("sp-*.transcript.vtt"))
+    assert len(files) == 1 and files[0].read_bytes() == b"WEBVTT\n\nsp"
+
+
+async def test_process_sp_transcript_ref_only_without_token(settings: Settings) -> None:
+    notes = await A.process(REC_SP, "RichText/Media_CallRecording", "sk", settings.media_dir, download=True)
+    assert notes == [f"[transcript(sp): {SP}]"]  # no sp_token → ref only, no crash
