@@ -156,3 +156,31 @@ async def test_process_relative_media_dir_still_links(settings: Settings, monkey
     _patch_client(monkeypatch, handler)
     notes = await A.process(IMG, "RichText/Html", "sk", Path("rel/media"), download=True)
     assert any("→" in n for n in notes), notes
+
+
+_OBJ = "https://fr-prod.asyncgw.teams.microsoft.com/v1/objects/rec1/views"
+REC = (
+    f'<URIObject type="Video.2/CallRecording.1" url_thumbnail="{_OBJ}/thumbnail_small" uri="">'
+    '<a href="https://sp.example/play">Play</a>'
+    f'<item type="amsVideo" uri="{_OBJ}/video" />'
+    f'<item type="amsTranscript" uri="{_OBJ}/transcript" />'
+    "</URIObject>"
+)
+
+
+def test_extract_recording_pulls_transcript_not_video() -> None:
+    items = A.extract(REC, "RichText/Media_CallRecording")
+    kinds = {(i["kind"], i["url"].rsplit("/", 1)[-1]) for i in items}
+    assert ("transcript", "transcript") in kinds  # transcript captured
+    assert ("file", "thumbnail_small") in kinds  # thumbnail (URIObject url_thumbnail)
+    assert not any(i["url"].endswith("/video") for i in items)  # video intentionally skipped
+
+
+async def test_process_downloads_transcript(settings: Settings, monkeypatch) -> None:
+    def handler(url: str) -> _Resp:
+        return _Resp(content=b"WEBVTT\n\nhi", headers={"content-type": "text/vtt"})
+
+    _patch_client(monkeypatch, handler)
+    notes = await A.process(REC, "RichText/Media_CallRecording", "sk", settings.media_dir, download=True)
+    assert (settings.media_dir / "rec1.transcript.vtt").read_bytes() == b"WEBVTT\n\nhi"
+    assert any(n.startswith("[transcript:") and "→" in n for n in notes)

@@ -22,8 +22,18 @@ _AMSIMAGE = "http://schema.skype.com/AMSImage"
 _OBJECT_HOST_RE = re.compile(r"^(api\.asm\.skype\.com|[^.]+\.asyncgw\.teams\.microsoft\.com)$")
 _IMG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 _URIOBJ_RE = re.compile(r"<URIObject\b[^>]*>", re.IGNORECASE)
+# Call-recording messages nest the transcript/video as <item type="amsTranscript" uri="…">.
+_ITEM_RE = re.compile(r"<item\b[^>]*>", re.IGNORECASE)
 _ATTR_RE = re.compile(r'([\w-]+)\s*=\s*"([^"]*)"')
-_CTYPE_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
+_CTYPE_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "text/vtt": ".vtt",
+    "application/json": ".json",
+    "text/plain": ".txt",
+}
 _VIEW_RE = re.compile(r"/views/[^/?#]+")
 _FULL_VIEW = "imgpsh_fullsize"  # full-resolution view (vs the bounded `imgo` Teams references)
 
@@ -59,6 +69,12 @@ def extract(content: str, msgtype: str) -> list[dict[str, str]]:
         url = attrs.get("uri") or attrs.get("url_thumbnail")
         if url:
             items.append({"kind": "file", "url": url})
+    # Meeting-recording transcript (the video item is intentionally left out — huge, and the
+    # SharePoint "Play" link in the same message already preserves the recording).
+    for tag in _ITEM_RE.findall(content):
+        attrs = _attrs(tag)
+        if attrs.get("type") == "amsTranscript" and attrs.get("uri"):
+            items.append({"kind": "transcript", "url": attrs["uri"]})
     return items
 
 
@@ -178,6 +194,10 @@ async def process(
                     primary = Path(full_path or optim_path).resolve().as_uri()
                     extra = f" (optim {Path(optim_path).resolve().as_uri()})" if full_path else ""
                     notes.append(f"[image: {url} → {primary}{extra}]")
+                elif kind == "transcript":
+                    # Direct /views/transcript GET, named by content-type (vtt/json/txt).
+                    path = await _fetch_image(client, token, url, media_dir, suffix=".transcript")
+                    notes.append(f"[transcript: {url} → {Path(path).resolve().as_uri()}]")
                 else:
                     fpath, name, size = await _download_file(client, token, url, media_dir)
                     sz = f" ({size}B)" if size else ""
