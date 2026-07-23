@@ -374,3 +374,38 @@ async def test_resume_skips_unchanged_chat(settings: Settings, tmp_path, monkeyp
 
     assert hist_calls == []  # no top-up / backfill request
     assert thread_fetched == []  # thread metadata not even fetched
+
+
+async def test_verify_media_forces_pass_on_unchanged_chat(settings: Settings, tmp_path, monkeypatch) -> None:
+    """--verify-media disables the unchanged fast-skip so the media pass re-runs (skip-exists
+    downloads only what's missing) on an already-backfilled, unchanged chat."""
+    data = tmp_path / "data"
+    pre = ChatStore(data, C1)
+    pre.insert_page([_msg("a1", "2026-07-01T09:00:00Z")])
+    pre.close()
+    index = Index(data)
+    index.upsert_chat(C1)
+    index.mark_backfill_done(C1)
+    index.close()
+
+    conv = {"id": C1, "lastMessage": {"composetime": "2026-07-01T09:00:00Z"}}  # unchanged
+    monkeypatch.setattr(AR, "fetch_conversations", lambda s, tok: iter([[conv]]))
+    monkeypatch.setattr(AR, "iter_history_pages", _FakeApi({C1: []}).iter_pages)
+
+    async def fake_thread(self, tid):  # noqa: ANN001
+        return {"topic": "", "members": [], "picture": None}
+
+    async def fake_label(self, tid):  # noqa: ANN001
+        return "L"
+
+    monkeypatch.setattr(AR.Directory, "thread", fake_thread)
+    monkeypatch.setattr(AR.Directory, "label", fake_label)
+
+    media_ran = []
+    monkeypatch.setattr(AR, "_download_media", lambda *a, **k: media_ran.append(1) or _acount())
+    await _run(settings, data, download_media=True, verify_media=True)
+    assert media_ran == [1]  # media pass ran despite the chat being unchanged
+
+
+async def _acount() -> int:
+    return 0

@@ -262,12 +262,16 @@ async def archive_chat(
     conv: dict[str, Any] | None = None,
     download_media: bool = True,
     download_avatars: bool = True,
+    verify_media: bool = False,
 ) -> None:
     directory.set_token(skype_token, bearer)
     # Fast-skip on resume: enumeration carries the chat's last activity; if it's already
     # backfilled and that activity is at/before our newest stored message, nothing changed —
     # skip the thread fetch, the top-up probe, and the media/avatar rescan entirely.
-    if conv and index.backfill_done(thread_id):
+    # `verify_media` disables the skip so every message's assets are re-checked against disk
+    # (skip-exists means only missing ones download) — covers a backfill that succeeded while
+    # its media didn't (a prior --no-media run, download failures, an interrupted media pass).
+    if conv and index.backfill_done(thread_id) and not verify_media:
         probe = ChatStore(data_dir, thread_id)
         newest, last = probe.newest(), last_activity(conv)
         probe.close()
@@ -331,6 +335,7 @@ async def run_archive(
     include_all: bool = False,
     download_media: bool = True,
     download_avatars: bool = True,
+    verify_media: bool = False,
 ) -> None:
     # Absolute: downloaded media paths are turned into file:// URIs (Path.as_uri), which rejects
     # relative paths — a relative --data-dir would otherwise fail every attachment.
@@ -357,6 +362,7 @@ async def run_archive(
                     conv=conv,
                     download_media=download_media,
                     download_avatars=download_avatars,
+                    verify_media=verify_media,
                 )
             except Exception as exc:  # noqa: BLE001 — per-chat isolation; resumes next run
                 log.error("chat_archive_failed", thread=thread_id, error=str(exc))

@@ -166,6 +166,7 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
             include_all=args.all,
             download_media=not args.no_media,
             download_avatars=not args.no_avatars,
+            verify_media=args.verify_media,
         )
     )
     return 0
@@ -265,6 +266,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_archive.add_argument(
         "--no-avatars", action="store_true", help="skip downloading group icons / member avatars"
+    )
+    p_archive.add_argument(
+        "--verify-media",
+        action="store_true",
+        help="re-check every message's assets against disk (even backfilled chats), "
+        "downloading any that are missing",
     )
     p_archive.set_defaults(func=cmd_archive)
 
