@@ -300,3 +300,13 @@ async def test_process_sp_file_folder_is_ref_only(settings: Settings, monkeypatc
         graph_token=lambda: "GTOK",
     )
     assert any(n.startswith("[file(sp):") for n in notes)  # folder → not downloaded
+
+
+def test_extract_excludes_sharepoint_videos() -> None:
+    mp4_files_itemtype = (
+        '<a itemtype="http://schema.skype.com/HyperLink/Files" '
+        'href="https://c.sharepoint.com/:v:/r/personal/x/clip.mp4?web=1">clip</a>'
+    )
+    mp4_by_ext = '<a itemtype="http://schema.skype.com/HyperLink/Files" href="https://c.sharepoint.com/sites/x/clip.mp4">c</a>'
+    items = A.extract(mp4_files_itemtype + mp4_by_ext, "RichText/Html")
+    assert not any(i["kind"] == "sp_file" for i in items)  # videos excluded even as HyperLink/Files

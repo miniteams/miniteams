@@ -33,6 +33,8 @@ _FILE_LINK = "http://schema.skype.com/HyperLink/Files"
 # SharePoint "open in <app>" path prefixes: :x: Excel, :w: Word, :p: PowerPoint, :b: PDF/other doc.
 # Downloadable single documents — EXCLUDES :v: (video, huge), :f: (folder), :u:/:o: (site/OneNote).
 _SP_DOC_PREFIX = re.compile(r"sharepoint\.com/:[xwpb]:/", re.IGNORECASE)
+# Videos are excluded even when tagged as a shared file (HyperLink/Files can point at an .mp4).
+_VIDEO_EXT = re.compile(r"\.(mp4|mov|avi|mkv|webm|wmv|m4v)(\?|$)", re.IGNORECASE)
 _ATTR_RE = re.compile(r'([\w-]+)\s*=\s*"([^"]*)"')
 _CTYPE_EXT = {
     "image/png": ".png",
@@ -93,8 +95,8 @@ def extract(content: str, msgtype: str) -> list[dict[str, str]]:
     for tag in _A_RE.findall(content):
         attrs = _attrs(tag)
         href = attrs.get("href") or ""
-        if "sharepoint.com" not in href:
-            continue
+        if "sharepoint.com" not in href or "/:v:/" in href.lower() or _VIDEO_EXT.search(href):
+            continue  # not SharePoint, or a video (excluded)
         if attrs.get("itemtype") == _FILE_LINK or _SP_DOC_PREFIX.search(href):
             items.append({"kind": "sp_file", "url": href})
     return items
