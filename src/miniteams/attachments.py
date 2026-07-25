@@ -198,17 +198,26 @@ async def _download_sp_file(
 
 
 async def _download_image(
-    client: httpx.AsyncClient, token: str, src: str, media_dir: Path
+    client: httpx.AsyncClient,
+    token: str,
+    src: str,
+    media_dir: Path,
+    skip_url: Callable[[str], bool] | None = None,
+    on_fail: Callable[[str, Exception], None] | None = None,
 ) -> tuple[str, str | None]:
     """Fetch the optimized view (as referenced) and the full-resolution view; return (optim, full)."""
     optim = await _fetch_image(client, token, src, media_dir, suffix="")
     full_url = _VIEW_RE.sub(f"/views/{_FULL_VIEW}", src)
-    if full_url == src:
+    # The full view has its own URL: a denied one must be skipped/recorded on that URL, or a
+    # message whose optimized view is fine would re-poll a 403 full view on every run.
+    if full_url == src or (skip_url and skip_url(full_url)):
         return optim, None
     try:
         full = await _fetch_image(client, token, full_url, media_dir, suffix=".full")
     except Exception as exc:  # noqa: BLE001 — full view may 404; the optimized one still stands
         log.debug("full_image_failed", url=full_url, error=str(exc))
+        if on_fail:
+            on_fail(full_url, exc)
         return optim, None
     return optim, full
 
@@ -244,16 +253,21 @@ async def process(
     client: httpx.AsyncClient | None = None,
     sp_token: Callable[[str], str | None] | None = None,
     graph_token: Callable[[], str | None] | None = None,
+    skip_url: Callable[[str], bool] | None = None,
+    on_fail: Callable[[str, Exception], None] | None = None,
 ) -> list[str]:
     """Return human annotations for the print line, downloading bytes when enabled.
 
     Pass `client` to reuse a shared connection pool (archive downloads thousands of attachments
     concurrently); when omitted a private client is opened for the call (live-stream path).
     `sp_token(host)` supplies a SharePoint bearer for durable OneDrive transcripts; `graph_token()`
-    a Graph bearer for SharePoint-hosted shared documents. Without them those items are refs only."""
+    a Graph bearer for SharePoint-hosted shared documents. Without them those items are refs only.
+    `skip_url(url)` vetoes a download (ref-only note, no network) — the archive's denied-asset
+    cache; `on_fail(url, exc)` observes each failed download so callers can feed that cache."""
     items = extract(content, msgtype)
     notes: list[str] = []
     _remote = {"sp_transcript", "sp_file"}
+    _ref_label = {"sp_transcript": "transcript(sp)", "sp_file": "file(sp)"}
     do_fetch = download and any(_downloadable(i["url"]) or i["kind"] in _remote for i in items)
     if do_fetch:
         media_dir.mkdir(parents=True, exist_ok=True)
@@ -264,6 +278,9 @@ async def process(
     try:
         for item in items:
             url, kind = item["url"], item["kind"]
+            if skip_url and skip_url(url):
+                notes.append(f"[{_ref_label.get(kind, kind)}: {url}]")
+                continue
             if kind == "sp_transcript":
                 bearer = sp_token(urlsplit(url).hostname or "") if (download and sp_token) else None
                 if not bearer:
@@ -274,6 +291,8 @@ async def process(
                     notes.append(f"[transcript: {url} → {Path(path).resolve().as_uri()}]")
                 except Exception as exc:  # noqa: BLE001 — best-effort; ref-only on failure
                     log.debug("sp_transcript_failed", url=url, error=str(exc))
+                    if on_fail:
+                        on_fail(url, exc)
                     notes.append(f"[transcript(sp): {url}]")
                 continue
             if kind == "sp_file":
@@ -289,6 +308,8 @@ async def process(
                         notes.append(f"[file(sp): {url}]")  # folder/site/page — not a file
                 except Exception as exc:  # noqa: BLE001 — best-effort; ref-only on failure
                     log.debug("sp_file_failed", url=url, error=str(exc))
+                    if on_fail:
+                        on_fail(url, exc)
                     notes.append(f"[file(sp): {url}]")
                 continue
             if not (download and _downloadable(url)):
@@ -296,7 +317,9 @@ async def process(
                 continue
             try:
                 if kind == "image":
-                    optim_path, full_path = await _download_image(client, token, url, media_dir)
+                    optim_path, full_path = await _download_image(
+                        client, token, url, media_dir, skip_url=skip_url, on_fail=on_fail
+                    )
                     # Show the local file:// (full-res when available) next to the original URL.
                     # resolve(): as_uri() rejects relative paths (a relative media_dir would 500).
                     primary = Path(full_path or optim_path).resolve().as_uri()
@@ -312,6 +335,8 @@ async def process(
                     notes.append(f"[file: {name}{sz} → {fpath}]" if fpath else f"[file: {name}{sz} {url}]")
             except Exception as exc:  # noqa: BLE001 — a failed download must not drop the message
                 log.debug("attachment_download_failed", kind=kind, url=url, error=str(exc))
+                if on_fail:
+                    on_fail(url, exc)
                 notes.append(f"[{kind}: {url}]")
     finally:
         if owns_client:

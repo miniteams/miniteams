@@ -147,6 +147,7 @@ def cmd_chats(settings: Settings, args: argparse.Namespace) -> int:
 def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
     """Build/refresh a resumable local archive of chats under data/ (see spec 001)."""
     import asyncio
+    import time
     from pathlib import Path
 
     from .archive import RefreshingToken, run_archive
@@ -157,20 +158,32 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
     source = TokenSource(settings)
     source.acquire()
     provider = RefreshingToken(settings, source)
-    asyncio.run(
-        run_archive(
-            settings,
-            Path(args.data_dir),
-            token_provider=provider,
-            thread=args.thread,
-            include_all=args.all,
-            download_media=not args.no_media,
-            download_avatars=not args.no_avatars,
-            verify_media=args.verify_media or args.assets_only,
-            assets_only=args.assets_only,
-        )
-    )
-    return 0
+    try:
+        while True:
+            auth_expired = asyncio.run(
+                run_archive(
+                    settings,
+                    Path(args.data_dir),
+                    token_provider=provider,
+                    thread=args.thread,
+                    include_all=args.all,
+                    download_media=not args.no_media,
+                    download_avatars=not args.no_avatars,
+                    verify_media=args.verify_media or args.assets_only,
+                    assets_only=args.assets_only,
+                    retry_denied=args.retry_denied,
+                )
+            )
+            if auth_expired:
+                log.error("archive_stopped", reason="auth_expired", hint="run `miniteams login`")
+                return 1
+            if args.loop is None:
+                return 0
+            log.info("archive_loop_sleep", seconds=args.loop)
+            time.sleep(args.loop)
+    except KeyboardInterrupt:
+        log.info("interrupted")
+        return 0
 
 
 def cmd_stream(settings: Settings, args: argparse.Namespace) -> int:
@@ -188,6 +201,14 @@ def cmd_stream(settings: Settings, args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         log.info("interrupted")
     return 0
+
+
+def _positive_int(value: str) -> int:
+    # --loop 0 would hot-loop the API with no pause; negatives crash time.sleep. Reject both.
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return n
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -279,6 +300,20 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="fast recovery pass: only download missing assets for already-archived chats "
         "(no history, no metadata, no avatars, no network enumeration)",
+    )
+    p_archive.add_argument(
+        "--retry-denied",
+        action="store_true",
+        help="re-attempt chats whose history previously came back 403 (normally skipped for good)",
+    )
+    p_archive.add_argument(
+        "--loop",
+        type=_positive_int,
+        nargs="?",
+        const=300,
+        metavar="SECONDS",
+        help="re-run the archive indefinitely, sleeping SECONDS between runs (default 300); "
+        "stops when authentication breaks",
     )
     p_archive.set_defaults(func=cmd_archive)
 

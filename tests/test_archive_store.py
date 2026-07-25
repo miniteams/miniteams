@@ -63,3 +63,16 @@ def test_index_survives_reopen(tmp_path: Path) -> None:
     index.upsert_chat(THREAD, label="x")
     index.close()
     assert Index(tmp_path).chats()[0]["id"] == THREAD
+
+
+def test_denied_assets_roundtrip(tmp_path) -> None:
+    store = ChatStore(tmp_path, "19:x@thread.v2")
+    assert store.denied_urls() == set()
+    store.mark_denied("https://api.asm.skype.com/v1/objects/gone", 403, "2026-07-24T00:00:00Z")
+    store.mark_denied("https://api.asm.skype.com/v1/objects/gone", 403, "2026-07-25T00:00:00Z")  # idempotent
+    assert store.denied_urls() == {"https://api.asm.skype.com/v1/objects/gone"}
+    store.close()
+    # Survives reopen (that's the whole point) — and old DBs get the table via IF NOT EXISTS.
+    store2 = ChatStore(tmp_path, "19:x@thread.v2")
+    assert store2.denied_urls() == {"https://api.asm.skype.com/v1/objects/gone"}
+    store2.close()

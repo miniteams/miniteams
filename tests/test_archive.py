@@ -7,6 +7,7 @@ import pytest
 
 from miniteams import archive as AR
 from miniteams.archive_store import ChatStore, Index, chat_dir_name
+from miniteams.auth import AuthExpired
 from miniteams.config import Settings
 from miniteams.dump import _epoch_seconds
 
@@ -222,7 +223,16 @@ async def test_media_downloaded_skipped_and_failure_nonfatal(
     seen: list[tuple[str, Path]] = []
 
     async def fake_process(
-        content, msgtype, token, media_dir, download, client=None, sp_token=None, graph_token=None
+        content,
+        msgtype,
+        token,
+        media_dir,
+        download,
+        client=None,
+        sp_token=None,
+        graph_token=None,
+        skip_url=None,
+        on_fail=None,
     ):  # noqa: ANN001
         seen.append((content, media_dir))
         if len(seen) == 1:
@@ -445,3 +455,238 @@ async def test_assets_only_downloads_media_no_history_no_avatars(settings, tmp_p
     assert media_ran == [1]  # media pass ran
     assert hist == [] and enum == []  # no history, no network enumeration (used index)
     assert thread_fetched == [] and avatars_ran == []  # no metadata, no avatars
+
+
+# --- recap counts + auth-expired stop (return values feeding the run recap / --loop) ---
+
+
+class _DyingToken:
+    """Valid for the first `good` token() calls, then AuthExpired — simulates a refresh token
+    dying mid-run (good=1: survives enumeration, dies at the first per-chat mint)."""
+
+    def __init__(self, good: int) -> None:
+        self.good = good
+        self.calls = 0
+
+    def token(self) -> str:
+        self.calls += 1
+        if self.calls > self.good:
+            raise AuthExpired("refresh token dead")
+        return "sk"
+
+    def bearer(self) -> str:
+        return ""
+
+    def sharepoint_token(self, host: str) -> str | None:
+        return None
+
+    def graph_token(self) -> str | None:
+        return None
+
+
+async def test_archive_chat_returns_counts(settings: Settings, tmp_path, monkeypatch) -> None:
+    api = _FakeApi({C1: [_msg("m1", "2026-07-01T09:00:00Z"), _msg("m2", "2026-07-01T10:00:00Z")]})
+    _wire(monkeypatch, api, [C1])
+    data = tmp_path / "data"
+    index = Index(data)
+    counts = await AR.archive_chat(
+        settings,
+        "sk",
+        "",
+        C1,
+        data,
+        AR.Directory(settings),
+        index,
+        download_media=False,
+        download_avatars=False,
+    )
+    index.close()
+    assert counts == {"new": 2, "media": 0, "avatars": 0}
+
+
+async def test_run_archive_returns_false_when_auth_ok(settings: Settings, tmp_path, monkeypatch) -> None:
+    api = _FakeApi({C1: [_msg("m1", "2026-07-01T09:00:00Z")]})
+    _wire(monkeypatch, api, [C1])
+    expired = await AR.run_archive(
+        settings,
+        tmp_path / "data",
+        token_provider=AR.StaticToken("sk", ""),
+        download_media=False,
+        download_avatars=False,
+    )
+    assert expired is False
+
+
+async def test_run_archive_auth_expired_at_enumeration(settings: Settings, tmp_path) -> None:
+    # The --loop failure mode: token dies during the sleep, next run's FIRST token use is
+    # enumeration — must return True (clean stop), not raise.
+    expired = await AR.run_archive(settings, tmp_path / "data", token_provider=_DyingToken(good=0))
+    assert expired is True
+
+
+async def test_run_archive_auth_expired_mid_run(settings: Settings, tmp_path, monkeypatch) -> None:
+    api = _FakeApi({C1: [_msg("m1", "2026-07-01T09:00:00Z")]})
+    _wire(monkeypatch, api, [C1])
+    data = tmp_path / "data"
+    expired = await AR.run_archive(settings, data, token_provider=_DyingToken(good=1))
+    assert expired is True
+    assert not ChatStore(data, C1).count()  # stopped before archiving the chat
+
+
+async def test_media_denied_cache_skips_and_records(settings: Settings, tmp_path, monkeypatch) -> None:
+    """403 on an asset → recorded; next pass never re-polls it; --verify-media bypass re-tries."""
+    import httpx
+
+    URL = "https://api.asm.skype.com/v1/objects/dead/views/imgo"
+    IMG = f'<img itemtype="http://schema.skype.com/AMSImage" src="{URL}">'
+    store = ChatStore(tmp_path / "data", C1)
+    store.insert_page(
+        [{"id": "m1", "composetime": "2026-07-01T09:00:00Z", "content": IMG, "messagetype": "RichText/Html"}]
+    )
+
+    calls: list[str] = []
+
+    async def fake_process(
+        content,
+        msgtype,
+        token,
+        media_dir,
+        download,
+        client=None,
+        sp_token=None,
+        graph_token=None,
+        skip_url=None,
+        on_fail=None,
+    ):  # noqa: ANN001
+        if skip_url and skip_url(URL):
+            calls.append("skipped")
+        else:
+            calls.append("attempted")
+            req = httpx.Request("GET", URL)
+            on_fail(URL, httpx.HTTPStatusError("403", request=req, response=httpx.Response(403, request=req)))
+        return [f"[image: {URL}]"]
+
+    monkeypatch.setattr(AR.attachments, "process", fake_process)
+
+    await AR._download_media(store, "sk", "label")
+    assert calls == ["attempted"] and store.denied_urls() == {URL}  # 403 recorded
+    await AR._download_media(store, "sk", "label")
+    assert calls == ["attempted", "skipped"]  # negative cache honored
+    await AR._download_media(store, "sk", "label", ignore_denied=True)
+    assert calls == ["attempted", "skipped", "attempted"]  # asset flag bypasses
+    store.close()
+
+
+async def test_label_falls_back_to_enumeration_topic(settings: Settings, tmp_path, monkeypatch) -> None:
+    """Directory denied (403 meeting) → label/topic come from the enumeration raw, not the bare id."""
+    conv = {"id": C1, "threadProperties": {"topic": "[Acme] DNS"}}
+    api = _FakeApi({C1: [_msg("m1", "2026-07-01T09:00:00Z")]})
+    monkeypatch.setattr(AR, "iter_history_pages", api.iter_pages)
+    monkeypatch.setattr(AR, "fetch_conversations", lambda s, tok: iter([[conv]]))
+
+    async def denied_thread(self, thread_id):  # noqa: ANN001 — directory fetch fails (403)
+        return None
+
+    async def denied_label(self, thread_id):  # noqa: ANN001 — falls back to the bare id
+        return thread_id
+
+    monkeypatch.setattr(AR.Directory, "thread", denied_thread)
+    monkeypatch.setattr(AR.Directory, "label", denied_label)
+    data = tmp_path / "data"
+    await _run(settings, data, download_media=False)
+
+    index = Index(data)
+    chat = {c["id"]: c for c in index.chats()}[C1]
+    index.close()
+    assert chat["label"] == "[Acme] DNS" and chat["topic"] == "[Acme] DNS"
+
+
+async def test_history_403_counted_denied_not_failed(settings: Settings, tmp_path, monkeypatch) -> None:
+    """History 403 on one chat: warning + denied counter, other chats still archived."""
+    import httpx
+
+    api = _FakeApi({C2: [_msg("b1", "2026-07-03T09:00:00Z")]})
+    original = api.iter_pages
+
+    def forbidden(settings, token, thread_id, page_size, max_pages, end_before=None):  # noqa: ANN001
+        if thread_id == C1:
+            req = httpx.Request("GET", "https://msg.example/messages")
+            raise httpx.HTTPStatusError("403", request=req, response=httpx.Response(403, request=req))
+        return original(settings, token, thread_id, page_size, max_pages, end_before)
+
+    _wire(monkeypatch, api, [C1, C2])
+    monkeypatch.setattr(AR, "iter_history_pages", forbidden)
+
+    events: list[tuple[str, str, dict]] = []
+
+    class _Log:
+        def __getattr__(self, level):  # noqa: ANN001
+            return lambda event, **kw: events.append((level, event, kw))
+
+    monkeypatch.setattr(AR, "log", _Log())
+    await _run(settings, tmp_path / "data", download_media=False)
+
+    assert _stored_ids(tmp_path / "data", C2) == {"b1"}  # isolation preserved
+    assert ("warning", "chat_history_denied", {"thread": C1}) in events
+    assert not any(e[1] == "chat_archive_failed" for e in events)
+    recap = next(kw for _, event, kw in events if event == "archive_recap")
+    assert recap["denied"] == 1 and recap["failed"] == 0 and recap["chats"] == 2
+
+
+async def test_history_denied_skipped_next_run_and_retry_flag(
+    settings: Settings, tmp_path, monkeypatch
+) -> None:
+    """403 persisted → next run makes zero calls for that chat; --retry-denied re-attempts and a
+    successful retry clears the denial."""
+    import httpx
+
+    data = tmp_path / "data"
+    api = _FakeApi({C1: [_msg("a1", "2026-07-01T09:00:00Z")]})
+    original = api.iter_pages
+    allow = False
+
+    def forbidden(settings, token, thread_id, page_size, max_pages, end_before=None):  # noqa: ANN001
+        if not allow:
+            req = httpx.Request("GET", "https://msg.example/messages")
+            raise httpx.HTTPStatusError("403", request=req, response=httpx.Response(403, request=req))
+        return original(settings, token, thread_id, page_size, max_pages, end_before)
+
+    _wire(monkeypatch, api, [C1])
+    monkeypatch.setattr(AR, "iter_history_pages", forbidden)
+
+    await _run(settings, data, download_media=False)  # run 1: 403 → marked denied
+    index = Index(data)
+    assert index.history_denied_ids() == {C1}
+    index.close()
+
+    calls: list[str] = []
+    monkeypatch.setattr(AR, "iter_history_pages", lambda *a, **kw: calls.append("hit") or original(*a, **kw))
+    await _run(settings, data, download_media=False)  # run 2: skipped, no history call
+    assert calls == []
+
+    allow = True
+    monkeypatch.setattr(AR, "iter_history_pages", forbidden)
+    await _run(settings, data, download_media=False, retry_denied=True)  # run 3: forced, succeeds
+    assert _stored_ids(data, C1) == {"a1"}
+    index = Index(data)
+    assert index.history_denied_ids() == set()  # denial lifted after success
+    index.close()
+
+
+async def test_empty_backfilled_chat_refetches_when_messages_arrive(
+    settings: Settings, tmp_path, monkeypatch
+) -> None:
+    """Meeting chat archived before the meeting: empty history drained, backfill_done set. Once
+    messages exist, the next run must fetch them (regression: top-up had no cursor and backfill
+    was skipped → chat frozen empty forever)."""
+    data = tmp_path / "data"
+    _wire(monkeypatch, _FakeApi({C1: []}), [C1])
+    await _run(settings, data, download_media=False)  # pre-meeting: empty, marked done
+    index = Index(data)
+    assert index.backfill_done(C1)
+    index.close()
+    assert _stored_ids(data, C1) == set()
+
+    _wire(monkeypatch, _FakeApi({C1: [_msg("m1", "2026-07-24T11:30:00Z")]}), [C1])
+    await _run(settings, data, download_media=False)  # meeting happened
+    assert _stored_ids(data, C1) == {"m1"}

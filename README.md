@@ -43,6 +43,8 @@ uv run miniteams archive --thread 19:xxx@thread.v2     # archive one conversatio
 uv run miniteams archive --no-media                    # messages only, skip attachments
 uv run miniteams archive --verify-media                # re-check every asset on disk, fetch missing
                                                        # (recovers old transcripts from SharePoint too)
+uv run miniteams archive --loop 600                    # re-run forever, sleeping 600s between runs
+                                                       # (bare --loop = 300s); stops on auth expiry
 uv run miniteams dump             # dump your Notes' full history (oldest → newest)
 uv run miniteams dump --thread 19:xxx@thread.v2        # dump a conversation
 uv run miniteams dump --jsonl > notes.jsonl            # full-detail JSON per line
@@ -61,8 +63,12 @@ endpoints, presence/calls, named events), decoded.
 `archive` builds a resumable local archive under `./data/`: `index.db` (chat metadata) plus
 one folder per conversation with a `messages.db` (every message as raw API JSON, keyed by id)
 and a `media/` folder (attachments at original quality). Interrupt anytime — re-running resumes
-from the oldest stored message, tops up new ones, and skips media already on disk. `data/` is
-gitignored (personal chat data).
+from the oldest stored message, tops up new ones, and skips media already on disk. Assets that
+came back HTTP 403 (deleted object, lost share permission) are remembered per chat and never
+re-polled; `--verify-media` / `--assets-only` retry them. Likewise a chat whose whole history is
+403 (revoked meeting access) is skipped on later runs; `--retry-denied` re-attempts it. Every run
+ends with an `archive_recap` log line (chats, failures, new messages, media files, avatars,
+duration). `data/` is gitignored (personal chat data).
 
 Tokens cache under `~/.config/miniteams/` (`0600`); re-runs are silent until the refresh
 token expires. Downloaded media (from `stream`) lives under `~/.cache/miniteams/media/`.

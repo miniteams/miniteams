@@ -3,6 +3,8 @@
 from pathlib import Path
 from typing import Any
 
+import httpx as _httpx
+
 from miniteams import attachments as A
 from miniteams.config import Settings
 
@@ -310,3 +312,75 @@ def test_extract_excludes_sharepoint_videos() -> None:
     mp4_by_ext = '<a itemtype="http://schema.skype.com/HyperLink/Files" href="https://c.sharepoint.com/sites/x/clip.mp4">c</a>'
     items = A.extract(mp4_files_itemtype + mp4_by_ext, "RichText/Html")
     assert not any(i["kind"] == "sp_file" for i in items)  # videos excluded even as HyperLink/Files
+
+
+def _403(url: str) -> _httpx.HTTPStatusError:
+    req = _httpx.Request("GET", url)
+    return _httpx.HTTPStatusError("403", request=req, response=_httpx.Response(403, request=req))
+
+
+async def test_process_skip_url_prevents_network(settings: Settings, monkeypatch) -> None:
+    def handler(url: str) -> _Resp:
+        raise AssertionError("network must not be touched for a skipped url")
+
+    _patch_client(monkeypatch, handler)
+    notes = await A.process(
+        IMG, "RichText/Html", "sk", settings.media_dir, download=True, skip_url=lambda u: True
+    )
+    assert notes == ["[image: https://api.asm.skype.com/v1/objects/o1/views/imgo]"]  # ref-only
+
+
+async def test_process_on_fail_sees_403(settings: Settings, monkeypatch) -> None:
+    def handler(url: str) -> _Resp:
+        raise _403(url)
+
+    _patch_client(monkeypatch, handler)
+    failures: list[tuple[str, int]] = []
+    await A.process(
+        IMG,
+        "RichText/Html",
+        "sk",
+        settings.media_dir,
+        download=True,
+        on_fail=lambda url, exc: failures.append((url, exc.response.status_code)),  # type: ignore[attr-defined]
+    )
+    assert failures == [("https://api.asm.skype.com/v1/objects/o1/views/imgo", 403)]
+
+
+async def test_full_view_403_recorded_and_skippable(settings: Settings, monkeypatch) -> None:
+    """Optimized view OK but full view 403: the full URL must reach on_fail (so the archive can
+    deny-cache it), and a skip_url veto on it must prevent the fetch while keeping the optim."""
+    full_url = "https://api.asm.skype.com/v1/objects/o1/views/imgpsh_fullsize"
+
+    def handler(url: str) -> _Resp:
+        if url == full_url:
+            raise _403(url)
+        return _Resp(content=b"PNGDATA", headers={"content-type": "image/png"})
+
+    _patch_client(monkeypatch, handler)
+    failures: list[str] = []
+    await A.process(
+        IMG,
+        "RichText/Html",
+        "sk",
+        settings.media_dir,
+        download=True,
+        on_fail=lambda url, exc: failures.append(url),
+    )
+    assert failures == [full_url]  # recorded under the full-view URL
+    assert (settings.media_dir / "o1.png").exists()
+
+    def no_full(url: str) -> _Resp:
+        assert url != full_url, "denied full view must not be fetched"
+        return _Resp(content=b"PNGDATA", headers={"content-type": "image/png"})
+
+    _patch_client(monkeypatch, no_full)
+    notes = await A.process(
+        IMG,
+        "RichText/Html",
+        "sk",
+        settings.media_dir,
+        download=True,
+        skip_url=lambda url: url == full_url,
+    )
+    assert any("image:" in n and "optim" not in n for n in notes)  # optim kept, full skipped

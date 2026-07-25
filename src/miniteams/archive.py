@@ -205,6 +205,7 @@ async def _download_media(
     label: str,
     sp_token: Callable[[str], str | None] | None = None,
     graph_token: Callable[[], str | None] | None = None,
+    ignore_denied: bool = False,
 ) -> int:
     """Best-effort pass: download every stored message's attachments at original quality.
 
@@ -212,6 +213,11 @@ async def _download_media(
     re-runs cheaply, skipping files already on disk) and never blocks message capture. Downloads run
     over a bounded async pool sharing one connection pool; `_MEDIA_CONCURRENCY` caps in-flight
     requests to stay polite (429-friendly).
+
+    Assets that came back 403 are remembered (`denied_assets`) and never re-polled — a deleted
+    object or lost share permission stays 403 forever, and the loop mode would hammer it every
+    cycle. `ignore_denied` (--verify-media / --assets-only) retries them; fresh 403s are recorded
+    either way.
     """
     targets = [
         m
@@ -220,6 +226,21 @@ async def _download_media(
     ]
     if not targets:
         return 0
+    denied = set() if ignore_denied else store.denied_urls()
+    skipped = 0
+
+    def _skip(url: str) -> bool:
+        nonlocal skipped
+        if url in denied:
+            skipped += 1
+            return True
+        return False
+
+    def _on_fail(url: str, exc: Exception) -> None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status == 403:
+            store.mark_denied(url, 403, _now_iso())
+
     fetched = done = 0
     start = time.monotonic()
     sem = asyncio.Semaphore(_MEDIA_CONCURRENCY)
@@ -236,6 +257,8 @@ async def _download_media(
                     client=client,
                     sp_token=sp_token,
                     graph_token=graph_token,
+                    skip_url=_skip,
+                    on_fail=_on_fail,
                 )
             except Exception as exc:  # noqa: BLE001 — one message's media must not abort the pass
                 log.debug("message_media_failed", id=message.get("id"), error=str(exc))
@@ -257,6 +280,8 @@ async def _download_media(
                     files=fetched,
                     files_per_s=_rate(fetched, start),
                 )
+    if skipped:
+        log.info("media_denied_skipped", chat=label, thread=store.thread_id, skipped=skipped)
     return fetched
 
 
@@ -289,8 +314,10 @@ async def archive_chat(
     assets_only: bool = False,
     sp_token: Callable[[str], str | None] | None = None,
     graph_token: Callable[[], str | None] | None = None,
-) -> None:
+) -> dict[str, int]:
+    """Returns per-chat counts (`new`, `media`, `avatars`) for the run recap."""
     directory.set_token(skype_token, bearer)
+    counts = {"new": 0, "media": 0, "avatars": 0}
     # Assets-only fast pass: no history, no metadata, no avatars — just re-scan already-stored
     # messages and download any missing asset (skip-exists). For recovering media/transcripts
     # over an existing archive without paying for a full re-run.
@@ -298,12 +325,15 @@ async def archive_chat(
         store = ChatStore(data_dir, thread_id)
         try:
             if store.count():
-                media = await _download_media(store, skype_token, thread_id, sp_token, graph_token)
+                media = await _download_media(
+                    store, skype_token, thread_id, sp_token, graph_token, ignore_denied=verify_media
+                )
                 index.touch(thread_id, _now_iso())
                 log.info("chat_assets", thread=thread_id, total=store.count(), media=media)
+                counts["media"] = media
         finally:
             store.close()
-        return
+        return counts
 
     # Fast-skip on resume: enumeration carries the chat's last activity; if it's already
     # backfilled and that activity is at/before our newest stored message, nothing changed —
@@ -319,10 +349,15 @@ async def archive_chat(
         if newest and last and _epoch_seconds(last) <= _epoch_seconds(newest):
             log.info("chat_unchanged", thread=thread_id, newest=newest[:19])
             index.touch(thread_id, _now_iso())
-            return
+            return counts
 
     info = await directory.thread(thread_id) or {}  # topic + roster + picture (best-effort)
     label = await directory.label(thread_id)
+    # The directory fetch is itself denied on meeting chats whose access was revoked (403);
+    # the enumeration raw still carries the topic — use it so index + logs show a name, not the id.
+    topic = str(info.get("topic") or ((conv or {}).get("threadProperties") or {}).get("topic") or "")
+    if label == thread_id and topic:
+        label = topic
     log.info("chat_start", chat=label, thread=thread_id)
     # Store the full conversation object only when we have a real one (enumeration); a bare
     # single-thread run carries just the id, which must not clobber richer stored metadata.
@@ -330,7 +365,7 @@ async def archive_chat(
     index.upsert_chat(
         thread_id,
         label=label,
-        topic=info.get("topic") or "",
+        topic=topic,
         participants=info.get("members") or [],
         raw=raw,
     )
@@ -339,13 +374,21 @@ async def archive_chat(
     try:
         new_top = _topup(settings, skype_token, thread_id, store, label)
         new_old = 0
-        if not index.backfill_done(thread_id):
+        # Empty store must re-backfill even when flagged done: a meeting chat archived BEFORE its
+        # meeting drains an empty history and gets marked done — top-up then starts from nothing
+        # (no overlap bound) and would never fetch, freezing the chat empty forever.
+        if not index.backfill_done(thread_id) or not store.count():
             new_old = _backfill(settings, skype_token, thread_id, store, index, label)
         media = (
-            await _download_media(store, skype_token, label, sp_token, graph_token) if download_media else 0
+            await _download_media(
+                store, skype_token, label, sp_token, graph_token, ignore_denied=verify_media
+            )
+            if download_media
+            else 0
         )
         avatars_n = await _download_avatars(store, info, skype_token, bearer) if download_avatars else 0
         index.touch(thread_id, _now_iso())
+        counts = {"new": new_top + new_old, "media": media, "avatars": avatars_n}
         log.info(
             "chat_archived",
             chat=label,
@@ -366,6 +409,7 @@ async def archive_chat(
         )
     finally:
         store.close()
+    return counts
 
 
 async def run_archive(
@@ -379,12 +423,18 @@ async def run_archive(
     download_avatars: bool = True,
     verify_media: bool = False,
     assets_only: bool = False,
-) -> None:
+    retry_denied: bool = False,
+) -> bool:
+    """Returns True when the run stopped on AuthExpired (re-login needed), False otherwise."""
     # Absolute: downloaded media paths are turned into file:// URIs (Path.as_uri), which rejects
     # relative paths — a relative --data-dir would otherwise fail every attachment.
     data_dir = data_dir.resolve()
     index = Index(data_dir)
     directory = Directory(settings)
+    run_start = time.monotonic()
+    totals = {"new": 0, "media": 0, "avatars": 0}
+    failed = denied = 0
+    auth_expired = False
     try:
         if thread:
             targets: list[dict[str, Any]] = [{"id": thread}]
@@ -392,12 +442,29 @@ async def run_archive(
             # Recover assets over what's already archived — no network enumeration needed.
             targets = [{"id": c["id"]} for c in index.chats()]
         else:
-            targets = _enumerate(settings, token_provider.token(), include_all)
+            # Enumeration is the first token use of a run — in --loop mode it is where a refresh
+            # token that died during the sleep surfaces, so it needs the same clean stop as the
+            # per-chat path below.
+            try:
+                targets = _enumerate(settings, token_provider.token(), include_all)
+            except AuthExpired:
+                log.error("archive_auth_expired", done=0, remaining=0, hint="run `miniteams login`")
+                targets = []
+                auth_expired = True
         log.info("archive_start", chats=len(targets), data_dir=str(data_dir), assets_only=assets_only)
+        # Chats whose history came back 403: access does not come back on its own, so they are
+        # skipped entirely (no directory fetch, no probe) until --retry-denied. An explicit
+        # --thread run is its own retry request.
+        denied_ids = set() if (retry_denied or thread or assets_only) else index.history_denied_ids()
         done = 0
         for conv in targets:
             thread_id = str(conv.get("id") or "")
             if not thread_id:
+                continue
+            if thread_id in denied_ids:
+                log.info("chat_skipped_denied", thread=thread_id, hint="--retry-denied to re-attempt")
+                denied += 1
+                done += 1
                 continue
             # Resolve the token OUTSIDE the per-chat guard: a dead refresh token (AuthExpired) is
             # fatal to the whole run — re-auth is needed — so stop loudly instead of cascading it
@@ -411,10 +478,11 @@ async def run_archive(
                     remaining=len(targets) - done,
                     hint="re-run to resume from here",
                 )
+                auth_expired = True
                 break
             # One failing chat must not abort the archive of the rest.
             try:
-                await archive_chat(
+                counts = await archive_chat(
                     settings,
                     skype_token,
                     bearer,
@@ -430,9 +498,40 @@ async def run_archive(
                     sp_token=token_provider.sharepoint_token,
                     graph_token=token_provider.graph_token,
                 )
+            except httpx.HTTPStatusError as exc:
+                # A chat can enumerate while its history is 403 (meeting access revoked): a known
+                # permanent state, not a run failure. Persisted — later runs skip the chat without
+                # a single request; --retry-denied (or --thread) forces a new attempt.
+                if exc.response.status_code == 403:
+                    log.warning("chat_history_denied", thread=thread_id)
+                    index.mark_history_denied(thread_id, _now_iso())
+                    denied += 1
+                else:
+                    log.error("chat_archive_failed", thread=thread_id, error=str(exc))
+                    failed += 1
             except Exception as exc:  # noqa: BLE001 — per-chat isolation; resumes next run
                 log.error("chat_archive_failed", thread=thread_id, error=str(exc))
+                failed += 1
+            else:
+                # A successful pass proves history access — lift any stored denial (forced retry
+                # that worked, or access restored).
+                if not assets_only:
+                    index.clear_history_denied(thread_id)
+                for key in totals:
+                    totals[key] += counts[key]
             done += 1
-        log.info("archive_done", chats=done, of=len(targets))
+        log.info(
+            "archive_recap",
+            chats=done,
+            of=len(targets),
+            failed=failed,
+            denied=denied,
+            new_messages=totals["new"],
+            media_files=totals["media"],
+            avatars=totals["avatars"],
+            duration_s=round(time.monotonic() - run_start, 1),
+            auth_expired=auth_expired,
+        )
     finally:
         index.close()
+    return auth_expired

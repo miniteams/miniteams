@@ -49,13 +49,16 @@ class Index:
                 participants TEXT NOT NULL DEFAULT '[]',
                 raw TEXT NOT NULL DEFAULT '{}',  -- full conversation object (lastMessage, version…)
                 backfill_done INTEGER NOT NULL DEFAULT 0,
-                last_fetch_at TEXT NOT NULL DEFAULT ''
+                last_fetch_at TEXT NOT NULL DEFAULT '',
+                history_denied_at TEXT NOT NULL DEFAULT ''  -- 403 on history; skip until forced
             )"""
         )
-        # Migrate an index.db created before `raw` existed.
+        # Migrate an index.db created before these columns existed.
         cols = {r[1] for r in self._db.execute("PRAGMA table_info(chats)")}
         if "raw" not in cols:
             self._db.execute("ALTER TABLE chats ADD COLUMN raw TEXT NOT NULL DEFAULT '{}'")
+        if "history_denied_at" not in cols:
+            self._db.execute("ALTER TABLE chats ADD COLUMN history_denied_at TEXT NOT NULL DEFAULT ''")
         self._db.commit()
 
     def upsert_chat(
@@ -116,6 +119,17 @@ class Index:
         with self._db:
             self._db.execute("UPDATE chats SET last_fetch_at = ? WHERE id = ?", (when_iso, thread_id))
 
+    def history_denied_ids(self) -> set[str]:
+        return {r[0] for r in self._db.execute("SELECT id FROM chats WHERE history_denied_at != ''")}
+
+    def mark_history_denied(self, thread_id: str, when_iso: str) -> None:
+        with self._db:
+            self._db.execute("UPDATE chats SET history_denied_at = ? WHERE id = ?", (when_iso, thread_id))
+
+    def clear_history_denied(self, thread_id: str) -> None:
+        with self._db:
+            self._db.execute("UPDATE chats SET history_denied_at = '' WHERE id = ?", (thread_id,))
+
     def close(self) -> None:
         self._db.close()
 
@@ -137,6 +151,15 @@ class ChatStore:
             )"""
         )
         self._db.execute("CREATE INDEX IF NOT EXISTS idx_messages_composetime ON messages (composetime)")
+        # Negative cache: assets that came back 403 (deleted object, lost share permission) —
+        # re-polling them every run/loop iteration is pure waste; --verify-media retries them.
+        self._db.execute(
+            """CREATE TABLE IF NOT EXISTS denied_assets (
+                url TEXT PRIMARY KEY,
+                status INTEGER NOT NULL,
+                at TEXT NOT NULL
+            )"""
+        )
         self._db.commit()
 
     def insert_page(self, messages: list[dict[str, Any]]) -> int:
@@ -177,6 +200,16 @@ class ChatStore:
 
     def count(self) -> int:
         return int(self._db.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
+
+    def denied_urls(self) -> set[str]:
+        return {r[0] for r in self._db.execute("SELECT url FROM denied_assets")}
+
+    def mark_denied(self, url: str, status: int, when_iso: str) -> None:
+        with self._db:
+            self._db.execute(
+                "INSERT OR REPLACE INTO denied_assets (url, status, at) VALUES (?, ?, ?)",
+                (url, status, when_iso),
+            )
 
     def close(self) -> None:
         self._db.close()
