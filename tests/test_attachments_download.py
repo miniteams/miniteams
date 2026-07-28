@@ -1,5 +1,6 @@
 """Attachment download paths with a fake async httpx client."""
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -10,13 +11,18 @@ from miniteams.config import Settings
 
 
 class _Resp:
-    def __init__(self, content: bytes = b"", headers: dict | None = None, data: Any = None) -> None:
+    def __init__(
+        self, content: bytes = b"", headers: dict | None = None, data: Any = None, status_code: int = 200
+    ) -> None:
         self.content = content
         self.headers = headers or {}
         self._data = data
+        self.status_code = status_code  # read by http.aget_with_retry before raise_for_status
 
     def raise_for_status(self) -> None:
-        pass
+        # `response=self` mirrors httpx: archive._on_fail reads exc.response.status_code.
+        if self.status_code >= 400:
+            raise _httpx.HTTPStatusError(f"{self.status_code}", request=None, response=self)  # type: ignore[arg-type]
 
     def json(self) -> Any:
         return self._data
@@ -215,6 +221,9 @@ async def test_process_downloads_sp_transcript_with_bearer(settings: Settings, m
 
         async def get(self, url, headers=None, cookies=None, **kw):
             seen_auth["hdr"] = headers
+            seen_auth.setdefault("params", []).append(kw.get("params"))
+            if kw.get("params", {}).get("format") == "json":
+                return _Resp(content=b'{"entries":[]}', headers={"content-type": "application/json"})
             return _Resp(content=b"WEBVTT\n\nsp", headers={"content-type": "text/vtt"})
 
     monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
@@ -228,8 +237,259 @@ async def test_process_downloads_sp_transcript_with_bearer(settings: Settings, m
     )
     assert any(n.startswith("[transcript:") and "→" in n for n in notes)
     assert seen_auth["hdr"]["Authorization"] == "Bearer SPTOK::contoso-my.sharepoint.com"
-    files = list(settings.media_dir.glob("sp-*.transcript.vtt"))
-    assert len(files) == 1 and files[0].read_bytes() == b"WEBVTT\n\nsp"
+    # Both renditions: format=json has the speakers, the default VTT the sub-cue timings.
+    assert seen_auth["params"] == [{"format": "json"}, {}]
+    js = list(settings.media_dir.glob("sp-*.transcript.json"))
+    vtt = list(settings.media_dir.glob("sp-*.transcript.vtt"))
+    assert len(js) == 1 and js[0].read_bytes() == b'{"entries":[]}'
+    assert len(vtt) == 1 and vtt[0].read_bytes() == b"WEBVTT\n\nsp"
+    assert not list(settings.media_dir.glob("*.part"))
+
+
+async def test_process_sp_transcript_mislabelled_body_is_not_written(settings: Settings, monkeypatch) -> None:
+    """A server ignoring `format` must not land VTT bytes under .json — the archive would lie."""
+
+    class _C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aclose(self):
+            return None
+
+        async def get(self, url, headers=None, cookies=None, **kw):
+            return _Resp(content=b"WEBVTT\n\nnope", headers={"content-type": "text/vtt"})
+
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
+    notes = await A.process(
+        REC_SP,
+        "RichText/Media_CallRecording",
+        "sk",
+        settings.media_dir,
+        download=True,
+        sp_token=lambda host: "T",
+    )
+    assert not list(settings.media_dir.glob("*.json"))
+    assert list(settings.media_dir.glob("sp-*.transcript.vtt"))  # the VTT rendition still lands
+    assert any(n.startswith("[transcript:") for n in notes)
+
+
+async def test_process_sp_transcript_refetches_over_untagged_vtt(settings: Settings, monkeypatch) -> None:
+    """An archive holding the old untagged VTT must still pull the tagged JSON — and keep the VTT."""
+    stale = (
+        settings.media_dir / f"sp-{hashlib.sha1(SP.split('?')[0].encode()).hexdigest()[:16]}.transcript.vtt"
+    )
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_bytes(b"WEBVTT\n\nuntagged")
+    calls = []
+
+    class _C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aclose(self):
+            return None
+
+        async def get(self, url, headers=None, cookies=None, **kw):
+            calls.append(url)
+            return _Resp(
+                content=b'{"entries":[{"speakerDisplayName":"A"}]}',
+                headers={"content-type": "application/json"},
+            )
+
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
+    for _ in range(2):  # second pass must be a no-op: skip-if-exists on the JSON
+        await A.process(
+            REC_SP,
+            "RichText/Media_CallRecording",
+            "sk",
+            settings.media_dir,
+            download=True,
+            sp_token=lambda host: "T",
+        )
+    assert len(calls) == 1
+    assert stale.read_bytes() == b"WEBVTT\n\nuntagged"  # never deleted — the 404 case keeps its only copy
+    assert list(settings.media_dir.glob("sp-*.transcript.json"))
+
+
+async def test_process_sp_transcript_both_renditions_denied_keeps_status(
+    settings: Settings, monkeypatch
+) -> None:
+    """Both renditions 403 → on_fail must receive the original error, status readable."""
+
+    class _C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aclose(self):
+            return None
+
+        async def get(self, url, headers=None, cookies=None, **kw):
+            return _Resp(status_code=403)
+
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
+    seen: list[Exception] = []
+    notes = await A.process(
+        REC_SP,
+        "RichText/Media_CallRecording",
+        "sk",
+        settings.media_dir,
+        download=True,
+        sp_token=lambda host: "T",
+        on_fail=lambda url, exc: seen.append(exc),
+    )
+    assert notes == [f"[transcript(sp): {SP}]"]
+    assert not list(settings.media_dir.glob("sp-*"))
+    # archive._on_fail reads exc.response.status_code to fill denied_assets: wrapping the original
+    # exception (or re-raising a bare RuntimeError) silently disables the whole denied cache.
+    assert len(seen) == 1
+    assert getattr(getattr(seen[0], "response", None), "status_code", None) == 403
+
+
+async def test_process_sp_transcript_partial_failure_is_reported(settings: Settings, monkeypatch) -> None:
+    """One rendition denied while the other serves: swallowing it re-requests a dead URL forever."""
+
+    class _C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aclose(self):
+            return None
+
+        async def get(self, url, headers=None, cookies=None, **kw):
+            if kw.get("params", {}).get("format") == "json":
+                return _Resp(status_code=403)
+            return _Resp(content=b"WEBVTT\n\nsp", headers={"content-type": "text/vtt"})
+
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
+    seen: list[Exception] = []
+    notes = await A.process(
+        REC_SP,
+        "RichText/Media_CallRecording",
+        "sk",
+        settings.media_dir,
+        download=True,
+        sp_token=lambda host: "T",
+        on_fail=lambda url, exc: seen.append(exc),
+    )
+    assert list(settings.media_dir.glob("sp-*.transcript.vtt"))  # the surviving rendition lands
+    assert not list(settings.media_dir.glob("sp-*.transcript.json"))
+    assert any("→" in n for n in notes)  # still counted as fetched — hence the on_fail below
+    assert len(seen) == 1
+    assert getattr(getattr(seen[0], "response", None), "status_code", None) == 403
+
+
+async def test_process_sp_transcript_written_owner_only(settings: Settings, monkeypatch) -> None:
+    """Named speaker turns for every participant: 0600, not umask-dependent 0644."""
+
+    class _C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aclose(self):
+            return None
+
+        async def get(self, url, headers=None, cookies=None, **kw):
+            if kw.get("params", {}).get("format") == "json":
+                return _Resp(content=b'{"entries":[]}', headers={"content-type": "application/json"})
+            return _Resp(content=b"WEBVTT\n\nsp", headers={"content-type": "text/vtt"})
+
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
+    await A.process(
+        REC_SP,
+        "RichText/Media_CallRecording",
+        "sk",
+        settings.media_dir,
+        download=True,
+        sp_token=lambda h: "T",
+    )
+    modes = {f.suffix: f.stat().st_mode & 0o777 for f in settings.media_dir.glob("sp-*.transcript.*")}
+    assert modes == {".json": 0o600, ".vtt": 0o600}
+
+
+async def test_process_sp_transcript_write_failure_leaves_no_part(settings: Settings, monkeypatch) -> None:
+    """A truncated .part must not survive: a later run would trust it as a complete rendition."""
+
+    class _C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aclose(self):
+            return None
+
+        async def get(self, url, headers=None, cookies=None, **kw):
+            return _Resp(content=b'{"entries":[]}', headers={"content-type": "application/json"})
+
+    def _boom(self, data):
+        # ENOSPC mid-write: the bytes already on disk are what the cleanup has to remove.
+        with open(self, "wb") as fh:
+            fh.write(data[:4])
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
+    monkeypatch.setattr(Path, "write_bytes", _boom)
+    notes = await A.process(
+        REC_SP,
+        "RichText/Media_CallRecording",
+        "sk",
+        settings.media_dir,
+        download=True,
+        sp_token=lambda h: "T",
+    )
+    assert not list(settings.media_dir.glob("*.part"))
+    assert notes == [f"[transcript(sp): {SP}]"]
+
+
+async def test_process_sp_transcript_retries_on_429(settings: Settings, monkeypatch) -> None:
+    """The download path must go through aget_with_retry, not a bare client.get."""
+    codes = [429, 200]
+
+    class _C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aclose(self):
+            return None
+
+        async def get(self, url, headers=None, cookies=None, **kw):
+            if kw.get("params", {}).get("format") != "json":
+                return _Resp(content=b"WEBVTT\n\nsp", headers={"content-type": "text/vtt"})
+            code = codes.pop(0)
+            if code == 429:
+                return _Resp(status_code=429, headers={"Retry-After": "0"})
+            return _Resp(content=b'{"entries":[]}', headers={"content-type": "application/json"})
+
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
+    await A.process(
+        REC_SP,
+        "RichText/Media_CallRecording",
+        "sk",
+        settings.media_dir,
+        download=True,
+        sp_token=lambda h: "T",
+    )
+    assert not codes  # both responses consumed: the 429 was retried, not surfaced as a failure
+    assert list(settings.media_dir.glob("sp-*.transcript.json"))
 
 
 async def test_process_sp_transcript_ref_only_without_token(settings: Settings) -> None:
@@ -276,6 +536,39 @@ async def test_process_downloads_sp_file_via_graph(settings: Settings, monkeypat
     )
     assert (settings.media_dir / "z.xlsx").read_bytes() == b"XLSXBYTES"
     assert any(n.startswith("[file:") and "→" in n for n in notes)
+
+
+async def test_process_sp_file_write_failure_leaves_no_part(settings: Settings, monkeypatch) -> None:
+    """Same truncation hazard as the transcript path: a surviving .part reads as a complete file."""
+
+    class _C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aclose(self):
+            return None
+
+        async def get(self, url, headers=None, **kw):
+            if url.endswith("/driveItem"):
+                return _Resp(data={"name": "z.xlsx", "file": {"mimeType": "x"}})
+            return _Resp(content=b"XLSXBYTES")
+
+    def _boom(self, data):
+        with open(self, "wb") as fh:
+            fh.write(data[:4])
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
+    monkeypatch.setattr(Path, "write_bytes", _boom)
+    notes = await A.process(
+        FILE_A, "RichText/Html", "sk", settings.media_dir, download=True, graph_token=lambda: "GTOK"
+    )
+    assert not list(settings.media_dir.glob("*.part"))
+    assert not (settings.media_dir / "z.xlsx").exists()
+    assert any(n.startswith("[file(sp):") for n in notes)  # ref-only, download not claimed
 
 
 async def test_process_sp_file_folder_is_ref_only(settings: Settings, monkeypatch) -> None:

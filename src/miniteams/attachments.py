@@ -18,6 +18,8 @@ from urllib.parse import urlsplit
 import httpx
 import structlog
 
+from miniteams.http import aget_with_retry
+
 log = structlog.get_logger()
 
 _AMSIMAGE = "http://schema.skype.com/AMSImage"
@@ -145,25 +147,65 @@ async def _fetch_image(client: httpx.AsyncClient, token: str, url: str, media_di
     return str(dest)
 
 
-async def _download_sp_transcript(client: httpx.AsyncClient, url: str, bearer: str, media_dir: Path) -> str:
+# Both renditions of the same SharePoint transcript, neither derivable from the other: the JSON
+# carries the speakers (`speakerDisplayName`/`speakerId`), the default VTT splits each turn into
+# sub-cues with their own timings (~2.5x the entry count). Order matters — the JSON is the primary,
+# returned for the message annotation.
+_SP_RENDITIONS = (("json", ".json", "application/json"), ("", ".vtt", "text/vtt"))
+
+
+async def _download_sp_transcript(
+    client: httpx.AsyncClient,
+    url: str,
+    bearer: str,
+    media_dir: Path,
+    on_fail: Callable[[str, Exception], None] | None = None,
+) -> str:
     """Fetch a meeting transcript from SharePoint/OneDrive with a SharePoint bearer.
 
-    Named by a hash of the URL (no stable object id like AMS); skip-if-exists on re-runs."""
+    Named by a hash of the URL (no stable object id like AMS); skip-if-exists per rendition, so an
+    archive holding only the older untagged VTT picks up the JSON on the next run without losing it
+    (for a since-deleted recording that VTT is the only copy left). Raises only when *both* fail —
+    a rendition that fails on its own is still reported through `on_fail`, or a permanently denied
+    one is silently re-requested on every archive pass forever."""
     stem = f"sp-{hashlib.sha1(url.split('?')[0].encode()).hexdigest()[:16]}.transcript"
-    cached = _existing(media_dir, stem)
-    if cached:
-        return cached
     media_dir.mkdir(parents=True, exist_ok=True)
-    resp = await client.get(
-        url, headers={"Authorization": f"Bearer {bearer}", "Accept": "*/*"}, follow_redirects=True
-    )
-    resp.raise_for_status()
-    ext = _CTYPE_EXT.get((resp.headers.get("content-type") or "").split(";")[0], ".vtt")
-    dest = media_dir / f"{stem}{ext}"
-    tmp = media_dir / f"{stem}.part"
-    tmp.write_bytes(resp.content)  # transcripts are small text
-    tmp.rename(dest)
-    return str(dest)
+    headers = {"Authorization": f"Bearer {bearer}", "Accept": "*/*"}
+    got: list[Path] = []
+    failures: list[Exception] = []
+    for fmt, ext, ctype in _SP_RENDITIONS:
+        dest = media_dir / f"{stem}{ext}"
+        if dest.exists():
+            got.append(dest)
+            continue
+        tmp = media_dir / f"{stem}{ext}.part"
+        try:
+            resp = await aget_with_retry(
+                client,
+                url,
+                params={"format": fmt} if fmt else {},
+                headers=headers,
+                follow_redirects=True,
+            )
+            if (resp.headers.get("content-type") or "").split(";")[0] != ctype:
+                # Server ignored `format`: those bytes under this extension would mislabel them.
+                raise RuntimeError(f"unexpected content-type {resp.headers.get('content-type')!r}")
+            tmp.write_bytes(resp.content)  # transcripts are small text
+            tmp.rename(dest)
+            # Named speaker turns for every participant: keep them owner-only, like the token cache.
+            dest.chmod(0o600)
+        except Exception as exc:  # noqa: BLE001 — one rendition may 404 while the other serves
+            tmp.unlink(missing_ok=True)  # never leave partial bytes a later skip would trust
+            failures.append(exc)
+            continue
+        got.append(dest)
+    if not got:
+        raise failures[0]  # the original error, so the caller can read its HTTP status
+    for failure in failures:
+        log.debug("sp_transcript_rendition_failed", url=url, error=str(failure))
+        if on_fail:
+            on_fail(url, failure)
+    return str(got[0])
 
 
 _GRAPH = "https://graph.microsoft.com/v1.0"
@@ -179,8 +221,7 @@ async def _download_sp_file(
     # Graph share id: unpadded base64url of the sharing URL, prefixed "u!".
     share = "u!" + base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
     hdr = {"Authorization": f"Bearer {graph_bearer}"}
-    meta = await client.get(f"{_GRAPH}/shares/{share}/driveItem", headers=hdr)
-    meta.raise_for_status()
+    meta = await aget_with_retry(client, f"{_GRAPH}/shares/{share}/driveItem", headers=hdr)
     info = meta.json()
     if "file" not in info:  # folder / notebook / list item — not a single downloadable file
         return None
@@ -189,11 +230,16 @@ async def _download_sp_file(
     if dest.exists():
         return str(dest)  # skip re-download
     media_dir.mkdir(parents=True, exist_ok=True)
-    resp = await client.get(f"{_GRAPH}/shares/{share}/driveItem/content", headers=hdr, follow_redirects=True)
-    resp.raise_for_status()
+    resp = await aget_with_retry(
+        client, f"{_GRAPH}/shares/{share}/driveItem/content", headers=hdr, follow_redirects=True
+    )
     tmp = media_dir / f"{name}.part"
-    tmp.write_bytes(resp.content)
-    tmp.rename(dest)
+    try:
+        tmp.write_bytes(resp.content)
+        tmp.rename(dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)  # a truncated file would look complete to a later skip-if-exists
+        raise
     return str(dest)
 
 
@@ -287,7 +333,7 @@ async def process(
                     notes.append(f"[transcript(sp): {url}]")
                     continue
                 try:
-                    path = await _download_sp_transcript(client, url, bearer, media_dir)
+                    path = await _download_sp_transcript(client, url, bearer, media_dir, on_fail)
                     notes.append(f"[transcript: {url} → {Path(path).resolve().as_uri()}]")
                 except Exception as exc:  # noqa: BLE001 — best-effort; ref-only on failure
                     log.debug("sp_transcript_failed", url=url, error=str(exc))

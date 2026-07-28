@@ -3,7 +3,7 @@
 import httpx
 import pytest
 
-from miniteams.http import get_with_retry
+from miniteams.http import aget_with_retry, get_with_retry
 
 
 class _Resp:
@@ -54,3 +54,44 @@ def test_non_429_error_raises_immediately() -> None:
     with pytest.raises(httpx.HTTPStatusError):
         get_with_retry(client, "u", sleep=lambda _: None)  # type: ignore[arg-type]
     assert client.calls == 1
+
+
+class _AsyncClient(_Client):
+    def __init__(self, responses: list[_Resp]) -> None:
+        super().__init__(responses)
+        self.kwargs: list[dict] = []
+
+    async def get(self, url: str, **kw) -> _Resp:  # type: ignore[override]
+        self.kwargs.append(kw)
+        return super().get(url)
+
+
+async def test_async_retries_on_429_and_passes_kwargs_through() -> None:
+    slept: list[float] = []
+
+    async def _sleep(d: float) -> None:
+        slept.append(d)
+
+    client = _AsyncClient([_Resp(429, {"Retry-After": "3"}), _Resp(200)])
+    resp = await aget_with_retry(
+        client,  # type: ignore[arg-type]
+        "u",
+        sleep=_sleep,
+        params={"format": "json"},
+        headers={"Authorization": "Bearer x"},
+    )
+    assert resp.status_code == 200
+    assert slept == [3.0]  # honored Retry-After, without blocking the event loop
+    # The retry must re-send the same query/auth, or the second attempt fetches a different thing.
+    assert client.kwargs[1]["params"] == {"format": "json"}
+    assert client.kwargs[1]["headers"] == {"Authorization": "Bearer x"}
+
+
+async def test_async_raises_after_max_retries() -> None:
+    async def _sleep(_: float) -> None:
+        return None
+
+    client = _AsyncClient([_Resp(429) for _ in range(4)])
+    with pytest.raises(httpx.HTTPStatusError):
+        await aget_with_retry(client, "u", max_retries=2, sleep=_sleep)  # type: ignore[arg-type]
+    assert client.calls == 3
