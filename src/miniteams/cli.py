@@ -169,9 +169,10 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
                     include_all=args.all,
                     download_media=not args.no_media,
                     download_avatars=not args.no_avatars,
-                    verify_media=args.verify_media or args.assets_only,
+                    verify_media=args.verify_media,
                     assets_only=args.assets_only,
                     retry_denied=args.retry_denied,
+                    retry_assets=args.retry_assets,
                 )
             )
             if auth_expired:
@@ -307,6 +308,12 @@ def main(argv: list[str] | None = None) -> int:
         help="re-attempt chats whose history previously came back 403 (normally skipped for good)",
     )
     p_archive.add_argument(
+        "--retry-assets",
+        action="store_true",
+        help="re-attempt assets the archive gave up on, skipping the backoff: both the 403-denied "
+        "(normally permanent) and the 404 ones still waiting out their retry delay",
+    )
+    p_archive.add_argument(
         "--loop",
         type=_positive_int,
         nargs="?",
@@ -332,6 +339,10 @@ def main(argv: list[str] | None = None) -> int:
     p_stream.set_defaults(func=cmd_stream)
 
     args = parser.parse_args(argv)
+    # A one-shot override on a timer stops being an override: it would re-request every dead asset
+    # every cycle, which is exactly the hammering the backoff exists to stop.
+    if getattr(args, "retry_assets", False) and getattr(args, "loop", None) is not None:
+        parser.error("--retry-assets is a one-shot recovery flag; it cannot be combined with --loop")
 
     settings = Settings()  # type: ignore[call-arg]  # tenant_id comes from env/.env
     if args.device_code:

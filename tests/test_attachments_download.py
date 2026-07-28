@@ -336,7 +336,7 @@ async def test_process_sp_transcript_both_renditions_denied_keeps_status(
             return _Resp(status_code=403)
 
     monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
-    seen: list[Exception] = []
+    seen: list[tuple[str, Exception]] = []
     notes = await A.process(
         REC_SP,
         "RichText/Media_CallRecording",
@@ -344,14 +344,16 @@ async def test_process_sp_transcript_both_renditions_denied_keeps_status(
         settings.media_dir,
         download=True,
         sp_token=lambda host: "T",
-        on_fail=lambda url, exc: seen.append(exc),
+        on_fail=lambda key, exc: seen.append((key, exc)),
     )
     assert notes == [f"[transcript(sp): {SP}]"]
     assert not list(settings.media_dir.glob("sp-*"))
+    # Both renditions reported under their OWN key — a total failure recorded against the bare URL
+    # would never be consulted again, since the skip check is per rendition.
+    assert [k for k, _ in seen] == [f"{SP}#.json", f"{SP}#.vtt"]
     # archive._on_fail reads exc.response.status_code to fill denied_assets: wrapping the original
     # exception (or re-raising a bare RuntimeError) silently disables the whole denied cache.
-    assert len(seen) == 1
-    assert getattr(getattr(seen[0], "response", None), "status_code", None) == 403
+    assert all(getattr(getattr(e, "response", None), "status_code", None) == 403 for _, e in seen)
 
 
 async def test_process_sp_transcript_partial_failure_is_reported(settings: Settings, monkeypatch) -> None:
@@ -490,6 +492,78 @@ async def test_process_sp_transcript_retries_on_429(settings: Settings, monkeypa
     )
     assert not codes  # both responses consumed: the 429 was retried, not surfaced as a failure
     assert list(settings.media_dir.glob("sp-*.transcript.json"))
+
+
+async def test_process_sp_transcript_skip_is_per_rendition(settings: Settings, monkeypatch) -> None:
+    """A suppressed rendition must cost no request, while the other still downloads."""
+    asked: list[dict] = []
+
+    class _C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aclose(self):
+            return None
+
+        async def get(self, url, headers=None, cookies=None, **kw):
+            asked.append(kw.get("params"))
+            return _Resp(content=b"WEBVTT\n\nsp", headers={"content-type": "text/vtt"})
+
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
+    await A.process(
+        REC_SP,
+        "RichText/Media_CallRecording",
+        "sk",
+        settings.media_dir,
+        download=True,
+        sp_token=lambda host: "T",
+        skip_url=lambda key: key == f"{SP}#.json",  # the JSON is backing off
+    )
+    assert asked == [{}]  # only the VTT rendition was requested
+    assert list(settings.media_dir.glob("sp-*.transcript.vtt"))
+    assert not list(settings.media_dir.glob("sp-*.transcript.json"))
+
+
+async def test_process_sp_transcript_all_suppressed_is_not_a_failure(settings: Settings, monkeypatch) -> None:
+    """Steady state of a dead asset: no network, no failure log — 126 of them run this every pass."""
+    logged: list[str] = []
+
+    class _Log:  # replacing the module attribute: setattr on structlog's proxy does not bind
+        def __getattr__(self, level):
+            return lambda event, **kw: logged.append(event)
+
+    monkeypatch.setattr(A, "log", _Log())
+
+    class _C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aclose(self):
+            return None
+
+        async def get(self, url, headers=None, cookies=None, **kw):
+            raise AssertionError("a suppressed rendition must cost no request")
+
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
+    notes = await A.process(
+        REC_SP,
+        "RichText/Media_CallRecording",
+        "sk",
+        settings.media_dir,
+        download=True,
+        sp_token=lambda host: "T",
+        # Only the per-rendition keys back off; the bare URL must NOT match, or process()'s early
+        # skip short-circuits the item and this never reaches the code under test.
+        skip_url=lambda key: key.startswith(f"{SP}#"),
+    )
+    assert notes == [f"[transcript(sp): {SP}]"]
+    assert "sp_transcript_failed" not in logged  # nominal skip must not read as a failure
 
 
 async def test_process_sp_transcript_ref_only_without_token(settings: Settings) -> None:

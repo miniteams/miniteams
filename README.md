@@ -63,9 +63,11 @@ endpoints, presence/calls, named events), decoded.
 `archive` builds a resumable local archive under `./data/`: `index.db` (chat metadata) plus
 one folder per conversation with a `messages.db` (every message as raw API JSON, keyed by id)
 and a `media/` folder (attachments at original quality). Interrupt anytime — re-running resumes
-from the oldest stored message, tops up new ones, and skips media already on disk. Assets that
-came back HTTP 403 (deleted object, lost share permission) are remembered per chat and never
-re-polled; `--verify-media` / `--assets-only` retry them. Likewise a chat whose whole history is
+from the oldest stored message, tops up new ones, and skips media already on disk. Assets the
+archive gave up on are remembered per chat: a 403 (deleted object, lost share permission) is
+permanent, a 404 backs off (1h → 6h → 12h → 24h → 48h, then every 48h) because it may just be a
+transcript still being generated. `--retry-assets` forces both, and refuses to run under `--loop`
+— a one-shot override on a timer is not an override. Likewise a chat whose whole history is
 403 (revoked meeting access) is skipped on later runs; `--retry-denied` re-attempts it. Every run
 ends with an `archive_recap` log line (chats, failures, new messages, media files, avatars,
 duration). `data/` is gitignored (personal chat data).

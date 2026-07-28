@@ -12,7 +12,7 @@ resumes with no gap and no duplicate — see `archive_store` for the storage inv
 import asyncio
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -33,6 +33,18 @@ log = structlog.get_logger()
 _PAGE_SIZE = 100
 _INTER_PAGE_DELAY = 0.2  # politeness pause between history pages (seconds)
 _MEDIA_CONCURRENCY = 8  # max concurrent attachment downloads per chat (429-friendly)
+# 404 backoff ladder, in hours. The last value is a standing cap, not a terminal state: a dead URL
+# decays to one probe every two days (cheap), and a recording restored from backup is still picked up.
+_BACKOFF_HOURS = (1, 6, 12, 24, 48)
+
+
+def _retry_after(attempts: int) -> str:
+    """Next due time for a backed-off asset, in the SAME format as `_now_iso()`.
+
+    `denied_urls` compares the two as SQL strings, so a second format (`isoformat()` emits
+    `+00:00` and microseconds) would make the comparison decide on punctuation, not on time."""
+    hours = _BACKOFF_HOURS[min(attempts, len(_BACKOFF_HOURS)) - 1]
+    return (datetime.now(UTC) + timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class TokenProvider(Protocol):
@@ -214,9 +226,10 @@ async def _download_media(
     over a bounded async pool sharing one connection pool; `_MEDIA_CONCURRENCY` caps in-flight
     requests to stay polite (429-friendly).
 
-    Assets that came back 403 are remembered (`denied_assets`) and never re-polled — a deleted
-    object or lost share permission stays 403 forever, and the loop mode would hammer it every
-    cycle. `ignore_denied` (--verify-media / --assets-only) retries them; fresh 403s are recorded
+    Assets the archive gave up on are remembered in `denied_assets`, or the loop mode hammers them
+    every cycle. A 403 (deleted object, lost share permission) is permanent. A 404 backs off along
+    `_BACKOFF_HOURS` instead: it may just be a transcript still being generated, and a permanent
+    verdict would lose it. `ignore_denied` (--retry-assets) forces both; fresh failures are recorded
     either way.
     """
     targets = [
@@ -226,20 +239,24 @@ async def _download_media(
     ]
     if not targets:
         return 0
-    denied = set() if ignore_denied else store.denied_urls()
+    denied = set() if ignore_denied else store.denied_urls(_now_iso())
     skipped = 0
 
-    def _skip(url: str) -> bool:
+    def _skip(key: str) -> bool:
         nonlocal skipped
-        if url in denied:
+        if key in denied:
             skipped += 1
             return True
         return False
 
-    def _on_fail(url: str, exc: Exception) -> None:
+    def _on_fail(key: str, exc: Exception) -> None:
         status = getattr(getattr(exc, "response", None), "status_code", None)
+        now = _now_iso()
         if status == 403:
-            store.mark_denied(url, 403, _now_iso())
+            store.mark_denied(key, 403, now)  # permanent: permission does not come back on its own
+        elif status == 404:
+            attempts = store.denied_attempts(key) + 1
+            store.mark_denied(key, 404, now, attempts, _retry_after(attempts))
 
     fetched = done = 0
     start = time.monotonic()
@@ -312,6 +329,7 @@ async def archive_chat(
     download_avatars: bool = True,
     verify_media: bool = False,
     assets_only: bool = False,
+    retry_assets: bool = False,
     sp_token: Callable[[str], str | None] | None = None,
     graph_token: Callable[[], str | None] | None = None,
 ) -> dict[str, int]:
@@ -326,7 +344,7 @@ async def archive_chat(
         try:
             if store.count():
                 media = await _download_media(
-                    store, skype_token, thread_id, sp_token, graph_token, ignore_denied=verify_media
+                    store, skype_token, thread_id, sp_token, graph_token, ignore_denied=retry_assets
                 )
                 index.touch(thread_id, _now_iso())
                 log.info("chat_assets", thread=thread_id, total=store.count(), media=media)
@@ -381,7 +399,7 @@ async def archive_chat(
             new_old = _backfill(settings, skype_token, thread_id, store, index, label)
         media = (
             await _download_media(
-                store, skype_token, label, sp_token, graph_token, ignore_denied=verify_media
+                store, skype_token, label, sp_token, graph_token, ignore_denied=retry_assets
             )
             if download_media
             else 0
@@ -424,6 +442,7 @@ async def run_archive(
     verify_media: bool = False,
     assets_only: bool = False,
     retry_denied: bool = False,
+    retry_assets: bool = False,
 ) -> bool:
     """Returns True when the run stopped on AuthExpired (re-login needed), False otherwise."""
     # Absolute: downloaded media paths are turned into file:// URIs (Path.as_uri), which rejects
@@ -495,6 +514,7 @@ async def run_archive(
                     download_avatars=download_avatars,
                     verify_media=verify_media,
                     assets_only=assets_only,
+                    retry_assets=retry_assets,
                     sp_token=token_provider.sharepoint_token,
                     graph_token=token_provider.graph_token,
                 )

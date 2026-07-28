@@ -151,15 +151,29 @@ class ChatStore:
             )"""
         )
         self._db.execute("CREATE INDEX IF NOT EXISTS idx_messages_composetime ON messages (composetime)")
-        # Negative cache: assets that came back 403 (deleted object, lost share permission) —
-        # re-polling them every run/loop iteration is pure waste; --verify-media retries them.
+        # Negative cache for assets the archive gave up on; `--retry-assets` forces them all.
+        # 403 (deleted object, lost share permission) is permanent — `retry_after` stays ''.
+        # 404 backs off instead of being permanent: a transcript can still be generating when the
+        # recording message lands, and a permanent verdict would lose it for good.
+        # `url` holds a cache KEY, not always a bare URL: assets fetched in several renditions key
+        # as `<url>#<ext>`, so one dead rendition never suppresses the one that still serves.
         self._db.execute(
             """CREATE TABLE IF NOT EXISTS denied_assets (
                 url TEXT PRIMARY KEY,
                 status INTEGER NOT NULL,
-                at TEXT NOT NULL
+                at TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 1,
+                retry_after TEXT NOT NULL DEFAULT ''
             )"""
         )
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(denied_assets)")}
+        for name, decl in (
+            ("attempts", "INTEGER NOT NULL DEFAULT 1"),
+            ("retry_after", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if name not in cols:
+                # Pre-existing rows are all 403s: the '' default is exactly their semantics.
+                self._db.execute(f"ALTER TABLE denied_assets ADD COLUMN {name} {decl}")
         self._db.commit()
 
     def insert_page(self, messages: list[dict[str, Any]]) -> int:
@@ -201,14 +215,28 @@ class ChatStore:
     def count(self) -> int:
         return int(self._db.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
 
-    def denied_urls(self) -> set[str]:
-        return {r[0] for r in self._db.execute("SELECT url FROM denied_assets")}
+    def denied_urls(self, now_iso: str) -> set[str]:
+        """Cache keys still suppressed at `now_iso`: permanent ones, plus backoffs not yet due."""
+        return {
+            r[0]
+            for r in self._db.execute(
+                "SELECT url FROM denied_assets WHERE retry_after = '' OR retry_after > ?", (now_iso,)
+            )
+        }
 
-    def mark_denied(self, url: str, status: int, when_iso: str) -> None:
+    def denied_attempts(self, key: str) -> int:
+        row = self._db.execute("SELECT attempts FROM denied_assets WHERE url = ?", (key,)).fetchone()
+        return int(row[0]) if row else 0
+
+    def mark_denied(
+        self, key: str, status: int, when_iso: str, attempts: int = 1, retry_after: str = ""
+    ) -> None:
+        """Record a give-up. `retry_after` empty ⇒ permanent (403); an ISO stamp ⇒ retry past it."""
         with self._db:
             self._db.execute(
-                "INSERT OR REPLACE INTO denied_assets (url, status, at) VALUES (?, ?, ?)",
-                (url, status, when_iso),
+                "INSERT OR REPLACE INTO denied_assets (url, status, at, attempts, retry_after) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (key, status, when_iso, attempts, retry_after),
             )
 
     def close(self) -> None:

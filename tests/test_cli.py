@@ -47,3 +47,46 @@ def test_cmd_update_deeplink_overrides_thread(settings: Settings, monkeypatch) -
     rc = cli.cmd_update(settings, _ns(target=url, text="new", file=None, thread="OTHER", html=False))
     assert rc == 0
     assert seen == {"thread": "48:notes", "mid": "123", "text": "new"}
+
+
+def test_retry_assets_cannot_be_looped(capsys, monkeypatch) -> None:
+    """A one-shot override on a timer would re-request every dead asset every cycle."""
+    import pytest
+
+    from miniteams import archive, auth
+
+    # Stub the run itself: without this, a regressed guard makes this test authenticate and loop
+    # for real instead of failing — a hang, not a red.
+    async def fake_run_archive(settings, data_dir, **kw):
+        raise AssertionError("guard bypassed: the archive run must never start with --loop")
+
+    monkeypatch.setattr(archive, "run_archive", fake_run_archive)
+    monkeypatch.setattr(auth.TokenSource, "acquire", lambda self: {"access_token": "x"})
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["archive", "--retry-assets", "--loop", "300"])
+    assert exc.value.code == 2  # argparse usage error, raised before any work
+    assert "cannot be combined with --loop" in capsys.readouterr().err
+
+
+def test_assets_only_no_longer_forces_denied_assets(monkeypatch) -> None:
+    """--assets-only is scope, not policy: it must respect the backoff unless --retry-assets."""
+    from miniteams import archive, auth
+
+    seen: dict[str, Any] = {}
+
+    async def fake_run_archive(settings, data_dir, **kw):
+        seen.update(kw)
+        return False  # not auth-expired → cmd_archive returns 0 (no --loop)
+
+    monkeypatch.setattr(archive, "run_archive", fake_run_archive)
+    monkeypatch.setattr(auth.TokenSource, "acquire", lambda self: {"access_token": "x"})
+
+    assert cli.main(["archive", "--assets-only"]) == 0
+    assert seen["assets_only"] is True
+    assert seen["retry_assets"] is False
+    assert seen["verify_media"] is False  # no longer smuggled in by --assets-only
+
+    seen.clear()
+    assert cli.main(["archive", "--assets-only", "--retry-assets"]) == 0
+    assert seen["retry_assets"] is True  # the policy is opted into explicitly

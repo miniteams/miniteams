@@ -154,12 +154,17 @@ async def _fetch_image(client: httpx.AsyncClient, token: str, url: str, media_di
 _SP_RENDITIONS = (("json", ".json", "application/json"), ("", ".vtt", "text/vtt"))
 
 
+class _AllSuppressed(Exception):
+    """Every rendition is waiting out its backoff — nominal steady state, not a failure."""
+
+
 async def _download_sp_transcript(
     client: httpx.AsyncClient,
     url: str,
     bearer: str,
     media_dir: Path,
     on_fail: Callable[[str, Exception], None] | None = None,
+    skip_url: Callable[[str], bool] | None = None,
 ) -> str:
     """Fetch a meeting transcript from SharePoint/OneDrive with a SharePoint bearer.
 
@@ -172,11 +177,14 @@ async def _download_sp_transcript(
     media_dir.mkdir(parents=True, exist_ok=True)
     headers = {"Authorization": f"Bearer {bearer}", "Accept": "*/*"}
     got: list[Path] = []
-    failures: list[Exception] = []
+    failures: list[tuple[str, Exception]] = []
     for fmt, ext, ctype in _SP_RENDITIONS:
         dest = media_dir / f"{stem}{ext}"
         if dest.exists():
             got.append(dest)
+            continue
+        # Per-rendition cache key: one rendition permanently gone must never suppress the other.
+        if skip_url and skip_url(f"{url}#{ext}"):
             continue
         tmp = media_dir / f"{stem}{ext}.part"
         try:
@@ -196,15 +204,19 @@ async def _download_sp_transcript(
             dest.chmod(0o600)
         except Exception as exc:  # noqa: BLE001 — one rendition may 404 while the other serves
             tmp.unlink(missing_ok=True)  # never leave partial bytes a later skip would trust
-            failures.append(exc)
+            failures.append((ext, exc))
             continue
         got.append(dest)
-    if not got:
-        raise failures[0]  # the original error, so the caller can read its HTTP status
-    for failure in failures:
-        log.debug("sp_transcript_rendition_failed", url=url, error=str(failure))
+    # Report before raising: a total failure must still record BOTH renditions under their own key,
+    # or the retry policy never sees them and every pass re-requests a dead URL.
+    for ext, failure in failures:
+        log.debug("sp_transcript_rendition_failed", url=url, rendition=ext, error=str(failure))
         if on_fail:
-            on_fail(url, failure)
+            on_fail(f"{url}#{ext}", failure)
+    if not got:
+        if not failures:
+            raise _AllSuppressed(url)
+        raise failures[0][1]  # the original error, so the caller can read its HTTP status
     return str(got[0])
 
 
@@ -333,12 +345,13 @@ async def process(
                     notes.append(f"[transcript(sp): {url}]")
                     continue
                 try:
-                    path = await _download_sp_transcript(client, url, bearer, media_dir, on_fail)
+                    path = await _download_sp_transcript(client, url, bearer, media_dir, on_fail, skip_url)
                     notes.append(f"[transcript: {url} → {Path(path).resolve().as_uri()}]")
+                except _AllSuppressed:
+                    notes.append(f"[transcript(sp): {url}]")  # backing off: nominal, not a failure
                 except Exception as exc:  # noqa: BLE001 — best-effort; ref-only on failure
+                    # No on_fail here: the helper already reported each rendition under its own key.
                     log.debug("sp_transcript_failed", url=url, error=str(exc))
-                    if on_fail:
-                        on_fail(url, exc)
                     notes.append(f"[transcript(sp): {url}]")
                 continue
             if kind == "sp_file":

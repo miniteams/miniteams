@@ -569,11 +569,72 @@ async def test_media_denied_cache_skips_and_records(settings: Settings, tmp_path
     monkeypatch.setattr(AR.attachments, "process", fake_process)
 
     await AR._download_media(store, "sk", "label")
-    assert calls == ["attempted"] and store.denied_urls() == {URL}  # 403 recorded
+    assert calls == ["attempted"] and store.denied_urls(AR._now_iso()) == {URL}  # 403 recorded
     await AR._download_media(store, "sk", "label")
     assert calls == ["attempted", "skipped"]  # negative cache honored
     await AR._download_media(store, "sk", "label", ignore_denied=True)
     assert calls == ["attempted", "skipped", "attempted"]  # asset flag bypasses
+    store.close()
+
+
+def test_backoff_ladder_climbs_then_caps() -> None:
+    """A dead URL must decay to the cap, never to silence and never staying at one hour."""
+    from datetime import datetime
+
+    def hours(n: int) -> float:
+        delta = datetime.fromisoformat(AR._retry_after(n)) - datetime.now(AR.UTC)
+        return round(delta.total_seconds() / 3600)
+
+    assert [hours(n) for n in (1, 2, 3, 4, 5)] == [1, 6, 12, 24, 48]
+    assert hours(9) == 48  # standing cap, not a terminal state
+
+
+async def test_media_404_backs_off_while_403_stays_permanent(
+    settings: Settings, tmp_path, monkeypatch
+) -> None:
+    """The split that makes a still-generating transcript recoverable and a dead one cheap."""
+    import httpx
+
+    URL = "https://c-my.sharepoint.com/personal/x/_api/v2.1/drives/b!a/items/01A"
+    REC = (
+        '<URIObject type="Video.2/CallRecording.1" uri="">'
+        f'<item type="onedriveForBusinessTranscript" uri="{URL}" /></URIObject>'
+    )
+    store = ChatStore(tmp_path / "data", C1)
+    store.insert_page(
+        [
+            {
+                "id": "m1",
+                "composetime": "2026-07-01T09:00:00Z",
+                "content": REC,
+                "messagetype": "RichText/Media_CallRecording",
+            }
+        ]
+    )
+
+    async def fake_process(content, msgtype, token, media_dir, download, **kw):  # noqa: ANN001
+        req = httpx.Request("GET", URL)
+        for key, code in ((f"{URL}#.json", 404), (f"{URL}#.vtt", 403)):
+            if kw.get("skip_url") and kw["skip_url"](key):
+                continue
+            kw["on_fail"](
+                key, httpx.HTTPStatusError(str(code), request=req, response=httpx.Response(code, request=req))
+            )
+        return [f"[transcript(sp): {URL}]"]
+
+    monkeypatch.setattr(AR.attachments, "process", fake_process)
+    await AR._download_media(store, "sk", "label")
+
+    rows = {
+        r[0]: r for r in store._db.execute("SELECT url, status, attempts, retry_after FROM denied_assets")
+    }
+    assert rows[f"{URL}#.vtt"][3] == ""  # 403 → permanent
+    assert rows[f"{URL}#.json"][1] == 404 and rows[f"{URL}#.json"][3] != ""  # 404 → dated retry
+    assert rows[f"{URL}#.json"][2] == 1
+
+    # Second pass while the delay stands: the 404 key is suppressed, so attempts must NOT climb.
+    await AR._download_media(store, "sk", "label")
+    assert store.denied_attempts(f"{URL}#.json") == 1
     store.close()
 
 

@@ -26,7 +26,8 @@ chats(id TEXT PK, dir TEXT, label TEXT, topic TEXT, participants TEXT /*JSON*/,
 
 -- <thread>/messages.db
 messages(id TEXT PK, composetime TEXT /*ISO-8601 UTC*/, raw TEXT /*JSON message*/)
-denied_assets(url TEXT PK, status INT, at TEXT)   -- 403 negative cache, ignore when reading
+denied_assets(url TEXT PK, status INT, at TEXT,   -- give-up cache, ignore when reading
+              attempts INT, retry_after TEXT)     -- '' = permanent (403); else retry past it (404)
 ```
 
 Index on `composetime` — always order/filter on it, never on `id`.
