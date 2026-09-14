@@ -233,6 +233,7 @@ async def test_media_downloaded_skipped_and_failure_nonfatal(
         graph_token=None,
         skip_url=None,
         on_fail=None,
+        videos=False,
     ):  # noqa: ANN001
         seen.append((content, media_dir))
         if len(seen) == 1:
@@ -557,6 +558,7 @@ async def test_media_denied_cache_skips_and_records(settings: Settings, tmp_path
         graph_token=None,
         skip_url=None,
         on_fail=None,
+        videos=False,
     ):  # noqa: ANN001
         if skip_url and skip_url(URL):
             calls.append("skipped")
@@ -751,3 +753,57 @@ async def test_empty_backfilled_chat_refetches_when_messages_arrive(
     _wire(monkeypatch, _FakeApi({C1: [_msg("m1", "2026-07-24T11:30:00Z")]}), [C1])
     await _run(settings, data, download_media=False)  # meeting happened
     assert _stored_ids(data, C1) == {"m1"}
+
+
+async def test_media_pass_writes_recordings_manifest(settings: Settings, tmp_path, monkeypatch) -> None:
+    """media/recordings.json pairs each Media_CallRecording with its on-disk files."""
+    import json as _json
+
+    OBJ = "https://fr-prod.asyncgw.teams.microsoft.com/v1/objects/rec1/views"
+    REC = (
+        '<URIObject type="Video.2/CallRecording.1" uri="">'
+        "<Title>CIR OPS</Title>"
+        f'<item type="amsVideo" uri="{OBJ}/video" />'
+        "</URIObject>"
+    )
+    data = tmp_path / "data"
+    pre = ChatStore(data, C1)
+    pre.insert_page(
+        [
+            {
+                "id": "r1",
+                "composetime": "2026-08-18T10:00:00Z",
+                "content": REC,
+                "messagetype": "RichText/Media_CallRecording",
+            }
+        ]
+    )
+    pre.media_dir.mkdir(parents=True, exist_ok=True)
+    (pre.media_dir / "rec1.video.mp4").write_bytes(b"MP4")
+    pre.close()
+    index = Index(data)
+    index.upsert_chat(C1)
+    index.mark_backfill_done(C1)
+    index.close()
+
+    async def fake_process(*a, **k):  # noqa: ANN002, ANN003 — downloads themselves are not under test
+        return []
+
+    monkeypatch.setattr(AR.attachments, "process", fake_process)
+    api = _FakeApi({C1: []})
+    _wire(monkeypatch, api, [C1])
+    await _run(settings, data, download_media=True)
+
+    manifest_path = ChatStore(data, C1).media_dir / "recordings.json"
+    assert manifest_path.stat().st_mode & 0o777 == 0o600  # owner-only, like the transcripts
+    manifest = _json.loads(manifest_path.read_text())
+    assert manifest == [
+        {
+            "title": "CIR OPS",
+            "duration": "",
+            "videos": ["rec1.video.mp4"],
+            "transcripts": [],
+            "message_id": "r1",
+            "composetime": "2026-08-18T10:00:00Z",
+        }
+    ]

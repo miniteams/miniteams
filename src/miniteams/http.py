@@ -6,7 +6,8 @@ the caller down, never crash it. Centralised here so every paged walk inherits t
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
@@ -62,6 +63,31 @@ async def aget_with_retry(
             resp.raise_for_status()
             return resp
         delay = _retry_delay(resp, attempt)
+        log.warning("rate_limited", url=url, attempt=attempt + 1, delay=delay)
+        await sleep(delay)
+    raise AssertionError("unreachable")  # loop always returns or raises
+
+
+@asynccontextmanager
+async def astream_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    max_retries: int = _MAX_RETRIES,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    **kwargs: Any,
+) -> AsyncIterator[httpx.Response]:
+    """Streaming twin of `aget_with_retry`: `async with astream_with_retry(...) as resp`.
+
+    A 429 is decided on the headers alone, before any body byte is consumed, so the retry costs
+    no bandwidth — what matters for the GB-scale recordings the streamed paths carry."""
+    for attempt in range(max_retries + 1):
+        async with client.stream("GET", url, **kwargs) as resp:
+            if resp.status_code != 429 or attempt == max_retries:
+                resp.raise_for_status()
+                yield resp
+                return
+            delay = _retry_delay(resp, attempt)
         log.warning("rate_limited", url=url, attempt=attempt + 1, delay=delay)
         await sleep(delay)
     raise AssertionError("unreachable")  # loop always returns or raises

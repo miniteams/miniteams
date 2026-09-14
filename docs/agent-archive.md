@@ -10,7 +10,10 @@ data/
   index.db                          # one row per conversation (the channel directory)
   <thread-id>/                      # thread id with `/` → `_`; usually verbatim
     messages.db                     # every message of that conversation, raw API JSON
-    media/                          # downloaded images/files (optional, --no-media skips)
+    media/                          # downloaded images/files (optional, --no-media skips);
+                                    # with --videos also meeting recordings/shared videos, named
+                                    # <driveItem-name>.mp4 (SharePoint) or <id>.video.mp4 (AMS)
+      recordings.json               # recording ↔ video/transcript pairing (see below)
     avatars/                        # sender avatars, <sanitized-MRI>.jpg
 ```
 
@@ -125,18 +128,94 @@ The two SharePoint renditions are the same transcript at different granularity, 
 derivable from the other** — start from the `.json`, and only join the `.vtt` when you need
 subtitle-level timing. The join key is the entry id: JSON `…/9` ↔ VTT cues `…/9-0`, `…/9-1`, ….
 
+#### Pairing a video with its transcript
+
+**Start with `media/recordings.json`** — one entry per recording message, written by every media
+pass: `{title, duration, videos: [...], transcripts: [...], message_id, composetime}`, listing only
+files present on disk (empty lists = the recording existed but nothing was recoverable).
+
+Fallback for chats not yet re-swept: filenames alone don't link them (`sp-<sha1>` is a URL hash,
+videos carry a driveItem name or an AMS object id). The join lives in the **`Media_CallRecording`
+message** that references both:
+
+| In the message raw | On-disk file |
+|---|---|
+| `<item type="onedriveForBusinessTranscript" uri="U">` | `sp-{sha1(U.split('?')[0])[:16]}.transcript.{json,vtt}` |
+| `<item type="onedriveForBusinessVideo">` → driveItem name | `<OriginalName>.mp4` (SharePoint copy) |
+| `<item type="amsVideo" uri=".../objects/<id>/views/video">` | `<id>.video.mp4` (AMS fallback copy) |
+
 ```python
-entries = json.load(open(p))["entries"]        # Stream transcript schema
-for e in entries:
-    e["speakerDisplayName"], e["text"], e["startOffset"]   # "00:01:23.4567890"
+import hashlib, re
+raw = row_raw  # one Media_CallRecording message
+sp_t = re.search(r'onedriveForBusinessTranscript\\?" uri=\\?"([^"\\]+)', raw)
+stem = "sp-" + hashlib.sha1(sp_t.group(1).split("?")[0].encode()).hexdigest()[:16]
+ams  = re.search(r'amsVideo\\?" uri=\\?"[^"\\]*/objects/([^/\\]+)/', raw)
+# transcript: media/{stem}.transcript.json — video: media/{OriginalName v=…}.mp4 or media/{ams}.video.mp4
 ```
 
-`speakerId` is `<oid>@<tid>`; the `<oid>` half matches the `8:orgid:<oid>` MRI in `from`, so a
-transcript turn joins onto the chat's participants and `avatars/`. ~5% of entries have an empty
-`speakerDisplayName` (unrecognised guests/externals) — fall back to `speakerId`, don't drop the turn.
-`startOffset` is relative to the recording start, **not** a wall clock. The parent message's
-`composetime` is when the recording was *posted* (after the meeting), so it is not a usable anchor —
-keep offsets relative unless you resolve the real start from the calendar.
+Shortcut: the AMS video and AMS transcript of one recording share the object id — `<id>.video.mp4`
+pairs with `<id>.transcript.vtt` by stem alone, no message lookup needed.
+
+#### Entry schema
+
+`json.load(p)["entries"]` — a list of turns, chronological. Fields that matter:
+
+| Field | Notes |
+|---|---|
+| `text` | the turn, already plain text — no HTML, no escaping |
+| `speakerDisplayName` | `"Damien DEGOIS"`, or **empty** for an unrecognised speaker |
+| `speakerId` | `<oid>@<tid>`; the `<oid>` half matches the `8:orgid:<oid>` MRI in a message's `from` |
+| `startOffset` / `endOffset` | `"00:01:23.4567890"`, relative to the recording start |
+| `id` | `<guid>/<n>`; the VTT's sub-cues are `<guid>/<n>-0`, `-1`, … — the join key |
+| `spokenLanguageTag` | `fr-fr` / `en-us` / … — mixed across an archive, filter on it before NLP |
+| `confidence` | ASR confidence; median 0.56 under 25 chars vs 0.82 above — short turns score low by nature, not by error |
+| `hasBeenEdited` | manual Stream edit; false on every entry of this archive |
+
+`speakerId` makes a turn joinable onto the chat's `participants` and `avatars/`. When
+`speakerDisplayName` is empty, fall back to `speakerId` — never drop the turn.
+
+`startOffset` is **not** a wall clock. The parent message's `composetime` is when the recording was
+*posted* (after the meeting), so it is not a usable anchor — keep offsets relative unless the real
+start is resolved from the calendar.
+
+#### Transcripts are frozen — never re-fetch hoping for more
+
+Microsoft does **not** revise a transcript after publication. Five partially-anonymous transcripts
+from Sept–Dec 2025 (159/222, 721/1003, 409/908, 365/514, 458/644 anonymous turns) re-fetched in
+July 2026 came back **byte-identical**, with zero turns gaining a name.
+
+Consequences: skip-if-exists is safe (there is no newer version to miss); an empty
+`speakerDisplayName` is permanent, not "not yet resolved"; and revision detection (`cTag`
+polling, re-resolving the transcript id) solves a problem that does not exist — do not build it.
+
+Anonymity is concentrated, not spread — measure before assuming a gap is everywhere:
+
+```python
+import json, pathlib
+for p in sorted(pathlib.Path("data").glob("*/media/sp-*.transcript.json")):
+    e = json.loads(p.read_text())["entries"]
+    anon = sum(1 for x in e if not x.get("speakerDisplayName"))
+    if anon:
+        print(f"{anon:5}/{len(e):<5} {p.parent.parent.name[:50]}")
+```
+
+#### Recipe — what one person said
+
+```python
+import json, pathlib
+
+def turns_by(name, data_dir="data"):
+    """Yield (meeting_dir, startOffset, text) for every turn attributed to `name`."""
+    for p in pathlib.Path(data_dir).glob("*/media/sp-*.transcript.json"):
+        for e in json.loads(p.read_text())["entries"]:
+            if e.get("speakerDisplayName") == name:
+                yield p.parent.parent.name, e["startOffset"], e["text"]
+```
+
+Match on `speakerDisplayName` for readability, on `speakerId` when a display name is ambiguous
+(homonyms, renamed accounts) — the `oid` is the stable identity.
+
+#### Two file-level gotchas
 
 A stem may hold only the `.vtt`: the recording was deleted before the `.json` could be fetched, and
 that file is now the only copy — speakers unrecoverable for that meeting.

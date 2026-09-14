@@ -55,7 +55,7 @@ class _AsyncClient:
     async def get(self, url: str, headers: Any = None, cookies: Any = None) -> _Resp:
         return self._handler(url)
 
-    def stream(self, method: str, url: str, headers: Any = None, cookies: Any = None) -> _Resp:
+    def stream(self, method: str, url: str, headers: Any = None, cookies: Any = None, **kw: Any) -> _Resp:
         return self._handler(url)  # _Resp doubles as its own async context manager
 
 
@@ -597,13 +597,11 @@ async def test_process_downloads_sp_file_via_graph(settings: Settings, monkeypat
             return None
 
         async def get(self, url, headers=None, **kw):
-            if url.endswith("/driveItem"):
-                return _Resp(data={"name": "z.xlsx", "file": {"mimeType": "x"}})
-            return _Resp(content=b"XLSXBYTES")  # /content
+            return _Resp(data={"name": "z.xlsx", "file": {"mimeType": "x"}})  # /driveItem
 
-        def json_get(self): ...
+        def stream(self, method, url, headers=None, **kw):
+            return _Resp(content=b"XLSXBYTES")  # /content — streamed to disk
 
-    # _Resp.json returns _data; content path returns bytes
     monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
     notes = await A.process(
         FILE_A, "RichText/Html", "sk", settings.media_dir, download=True, graph_token=lambda: "GTOK"
@@ -626,17 +624,17 @@ async def test_process_sp_file_write_failure_leaves_no_part(settings: Settings, 
             return None
 
         async def get(self, url, headers=None, **kw):
-            if url.endswith("/driveItem"):
-                return _Resp(data={"name": "z.xlsx", "file": {"mimeType": "x"}})
-            return _Resp(content=b"XLSXBYTES")
+            return _Resp(data={"name": "z.xlsx", "file": {"mimeType": "x"}})  # /driveItem
 
-    def _boom(self, data):
-        with open(self, "wb") as fh:
-            fh.write(data[:4])
-        raise OSError(28, "No space left on device")
+        def stream(self, method, url, headers=None, **kw):
+            return _BoomResp(content=b"XLSXBYTES")  # /content — dies mid-stream
+
+    class _BoomResp(_Resp):
+        async def aiter_bytes(self, size: int = 65536):
+            yield self.content[:4]  # partial bytes hit the .part file, then the stream dies
+            raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
-    monkeypatch.setattr(Path, "write_bytes", _boom)
     notes = await A.process(
         FILE_A, "RichText/Html", "sk", settings.media_dir, download=True, graph_token=lambda: "GTOK"
     )
@@ -679,6 +677,151 @@ def test_extract_excludes_sharepoint_videos() -> None:
     mp4_by_ext = '<a itemtype="http://schema.skype.com/HyperLink/Files" href="https://c.sharepoint.com/sites/x/clip.mp4">c</a>'
     items = A.extract(mp4_files_itemtype + mp4_by_ext, "RichText/Html")
     assert not any(i["kind"] == "sp_file" for i in items)  # videos excluded even as HyperLink/Files
+
+
+_SP_VID = "https://c-my.sharepoint.com/:v:/g/personal/x/EQrec123"
+REC_VID = (
+    '<URIObject type="Video.2/CallRecording.1" uri="">'
+    f'<a href="{_SP_VID}">Play</a>'
+    f'<item type="amsVideo" uri="{_OBJ}/video" />'
+    f'<item type="onedriveForBusinessVideo" uri="{_SP_VID}" driveId="b!x" driveItemId="01A" />'
+    "</URIObject>"
+)
+
+
+def test_extract_videos_flag_includes_recording_once() -> None:
+    items = A.extract(REC_VID, "RichText/Media_CallRecording", videos=True)
+    sp = [i["url"] for i in items if i["kind"] == "sp_file"]
+    assert sp == [_SP_VID]  # the <item> and the Play <a> carry the same URL — captured once
+    # AMS fallback copy is captured too, and LAST — process() must see the SP outcome first.
+    assert items[-1] == {"kind": "video", "url": f"{_OBJ}/video"}
+
+
+def test_extract_videos_flag_includes_shared_video_files() -> None:
+    by_prefix = '<a href="https://c.sharepoint.com/:v:/r/personal/x/rec.mp4?web=1">rec</a>'
+    by_ext = '<a itemtype="http://schema.skype.com/HyperLink/Files" href="https://c.sharepoint.com/sites/x/clip.mkv">c</a>'
+    items = A.extract(by_prefix + by_ext, "RichText/Html", videos=True)
+    sp = {i["url"] for i in items if i["kind"] == "sp_file"}
+    assert sp == {
+        "https://c.sharepoint.com/:v:/r/personal/x/rec.mp4?web=1",
+        "https://c.sharepoint.com/sites/x/clip.mkv",
+    }
+
+
+def test_extract_videos_default_off() -> None:
+    items = A.extract(REC_VID, "RichText/Media_CallRecording")
+    assert not any(i["kind"] in ("sp_file", "video") for i in items)
+
+
+async def test_process_ams_video_skipped_when_sp_copy_downloads(settings: Settings, monkeypatch) -> None:
+    fetched: list[str] = []
+
+    class _C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aclose(self):
+            return None
+
+        async def get(self, url, headers=None, **kw):
+            return _Resp(data={"name": "rec.mp4", "file": {"mimeType": "video/mp4"}})  # /driveItem
+
+        def stream(self, method, url, headers=None, **kw):
+            fetched.append(url)
+            return _Resp(content=b"MP4", headers={"content-type": "video/mp4"})
+
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
+    notes = await A.process(
+        REC_VID,
+        "RichText/Media_CallRecording",
+        "sk",
+        settings.media_dir,
+        download=True,
+        graph_token=lambda: "GTOK",
+        videos=True,
+    )
+    assert (settings.media_dir / "rec.mp4").exists()  # durable SharePoint copy
+    assert not any(u.endswith("/video") for u in fetched)  # AMS copy NOT pulled — redundant
+    assert any(n == f"[video: {_OBJ}/video]" for n in notes)  # ref-only note
+
+
+async def test_process_ams_video_fallback_when_sp_denied(settings: Settings, monkeypatch) -> None:
+    def handler(url: str) -> _Resp:
+        assert url.endswith("/video")  # only the AMS copy may be fetched here
+        return _Resp(content=b"MP4BYTES", headers={"content-type": "video/mp4"})
+
+    _patch_client(monkeypatch, handler)
+    notes = await A.process(
+        REC_VID,
+        "RichText/Media_CallRecording",
+        "sk",
+        settings.media_dir,
+        download=True,
+        graph_token=lambda: "GTOK",
+        # SharePoint copy previously 403'd (block-download policy) → denied cache vetoes it.
+        skip_url=lambda u: "sharepoint" in u,
+        videos=True,
+    )
+    assert (settings.media_dir / "rec1.video.mp4").read_bytes() == b"MP4BYTES"
+    assert any(n.startswith("[video:") and "→" in n for n in notes)
+
+
+async def test_process_ams_video_failure_feeds_on_fail(settings: Settings, monkeypatch) -> None:
+    """Without on_fail the denied cache never learns, and an expired AMS object is re-polled forever."""
+
+    def handler(url: str) -> _Resp:
+        return _Resp(status_code=403)  # expired/denied AMS object
+
+    _patch_client(monkeypatch, handler)
+    failed: list[str] = []
+    notes = await A.process(
+        REC_VID,
+        "RichText/Media_CallRecording",
+        "sk",
+        settings.media_dir,
+        download=True,
+        skip_url=lambda u: "sharepoint" in u,  # SP copy already denied → AMS attempted
+        on_fail=lambda u, exc: failed.append(u),
+        videos=True,
+    )
+    assert failed == [f"{_OBJ}/video"]  # the AMS URL lands in the denied cache
+    assert any(n == f"[video: {_OBJ}/video]" for n in notes)  # ref-only, no download claimed
+    assert not list(settings.media_dir.glob("*.part"))
+
+
+async def test_process_ams_video_fallback_when_sp_fails(settings: Settings, monkeypatch) -> None:
+    class _C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aclose(self):
+            return None
+
+        async def get(self, url, headers=None, **kw):
+            return _Resp(status_code=403)  # /driveItem metadata denied
+
+        def stream(self, method, url, headers=None, **kw):
+            assert url.endswith("/video")  # SP content is never reached; AMS is
+            return _Resp(content=b"MP4BYTES", headers={"content-type": "video/mp4"})
+
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
+    notes = await A.process(
+        REC_VID,
+        "RichText/Media_CallRecording",
+        "sk",
+        settings.media_dir,
+        download=True,
+        graph_token=lambda: "GTOK",
+        videos=True,
+    )
+    assert (settings.media_dir / "rec1.video.mp4").read_bytes() == b"MP4BYTES"
+    assert any(n.startswith("[video:") and "→" in n for n in notes)
 
 
 def _403(url: str) -> _httpx.HTTPStatusError:
@@ -751,3 +894,154 @@ async def test_full_view_403_recorded_and_skippable(settings: Settings, monkeypa
         skip_url=lambda url: url == full_url,
     )
     assert any("image:" in n and "optim" not in n for n in notes)  # optim kept, full skipped
+
+
+# --- per-destination download serialization ------------------------------------------------------
+# Duplicate messages reference the same object; concurrent downloads once shared one deterministic
+# `.part` path — two writers truncated/mutated each other's bytes and a late failure after the
+# winner's rename could leave a corrupt dest that skip-if-exists trusts forever.
+
+
+class _SlowResp(_Resp):
+    async def aiter_bytes(self, size: int = 65536):
+        import asyncio
+
+        for i in range(0, len(self.content), size):
+            await asyncio.sleep(0.001)  # widen the race window across event-loop turns
+            yield self.content[i : i + size]
+
+
+async def test_concurrent_same_ams_object_downloads_once(settings: Settings, monkeypatch) -> None:
+    import asyncio
+
+    calls: list[str] = []
+
+    def handler(url: str) -> _Resp:
+        calls.append(url)
+        return _SlowResp(content=b"V" * 200_000, headers={"content-type": "video/mp4"})
+
+    client = _AsyncClient(handler)
+    url = f"{_OBJ}/video"
+    settings.media_dir.mkdir(parents=True, exist_ok=True)
+    paths = await asyncio.gather(
+        A._fetch_image(client, "sk", url, settings.media_dir, suffix=".video"),
+        A._fetch_image(client, "sk", url, settings.media_dir, suffix=".video"),
+    )
+    assert len(calls) == 1  # loser waited, then took the skip-if-exists path
+    assert paths[0] == paths[1]
+    assert (settings.media_dir / "rec1.video.mp4").read_bytes() == b"V" * 200_000
+    assert not A._dl_locks and not A._dl_refs  # bounded: entries dropped once free
+
+
+async def test_concurrent_same_sp_file_downloads_once(settings: Settings, monkeypatch) -> None:
+    import asyncio
+
+    streams: list[str] = []
+
+    class _C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, headers=None, **kw):
+            return _Resp(data={"name": "rec.mp4", "file": {"mimeType": "video/mp4"}})
+
+        def stream(self, method, url, headers=None, **kw):
+            streams.append(url)
+            return _SlowResp(content=b"S" * 200_000, headers={"content-type": "video/mp4"})
+
+    client = _C()
+    url = "https://c-my.sharepoint.com/:v:/g/personal/x/EQrec123"
+    paths = await asyncio.gather(
+        A._download_sp_file(client, url, "GTOK", settings.media_dir),
+        A._download_sp_file(client, url, "GTOK", settings.media_dir),
+    )
+    assert len(streams) == 1  # one content fetch; the duplicate returned the cached file
+    assert paths[0] == paths[1]
+    assert (settings.media_dir / "rec.mp4").read_bytes() == b"S" * 200_000
+    assert not A._dl_locks and not A._dl_refs
+
+
+def test_recording_files_pairs_video_and_transcripts(settings: Settings) -> None:
+    settings.media_dir.mkdir(parents=True, exist_ok=True)
+    sp_url = "https://c-my.sharepoint.com/personal/x/_layouts/15/transcript.ashx?id=1"
+    stem = "sp-" + hashlib.sha1(sp_url.split("?")[0].encode()).hexdigest()[:16]
+    content = (
+        '<URIObject type="Video.2/CallRecording.1" uri="">'
+        "<Title>CIR OPS</Title>"
+        '<OriginalName v="CIR OPS-20260818-Meeting Recording.mp4" />'
+        f'<item type="amsVideo" uri="{_OBJ}/video" />'
+        f'<item type="amsTranscript" uri="{_OBJ}/transcript" />'
+        f'<item type="onedriveForBusinessTranscript" uri="{sp_url}" />'
+        '<RecordingContent duration="1:07:09.315" />'
+        "</URIObject>"
+    )
+    for name in (
+        "CIR OPS-20260818-Meeting Recording.mp4",
+        "rec1.video.mp4",
+        "rec1.video.mp4.part",  # in-flight leftovers must never be listed
+        "rec1.transcript.vtt",
+        f"{stem}.transcript.json",
+        f"{stem}.transcript.vtt",
+    ):
+        (settings.media_dir / name).write_bytes(b"x")
+    entry = A.recording_files(content, settings.media_dir)
+    assert entry == {
+        "title": "CIR OPS",
+        "duration": "1:07:09.315",
+        "videos": ["CIR OPS-20260818-Meeting Recording.mp4", "rec1.video.mp4"],
+        "transcripts": ["rec1.transcript.vtt", f"{stem}.transcript.json", f"{stem}.transcript.vtt"],
+    }
+
+
+def test_recording_files_empty_when_nothing_on_disk(settings: Settings) -> None:
+    settings.media_dir.mkdir(parents=True, exist_ok=True)
+    content = (
+        f'<URIObject type="Video.2/CallRecording.1"><item type="amsVideo" uri="{_OBJ}/video" /></URIObject>'
+    )
+    entry = A.recording_files(content, settings.media_dir)
+    assert (
+        entry["videos"] == [] and entry["transcripts"] == []
+    )  # recording gone: entry still records it existed
+
+
+# --- 429 on a streamed content GET ------------------------------------------------------------
+# Graph and the AMS object host throttle bursts; the streamed paths must back off exactly like
+# `aget_with_retry` does, or one throttled pass silently loses the file.
+
+
+async def test_sp_file_content_429_is_retried(settings: Settings) -> None:
+    streams: list[str] = []
+
+    class _C:
+        async def get(self, url, headers=None, **kw):
+            return _Resp(data={"name": "rec.mp4", "file": {"mimeType": "video/mp4"}})
+
+        def stream(self, method, url, headers=None, **kw):
+            streams.append(url)
+            if len(streams) == 1:
+                return _Resp(status_code=429, headers={"Retry-After": "0"})
+            return _Resp(content=b"MP4", headers={"content-type": "video/mp4"})
+
+    path = await A._download_sp_file(_C(), _SP_VID, "GTOK", settings.media_dir)
+    assert len(streams) == 2
+    assert Path(path).read_bytes() == b"MP4"
+
+
+async def test_ams_stream_429_is_retried(settings: Settings) -> None:
+    calls: list[str] = []
+
+    def handler(url: str) -> _Resp:
+        calls.append(url)
+        if len(calls) == 1:
+            return _Resp(status_code=429, headers={"Retry-After": "0"})
+        return _Resp(content=b"IMG", headers={"content-type": "image/png"})
+
+    settings.media_dir.mkdir(parents=True, exist_ok=True)
+    path = await A._fetch_image(
+        _AsyncClient(handler), "sk", f"{_OBJ}/imgpsh_fullsize", settings.media_dir, ""
+    )
+    assert len(calls) == 2
+    assert Path(path).read_bytes() == b"IMG"

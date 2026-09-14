@@ -17,6 +17,9 @@ from .trouter import get_or_create_epid, handshake, trouter_info
 
 log = structlog.get_logger()
 
+_NET_RETRIES = 4  # consecutive transport failures an archive run may burn before giving up
+_NET_RETRY_MAX_BACKOFF = 30.0
+
 
 def _ensure_skype_token(settings: Settings) -> tuple[dict[str, Any], str]:
     """Silent AAD (cached) → fresh skype token. Returns (aad_result, skype_token)."""
@@ -150,6 +153,8 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
     import time
     from pathlib import Path
 
+    import httpx
+
     from .archive import RefreshingToken, run_archive
     from .auth import TokenSource
 
@@ -158,23 +163,46 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
     source = TokenSource(settings)
     source.acquire()
     provider = RefreshingToken(settings, source)
+    net_failures = 0
     try:
         while True:
-            auth_expired = asyncio.run(
-                run_archive(
-                    settings,
-                    Path(args.data_dir),
-                    token_provider=provider,
-                    thread=args.thread,
-                    include_all=args.all,
-                    download_media=not args.no_media,
-                    download_avatars=not args.no_avatars,
-                    verify_media=args.verify_media,
-                    assets_only=args.assets_only,
-                    retry_denied=args.retry_denied,
-                    retry_assets=args.retry_assets,
+            try:
+                auth_expired = asyncio.run(
+                    run_archive(
+                        settings,
+                        Path(args.data_dir),
+                        token_provider=provider,
+                        thread=args.thread,
+                        include_all=args.all,
+                        download_media=not args.no_media,
+                        download_avatars=not args.no_avatars,
+                        download_videos=args.videos,
+                        verify_media=args.verify_media,
+                        assets_only=args.assets_only,
+                        retry_denied=args.retry_denied,
+                        retry_assets=args.retry_assets,
+                    )
                 )
-            )
+            # OSError also covers msal's transport layer: requests.exceptions.RequestException
+            # subclasses it, so a reset during a token refresh lands here too.
+            except (OSError, httpx.TransportError, httpx.HTTPStatusError) as exc:
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500:
+                    raise  # 401/403/404 do not heal by waiting
+                net_failures += 1
+                if net_failures > _NET_RETRIES:
+                    log.error("archive_stopped", reason="network", attempts=net_failures, error=str(exc))
+                    return 1
+                delay = min(2.0**net_failures, _NET_RETRY_MAX_BACKOFF)
+                log.warning(
+                    "archive_network_retry",
+                    attempt=net_failures,
+                    of=_NET_RETRIES,
+                    delay=delay,
+                    error=str(exc),
+                )
+                time.sleep(delay)
+                continue  # the archive is reentrant: a fresh run resumes where this one died
+            net_failures = 0  # a run that reached its recap clears the streak
             if auth_expired:
                 log.error("archive_stopped", reason="auth_expired", hint="run `miniteams login`")
                 return 1
@@ -291,6 +319,13 @@ def main(argv: list[str] | None = None) -> int:
         "--no-avatars", action="store_true", help="skip downloading group icons / member avatars"
     )
     p_archive.add_argument(
+        "--videos",
+        action="store_true",
+        help="also download meeting recordings and shared video files (large — expect "
+        "hundreds of MB per hour of meeting; combine with --verify-media or --assets-only "
+        "to sweep chats already archived without videos)",
+    )
+    p_archive.add_argument(
         "--verify-media",
         action="store_true",
         help="re-check every message's assets against disk (even backfilled chats), "
@@ -343,6 +378,9 @@ def main(argv: list[str] | None = None) -> int:
     # every cycle, which is exactly the hammering the backoff exists to stop.
     if getattr(args, "retry_assets", False) and getattr(args, "loop", None) is not None:
         parser.error("--retry-assets is a one-shot recovery flag; it cannot be combined with --loop")
+    # Videos ride the media pass; without it the flag would be a silent no-op.
+    if getattr(args, "videos", False) and getattr(args, "no_media", False):
+        parser.error("--videos requires media downloads; drop --no-media")
 
     settings = Settings()  # type: ignore[call-arg]  # tenant_id comes from env/.env
     if args.device_code:

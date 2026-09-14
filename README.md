@@ -43,6 +43,8 @@ uv run miniteams archive --thread 19:xxx@thread.v2     # archive one conversatio
 uv run miniteams archive --no-media                    # messages only, skip attachments
 uv run miniteams archive --verify-media                # re-check every asset on disk, fetch missing
                                                        # (recovers old transcripts from SharePoint too)
+uv run miniteams archive --videos --verify-media       # also grab meeting recordings + shared videos
+                                                       # (large; --verify-media sweeps existing chats)
 uv run miniteams archive --loop 600                    # re-run forever, sleeping 600s between runs
                                                        # (bare --loop = 300s); stops on auth expiry
 uv run miniteams dump             # dump your Notes' full history (oldest → newest)

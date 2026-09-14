@@ -69,6 +69,24 @@ def test_retry_assets_cannot_be_looped(capsys, monkeypatch) -> None:
     assert "cannot be combined with --loop" in capsys.readouterr().err
 
 
+def test_videos_conflicts_with_no_media(capsys, monkeypatch) -> None:
+    """--videos rides the media pass; with --no-media it would be a silent no-op."""
+    import pytest
+
+    from miniteams import archive, auth
+
+    async def fake_run_archive(settings, data_dir, **kw):
+        raise AssertionError("guard bypassed: the archive run must never start")
+
+    monkeypatch.setattr(archive, "run_archive", fake_run_archive)
+    monkeypatch.setattr(auth.TokenSource, "acquire", lambda self: {"access_token": "x"})
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["archive", "--videos", "--no-media"])
+    assert exc.value.code == 2
+    assert "drop --no-media" in capsys.readouterr().err
+
+
 def test_assets_only_no_longer_forces_denied_assets(monkeypatch) -> None:
     """--assets-only is scope, not policy: it must respect the backoff unless --retry-assets."""
     from miniteams import archive, auth
@@ -90,3 +108,92 @@ def test_assets_only_no_longer_forces_denied_assets(monkeypatch) -> None:
     seen.clear()
     assert cli.main(["archive", "--assets-only", "--retry-assets"]) == 0
     assert seen["retry_assets"] is True  # the policy is opted into explicitly
+
+
+def _archive_retry_case(monkeypatch, outcomes: list[Any], argv: list[str]) -> tuple[int, list[float]]:
+    """Drive `miniteams archive` over a scripted sequence of run_archive outcomes (exception
+    instances are raised, values returned) with every sleep captured instead of served."""
+    import time
+
+    from miniteams import archive, auth
+
+    slept: list[float] = []
+    pending = list(outcomes)
+
+    async def fake_run_archive(settings, data_dir, **kw):
+        outcome = pending.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(archive, "run_archive", fake_run_archive)
+    monkeypatch.setattr(auth.TokenSource, "acquire", lambda self: {"access_token": "x"})
+    monkeypatch.setattr(time, "sleep", slept.append)
+    return cli.main(argv), slept
+
+
+def test_archive_retries_transport_resets(monkeypatch) -> None:
+    """A reset mid-run is transient; the archive is reentrant, so a fresh run resumes it."""
+    import httpx
+
+    rc, slept = _archive_retry_case(
+        monkeypatch,
+        [
+            ConnectionResetError(104, "Connection reset by peer"),
+            httpx.ConnectError("[Errno 104] Connection reset by peer"),
+            httpx.RemoteProtocolError("server disconnected"),
+            False,  # completed run, not auth-expired
+        ],
+        ["archive"],
+    )
+    assert rc == 0
+    assert slept == [2.0, 4.0, 8.0]  # backoff grows per consecutive failure
+
+
+def test_archive_gives_up_after_four_retries(monkeypatch) -> None:
+    """msal talks over requests, whose RequestException subclasses OSError — same guard."""
+    import pytest
+
+    requests = pytest.importorskip("requests")  # transitive via msal
+    boom = requests.exceptions.ConnectionError(
+        "('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))"
+    )
+    rc, slept = _archive_retry_case(monkeypatch, [boom] * 6, ["archive"])
+    assert rc == 1
+    assert len(slept) == 4  # four retries, then the fifth failure gives up
+
+
+def test_archive_retry_streak_resets_on_a_completed_run(monkeypatch) -> None:
+    """--loop runs for days: without the reset, four resets spread over a week would kill it."""
+    import httpx
+
+    fail = httpx.ReadError("connection reset")
+    rc, slept = _archive_retry_case(
+        monkeypatch,
+        [fail] * 4 + [False] + [fail] * 4 + [False] + [KeyboardInterrupt()],
+        ["archive", "--loop", "300"],
+    )
+    assert rc == 0  # the 8th failure is only the 4th of its streak, so the run survives
+    # Two backoff ladders, each restarted from scratch, plus one inter-cycle loop sleep each.
+    assert slept == [2.0, 4.0, 8.0, 16.0, 300, 2.0, 4.0, 8.0, 16.0, 300]
+
+
+def _status_error(code: int) -> Any:
+    import httpx
+
+    req = httpx.Request("GET", "https://chatsvc.example/x")
+    return httpx.HTTPStatusError(str(code), request=req, response=httpx.Response(code, request=req))
+
+
+def test_archive_retries_upstream_5xx(monkeypatch) -> None:
+    """A chatsvc 502/503 is as transient as a reset — get_with_retry backs off on 429 only."""
+    rc, slept = _archive_retry_case(monkeypatch, [_status_error(503), _status_error(502), False], ["archive"])
+    assert rc == 0
+    assert slept == [2.0, 4.0]
+
+
+def test_archive_does_not_retry_4xx(monkeypatch) -> None:
+    """401/403/404 do not heal by waiting: surface them instead of burning the retry budget."""
+    rc, slept = _archive_retry_case(monkeypatch, [_status_error(401)], ["archive"])
+    assert rc == 1
+    assert slept == []

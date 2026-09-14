@@ -10,6 +10,7 @@ resumes with no gap and no duplicate — see `archive_store` for the storage inv
 """
 
 import asyncio
+import json
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -218,6 +219,7 @@ async def _download_media(
     sp_token: Callable[[str], str | None] | None = None,
     graph_token: Callable[[], str | None] | None = None,
     ignore_denied: bool = False,
+    videos: bool = False,
 ) -> int:
     """Best-effort pass: download every stored message's attachments at original quality.
 
@@ -232,12 +234,18 @@ async def _download_media(
     verdict would lose it. `ignore_denied` (--retry-assets) forces both; fresh failures are recorded
     either way.
     """
-    targets = [
-        m
-        for m in store.iter_messages()
-        if attachments.extract(m.get("content") or "", str(m.get("messagetype") or ""))
-    ]
+    targets: list[dict[str, Any]] = []
+    recordings: list[dict[str, Any]] = []
+    for m in store.iter_messages():
+        content, msgtype = m.get("content") or "", str(m.get("messagetype") or "")
+        if msgtype == "RichText/Media_CallRecording":
+            recordings.append(m)
+        if attachments.extract(content, msgtype, videos=videos):
+            targets.append(m)
     if not targets:
+        # Still derive the recordings manifest: a chat can hold recording messages whose only
+        # copies aren't downloadable under current flags, and the pairing info is message-derived.
+        _write_recordings_manifest(store, recordings)
         return 0
     denied = set() if ignore_denied else store.denied_urls(_now_iso())
     skipped = 0
@@ -276,6 +284,7 @@ async def _download_media(
                     graph_token=graph_token,
                     skip_url=_skip,
                     on_fail=_on_fail,
+                    videos=videos,
                 )
             except Exception as exc:  # noqa: BLE001 — one message's media must not abort the pass
                 log.debug("message_media_failed", id=message.get("id"), error=str(exc))
@@ -299,7 +308,27 @@ async def _download_media(
                 )
     if skipped:
         log.info("media_denied_skipped", chat=label, thread=store.thread_id, skipped=skipped)
+    _write_recordings_manifest(store, recordings)
     return fetched
+
+
+def _write_recordings_manifest(store: ChatStore, recordings: list[dict[str, Any]]) -> None:
+    """`media/recordings.json`: one entry per Media_CallRecording message, pairing the recording
+    with its on-disk video/transcript files. Filenames alone can't link them (sp-<sha1> vs
+    driveItem names), so the pairing is derived from the messages and rewritten every media pass
+    — pure derived data, safe to regenerate."""
+    entries = []
+    for m in recordings:
+        entry = attachments.recording_files(m.get("content") or "", store.media_dir)
+        entry["message_id"] = m.get("id")
+        entry["composetime"] = m.get("composetime")
+        entries.append(entry)
+    if not entries:
+        return
+    store.media_dir.mkdir(parents=True, exist_ok=True)
+    path = store.media_dir / "recordings.json"
+    path.write_text(json.dumps(entries, ensure_ascii=False, indent=2) + "\n")
+    path.chmod(0o600)  # meeting titles: owner-only, like the transcripts it indexes
 
 
 async def _download_avatars(store: ChatStore, info: dict[str, Any], skype_token: str, bearer: str) -> int:
@@ -327,6 +356,7 @@ async def archive_chat(
     conv: dict[str, Any] | None = None,
     download_media: bool = True,
     download_avatars: bool = True,
+    download_videos: bool = False,
     verify_media: bool = False,
     assets_only: bool = False,
     retry_assets: bool = False,
@@ -344,7 +374,13 @@ async def archive_chat(
         try:
             if store.count():
                 media = await _download_media(
-                    store, skype_token, thread_id, sp_token, graph_token, ignore_denied=retry_assets
+                    store,
+                    skype_token,
+                    thread_id,
+                    sp_token,
+                    graph_token,
+                    ignore_denied=retry_assets,
+                    videos=download_videos,
                 )
                 index.touch(thread_id, _now_iso())
                 log.info("chat_assets", thread=thread_id, total=store.count(), media=media)
@@ -399,7 +435,13 @@ async def archive_chat(
             new_old = _backfill(settings, skype_token, thread_id, store, index, label)
         media = (
             await _download_media(
-                store, skype_token, label, sp_token, graph_token, ignore_denied=retry_assets
+                store,
+                skype_token,
+                label,
+                sp_token,
+                graph_token,
+                ignore_denied=retry_assets,
+                videos=download_videos,
             )
             if download_media
             else 0
@@ -439,6 +481,7 @@ async def run_archive(
     include_all: bool = False,
     download_media: bool = True,
     download_avatars: bool = True,
+    download_videos: bool = False,
     verify_media: bool = False,
     assets_only: bool = False,
     retry_denied: bool = False,
@@ -512,6 +555,7 @@ async def run_archive(
                     conv=conv,
                     download_media=download_media,
                     download_avatars=download_avatars,
+                    download_videos=download_videos,
                     verify_media=verify_media,
                     assets_only=assets_only,
                     retry_assets=retry_assets,

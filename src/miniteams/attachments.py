@@ -7,10 +7,12 @@ whitelisted `api.asm.skype.com` / `*.asyncgw.teams.microsoft.com` hosts. Files n
 `GET <uri>/views/original/status` for metadata, then GET its `view_location` for the bytes.
 """
 
+import asyncio
 import base64
 import hashlib
 import re
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -18,7 +20,7 @@ from urllib.parse import urlsplit
 import httpx
 import structlog
 
-from miniteams.http import aget_with_retry
+from miniteams.http import aget_with_retry, astream_with_retry
 
 log = structlog.get_logger()
 
@@ -46,6 +48,8 @@ _CTYPE_EXT = {
     "text/vtt": ".vtt",
     "application/json": ".json",
     "text/plain": ".txt",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
 }
 _VIEW_RE = re.compile(r"/views/[^/?#]+")
 _FULL_VIEW = "imgpsh_fullsize"  # full-resolution view (vs the bounded `imgo` Teams references)
@@ -70,37 +74,107 @@ def _safe_name(name: str) -> str:
     return Path(name).name or "file"
 
 
-def extract(content: str, msgtype: str) -> list[dict[str, str]]:
-    """Pull attachment references out of message content. No network."""
+def _is_video_url(url: str) -> bool:
+    return "/:v:/" in url.lower() or bool(_VIDEO_EXT.search(url))
+
+
+_TITLE_RE = re.compile(r"<Title>([^<]*)</Title>")
+_ORIGNAME_RE = re.compile(r'<OriginalName v="([^"]*)"')
+_DURATION_RE = re.compile(r'duration="([^"]*)"')
+
+
+def recording_files(content: str, media_dir: Path) -> dict[str, Any]:
+    """Manifest entry for one Media_CallRecording message: which of its video/transcript
+    files exist on disk. Filenames alone can't pair them (sp-<sha1> vs driveItem names) —
+    this derives every candidate name from the message and keeps the ones present."""
+    videos: list[str] = []
+    transcripts: list[str] = []
+
+    def _present(pattern: str) -> list[str]:
+        return sorted(p.name for p in media_dir.glob(pattern) if not p.name.endswith(".part"))
+
+    for tag in _ITEM_RE.findall(content):
+        attrs = _attrs(tag)
+        uri, typ = attrs.get("uri"), attrs.get("type")
+        if not uri:
+            continue
+        if typ == "onedriveForBusinessTranscript":
+            stem = f"sp-{hashlib.sha1(uri.split('?')[0].encode()).hexdigest()[:16]}.transcript"
+            transcripts += _present(f"{stem}.*")
+        elif typ == "amsTranscript":
+            transcripts += _present(f"{_object_id(uri)}.transcript.*")
+        elif typ == "amsVideo":
+            videos += _present(f"{_object_id(uri)}.video.*")
+    orig = _ORIGNAME_RE.search(content)
+    if orig:
+        name = _safe_name(orig.group(1))
+        if (media_dir / name).exists():
+            videos.insert(0, name)  # SharePoint copy first: durable, human-named
+    title = _TITLE_RE.search(content)
+    duration = _DURATION_RE.search(content)
+    return {
+        "title": title.group(1) if title else "",
+        "duration": duration.group(1) if duration else "",
+        "videos": videos,
+        "transcripts": transcripts,
+    }
+
+
+def extract(content: str, msgtype: str, videos: bool = False) -> list[dict[str, str]]:
+    """Pull attachment references out of message content. No network.
+
+    `videos=True` opts in to meeting recordings and shared video files (GB-scale — excluded
+    by default). The durable SharePoint copy rides the `sp_file` Graph path; the fast-expiring
+    AMS copy (`amsVideo`) is emitted as a trailing `video` fallback: SharePoint blocks the
+    file download of recordings owned by others ("block download" policy — streaming only),
+    while the AMS object host still serves the bytes with the skype token."""
     items: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()  # a recording's :v: URL is both an <item> and the Play <a>
+    # AMS fallbacks go LAST: process() walks items in order and must learn whether the
+    # SharePoint copy resolved before deciding to pull the (redundant) AMS bytes.
+    ams_videos: list[str] = []
+
+    def _add(kind: str, url: str) -> None:
+        if (kind, url) not in seen:
+            seen.add((kind, url))
+            items.append({"kind": kind, "url": url})
+
     for tag in _IMG_RE.findall(content):
         attrs = _attrs(tag)
         if attrs.get("itemtype") == _AMSIMAGE and attrs.get("src"):
-            items.append({"kind": "image", "url": attrs["src"]})
+            _add("image", attrs["src"])
     for tag in _URIOBJ_RE.findall(content):
         attrs = _attrs(tag)
         url = attrs.get("uri") or attrs.get("url_thumbnail")
         if url:
-            items.append({"kind": "file", "url": url})
-    # Meeting-recording transcript (the video item is intentionally left out — huge, and the
-    # SharePoint "Play" link in the same message already preserves the recording). Two sources:
-    # `amsTranscript` (fast-expiring AMS copy, skype-token) and `onedriveForBusinessTranscript`
-    # (durable SharePoint copy, needs a SharePoint bearer) — capture both, dedup on download.
+            _add("file", url)
+    # Meeting-recording items. Two transcript sources: `amsTranscript` (fast-expiring AMS copy,
+    # skype-token) and `onedriveForBusinessTranscript` (durable SharePoint copy, needs a
+    # SharePoint bearer) — capture both, dedup on download.
     for tag in _ITEM_RE.findall(content):
         attrs = _attrs(tag)
         if attrs.get("type") == "amsTranscript" and attrs.get("uri"):
-            items.append({"kind": "transcript", "url": attrs["uri"]})
+            _add("transcript", attrs["uri"])
         elif attrs.get("type") == "onedriveForBusinessTranscript" and attrs.get("uri"):
-            items.append({"kind": "sp_transcript", "url": attrs["uri"]})
+            _add("sp_transcript", attrs["uri"])
+        elif videos and attrs.get("type") == "onedriveForBusinessVideo" and attrs.get("uri"):
+            _add("sp_file", attrs["uri"])  # recording on OneDrive: same Graph /shares path as docs
+        elif videos and attrs.get("type") == "amsVideo" and attrs.get("uri"):
+            ams_videos.append(attrs["uri"])
     # SharePoint-hosted documents shared into the chat (xls/ppt/pdf/doc) — fetched via Graph.
-    # Videos (:v:) and folders (:f:) are deliberately left out.
+    # Videos (:v:) and folders (:f:) are left out unless `videos` opts in.
     for tag in _A_RE.findall(content):
         attrs = _attrs(tag)
         href = attrs.get("href") or ""
-        if "sharepoint.com" not in href or "/:v:/" in href.lower() or _VIDEO_EXT.search(href):
-            continue  # not SharePoint, or a video (excluded)
-        if attrs.get("itemtype") == _FILE_LINK or _SP_DOC_PREFIX.search(href):
-            items.append({"kind": "sp_file", "url": href})
+        if "sharepoint.com" not in href:
+            continue
+        is_video = _is_video_url(href)
+        if is_video and not videos:
+            continue  # excluded by default (huge)
+        if is_video or attrs.get("itemtype") == _FILE_LINK or _SP_DOC_PREFIX.search(href):
+            _add("sp_file", href)
+    for url in ams_videos:
+        _add("video", url)
     return items
 
 
@@ -109,10 +183,9 @@ async def _stream_to(client: httpx.AsyncClient, url: str, token: str, dest: Path
     # and CPython rarely returns freed arenas to the OS — so one fat attachment pins RSS for the
     # life of the (forever-running) stream. Chunked writes cap peak RAM at one chunk.
     try:
-        async with client.stream(
-            "GET", url, headers={"Accept": "*/*"}, cookies={"skypetoken_asm": token}
+        async with astream_with_retry(
+            client, url, headers={"Accept": "*/*"}, cookies={"skypetoken_asm": token}
         ) as resp:
-            resp.raise_for_status()
             with dest.open("wb") as fh:
                 async for chunk in resp.aiter_bytes(65536):
                     fh.write(chunk)
@@ -132,19 +205,50 @@ def _existing(media_dir: Path, stem: str) -> str | None:
     return None
 
 
+# Per-destination serialization: the same asset referenced by several messages (duplicate
+# recording posts, re-shared files) is downloaded concurrently by the media pass, and every
+# helper writes the same deterministic `.part` path — two writers truncate/mutate each other's
+# bytes and a late failure can leave a corrupt dest that skip-if-exists trusts forever. One
+# lock per dest key: the winner downloads, waiters re-check skip-if-exists and return the file.
+_dl_locks: dict[str, asyncio.Lock] = {}
+_dl_refs: dict[str, int] = {}
+
+
+@asynccontextmanager
+async def _serialized(key: str) -> AsyncGenerator[None]:
+    # Refcounted so entries are dropped as soon as no task holds or awaits them (bounded dict
+    # in a forever-running process). Single event loop: the counter updates are atomic.
+    _dl_refs[key] = _dl_refs.get(key, 0) + 1
+    lock = _dl_locks.setdefault(key, asyncio.Lock())
+    try:
+        async with lock:
+            yield
+    finally:
+        remaining = _dl_refs[key] - 1
+        if remaining:
+            _dl_refs[key] = remaining
+        else:
+            del _dl_refs[key], _dl_locks[key]
+
+
 async def _fetch_image(client: httpx.AsyncClient, token: str, url: str, media_dir: Path, suffix: str) -> str:
     stem = f"{_object_id(url)}{suffix}"
-    cached = _existing(media_dir, stem)
-    if cached:
-        return cached  # skip re-download (archive re-runs, same object across messages)
-    # Content-type is in the response headers (available before the body), so name the file after
-    # a HEAD-cheap streamed GET. Write to a temp path first, then rename once the ext is known.
-    tmp = media_dir / f"{stem}.part"
-    headers = await _stream_to(client, url, token, tmp)
-    ext = _CTYPE_EXT.get((headers.get("content-type") or "").split(";")[0], ".img")
-    dest = media_dir / f"{_object_id(url)}{suffix}{ext}"
-    tmp.rename(dest)
-    return str(dest)
+    async with _serialized(str(media_dir / stem)):
+        cached = _existing(media_dir, stem)
+        if cached:
+            return cached  # skip re-download (archive re-runs, same object across messages)
+        # Content-type is in the response headers (available before the body), so name the file
+        # after a HEAD-cheap streamed GET. Write to a temp path first, rename once the ext is known.
+        tmp = media_dir / f"{stem}.part"
+        headers = await _stream_to(client, url, token, tmp)
+        ext = _CTYPE_EXT.get((headers.get("content-type") or "").split(";")[0], ".img")
+        dest = media_dir / f"{_object_id(url)}{suffix}{ext}"
+        tmp.rename(dest)
+        if suffix == ".video":
+            # info, not debug — videos are rare and huge; one line per FRESH download only
+            # (the cached early-return above never reaches here, so loop re-runs stay quiet).
+            log.info("video_downloaded", source="ams", path=str(dest), bytes=dest.stat().st_size)
+        return str(dest)
 
 
 # Both renditions of the same SharePoint transcript, neither derivable from the other: the JSON
@@ -180,33 +284,8 @@ async def _download_sp_transcript(
     failures: list[tuple[str, Exception]] = []
     for fmt, ext, ctype in _SP_RENDITIONS:
         dest = media_dir / f"{stem}{ext}"
-        if dest.exists():
-            got.append(dest)
-            continue
-        # Per-rendition cache key: one rendition permanently gone must never suppress the other.
-        if skip_url and skip_url(f"{url}#{ext}"):
-            continue
-        tmp = media_dir / f"{stem}{ext}.part"
-        try:
-            resp = await aget_with_retry(
-                client,
-                url,
-                params={"format": fmt} if fmt else {},
-                headers=headers,
-                follow_redirects=True,
-            )
-            if (resp.headers.get("content-type") or "").split(";")[0] != ctype:
-                # Server ignored `format`: those bytes under this extension would mislabel them.
-                raise RuntimeError(f"unexpected content-type {resp.headers.get('content-type')!r}")
-            tmp.write_bytes(resp.content)  # transcripts are small text
-            tmp.rename(dest)
-            # Named speaker turns for every participant: keep them owner-only, like the token cache.
-            dest.chmod(0o600)
-        except Exception as exc:  # noqa: BLE001 — one rendition may 404 while the other serves
-            tmp.unlink(missing_ok=True)  # never leave partial bytes a later skip would trust
-            failures.append((ext, exc))
-            continue
-        got.append(dest)
+        async with _serialized(str(dest)):
+            await _sp_rendition(client, url, headers, fmt, ext, ctype, dest, got, failures, skip_url)
     # Report before raising: a total failure must still record BOTH renditions under their own key,
     # or the retry policy never sees them and every pass re-requests a dead URL.
     for ext, failure in failures:
@@ -218,6 +297,47 @@ async def _download_sp_transcript(
             raise _AllSuppressed(url)
         raise failures[0][1]  # the original error, so the caller can read its HTTP status
     return str(got[0])
+
+
+async def _sp_rendition(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    fmt: str,
+    ext: str,
+    ctype: str,
+    dest: Path,
+    got: list[Path],
+    failures: list[tuple[str, Exception]],
+    skip_url: Callable[[str], bool] | None,
+) -> None:
+    if dest.exists():
+        got.append(dest)
+        return
+    # Per-rendition cache key: one rendition permanently gone must never suppress the other.
+    if skip_url and skip_url(f"{url}#{ext}"):
+        return
+    tmp = dest.with_name(f"{dest.name}.part")
+    try:
+        resp = await aget_with_retry(
+            client,
+            url,
+            params={"format": fmt} if fmt else {},
+            headers=headers,
+            follow_redirects=True,
+        )
+        if (resp.headers.get("content-type") or "").split(";")[0] != ctype:
+            # Server ignored `format`: those bytes under this extension would mislabel them.
+            raise RuntimeError(f"unexpected content-type {resp.headers.get('content-type')!r}")
+        tmp.write_bytes(resp.content)  # transcripts are small text
+        tmp.rename(dest)
+        # Named speaker turns for every participant: keep them owner-only, like the token cache.
+        dest.chmod(0o600)
+    except Exception as exc:  # noqa: BLE001 — one rendition may 404 while the other serves
+        tmp.unlink(missing_ok=True)  # never leave partial bytes a later skip would trust
+        failures.append((ext, exc))
+        return
+    got.append(dest)
 
 
 _GRAPH = "https://graph.microsoft.com/v1.0"
@@ -239,20 +359,28 @@ async def _download_sp_file(
         return None
     name = _safe_name(str(info.get("name") or "file"))
     dest = media_dir / name
-    if dest.exists():
-        return str(dest)  # skip re-download
-    media_dir.mkdir(parents=True, exist_ok=True)
-    resp = await aget_with_retry(
-        client, f"{_GRAPH}/shares/{share}/driveItem/content", headers=hdr, follow_redirects=True
-    )
-    tmp = media_dir / f"{name}.part"
-    try:
-        tmp.write_bytes(resp.content)
-        tmp.rename(dest)
-    except BaseException:
-        tmp.unlink(missing_ok=True)  # a truncated file would look complete to a later skip-if-exists
-        raise
-    return str(dest)
+    async with _serialized(str(dest)):
+        if dest.exists():
+            return str(dest)  # skip re-download
+        media_dir.mkdir(parents=True, exist_ok=True)
+        tmp = media_dir / f"{name}.part"
+        try:
+            # Streamed, not buffered: shared items include meeting recordings (GBs) — a whole-body
+            # `.content` read would pin RSS by the full file size (see _stream_to).
+            async with astream_with_retry(
+                client, f"{_GRAPH}/shares/{share}/driveItem/content", headers=hdr, follow_redirects=True
+            ) as resp:
+                with tmp.open("wb") as fh:
+                    async for chunk in resp.aiter_bytes(65536):
+                        fh.write(chunk)
+            tmp.rename(dest)
+        except BaseException:
+            tmp.unlink(missing_ok=True)  # truncated file would look complete to a later skip-if-exists
+            raise
+        if _is_video_url(url):
+            # One line per fresh video download (cached early-return above stays quiet).
+            log.info("video_downloaded", source="sharepoint", path=str(dest), bytes=dest.stat().st_size)
+        return str(dest)
 
 
 async def _download_image(
@@ -294,12 +422,13 @@ async def _download_file(
     if info.get("content_state") != "ready" or not view:
         return None, name, size  # not ready yet — surface the ref only
     dest = media_dir / name
-    if dest.exists():
-        return str(dest), name, size  # already downloaded — skip
-    tmp = media_dir / f"{name}.part"
-    await _stream_to(client, view, token, tmp)  # chunked: files can be arbitrarily large
-    tmp.rename(dest)  # atomic: dest either absent or complete
-    return str(dest), name, size
+    async with _serialized(str(dest)):
+        if dest.exists():
+            return str(dest), name, size  # already downloaded — skip
+        tmp = media_dir / f"{name}.part"
+        await _stream_to(client, view, token, tmp)  # chunked: files can be arbitrarily large
+        tmp.rename(dest)  # atomic: dest either absent or complete
+        return str(dest), name, size
 
 
 async def process(
@@ -313,6 +442,7 @@ async def process(
     graph_token: Callable[[], str | None] | None = None,
     skip_url: Callable[[str], bool] | None = None,
     on_fail: Callable[[str, Exception], None] | None = None,
+    videos: bool = False,
 ) -> list[str]:
     """Return human annotations for the print line, downloading bytes when enabled.
 
@@ -322,7 +452,7 @@ async def process(
     a Graph bearer for SharePoint-hosted shared documents. Without them those items are refs only.
     `skip_url(url)` vetoes a download (ref-only note, no network) — the archive's denied-asset
     cache; `on_fail(url, exc)` observes each failed download so callers can feed that cache."""
-    items = extract(content, msgtype)
+    items = extract(content, msgtype, videos=videos)
     notes: list[str] = []
     _remote = {"sp_transcript", "sp_file"}
     _ref_label = {"sp_transcript": "transcript(sp)", "sp_file": "file(sp)"}
@@ -333,11 +463,27 @@ async def process(
 
     owns_client = client is None
     client = client or httpx.AsyncClient(timeout=60.0)
+    sp_video_ok = False  # durable copy secured → the trailing AMS `video` fallback is redundant
     try:
         for item in items:
             url, kind = item["url"], item["kind"]
             if skip_url and skip_url(url):
                 notes.append(f"[{_ref_label.get(kind, kind)}: {url}]")
+                continue
+            if kind == "video":
+                # AMS recording copy: fallback only — SharePoint "block download" recordings
+                # (owned by others) stream-only there, but the AMS object host still serves them.
+                if sp_video_ok or not (download and _downloadable(url)):
+                    notes.append(f"[video: {url}]")
+                    continue
+                try:
+                    path = await _fetch_image(client, token, url, media_dir, suffix=".video")
+                    notes.append(f"[video: {url} → {Path(path).resolve().as_uri()}]")
+                except Exception as exc:  # noqa: BLE001 — best-effort; ref-only on failure
+                    log.debug("ams_video_failed", url=url, error=str(exc))
+                    if on_fail:
+                        on_fail(url, exc)
+                    notes.append(f"[video: {url}]")
                 continue
             if kind == "sp_transcript":
                 bearer = sp_token(urlsplit(url).hostname or "") if (download and sp_token) else None
@@ -362,6 +508,11 @@ async def process(
                 try:
                     fpath = await _download_sp_file(client, url, gtok, media_dir)
                     if fpath:
+                        if _is_video_url(url):
+                            # ponytail: message-global flag — one SP video success mutes every AMS
+                            # fallback in the message; pair by recording id if multi-recording
+                            # messages ever appear (today's corpus: one recording per message).
+                            sp_video_ok = True
                         notes.append(f"[file: {url} → {Path(fpath).resolve().as_uri()}]")
                     else:
                         notes.append(f"[file(sp): {url}]")  # folder/site/page — not a file
