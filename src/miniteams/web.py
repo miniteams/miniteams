@@ -16,6 +16,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from http import HTTPStatus
 from importlib.resources import files
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -162,13 +163,37 @@ class Board:
         directory: Directory | None = None,
         reactions: bool = False,
         typing_ttl: float = _TYPING_TTL,
+        seen_path: Path | None = None,
     ) -> None:
         self.rows = rows
         self.directory = directory
         self.reactions = reactions
         self.typing_ttl = typing_ttl
+        self.seen_path = seen_path
         self.clients: set[ServerConnection] = set()
         self._typing_timers: dict[tuple[str, str], asyncio.TimerHandle] = {}
+        self._seen: dict[str, str] = _load_seen(seen_path)
+        for row in rows.values():
+            row["seen_at"] = self._seen.get(row["id"])
+
+    # --- seen marker (page verb) ---
+
+    def mark_seen(self, thread_id: str, at: str | None = None) -> bool:
+        """Stamp `at` (the activity the page showed when clicked) as seen; hidden until newer lands.
+
+        A message that landed between render and click keeps the row visible: the stamp never
+        exceeds what the user actually looked at.
+        """
+        row = self.rows.get(thread_id)
+        if row is None or not row.get("last_activity"):
+            return False
+        stamp = min(at, row["last_activity"]) if at else row["last_activity"]
+        self._seen[thread_id] = row["seen_at"] = stamp
+        if self.seen_path is not None:
+            self.seen_path.parent.mkdir(parents=True, exist_ok=True)
+            self.seen_path.write_text(json.dumps(self._seen, ensure_ascii=False, indent=0))
+        self.broadcast()
+        return True
 
     # --- live events (stream hook) ---
 
@@ -200,7 +225,12 @@ class Board:
         row = self.rows.get(thread_id)
         if row is None:
             label = await self.directory.label(thread_id) if self.directory else thread_id
-            row = self.rows[thread_id] = {"id": thread_id, "label": label, "seen_at": None, "typing": []}
+            row = self.rows[thread_id] = {
+                "id": thread_id,
+                "label": label,
+                "seen_at": self._seen.get(thread_id),
+                "typing": [],
+            }
         sender = await self._sender(resource)
         row.update(
             last_activity=str(resource.get("composetime") or resource.get("originalarrivaltime") or ""),
@@ -303,9 +333,27 @@ class Board:
         try:
             await ws.send(self.payload())
             async for raw in ws:
-                log.debug("ws_client_message", data=str(raw)[:100])  # `seen` lands here (phase 3)
+                try:
+                    verb = json.loads(raw)
+                except json.JSONDecodeError, TypeError:
+                    verb = None
+                if isinstance(verb, dict) and isinstance(verb.get("seen"), str):
+                    at = verb.get("at")
+                    self.mark_seen(verb["seen"], at if isinstance(at, str) else None)
+                else:
+                    log.debug("ws_client_message_ignored", data=str(raw)[:100])
         finally:
             self.clients.discard(ws)
+
+
+def _load_seen(path: Path | None) -> dict[str, str]:
+    if path is None:
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except OSError, ValueError:
+        return {}
+    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
 
 
 def _page() -> str:
@@ -349,7 +397,7 @@ async def run(
     directory.set_token(skype_token, bearer)
     rows = await bootstrap(fetch_conversations(settings, skype_token), directory, limit)
     log.info("web_bootstrap", rows=len(rows))
-    board = Board(rows, directory, reactions=reactions)
+    board = Board(rows, directory, reactions=reactions, seen_path=settings.config_dir / "seen.json")
     # The stream only returns when auth is dead: a page that silently stops updating is worse
     # than an exit, so the server goes down with it and the user re-runs.
     server = asyncio.create_task(serve_board(board, settings, bind))

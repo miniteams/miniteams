@@ -1,6 +1,6 @@
 # 002 — Web widget (live conversation list)
 
-**Status**: in progress
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-09-15
 
@@ -54,21 +54,21 @@ until a new message arrives; a toggle shows hidden rows anyway.
 
 ## Acceptance criteria
 
-- [ ] `uv run miniteams web` logs a `http://127.0.0.X:PORT/` URL; the page lists the same set
+- [x] `uv run miniteams web` logs a `http://127.0.0.X:PORT/` URL; the page lists the same set
       as `uv run miniteams chats --all --limit 50` minus channels, ordered by last message time
       (`chats` itself prints the server's *version* order, which membership bumps also move),
       each with label + last author + snippet.
-- [ ] Restarting the process yields the same URL; `--bind` changes it.
-- [ ] `--bind` refuses a non-loopback address; a websocket opened from another origin gets 403.
-- [ ] A message received on any in-scope thread moves its row to the top within a second, no
+- [x] Restarting the process yields the same URL; `--bind` changes it.
+- [x] `--bind` refuses a non-loopback address; a websocket opened from another origin gets 403.
+- [x] A message received on any in-scope thread moves its row to the top within a second, no
       page reload; a thread absent from the list appears.
-- [ ] Someone typing shows `✍ Name` on the row while it lasts; it clears on ClearTyping or 10s.
-- [ ] With `--reactions`, a reaction becomes the row's last event and bumps it; without, it is
+- [x] Someone typing shows `✍ Name` on the row while it lasts; it clears on ClearTyping or 10s.
+- [x] With `--reactions`, a reaction becomes the row's last event and bumps it; without, it is
       ignored.
-- [ ] Clicking **seen** hides the row; it stays hidden across page reload and process restart.
-- [ ] A new message on a hidden thread un-hides it.
-- [ ] "Show hidden" toggle reveals hidden rows (visually dimmed); un-toggling hides them again.
-- [ ] `stream` / `chats` behaviour and output unchanged (`uv run pytest` green).
+- [x] Clicking **seen** hides the row; it stays hidden across page reload and process restart.
+- [x] A new message on a hidden thread un-hides it.
+- [x] "Show hidden" toggle reveals hidden rows (visually dimmed); un-toggling hides them again.
+- [x] `stream` / `chats` behaviour and output unchanged (`uv run pytest` green).
 
 ## Phases
 

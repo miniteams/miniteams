@@ -402,3 +402,80 @@ async def test_reaction_becomes_last_event_and_bumps(board: W.Board) -> None:
     assert row["last_activity"] == "2026-09-16T23:06:40.000Z"
     await board.on_event(_reaction("19:unknown@thread.v2", "1", "like", "8:orgid:x", 1))  # no row: ignored
     assert "19:unknown@thread.v2" not in board.rows
+
+
+# --- seen marker (phase 3) ---
+
+
+async def test_seen_persists_and_newer_message_unhides(
+    quiet_directory: Directory, settings: Settings
+) -> None:
+    seen_path = settings.config_dir / "seen.json"
+    rows = {
+        "19:a@thread.v2": {
+            "id": "19:a@thread.v2",
+            "label": "A",
+            "last_activity": "2026-09-15T10:00:00Z",
+            "last_id": "1",
+            "sender": "",
+            "text": "",
+            "seen_at": None,
+            "typing": [],
+        }
+    }
+    board = W.Board(rows, quiet_directory, seen_path=seen_path)
+    assert board.mark_seen("19:a@thread.v2") is True
+    assert rows["19:a@thread.v2"]["seen_at"] == "2026-09-15T10:00:00Z"
+    assert json.loads(seen_path.read_text()) == {"19:a@thread.v2": "2026-09-15T10:00:00Z"}
+    assert board.mark_seen("19:nope@thread.v2") is False  # unknown id: no-op, nothing written
+    # The page says what it showed; a message that landed since keeps the row visible.
+    rows["19:a@thread.v2"]["last_activity"] = "2026-09-15T11:00:00Z"
+    assert board.mark_seen("19:a@thread.v2", at="2026-09-15T10:30:00Z") is True
+    assert rows["19:a@thread.v2"]["seen_at"] == "2026-09-15T10:30:00Z"
+    board.mark_seen("19:a@thread.v2", at="2026-09-15T23:00:00Z")  # a stamp from the future is clamped
+    assert rows["19:a@thread.v2"]["seen_at"] == "2026-09-15T11:00:00Z"
+    # A restart reloads the marker onto the bootstrap rows…
+    again = W.Board(
+        {"19:a@thread.v2": dict(rows["19:a@thread.v2"], seen_at=None)}, quiet_directory, seen_path=seen_path
+    )
+    assert again.rows["19:a@thread.v2"]["seen_at"] == "2026-09-15T10:00:00Z"
+    # …and a newer message moves last_activity past it: the page un-hides (seen_at < last_activity).
+    await again.on_event(_msg("19:a@thread.v2", "2026-09-15T12:00:00Z", "new"))
+    row = again.rows["19:a@thread.v2"]
+    assert row["seen_at"] < row["last_activity"]
+    # A thread first seen live still carries its stored marker.
+    await again.on_event(_msg("19:late@thread.v2", "2026-09-15T12:00:00Z", "x"))
+    assert again.rows["19:late@thread.v2"]["seen_at"] is None
+
+
+def test_load_seen_tolerates_missing_or_corrupt(settings: Settings) -> None:
+    path = settings.config_dir / "seen.json"
+    assert W._load_seen(None) == {} and W._load_seen(path) == {}
+    settings.config_dir.mkdir(parents=True)
+    path.write_text("[1, 2]")
+    assert W._load_seen(path) == {}
+    path.write_text('{"19:a@thread.v2": "2026-09-15T10:00:00Z"}')
+    assert W._load_seen(path) == {"19:a@thread.v2": "2026-09-15T10:00:00Z"}
+
+
+async def test_seen_verb_over_websocket(settings: Settings) -> None:
+    board = W.Board(
+        {"t": {"id": "t", "last_activity": "2026-09-15T10:00:00Z", "label": "L", "seen_at": None}},
+        seen_path=settings.config_dir / "seen.json",
+    )
+    port = _free_port()
+    task = asyncio.create_task(W.serve_board(board, settings, f"127.0.0.1:{port}"))
+    try:
+        await asyncio.sleep(0.2)
+        async with websockets.connect(f"ws://127.0.0.1:{port}/ws", origin=f"http://127.0.0.1:{port}") as ws:
+            await ws.recv()
+            await ws.send("not json")  # ignored, socket stays up
+            await ws.send(json.dumps({"seen": 42}))  # wrong shape, ignored
+            await ws.send(json.dumps({"seen": "t", "at": 5}))  # bad `at` shape → ignored, id still stamped
+            frame = json.loads(await ws.recv())
+            assert frame["rows"][0]["seen_at"] == "2026-09-15T10:00:00Z"
+        assert json.loads((settings.config_dir / "seen.json").read_text()) == {"t": "2026-09-15T10:00:00Z"}
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task

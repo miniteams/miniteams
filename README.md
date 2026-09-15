@@ -63,7 +63,9 @@ up, edits/deletes of the last message rewrite it, `✍ Name` shows who is typing
 10s if Teams never says so), and with `--reactions` a reaction becomes the row's last event.
 It binds a random `127.0.0.X:PORT` drawn once and kept in `~/.config/miniteams/web.json` so the
 URL stays bookmarkable; `--bind` overrides it and refuses anything but loopback (no auth on the
-page). The process exits non-zero when the stream dies (auth expired) — re-run it.
+page). Each row has a **seen** button: the row is hidden until something newer lands on that
+chat (state in `~/.config/miniteams/seen.json`); "show seen" reveals hidden rows dimmed. The
+process exits non-zero when the stream dies (auth expired) — re-run it.
 
 `stream` enriches each line with thread name + participants, resolves MRIs → display names
 (cached in `~/.cache/miniteams/names.json`), downloads images/files to `~/.cache/miniteams/media/`

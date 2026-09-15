@@ -10,26 +10,33 @@
   header { display: flex; gap: 1em; align-items: center; padding: .5em 1em; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: Canvas; }
   header h1 { font-size: 1em; margin: 0; flex: 1; }
   #status { color: var(--dim); font-size: .85em; }
+  header label { color: var(--dim); font-size: .85em; white-space: nowrap; }
+  li.hidden { opacity: .45; }
+  li button { grid-row: 1 / span 2; align-self: center; font: inherit; font-size: .85em; padding: .2em .6em; cursor: pointer; }
   #status.off { color: #d33; }
   ul { list-style: none; margin: 0; padding: 0; }
-  li { display: grid; grid-template-columns: 1fr auto; gap: .2em 1em; padding: .5em 1em; border-bottom: 1px solid var(--line); }
+  li { display: grid; grid-template-columns: 1fr auto auto; gap: .2em 1em; padding: .5em 1em; border-bottom: 1px solid var(--line); }
   li .label { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   li .when { color: var(--dim); font-size: .85em; white-space: nowrap; }
-  li .last { grid-column: 1 / -1; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  li .last { grid-column: 1 / span 2; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   li .last b { color: CanvasText; font-weight: 500; }
   li .typing { color: var(--hot); }
   #empty { padding: 2em; text-align: center; color: var(--dim); }
 </style>
 </head>
 <body>
-<header><h1>miniteams</h1><span id="status">connecting…</span></header>
+<header><h1>miniteams</h1><label><input type="checkbox" id="showhidden"> show seen (<span id="nhidden">0</span>)</label><span id="status">connecting…</span></header>
 <ul id="rows"></ul>
 <div id="empty" hidden>nothing yet</div>
 <script>
 (() => {
   const $rows = document.getElementById("rows"), $empty = document.getElementById("empty"),
-        $status = document.getElementById("status");
-  let rows = [];
+        $status = document.getElementById("status"), $show = document.getElementById("showhidden"),
+        $nhidden = document.getElementById("nhidden");
+  let rows = [], ws = null;
+  try { $show.checked = localStorage.getItem("showhidden") === "1"; } catch (e) {}
+  $show.onchange = () => { try { localStorage.setItem("showhidden", $show.checked ? "1" : "0"); } catch (e) {} render(); };
+  const isSeen = (r) => !!r.seen_at && r.seen_at >= r.last_activity;
 
   const ago = (iso) => {
     const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
@@ -42,9 +49,12 @@
 
   const render = () => {
     const sorted = [...rows].sort((a, b) => (a.last_activity < b.last_activity) - (a.last_activity > b.last_activity));
-    $rows.replaceChildren(...sorted.map((r) => {
+    $nhidden.textContent = sorted.filter(isSeen).length;
+    const shown = $show.checked ? sorted : sorted.filter((r) => !isSeen(r));
+    $rows.replaceChildren(...shown.map((r) => {
       const li = document.createElement("li");
       li.dataset.id = r.id;
+      if (isSeen(r)) li.classList.add("hidden");
       const label = Object.assign(document.createElement("span"), { className: "label", textContent: r.label });
       const when = Object.assign(document.createElement("span"), { className: "when", textContent: ago(r.last_activity), title: r.last_activity });
       const last = document.createElement("span"); last.className = "last";
@@ -54,15 +64,18 @@
         const who = Object.assign(document.createElement("b"), { textContent: r.sender ? r.sender + ": " : "" });
         last.append(who, r.text || "");
       }
-      li.append(label, when, last);
+      const seen = Object.assign(document.createElement("button"), { textContent: "seen", disabled: isSeen(r) });
+      // Send what was on screen: a message landing between render and click must stay visible.
+      seen.onclick = () => ws && ws.readyState === 1 && ws.send(JSON.stringify({ seen: r.id, at: r.last_activity }));
+      li.append(label, when, seen, last);
       return li;
     }));
-    $empty.hidden = sorted.length > 0;
+    $empty.hidden = shown.length > 0;
   };
 
   let retry = 1000;
   const connect = () => {
-    const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+    ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
     ws.onopen = () => { retry = 1000; $status.textContent = "live"; $status.classList.remove("off"); };
     ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.rows) { rows = m.rows; render(); } };
     ws.onclose = () => {
