@@ -147,6 +147,21 @@ def cmd_chats(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_web(settings: Settings, args: argparse.Namespace) -> int:
+    """Serve the live conversation-list widget on a loopback address (spec 002)."""
+    import asyncio
+
+    from .web import run
+
+    aad, skype_token = _ensure_skype_token(settings)
+    bearer = str(aad.get("id_token") or aad["access_token"])
+    try:
+        asyncio.run(run(settings, skype_token, bearer, args.limit, args.bind))
+    except KeyboardInterrupt:
+        log.info("interrupted")
+    return 0
+
+
 def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
     """Build/refresh a resumable local archive of chats under data/ (see spec 001)."""
     import asyncio
@@ -237,6 +252,13 @@ def _positive_int(value: str) -> int:
     n = int(value)
     if n < 1:
         raise argparse.ArgumentTypeError("must be >= 1")
+    return n
+
+
+def _non_negative_int(value: str) -> int:
+    n = int(value)
+    if n < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
     return n
 
 
@@ -358,6 +380,13 @@ def main(argv: list[str] | None = None) -> int:
         "stops when authentication breaks",
     )
     p_archive.set_defaults(func=cmd_archive)
+
+    p_web = sub.add_parser("web", help="serve the live conversation-list widget (local page)")
+    p_web.add_argument(
+        "--limit", type=_non_negative_int, default=50, help="max conversations to load (0 = no limit)"
+    )
+    p_web.add_argument("--bind", help="ADDR:PORT to listen on (default: persisted random 127.0.0.X:PORT)")
+    p_web.set_defaults(func=cmd_web)
 
     p_stream = sub.add_parser("stream", help="stream live incoming chat events (M2+)")
     p_stream.add_argument(

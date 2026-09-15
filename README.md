@@ -47,6 +47,8 @@ uv run miniteams archive --videos --verify-media       # also grab meeting recor
                                                        # (large; --verify-media sweeps existing chats)
 uv run miniteams archive --loop 600                    # re-run forever, sleeping 600s between runs
                                                        # (bare --loop = 300s); stops on auth expiry
+uv run miniteams web              # local live page: conversations newest-first (see below)
+uv run miniteams web --limit 0 --bind 127.0.0.5:8765   # load every chat; fixed loopback address
 uv run miniteams dump             # dump your Notes' full history (oldest → newest)
 uv run miniteams dump --thread 19:xxx@thread.v2        # dump a conversation
 uv run miniteams dump --jsonl > notes.jsonl            # full-detail JSON per line
@@ -54,6 +56,12 @@ uv run miniteams dump --jsonl > notes.jsonl            # full-detail JSON per li
 
 `dump --jsonl` emits one full-detail record per message (raw resource + resolved sender/thread
 + attachment refs + reactions), every message type, no media download — pipe-friendly.
+
+`web` serves a single page listing private, group and meeting chats newest-message-first
+(label, last author, snippet). It binds a random `127.0.0.X:PORT` drawn once and kept in
+`~/.config/miniteams/web.json` so the URL stays bookmarkable; `--bind` overrides it and refuses
+anything but loopback (no auth on the page). Live updates and the "seen" marker are the next
+phases of spec 002.
 
 `stream` enriches each line with thread name + participants, resolves MRIs → display names
 (cached in `~/.cache/miniteams/names.json`), downloads images/files to `~/.cache/miniteams/media/`

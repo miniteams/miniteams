@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>miniteams</title>
+<style>
+  :root { color-scheme: light dark; --dim: #888; --line: #8884; --hot: #2f81f7; }
+  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; }
+  header { display: flex; gap: 1em; align-items: center; padding: .5em 1em; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: Canvas; }
+  header h1 { font-size: 1em; margin: 0; flex: 1; }
+  #status { color: var(--dim); font-size: .85em; }
+  #status.off { color: #d33; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { display: grid; grid-template-columns: 1fr auto; gap: .2em 1em; padding: .5em 1em; border-bottom: 1px solid var(--line); }
+  li .label { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  li .when { color: var(--dim); font-size: .85em; white-space: nowrap; }
+  li .last { grid-column: 1 / -1; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  li .last b { color: CanvasText; font-weight: 500; }
+  li .typing { color: var(--hot); }
+  #empty { padding: 2em; text-align: center; color: var(--dim); }
+</style>
+</head>
+<body>
+<header><h1>miniteams</h1><span id="status">connecting…</span></header>
+<ul id="rows"></ul>
+<div id="empty" hidden>nothing yet</div>
+<script>
+(() => {
+  const $rows = document.getElementById("rows"), $empty = document.getElementById("empty"),
+        $status = document.getElementById("status");
+  let rows = [];
+
+  const ago = (iso) => {
+    const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+    if (isNaN(s)) return "";
+    if (s < 60) return "now";
+    if (s < 3600) return Math.floor(s / 60) + "m";
+    if (s < 86400) return Math.floor(s / 3600) + "h";
+    return Math.floor(s / 86400) + "d";
+  };
+
+  const render = () => {
+    const sorted = [...rows].sort((a, b) => (a.last_activity < b.last_activity) - (a.last_activity > b.last_activity));
+    $rows.replaceChildren(...sorted.map((r) => {
+      const li = document.createElement("li");
+      li.dataset.id = r.id;
+      const label = Object.assign(document.createElement("span"), { className: "label", textContent: r.label });
+      const when = Object.assign(document.createElement("span"), { className: "when", textContent: ago(r.last_activity), title: r.last_activity });
+      const last = document.createElement("span"); last.className = "last";
+      if (r.typing && r.typing.length) {
+        last.classList.add("typing"); last.textContent = "✍ " + r.typing.join(", ");
+      } else {
+        const who = Object.assign(document.createElement("b"), { textContent: r.sender ? r.sender + ": " : "" });
+        last.append(who, r.text || "");
+      }
+      li.append(label, when, last);
+      return li;
+    }));
+    $empty.hidden = sorted.length > 0;
+  };
+
+  let retry = 1000;
+  const connect = () => {
+    const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+    ws.onopen = () => { retry = 1000; $status.textContent = "live"; $status.classList.remove("off"); };
+    ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.rows) { rows = m.rows; render(); } };
+    ws.onclose = () => {
+      $status.textContent = "disconnected"; $status.classList.add("off");
+      setTimeout(connect, retry); retry = Math.min(retry * 2, 30000);  // server restarts → page recovers alone
+    };
+  };
+  connect();
+  setInterval(render, 30000);  // keep the relative timestamps honest
+})();
+</script>
+</body>
+</html>

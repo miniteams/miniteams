@@ -9,13 +9,13 @@ from miniteams.directory import Directory
 from miniteams.messages import (
     _decode_body,
     _print_reactions,
-    _strip_html,
     _thread_id,
     emit_raw_delivery,
     emit_raw_named,
     event_to_record,
     handle_delivery,
     resource_to_record,
+    strip_html,
 )
 
 NOTES_LINK = "https://h/v1/users/ME/conversations/48:notes"
@@ -57,7 +57,7 @@ def test_decode_empty_body_returns_none() -> None:
 
 
 def test_strip_html_unescapes_and_removes_tags() -> None:
-    assert _strip_html("<p>Hello &amp; <b>bye</b></p>") == "Hello & bye"
+    assert strip_html("<p>Hello &amp; <b>bye</b></p>") == "Hello & bye"
 
 
 def test_thread_id_from_conversation_link() -> None:

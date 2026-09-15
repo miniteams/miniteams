@@ -3,6 +3,8 @@
 import argparse
 from typing import Any
 
+import pytest
+
 from miniteams import cli
 from miniteams.config import Settings
 
@@ -197,3 +199,13 @@ def test_archive_does_not_retry_4xx(monkeypatch) -> None:
     rc, slept = _archive_retry_case(monkeypatch, [_status_error(401)], ["archive"])
     assert rc == 1
     assert slept == []
+
+
+def test_web_parser_defaults_and_limit_validation(monkeypatch) -> None:
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "cmd_web", lambda s, a: seen.update(vars(a)) or 0)
+    monkeypatch.setenv("MINITEAMS_TENANT_ID", "t")
+    assert cli.main(["web"]) == 0
+    assert seen["limit"] == 50 and seen["bind"] is None
+    with pytest.raises(SystemExit):
+        cli.main(["web", "--limit", "-1"])

@@ -67,7 +67,7 @@ def _decode_body(req: dict[str, Any]) -> dict[str, Any] | None:
     return obj if isinstance(obj, dict) else None
 
 
-def _strip_html(content: str) -> str:
+def strip_html(content: str) -> str:
     return html.unescape(_TAG_RE.sub("", content)).strip()
 
 
@@ -99,7 +99,7 @@ async def _print_message(resource: dict[str, Any], directory: Directory, tag: st
         directory.settings.media_dir,
         directory.settings.download_media,
     )
-    text = _strip_html(content) if msgtype == "RichText/Html" else content if msgtype == "Text" else ""
+    text = strip_html(content) if msgtype == "RichText/Html" else content if msgtype == "Text" else ""
     suffix = (" " + " ".join(notes)) if notes else ""
     await emit(f"[{when}] ({label}) {tag}{sender}: {text}{suffix}".rstrip() + "\n")
 
@@ -172,7 +172,7 @@ async def resource_to_record(resource: dict[str, Any], directory: Directory) -> 
     content = resource.get("content", "")
     props = resource.get("properties") or {}
     thread_id = _thread_id(resource)
-    text = _strip_html(content) if msgtype == "RichText/Html" else content if msgtype == "Text" else ""
+    text = strip_html(content) if msgtype == "RichText/Html" else content if msgtype == "Text" else ""
     return {
         "id": resource.get("id"),
         "time": resource.get("composetime") or resource.get("originalarrivaltime"),
@@ -204,7 +204,7 @@ async def _print_reactions(resource: dict[str, Any], emotions: list[Any], direct
     when = resource.get("composetime") or resource.get("originalarrivaltime") or ""
     label = await directory.label(_thread_id(resource))
     raw = resource.get("content") or ""
-    snippet = _strip_html(raw)[:40] if raw else ""
+    snippet = strip_html(raw)[:40] if raw else ""
     ctx = f' to "{snippet}"' if snippet else ""
     for emotion in emotions:
         key = emotion.get("key", "?")
