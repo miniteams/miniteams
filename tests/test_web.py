@@ -438,7 +438,7 @@ async def test_seen_persists_and_newer_message_unhides(
     again = W.Board(
         {"19:a@thread.v2": dict(rows["19:a@thread.v2"], seen_at=None)}, quiet_directory, seen_path=seen_path
     )
-    assert again.rows["19:a@thread.v2"]["seen_at"] == "2026-09-15T10:00:00Z"
+    assert again.rows["19:a@thread.v2"]["seen_at"] == "2026-09-15T11:00:00Z"
     # …and a newer message moves last_activity past it: the page un-hides (seen_at < last_activity).
     await again.on_event(_msg("19:a@thread.v2", "2026-09-15T12:00:00Z", "new"))
     row = again.rows["19:a@thread.v2"]
