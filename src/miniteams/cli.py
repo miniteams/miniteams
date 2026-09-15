@@ -156,7 +156,7 @@ def cmd_web(settings: Settings, args: argparse.Namespace) -> int:
     aad, skype_token = _ensure_skype_token(settings)
     bearer = str(aad.get("id_token") or aad["access_token"])
     try:
-        asyncio.run(run(settings, skype_token, bearer, args.limit, args.bind))
+        asyncio.run(run(settings, skype_token, bearer, args.limit, args.bind, args.reactions))
     except KeyboardInterrupt:
         log.info("interrupted")
     return 0
@@ -386,6 +386,9 @@ def main(argv: list[str] | None = None) -> int:
         "--limit", type=_non_negative_int, default=50, help="max conversations to load (0 = no limit)"
     )
     p_web.add_argument("--bind", help="ADDR:PORT to listen on (default: persisted random 127.0.0.X:PORT)")
+    p_web.add_argument(
+        "--reactions", action="store_true", help="a reaction becomes the row's last event and bumps it"
+    )
     p_web.set_defaults(func=cmd_web)
 
     p_stream = sub.add_parser("stream", help="stream live incoming chat events (M2+)")

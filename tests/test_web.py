@@ -88,6 +88,7 @@ async def test_row_prefers_imdisplayname_then_directory(quiet_directory: Directo
         "id": "19:g@thread.v2",
         "label": "label:19:g@thread.v2",
         "last_activity": "2026-09-15T10:00:00Z",
+        "last_id": "",
         "sender": "Alice",
         "text": "hi",
         "seen_at": None,
@@ -242,3 +243,162 @@ async def test_serve_redraws_when_persisted_port_is_taken(settings: Settings, mo
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+# --- live events (phase 2) ---
+
+
+def _event(resource_type: str, thread_id: str, **resource: Any) -> dict[str, Any]:
+    base = {"conversationLink": f"https://h/v1/users/ME/conversations/{thread_id}", "imdisplayname": "Bob"}
+    return {"type": "EventMessage", "resourceType": resource_type, "resource": {**base, **resource}}
+
+
+def _msg(thread_id: str, when: str, text: str, msg_id: str = "1", **extra: Any) -> dict[str, Any]:
+    return _event(
+        "NewMessage", thread_id, id=msg_id, composetime=when, messagetype="Text", content=text, **extra
+    )
+
+
+@pytest.fixture
+def board(quiet_directory: Directory) -> W.Board:
+    rows = {
+        "19:a@thread.v2": {
+            "id": "19:a@thread.v2",
+            "label": "A",
+            "last_activity": "2026-09-15T10:00:00Z",
+            "last_id": "10",
+            "sender": "Ann",
+            "text": "old",
+            "seen_at": None,
+            "typing": [],
+        },
+        "19:b@thread.v2": {
+            "id": "19:b@thread.v2",
+            "label": "B",
+            "last_activity": "2026-09-15T11:00:00Z",
+            "last_id": "20",
+            "sender": "Ben",
+            "text": "newer",
+            "seen_at": None,
+            "typing": [],
+        },
+    }
+    return W.Board(rows, quiet_directory, typing_ttl=0.05)
+
+
+def _order(board: W.Board) -> list[str]:
+    return [r["id"] for r in json.loads(board.payload())["rows"]]
+
+
+async def test_new_message_moves_row_to_top(board: W.Board) -> None:
+    assert _order(board) == ["19:b@thread.v2", "19:a@thread.v2"]
+    await board.on_event(_msg("19:a@thread.v2", "2026-09-15T12:00:00Z", "hi <b>there</b>", msg_id="11"))
+    assert _order(board) == ["19:a@thread.v2", "19:b@thread.v2"]
+    row = board.rows["19:a@thread.v2"]
+    assert (row["sender"], row["text"], row["last_id"]) == ("Bob", "hi <b>there</b>", "11")
+
+
+async def test_new_message_on_unknown_thread_creates_row(board: W.Board) -> None:
+    await board.on_event(_msg("19:new@unq.gbl.spaces", "2026-09-15T13:00:00Z", "yo"))
+    assert _order(board)[0] == "19:new@unq.gbl.spaces"
+    assert board.rows["19:new@unq.gbl.spaces"]["label"] == "label:19:new@unq.gbl.spaces"
+
+
+async def test_out_of_scope_and_control_events_are_ignored(board: W.Board) -> None:
+    before = json.loads(board.payload())
+    await board.on_event(_msg("19:chan@thread.tacv2", "2026-09-15T13:00:00Z", "channel"))
+    await board.on_event(_msg("48:notes", "2026-09-15T13:00:00Z", "notes"))
+    await board.on_event(_event("NewMessage", "19:a@thread.v2", messagetype="Control/ReadReceipt"))
+    await board.on_event(_event("ThreadUpdate", "19:a@thread.v2"))
+    assert json.loads(board.payload()) == before
+
+
+async def test_typing_sets_clears_and_expires(board: W.Board) -> None:
+    await board.on_event(_event("NewMessage", "19:a@thread.v2", messagetype="Control/Typing"))
+    await board.on_event(_event("NewMessage", "19:a@thread.v2", messagetype="Control/Typing"))  # idempotent
+    assert board.rows["19:a@thread.v2"]["typing"] == ["Bob"]
+    await board.on_event(_event("NewMessage", "19:a@thread.v2", messagetype="Control/ClearTyping"))
+    assert board.rows["19:a@thread.v2"]["typing"] == []
+    await board.on_event(_event("NewMessage", "19:a@thread.v2", messagetype="Control/Typing"))
+    await asyncio.sleep(0.1)  # > typing_ttl: Teams may never send ClearTyping
+    assert board.rows["19:a@thread.v2"]["typing"] == []
+    assert board._typing_timers == {}
+    # Typing on a thread we never listed is not an event worth a row.
+    await board.on_event(_event("NewMessage", "19:ghost@thread.v2", messagetype="Control/Typing"))
+    assert "19:ghost@thread.v2" not in board.rows
+
+
+async def test_message_ends_senders_typing(board: W.Board) -> None:
+    await board.on_event(_event("NewMessage", "19:a@thread.v2", messagetype="Control/Typing"))
+    await board.on_event(_msg("19:a@thread.v2", "2026-09-15T12:00:00Z", "sent"))
+    assert board.rows["19:a@thread.v2"]["typing"] == []
+    assert board._typing_timers == {}
+
+
+async def test_edit_and_delete_only_touch_the_last_message(board: W.Board) -> None:
+    edit = _event(
+        "MessageUpdate",
+        "19:a@thread.v2",
+        id="10",
+        messagetype="Text",
+        content="fixed",
+        skypeeditedid="10",
+        properties={"edittime": "1"},
+    )
+    await board.on_event(edit)
+    assert board.rows["19:a@thread.v2"]["text"] == "fixed"
+    assert board.rows["19:a@thread.v2"]["last_activity"] == "2026-09-15T10:00:00Z"  # an edit is not a bump
+    older = _event(
+        "MessageUpdate",
+        "19:a@thread.v2",
+        id="9",
+        messagetype="Text",
+        content="older",
+        properties={"edittime": "1"},
+    )
+    await board.on_event(older)
+    assert board.rows["19:a@thread.v2"]["text"] == "fixed"
+    gone = _event(
+        "MessageUpdate",
+        "19:a@thread.v2",
+        id="10",
+        messagetype="Text",
+        content="",
+        properties={"deletetime": "1"},
+    )
+    await board.on_event(gone)
+    assert board.rows["19:a@thread.v2"]["text"] == "🗑 deleted"
+    # An update carrying neither edit nor delete nor emotions is noise.
+    await board.on_event(_event("MessageUpdate", "19:a@thread.v2", id="10", properties={}))
+    assert board.rows["19:a@thread.v2"]["text"] == "🗑 deleted"
+
+
+def _reaction(thread_id: str, msg_id: str, key: str, mri: str, time_ms: int) -> dict[str, Any]:
+    return _event(
+        "MessageUpdate",
+        thread_id,
+        id=msg_id,
+        messagetype="Text",
+        content="old",
+        properties={"emotions": [{"key": key, "users": [{"mri": mri, "time": time_ms}]}]},
+    )
+
+
+async def test_reaction_ignored_unless_enabled(board: W.Board) -> None:
+    before = json.loads(board.payload())
+    await board.on_event(_reaction("19:a@thread.v2", "10", "like", "8:orgid:x", 1789600000000))
+    assert json.loads(board.payload()) == before
+
+
+async def test_reaction_becomes_last_event_and_bumps(board: W.Board) -> None:
+    board.reactions = True
+    await board.on_event(_reaction("19:a@thread.v2", "10", "like", "8:orgid:x", 1789600000000))
+    row = board.rows["19:a@thread.v2"]
+    assert row["text"] == "👍 name:8:orgid:x reacted" and row["sender"] == ""
+    assert row["last_activity"] == "2026-09-16T23:06:40.000Z"
+    assert _order(board)[0] == "19:a@thread.v2"
+    # Same reaction re-delivered (nothing added) → no change; unreact → no change either.
+    await board.on_event(_reaction("19:a@thread.v2", "10", "like", "8:orgid:x", 1789600000000))
+    assert row["last_activity"] == "2026-09-16T23:06:40.000Z"
+    await board.on_event(_reaction("19:unknown@thread.v2", "1", "like", "8:orgid:x", 1))  # no row: ignored
+    assert "19:unknown@thread.v2" not in board.rows

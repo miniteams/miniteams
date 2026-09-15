@@ -206,6 +206,6 @@ def test_web_parser_defaults_and_limit_validation(monkeypatch) -> None:
     monkeypatch.setattr(cli, "cmd_web", lambda s, a: seen.update(vars(a)) or 0)
     monkeypatch.setenv("MINITEAMS_TENANT_ID", "t")
     assert cli.main(["web"]) == 0
-    assert seen["limit"] == 50 and seen["bind"] is None
+    assert seen["limit"] == 50 and seen["bind"] is None and seen["reactions"] is False
     with pytest.raises(SystemExit):
         cli.main(["web", "--limit", "-1"])

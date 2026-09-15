@@ -13,6 +13,7 @@ import ipaddress
 import json
 import random
 from collections.abc import Iterable
+from datetime import UTC, datetime
 from http import HTTPStatus
 from importlib.resources import files
 from typing import Any
@@ -25,12 +26,14 @@ from websockets.typing import Origin
 from .chats import fetch_conversations, is_meeting, is_private, last_activity
 from .config import Settings
 from .directory import Directory
-from .messages import strip_html
+from .messages import EMOJI, strip_html, thread_of
+from .stream import run_forever
 
 log = structlog.get_logger()
 
 _SNIPPET_LEN = 140
 _LABEL_CONCURRENCY = 8
+_TYPING_TTL = 10.0  # seconds; Teams does not always send ClearTyping
 _BIND_ATTEMPTS = 3  # redraws when the persisted port turns out taken
 # Non-text last messages: a short marker instead of the raw HTML/card payload.
 _TYPE_MARKERS = {
@@ -74,6 +77,7 @@ async def row_from_conversation(conv: dict[str, Any], directory: Directory) -> d
         "id": thread_id,
         "label": await directory.label(thread_id),
         "last_activity": last_activity(conv),
+        "last_id": str(last.get("id") or ""),
         "sender": sender,
         "text": snippet(str(last.get("messagetype") or ""), str(last.get("content") or "")),
         "seen_at": None,
@@ -152,9 +156,138 @@ def save_bind(settings: Settings, host: str, port: int) -> None:
 class Board:
     """Row table + connected pages. Every mutation ends in a broadcast of the full sorted list."""
 
-    def __init__(self, rows: dict[str, dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        rows: dict[str, dict[str, Any]],
+        directory: Directory | None = None,
+        reactions: bool = False,
+        typing_ttl: float = _TYPING_TTL,
+    ) -> None:
         self.rows = rows
+        self.directory = directory
+        self.reactions = reactions
+        self.typing_ttl = typing_ttl
         self.clients: set[ServerConnection] = set()
+        self._typing_timers: dict[tuple[str, str], asyncio.TimerHandle] = {}
+
+    # --- live events (stream hook) ---
+
+    async def on_event(self, obj: dict[str, Any]) -> None:
+        resource = obj.get("resource") or {}
+        thread_id = thread_of(resource)
+        resource_type = obj.get("resourceType")
+        msgtype = str(resource.get("messagetype") or "")
+        log.debug("web_event", thread=thread_id, resource_type=resource_type, messagetype=msgtype)
+        if not in_scope(thread_id):
+            return
+        if resource_type == "NewMessage":
+            if msgtype in ("Control/Typing", "Control/ClearTyping"):
+                await self._typing(thread_id, resource, started=msgtype == "Control/Typing")
+            elif not msgtype.startswith("Control/"):  # read receipts & co carry no row change
+                await self._new_message(thread_id, resource, msgtype)
+        elif resource_type == "MessageUpdate":
+            await self._message_update(thread_id, resource, msgtype)
+
+    async def _sender(self, resource: dict[str, Any]) -> str:
+        mri = str(resource.get("from") or "")
+        name = resource.get("imdisplayname")
+        if self.directory is None:
+            return str(name or mri)
+        self.directory.note_name(mri, name)
+        return str(name) if name else await self.directory.display(mri)
+
+    async def _new_message(self, thread_id: str, resource: dict[str, Any], msgtype: str) -> None:
+        row = self.rows.get(thread_id)
+        if row is None:
+            label = await self.directory.label(thread_id) if self.directory else thread_id
+            row = self.rows[thread_id] = {"id": thread_id, "label": label, "seen_at": None, "typing": []}
+        sender = await self._sender(resource)
+        row.update(
+            last_activity=str(resource.get("composetime") or resource.get("originalarrivaltime") or ""),
+            last_id=str(resource.get("id") or ""),
+            sender=sender,
+            text=snippet(msgtype, str(resource.get("content") or "")),
+        )
+        self._typing_stop(thread_id, sender)  # their message is the end of their typing
+        self.broadcast()
+
+    async def _message_update(self, thread_id: str, resource: dict[str, Any], msgtype: str) -> None:
+        row = self.rows.get(thread_id)
+        props = resource.get("properties") or {}
+        if props.get("emotions") is not None:
+            if self.reactions and row is not None:
+                await self._reaction(row, resource, props["emotions"])
+            return
+        if row is None or row.get("last_id") != str(resource.get("id") or ""):
+            return  # edit/delete of an older message: the row shows the latest one, unchanged
+        if props.get("deletetime"):
+            row["text"] = "🗑 deleted"
+        elif resource.get("skypeeditedid") or props.get("edittime"):
+            row["text"] = snippet(msgtype, str(resource.get("content") or ""))
+        else:
+            return
+        self.broadcast()
+
+    async def _reaction(self, row: dict[str, Any], resource: dict[str, Any], emotions: list[Any]) -> None:
+        """Newest added reaction becomes the row's last event and bumps it (opt-in, `--reactions`)."""
+        msg_id = str(resource.get("id") or resource.get("clientmessageid") or "")
+        latest: tuple[int, str, str] | None = None  # (time_ms, emoji, mri)
+        for emotion in emotions:
+            key = emotion.get("key", "?")
+            users = emotion.get("users") or []
+            added, _ = (
+                self.directory.reaction_diff(msg_id, key, [str(u.get("mri", "")) for u in users])
+                if self.directory
+                else ({str(u.get("mri", "")) for u in users}, set())
+            )
+            for u in users:
+                mri = str(u.get("mri", ""))
+                if mri in added:
+                    candidate = (int(u.get("time") or 0), EMOJI.get(key, f":{key}:"), mri)
+                    latest = max(latest, candidate) if latest else candidate
+        if latest is None:
+            return
+        time_ms, emoji, mri = latest
+        who = await self.directory.display(mri) if self.directory else mri
+        when = datetime.fromtimestamp(time_ms / 1000, tz=UTC) if time_ms else datetime.now(UTC)
+        row.update(
+            last_activity=when.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            sender="",
+            text=f"{emoji} {who} reacted",
+        )
+        self.broadcast()
+
+    async def _typing(self, thread_id: str, resource: dict[str, Any], started: bool) -> None:
+        row = self.rows.get(thread_id)
+        if row is None:
+            return  # a thread we never listed: nothing to annotate
+        name = await self._sender(resource)
+        if not started:
+            self._typing_stop(thread_id, name)
+            self.broadcast()
+            return
+        if name not in row["typing"]:
+            row["typing"].append(name)
+        key = (thread_id, name)
+        if key in self._typing_timers:
+            self._typing_timers[key].cancel()
+        loop = asyncio.get_running_loop()
+        self._typing_timers[key] = loop.call_later(self.typing_ttl, self._typing_expired, thread_id, name)
+        self.broadcast()
+
+    def _typing_stop(self, thread_id: str, name: str) -> None:
+        timer = self._typing_timers.pop((thread_id, name), None)
+        if timer:
+            timer.cancel()
+        row = self.rows.get(thread_id)
+        if row and name in row["typing"]:
+            row["typing"].remove(name)
+
+    def _typing_expired(self, thread_id: str, name: str) -> None:
+        self._typing_stop(thread_id, name)
+        self.broadcast()
+
+    # --- pages ---
 
     def payload(self) -> str:
         ordered = sorted(self.rows.values(), key=lambda r: r["last_activity"], reverse=True)
@@ -209,9 +342,21 @@ async def serve_board(board: Board, settings: Settings, bind: str | None) -> Non
             save_bind(settings, host, port)
 
 
-async def run(settings: Settings, skype_token: str, bearer: str, limit: int, bind: str | None) -> None:
+async def run(
+    settings: Settings, skype_token: str, bearer: str, limit: int, bind: str | None, reactions: bool = False
+) -> None:
     directory = Directory(settings)
     directory.set_token(skype_token, bearer)
     rows = await bootstrap(fetch_conversations(settings, skype_token), directory, limit)
     log.info("web_bootstrap", rows=len(rows))
-    await serve_board(Board(rows), settings, bind)
+    board = Board(rows, directory, reactions=reactions)
+    # The stream only returns when auth is dead: a page that silently stops updating is worse
+    # than an exit, so the server goes down with it and the user re-runs.
+    server = asyncio.create_task(serve_board(board, settings, bind))
+    stream = asyncio.create_task(run_forever(settings, on_event=board.on_event, directory=directory))
+    done, pending = await asyncio.wait({server, stream}, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+    for task in done:
+        task.result()  # re-raise a server failure (e.g. bind) instead of exiting 0
+    raise RuntimeError("live stream ended (auth expired?) — re-run")

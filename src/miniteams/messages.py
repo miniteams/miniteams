@@ -34,7 +34,7 @@ _TAG_RE = re.compile(r"<[^>]+>")
 _THREAD_RE = re.compile(r"/conversations/([^/]+)")
 
 # Teams reaction keys → emoji; unknown keys fall back to ":key:".
-_EMOJI = {
+EMOJI = {
     "like": "👍",
     "heart": "❤️",
     "laugh": "😆",
@@ -71,7 +71,7 @@ def strip_html(content: str) -> str:
     return html.unescape(_TAG_RE.sub("", content)).strip()
 
 
-def _thread_id(resource: dict[str, Any]) -> str:
+def thread_of(resource: dict[str, Any]) -> str:
     link = resource.get("conversationLink") or ""
     match = _THREAD_RE.search(link)
     if match:
@@ -89,7 +89,7 @@ async def _print_message(resource: dict[str, Any], directory: Directory, tag: st
     directory.note_name(sender_mri, sender)  # feed the cache from free message metadata
     sender = sender or await directory.display(sender_mri)
     when = resource.get("composetime") or resource.get("originalarrivaltime") or ""
-    label = await directory.label(_thread_id(resource))
+    label = await directory.label(thread_of(resource))
     content = resource.get("content", "")
 
     notes = await attachments.process(
@@ -106,7 +106,7 @@ async def _print_message(resource: dict[str, Any], directory: Directory, tag: st
 
 async def _print_deleted(resource: dict[str, Any], directory: Directory) -> None:
     when = (resource.get("properties") or {}).get("deletetime") or resource.get("composetime") or ""
-    label = await directory.label(_thread_id(resource))
+    label = await directory.label(thread_of(resource))
     sender = await directory.display(resource.get("from", ""))
     await emit(f"[{when}] ({label}) 🗑 {sender} deleted a message\n")
 
@@ -171,7 +171,7 @@ async def resource_to_record(resource: dict[str, Any], directory: Directory) -> 
     directory.note_name(sender_mri, resource.get("imdisplayname"))
     content = resource.get("content", "")
     props = resource.get("properties") or {}
-    thread_id = _thread_id(resource)
+    thread_id = thread_of(resource)
     text = strip_html(content) if msgtype == "RichText/Html" else content if msgtype == "Text" else ""
     return {
         "id": resource.get("id"),
@@ -202,13 +202,13 @@ async def resource_to_record(resource: dict[str, Any], directory: Directory) -> 
 async def _print_reactions(resource: dict[str, Any], emotions: list[Any], directory: Directory) -> None:
     msg_id = str(resource.get("id") or resource.get("clientmessageid") or "")
     when = resource.get("composetime") or resource.get("originalarrivaltime") or ""
-    label = await directory.label(_thread_id(resource))
+    label = await directory.label(thread_of(resource))
     raw = resource.get("content") or ""
     snippet = strip_html(raw)[:40] if raw else ""
     ctx = f' to "{snippet}"' if snippet else ""
     for emotion in emotions:
         key = emotion.get("key", "?")
-        emoji = _EMOJI.get(key, f":{key}:")
+        emoji = EMOJI.get(key, f":{key}:")
         users = [str(u.get("mri", "")) for u in (emotion.get("users") or [])]
         added, removed = directory.reaction_diff(msg_id, key, users)
         for mri in added:
@@ -219,27 +219,35 @@ async def _print_reactions(resource: dict[str, Any], emotions: list[Any], direct
 
 async def _print_typing(resource: dict[str, Any], directory: Directory, started: bool) -> None:
     when = resource.get("composetime") or resource.get("originalarrivaltime") or ""
-    label = await directory.label(_thread_id(resource))
+    label = await directory.label(thread_of(resource))
     who = await directory.display(resource.get("from", ""))
     verb = "is typing…" if started else "stopped typing"
     await emit(f"[{when}] ({label}) ✍ {who} {verb}\n")
 
 
-async def handle_delivery(
-    req: dict[str, Any], directory: Directory, jsonl: bool = False, typing: bool = False
-) -> None:
+def decode_event(req: dict[str, Any]) -> dict[str, Any] | None:
+    """The `EventMessage` carried by a `/messaging` delivery, or None for anything else."""
     url = req.get("url", "")
     endpoint = url.rsplit("/", 1)[-1]
     if endpoint != "messaging":  # presence / call signaling — ignore for MVP
         log.debug("delivery_ignored", endpoint=endpoint)
-        return
+        return None
     try:
         obj = _decode_body(req)
     except Exception as exc:  # noqa: BLE001 — never let one bad frame kill the stream
         log.warning("decode_failed", error=str(exc))
-        return
+        return None
     if not obj or obj.get("type") != "EventMessage":
         log.debug("non_event", type=obj.get("type") if obj else None)
+        return None
+    return obj
+
+
+async def handle_delivery(
+    req: dict[str, Any], directory: Directory, jsonl: bool = False, typing: bool = False
+) -> None:
+    obj = decode_event(req)
+    if obj is None:
         return
 
     if jsonl:

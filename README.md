@@ -58,10 +58,12 @@ uv run miniteams dump --jsonl > notes.jsonl            # full-detail JSON per li
 + attachment refs + reactions), every message type, no media download — pipe-friendly.
 
 `web` serves a single page listing private, group and meeting chats newest-message-first
-(label, last author, snippet). It binds a random `127.0.0.X:PORT` drawn once and kept in
-`~/.config/miniteams/web.json` so the URL stays bookmarkable; `--bind` overrides it and refuses
-anything but loopback (no auth on the page). Live updates and the "seen" marker are the next
-phases of spec 002.
+(label, last author, snippet), updated live from the Trouter stream: new messages move a row
+up, edits/deletes of the last message rewrite it, `✍ Name` shows who is typing (cleared after
+10s if Teams never says so), and with `--reactions` a reaction becomes the row's last event.
+It binds a random `127.0.0.X:PORT` drawn once and kept in `~/.config/miniteams/web.json` so the
+URL stays bookmarkable; `--bind` overrides it and refuses anything but loopback (no auth on the
+page). The process exits non-zero when the stream dies (auth expired) — re-run it.
 
 `stream` enriches each line with thread name + participants, resolves MRIs → display names
 (cached in `~/.cache/miniteams/names.json`), downloads images/files to `~/.cache/miniteams/media/`

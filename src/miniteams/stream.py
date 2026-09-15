@@ -13,6 +13,7 @@ import base64
 import json
 import os
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -23,7 +24,7 @@ from ._io import force_blocking_stdout
 from .auth import AuthExpired, TokenSource
 from .config import Settings
 from .directory import Directory
-from .messages import emit_raw_delivery, emit_raw_named, handle_delivery
+from .messages import decode_event, emit_raw_delivery, emit_raw_named, handle_delivery
 from .skype import exchange_skype_token
 from .trouter import common_query, get_or_create_epid, handshake, trouter_info
 
@@ -33,6 +34,8 @@ _PING_INTERVAL = 30.0  # seconds; handshake advertised a 70s heartbeat window
 _REREGISTER_DEBOUNCE = 20.0  # seconds; collapse the message_loss flood into one re-register
 _BACKOFF_MAX = 60.0
 _STABLE_AFTER = 60.0  # a connection alive this long resets the backoff
+
+EventHook = Callable[[dict[str, Any]], Awaitable[None]]  # receives each decoded EventMessage
 
 
 def _correlation_vector() -> str:
@@ -53,6 +56,7 @@ class TrouterClient:
         jsonl: bool = False,
         raw: bool = False,
         typing: bool = False,
+        on_event: EventHook | None = None,
     ) -> None:
         self.settings = settings
         self.aad = aad
@@ -64,6 +68,7 @@ class TrouterClient:
         self.jsonl = jsonl
         self.raw = raw
         self.typing = typing
+        self.on_event = on_event  # set → events go to the hook instead of stdout
         self._count = 0
         self._last_register = 0.0
         # websockets' connection type churns across releases; keep it loose deliberately.
@@ -197,6 +202,14 @@ class TrouterClient:
         await self._ws.send(f"3:::{ack}")
         if self.raw:
             await emit_raw_delivery(req)  # every endpoint, decoded, no filtering
+        elif self.on_event is not None:
+            obj = decode_event(req)
+            if obj is None:
+                return
+            try:
+                await self.on_event(obj)
+            except Exception as exc:  # noqa: BLE001 — a bad event must not drop the socket
+                log.warning("hook_failed", error=str(exc), error_type=type(exc).__name__)
         else:
             await handle_delivery(req, self.directory, self.jsonl, self.typing)
 
@@ -244,7 +257,12 @@ class TrouterClient:
 
 
 async def run_forever(
-    settings: Settings, jsonl: bool = False, raw: bool = False, typing: bool = False
+    settings: Settings,
+    jsonl: bool = False,
+    raw: bool = False,
+    typing: bool = False,
+    on_event: EventHook | None = None,
+    directory: Directory | None = None,
 ) -> None:
     """Re-establish a full session on every disconnect (handoff §M4).
 
@@ -253,7 +271,7 @@ async def run_forever(
     and resets once a connection has been stable.
     """
     force_blocking_stdout()  # inside the running loop (see _io); guards `--jsonl | jq` backpressure
-    directory = Directory(settings)  # caches survive reconnects; only the token is refreshed
+    directory = directory or Directory(settings)  # caches survive reconnects; only the token is refreshed
     # Authenticate ONCE up front (may prompt: device-code in stream mode). Reconnects then only
     # refresh silently — never re-prompt — so a failed connect can't spin into endless logins.
     tokens = TokenSource(settings)
@@ -270,7 +288,7 @@ async def run_forever(
             session_id = handshake(settings, info, skype_token, epid)
             connected_at = time.monotonic()
             await TrouterClient(
-                settings, aad, skype_token, info, session_id, epid, directory, jsonl, raw, typing
+                settings, aad, skype_token, info, session_id, epid, directory, jsonl, raw, typing, on_event
             ).run()
         except asyncio.CancelledError:
             raise

@@ -9,13 +9,13 @@ from miniteams.directory import Directory
 from miniteams.messages import (
     _decode_body,
     _print_reactions,
-    _thread_id,
     emit_raw_delivery,
     emit_raw_named,
     event_to_record,
     handle_delivery,
     resource_to_record,
     strip_html,
+    thread_of,
 )
 
 NOTES_LINK = "https://h/v1/users/ME/conversations/48:notes"
@@ -62,11 +62,11 @@ def test_strip_html_unescapes_and_removes_tags() -> None:
 
 def test_thread_id_from_conversation_link() -> None:
     res = {"conversationLink": "https://h/v1/users/ME/conversations/19:abc@thread.v2/messages/7"}
-    assert _thread_id(res) == "19:abc@thread.v2"
+    assert thread_of(res) == "19:abc@thread.v2"
 
 
 def test_thread_id_falls_back_to_to() -> None:
-    assert _thread_id({"to": "48:notes"}) == "48:notes"
+    assert thread_of({"to": "48:notes"}) == "48:notes"
 
 
 async def test_resource_to_record_surfaces_fields(directory: Directory) -> None:
