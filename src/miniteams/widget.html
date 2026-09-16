@@ -29,17 +29,20 @@
 </style>
 </head>
 <body>
-<header><h1>miniteams</h1><label><input type="checkbox" id="showhidden"> show seen (<span id="nhidden">0</span>)</label><span id="status">connecting…</span></header>
+<header><h1>miniteams</h1><label><input type="checkbox" id="unreadonly"> unread only (<span id="nunread">0</span>)</label><label><input type="checkbox" id="showhidden"> show seen (<span id="nhidden">0</span>)</label><span id="status">connecting…</span></header>
 <ul id="rows"></ul>
 <div id="empty" hidden>nothing yet</div>
 <script>
 (() => {
   const $rows = document.getElementById("rows"), $empty = document.getElementById("empty"),
         $status = document.getElementById("status"), $show = document.getElementById("showhidden"),
-        $nhidden = document.getElementById("nhidden");
+        $nhidden = document.getElementById("nhidden"), $unread = document.getElementById("unreadonly"),
+        $nunread = document.getElementById("nunread");
   let rows = [], ws = null;
   try { $show.checked = localStorage.getItem("showhidden") === "1"; } catch (e) {}
   $show.onchange = () => { try { localStorage.setItem("showhidden", $show.checked ? "1" : "0"); } catch (e) {} render(); };
+  try { $unread.checked = localStorage.getItem("unreadonly") === "1"; } catch (e) {}
+  $unread.onchange = () => { try { localStorage.setItem("unreadonly", $unread.checked ? "1" : "0"); } catch (e) {} render(); };
   const isSeen = (r) => !!r.seen_at && r.seen_at >= r.last_activity;
 
   const ago = (iso) => {
@@ -54,7 +57,9 @@
   const render = () => {
     const sorted = [...rows].sort((a, b) => (a.last_activity < b.last_activity) - (a.last_activity > b.last_activity));
     $nhidden.textContent = sorted.filter(isSeen).length;
-    const shown = $show.checked ? sorted : sorted.filter((r) => !isSeen(r));
+    $nunread.textContent = sorted.filter((r) => r.unread).length;
+    let shown = $show.checked ? sorted : sorted.filter((r) => !isSeen(r));
+    if ($unread.checked) shown = shown.filter((r) => r.unread);
     $rows.replaceChildren(...shown.map((r) => {
       const li = document.createElement("li");
       li.dataset.id = r.id;
