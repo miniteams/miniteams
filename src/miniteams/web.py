@@ -19,6 +19,7 @@ from http import HTTPStatus
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import structlog
 from websockets.asyncio.server import ServerConnection, broadcast, serve
@@ -72,6 +73,12 @@ def is_unread(last_id: str, read_id: str) -> bool:
     if last_id.isdigit() and read_id.isdigit():
         return int(last_id) > int(read_id)
     return last_id > read_id
+
+
+def deep_link(thread_id: str, msg_id: str, scheme: str = "https") -> str:
+    """Teams link opening the chat at a message; `msteams` targets the desktop client."""
+    ctx = quote('{"contextType":"chat"}', safe="")
+    return f"{scheme}://teams.microsoft.com/l/message/{quote(thread_id, safe='')}/{msg_id}?context={ctx}"
 
 
 def in_scope(thread_id: str) -> bool:
@@ -245,12 +252,16 @@ class Board:
         reactions: bool = False,
         typing_ttl: float = _TYPING_TTL,
         seen_path: Path | None = None,
+        opener: list[str] | None = None,
+        open_scheme: str = "msteams",
     ) -> None:
         self.rows = rows
         self.directory = directory
         self.reactions = reactions
         self.typing_ttl = typing_ttl
         self.seen_path = seen_path
+        self.opener = opener  # argv the deep link is appended to; None = the page follows its link
+        self.open_scheme = open_scheme
         self.clients: set[ServerConnection] = set()
         self._typing_timers: dict[tuple[str, str], asyncio.TimerHandle] = {}
         self._seen: dict[str, str] = _load_seen(seen_path)
@@ -420,7 +431,35 @@ class Board:
     def payload(self) -> str:
         ordered = sorted(self.rows.values(), key=lambda r: r["last_activity"], reverse=True)
         # `page` lets an open tab notice a newer widget.html (server restart, edit) and reload.
-        return json.dumps({"rows": ordered, "page": page_version()}, ensure_ascii=False)
+        for row in ordered:
+            row["link"] = deep_link(row["id"], row.get("last_id", "")) if row.get("last_id") else ""
+        return json.dumps(
+            {"rows": ordered, "page": page_version(), "opener": self.opener is not None}, ensure_ascii=False
+        )
+
+    async def open_row(self, thread_id: str, at: str | None = None) -> bool:
+        """Page verb `open`: launch the configured opener on the row's deep link, and mark it seen."""
+        row = self.rows.get(thread_id)
+        if row is None or not row.get("last_id") or self.opener is None:
+            return False
+        url = deep_link(thread_id, row["last_id"], self.open_scheme)
+        try:
+            # argv exec, no shell: the only variable part is a URL built from ids we already hold.
+            proc = await asyncio.create_subprocess_exec(
+                *self.opener,
+                url,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            log.warning("opener_failed", opener=self.opener[0], error=str(exc))
+            return False
+        asyncio.get_running_loop().create_task(proc.wait())  # reap; xdg-open returns at once
+        log.info("opened", thread=thread_id)
+        self.mark_seen(thread_id, at)
+        return True
 
     async def watch_page(self, interval: float = _PAGE_POLL) -> None:
         """Broadcast when widget.html changes so open tabs reload without waiting for an event."""
@@ -446,9 +485,12 @@ class Board:
                     verb = json.loads(raw)
                 except json.JSONDecodeError, TypeError:
                     verb = None
+                at = verb.get("at") if isinstance(verb, dict) else None
+                at = at if isinstance(at, str) else None
                 if isinstance(verb, dict) and isinstance(verb.get("seen"), str):
-                    at = verb.get("at")
-                    self.mark_seen(verb["seen"], at if isinstance(at, str) else None)
+                    self.mark_seen(verb["seen"], at)
+                elif isinstance(verb, dict) and isinstance(verb.get("open"), str):
+                    await self.open_row(verb["open"], at)
                 else:
                     log.debug("ws_client_message_ignored", data=str(raw)[:100])
         finally:
@@ -511,13 +553,27 @@ async def serve_board(board: Board, settings: Settings, bind: str | None) -> Non
 
 
 async def run(
-    settings: Settings, skype_token: str, bearer: str, limit: int, bind: str | None, reactions: bool = False
+    settings: Settings,
+    skype_token: str,
+    bearer: str,
+    limit: int,
+    bind: str | None,
+    reactions: bool = False,
+    opener: str = "xdg-open",
+    open_scheme: str = "msteams",
 ) -> None:
     directory = Directory(settings)
     directory.set_token(skype_token, bearer)
     rows = await bootstrap(fetch_conversations(settings, skype_token), directory, limit)
     log.info("web_bootstrap", rows=len(rows))
-    board = Board(rows, directory, reactions=reactions, seen_path=settings.config_dir / "seen.json")
+    board = Board(
+        rows,
+        directory,
+        reactions=reactions,
+        seen_path=settings.config_dir / "seen.json",
+        opener=None if opener in ("", "none") else opener.split(),
+        open_scheme=open_scheme,
+    )
     # The stream only returns when auth is dead: a page that silently stops updating is worse
     # than an exit, so the server goes down with it and the user re-runs.
     server = asyncio.create_task(serve_board(board, settings, bind))

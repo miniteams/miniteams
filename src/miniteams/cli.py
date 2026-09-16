@@ -156,7 +156,18 @@ def cmd_web(settings: Settings, args: argparse.Namespace) -> int:
     aad, skype_token = _ensure_skype_token(settings)
     bearer = str(aad.get("id_token") or aad["access_token"])
     try:
-        asyncio.run(run(settings, skype_token, bearer, args.limit, args.bind, args.reactions))
+        asyncio.run(
+            run(
+                settings,
+                skype_token,
+                bearer,
+                args.limit,
+                args.bind,
+                args.reactions,
+                args.opener,
+                args.open_scheme,
+            )
+        )
     except KeyboardInterrupt:
         log.info("interrupted")
     return 0
@@ -388,6 +399,18 @@ def main(argv: list[str] | None = None) -> int:
     p_web.add_argument("--bind", help="ADDR:PORT to listen on (default: persisted random 127.0.0.X:PORT)")
     p_web.add_argument(
         "--reactions", action="store_true", help="a reaction becomes the row's last event and bumps it"
+    )
+    p_web.add_argument(
+        "--opener",
+        default="xdg-open",
+        help="command run with the chat's deep link on row click (default: xdg-open; 'none' = the page "
+        "just follows its https link)",
+    )
+    p_web.add_argument(
+        "--open-scheme",
+        choices=["msteams", "https"],
+        default="msteams",
+        help="deep-link scheme handed to --opener: msteams = desktop client, https = Teams web",
     )
     p_web.set_defaults(func=cmd_web)
 

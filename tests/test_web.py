@@ -282,6 +282,49 @@ async def test_page_version_in_payload_and_watch_broadcasts_on_change(monkeypatc
     assert sent == ["b"]  # exactly one broadcast, when v1 → v2 was observed
 
 
+def test_deep_link_formats() -> None:
+    link = W.deep_link("19:e45a@thread.v2", "1789552947563")
+    assert link == (
+        "https://teams.microsoft.com/l/message/19%3Ae45a%40thread.v2/1789552947563"
+        "?context=%7B%22contextType%22%3A%22chat%22%7D"
+    )
+    assert W.deep_link("19:e45a@thread.v2", "1", "msteams").startswith(
+        "msteams://teams.microsoft.com/l/message/"
+    )
+
+
+async def test_open_row_launches_opener_and_marks_seen(settings: Settings, monkeypatch) -> None:
+    launched: list[tuple[str, ...]] = []
+
+    class _Proc:
+        async def wait(self) -> int:
+            return 0
+
+    async def fake_exec(*argv: str, **kw: Any) -> _Proc:
+        launched.append(argv)
+        return _Proc()
+
+    monkeypatch.setattr(W.asyncio, "create_subprocess_exec", fake_exec)
+    rows = {"t": {"id": "t", "last_activity": "2026-09-15T10:00:00Z", "last_id": "42", "seen_at": None}}
+    board = W.Board(rows, seen_path=settings.config_dir / "seen.json", opener=["xdg-open"])
+    assert await board.open_row("t", at="2026-09-15T10:00:00Z") is True
+    assert launched == [("xdg-open", W.deep_link("t", "42", "msteams"))]
+    assert rows["t"]["seen_at"] == "2026-09-15T10:00:00Z"
+    assert await board.open_row("nope") is False and len(launched) == 1
+    assert json.loads(board.payload())["opener"] is True
+    assert json.loads(board.payload())["rows"][0]["link"] == W.deep_link("t", "42")
+    # No opener configured: the verb is a no-op and the page is told to follow its own link.
+    plain = W.Board(dict(rows), opener=None)
+    assert await plain.open_row("t") is False and json.loads(plain.payload())["opener"] is False
+
+
+async def test_open_row_survives_missing_opener_binary(settings: Settings) -> None:
+    rows = {"t": {"id": "t", "last_activity": "2026-09-15T10:00:00Z", "last_id": "42", "seen_at": None}}
+    board = W.Board(rows, opener=["/nonexistent/opener"])
+    assert await board.open_row("t") is False
+    assert rows["t"]["seen_at"] is None  # not marked seen when nothing opened
+
+
 def test_board_payload_sorted_newest_first() -> None:
     board = W.Board(
         {

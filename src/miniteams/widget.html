@@ -20,7 +20,8 @@
   /* Every cell is placed explicitly: an auto-placed item next to a row-spanning one lands
      wherever the algorithm likes (the button ended up in column 1, full width). */
   li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; grid-template-rows: auto auto; gap: .15em .8em; padding: .5em 1em; border-bottom: 1px solid var(--line); }
-  li .label { grid-column: 1; grid-row: 1; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  li .label { grid-column: 1; grid-row: 1; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: inherit; text-decoration: none; }
+  li .label:hover { text-decoration: underline; }
   li .when { grid-column: 2; grid-row: 1; color: var(--dim); font-size: .85em; white-space: nowrap; }
   li .last { grid-column: 1 / span 2; grid-row: 2; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   li .last b { color: CanvasText; font-weight: 500; }
@@ -38,7 +39,7 @@
         $status = document.getElementById("status"), $show = document.getElementById("showhidden"),
         $nhidden = document.getElementById("nhidden"), $unread = document.getElementById("unreadonly"),
         $nunread = document.getElementById("nunread");
-  let rows = [], ws = null, pageVersion = null;
+  let rows = [], ws = null, pageVersion = null, opener = false;
   try { $show.checked = localStorage.getItem("showhidden") === "1"; } catch (e) {}
   $show.onchange = () => { try { localStorage.setItem("showhidden", $show.checked ? "1" : "0"); } catch (e) {} render(); };
   try { $unread.checked = localStorage.getItem("unreadonly") === "1"; } catch (e) {}
@@ -65,7 +66,13 @@
       li.dataset.id = r.id;
       if (isSeen(r)) li.classList.add("hidden");
       if (r.unread) li.classList.add("unread");
-      const label = Object.assign(document.createElement("span"), { className: "label", textContent: r.label });
+      const label = Object.assign(document.createElement("a"), { className: "label", textContent: r.label, href: r.link || "#", target: "_blank", rel: "noopener" });
+      // Plain click → the server opens the chat (desktop client); modified/middle click → the https link.
+      label.onclick = (ev) => {
+        if (!opener || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.button !== 0) return;
+        ev.preventDefault();
+        if (ws && ws.readyState === 1) ws.send(JSON.stringify({ open: r.id, at: r.last_activity }));
+      };
       const when = Object.assign(document.createElement("span"), { className: "when", textContent: ago(r.last_activity), title: r.last_activity });
       const last = document.createElement("span"); last.className = "last";
       if (r.typing && r.typing.length) {
@@ -91,6 +98,7 @@
       const m = JSON.parse(e.data);
       // A newer widget.html on the server (restart, edit): this page is stale, reload it.
       if (m.page) { if (pageVersion && m.page !== pageVersion) { location.reload(); return; } pageVersion = m.page; }
+      if ("opener" in m) opener = !!m.opener;
       if (m.rows) { rows = m.rows; render(); }
     };
     ws.onclose = () => {
