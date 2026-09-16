@@ -100,6 +100,21 @@ until a new message arrives; a toggle shows hidden rows anyway.
 - **DoD**: `uv run pytest tests/test_web.py -k seen` green — seen persists, newer message
   un-hides, seen on unknown id is a no-op.
 
+## Addenda (shipped after the initial scope, 2026-09-16)
+
+- Unread rows in bold from Teams' own read marker (`consumptionhorizon` at bootstrap,
+  `ConversationUpdate` live); "unread only" quick filter; `unseen` undoes a seen marker.
+- Row click opens the chat through `--opener` (default `xdg-open` on an `msteams://` deep link to
+  the last message, host `teams.cloud.microsoft`); Ctrl/middle click → https link through
+  `--browser` when set. Opening does not mark seen. The Linux client reloads its SPA on every
+  deep link (no in-page route is consumed) — inherent, not fixable from here.
+- Open tabs reload when `widget.html` changes (version in every frame, 2s file poll).
+- `web` registers its own Trouter endpoint id (`endpoint_id-web`): sharing `stream`'s made the
+  last registrant the only receiver.
+- File/card posts render from `properties` (`📎 name`); listing stubs that look deleted are
+  resolved with one history call. Topic/roster changes refresh the label; a failed lookup keeps
+  the old name; thread lookups retry on 429 and never cache a transient failure.
+
 ## Data model impact (summary)
 
 Two small JSON files under `<config_dir>` (`web.json`, `seen.json`). No change to existing
