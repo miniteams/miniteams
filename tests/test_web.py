@@ -180,9 +180,10 @@ async def test_bootstrap_resolves_ambiguous_stubs_with_one_history_call(
 
     def fake_history(settings: Any, token: str, thread_id: str, page_size: int, max_pages: int) -> list[Any]:
         fetched.append(thread_id)
+        assert page_size > 1  # pageSize=1 skips the newest message on the real API
         if thread_id == "19:down@thread.v2":
             raise RuntimeError("503")
-        return [full[thread_id]]
+        return [{"id": "older", "messagetype": "Text", "content": "x"}, full[thread_id]]
 
     monkeypatch.setattr(W, "fetch_history", fake_history)
     stub = {"messagetype": "RichText/Html", "content": ""}

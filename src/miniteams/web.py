@@ -36,6 +36,7 @@ log = structlog.get_logger()
 
 _SNIPPET_LEN = 140
 _LABEL_CONCURRENCY = 8
+_STUB_PAGE = 5  # history page fetched to resolve an ambiguous listing stub
 _TYPING_TTL = 10.0  # seconds; Teams does not always send ClearTyping
 # Thread activity that changes the label (topic, member count): drop the cached thread info.
 # Someone reading a chat is not activity: bumping the row on it would defeat "seen".
@@ -156,15 +157,16 @@ async def _resolve_stub(row: dict[str, Any], directory: Directory) -> None:
     """The listing's lastMessage drops `properties`, so a file/card post looks exactly like a
     deleted message. One history call for the few ambiguous rows tells them apart."""
     try:
-        newest = await asyncio.to_thread(
-            fetch_history, directory.settings, directory.skype_token, row["id"], 1, 1
+        # pageSize=1 skips the newest message (window artefact); ask for a few and pick by id.
+        recent = await asyncio.to_thread(
+            fetch_history, directory.settings, directory.skype_token, row["id"], _STUB_PAGE, 1
         )
     except Exception as exc:  # noqa: BLE001 — cosmetic: keep the stub rather than fail bootstrap
         log.debug("stub_resolve_failed", thread=row["id"], error=str(exc))
         return
-    if not newest or str(newest[-1].get("id") or "") != row["last_id"]:
+    message = next((m for m in recent if str(m.get("id") or "") == row["last_id"]), None)
+    if message is None:
         return
-    message = newest[-1]
     msgtype = str(message.get("messagetype") or "")
     row["text"] = snippet(msgtype, str(message.get("content") or ""), message.get("properties"))
     if not _is_system(msgtype):
