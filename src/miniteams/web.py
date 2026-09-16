@@ -76,9 +76,14 @@ def is_unread(last_id: str, read_id: str) -> bool:
 
 
 def deep_link(thread_id: str, msg_id: str, scheme: str = "https") -> str:
-    """Teams link opening the chat at a message; `msteams` targets the desktop client."""
+    """Teams link opening the chat at a message; `msteams` targets the desktop client.
+
+    The client (teams-for-linux) falls back to a full navigation to the link's host, which a
+    redirecting host aborts silently — so the msteams form uses the host the client itself loads.
+    """
+    host = "teams.cloud.microsoft" if scheme == "msteams" else "teams.microsoft.com"
     ctx = quote('{"contextType":"chat"}', safe="")
-    return f"{scheme}://teams.microsoft.com/l/message/{quote(thread_id, safe='')}/{msg_id}?context={ctx}"
+    return f"{scheme}://{host}/l/message/{quote(thread_id, safe='')}/{msg_id}?context={ctx}"
 
 
 def in_scope(thread_id: str) -> bool:
