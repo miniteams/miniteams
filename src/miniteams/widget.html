@@ -12,13 +12,15 @@
   #status { color: var(--dim); font-size: .85em; }
   header label { color: var(--dim); font-size: .85em; white-space: nowrap; }
   li.hidden { opacity: .45; }
-  li button { grid-row: 1 / span 2; align-self: center; font: inherit; font-size: .85em; padding: .2em .6em; cursor: pointer; }
+  li button { grid-column: 3; grid-row: 1 / span 2; align-self: center; font: inherit; font-size: .8em; padding: .15em .5em; cursor: pointer; }
   #status.off { color: #d33; }
   ul { list-style: none; margin: 0; padding: 0; }
-  li { display: grid; grid-template-columns: 1fr auto auto; gap: .2em 1em; padding: .5em 1em; border-bottom: 1px solid var(--line); }
-  li .label { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  li .when { color: var(--dim); font-size: .85em; white-space: nowrap; }
-  li .last { grid-column: 1 / span 2; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Every cell is placed explicitly: an auto-placed item next to a row-spanning one lands
+     wherever the algorithm likes (the button ended up in column 1, full width). */
+  li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; grid-template-rows: auto auto; gap: .15em .8em; padding: .5em 1em; border-bottom: 1px solid var(--line); }
+  li .label { grid-column: 1; grid-row: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  li .when { grid-column: 2; grid-row: 1; color: var(--dim); font-size: .85em; white-space: nowrap; }
+  li .last { grid-column: 1 / span 2; grid-row: 2; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   li .last b { color: CanvasText; font-weight: 500; }
   li .typing { color: var(--hot); }
   #empty { padding: 2em; text-align: center; color: var(--dim); }

@@ -10,6 +10,7 @@ class _Resp:
     def __init__(self, data: Any = None, fail: bool = False) -> None:
         self._data = data
         self._fail = fail
+        self.status_code = 500 if fail else 200  # aget_with_retry reads it before raise_for_status
 
     def raise_for_status(self) -> None:
         if self._fail:

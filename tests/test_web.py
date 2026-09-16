@@ -46,6 +46,8 @@ def test_in_scope_private_group_meeting_not_channel() -> None:
 
 def test_snippet_strips_html_and_collapses_whitespace() -> None:
     assert W.snippet("RichText/Html", "<p>Hello &amp;\n  <b>bye</b></p>") == "Hello & bye"
+    # A mention tag glued to the next word must not fuse the two.
+    assert W.snippet("RichText/Html", '<at id="8:x">Bob</at>dis moi') == "Bob dis moi"
     assert W.snippet("Text", "  plain\ttext  ") == "plain text"
 
 
@@ -96,6 +98,29 @@ async def test_row_prefers_imdisplayname_then_directory(quiet_directory: Directo
     }
     conv["lastMessage"].pop("imdisplayname")
     assert (await W.row_from_conversation(conv, quiet_directory))["sender"] == "name:8:orgid:alice"
+
+
+async def test_row_falls_back_to_listing_topic_when_lookup_fails(directory: Directory, monkeypatch) -> None:
+    async def unresolved(self: Directory, thread_id: str) -> str:
+        return thread_id  # what label() returns when the thread fetch failed
+
+    monkeypatch.setattr(Directory, "label", unresolved)
+    conv = {**_conv("19:meeting_x@thread.v2", "2026-09-15T10:00:00Z"), "threadProperties": {"topic": "Sync"}}
+    assert (await W.row_from_conversation(conv, directory))["label"] == "Sync"
+    conv["threadProperties"] = {}
+    assert (await W.row_from_conversation(conv, directory))["label"] == "19:meeting_x@thread.v2"
+
+
+async def test_row_system_event_has_no_sender(quiet_directory: Directory) -> None:
+    conv = _conv(
+        "19:g@thread.v2",
+        "2026-09-15T10:00:00Z",
+        messagetype="ThreadActivity/AddMember",
+        content="<addmember/>",
+        **{"from": "19:g@thread.v2"},
+    )
+    row = await W.row_from_conversation(conv, quiet_directory)
+    assert (row["sender"], row["text"]) == ("", "👥 member added")
 
 
 async def test_row_without_last_message_is_empty_but_valid(quiet_directory: Directory) -> None:
@@ -298,6 +323,36 @@ async def test_new_message_moves_row_to_top(board: W.Board) -> None:
     assert (row["sender"], row["text"], row["last_id"]) == ("Bob", "hi <b>there</b>", "11")
 
 
+async def test_rename_and_roster_change_refresh_the_label(board: W.Board, monkeypatch) -> None:
+    labels = iter(["Renamed · 3p", "Renamed · 4p"])
+    forgotten: list[str] = []
+    monkeypatch.setattr(Directory, "forget", lambda self, t: forgotten.append(t))
+
+    async def fake_label(self: Directory, thread_id: str) -> str:
+        return next(labels)
+
+    monkeypatch.setattr(Directory, "label", fake_label)
+    rename = _event(
+        "NewMessage",
+        "19:a@thread.v2",
+        id="12",
+        composetime="2026-09-15T12:00:00Z",
+        messagetype="ThreadActivity/TopicUpdate",
+        content="<topicupdate><value>Renamed</value></topicupdate>",
+        **{"from": "19:a@thread.v2"},
+    )
+    await board.on_event(rename)
+    row = board.rows["19:a@thread.v2"]
+    assert (row["label"], row["sender"], row["text"]) == ("Renamed · 3p", "", "✎ renamed")
+    assert forgotten == ["19:a@thread.v2"]
+    joined = dict(rename, resource=dict(rename["resource"], id="13", messagetype="ThreadActivity/AddMember"))
+    await board.on_event(joined)
+    assert row["label"] == "Renamed · 4p" and row["text"] == "👥 member added"
+    plain = _msg("19:a@thread.v2", "2026-09-15T13:00:00Z", "hi", msg_id="14")
+    await board.on_event(plain)
+    assert forgotten == ["19:a@thread.v2", "19:a@thread.v2"]  # a normal message does not refetch
+
+
 async def test_new_message_on_unknown_thread_creates_row(board: W.Board) -> None:
     await board.on_event(_msg("19:new@unq.gbl.spaces", "2026-09-15T13:00:00Z", "yo"))
     assert _order(board)[0] == "19:new@unq.gbl.spaces"
@@ -309,6 +364,16 @@ async def test_out_of_scope_and_control_events_are_ignored(board: W.Board) -> No
     await board.on_event(_msg("19:chan@thread.tacv2", "2026-09-15T13:00:00Z", "channel"))
     await board.on_event(_msg("48:notes", "2026-09-15T13:00:00Z", "notes"))
     await board.on_event(_event("NewMessage", "19:a@thread.v2", messagetype="Control/ReadReceipt"))
+    await board.on_event(
+        _event(
+            "NewMessage",
+            "19:a@thread.v2",
+            id="99",
+            composetime="2026-09-15T14:00:00Z",
+            messagetype="ThreadActivity/MemberConsumptionHorizonUpdate",
+            content="<x/>",
+        )
+    )
     await board.on_event(_event("ThreadUpdate", "19:a@thread.v2"))
     assert json.loads(board.payload()) == before
 

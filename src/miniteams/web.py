@@ -9,6 +9,7 @@ survives restarts; the whole 127/8 is loopback on Linux, no interface setup need
 """
 
 import asyncio
+import html
 import ipaddress
 import json
 import random
@@ -27,7 +28,7 @@ from websockets.typing import Origin
 from .chats import fetch_conversations, is_meeting, is_private, last_activity
 from .config import Settings
 from .directory import Directory
-from .messages import EMOJI, strip_html, thread_of
+from .messages import _TAG_RE, EMOJI, thread_of
 from .stream import run_forever
 
 log = structlog.get_logger()
@@ -35,6 +36,10 @@ log = structlog.get_logger()
 _SNIPPET_LEN = 140
 _LABEL_CONCURRENCY = 8
 _TYPING_TTL = 10.0  # seconds; Teams does not always send ClearTyping
+# Thread activity that changes the label (topic, member count): drop the cached thread info.
+# Someone reading a chat is not activity: bumping the row on it would defeat "seen".
+_SILENT_TYPES = {"ThreadActivity/MemberConsumptionHorizonUpdate"}
+_RELABEL_TYPES = {"ThreadActivity/TopicUpdate", "ThreadActivity/AddMember", "ThreadActivity/DeleteMember"}
 _BIND_ATTEMPTS = 3  # redraws when the persisted port turns out taken
 # Non-text last messages: a short marker instead of the raw HTML/card payload.
 _TYPE_MARKERS = {
@@ -45,6 +50,8 @@ _TYPE_MARKERS = {
     "RichText/Media_LocalRecording": "🎥 recording",
     "ThreadActivity/AddMember": "👥 member added",
     "ThreadActivity/DeleteMember": "👥 member removed",
+    "ThreadActivity/TopicUpdate": "✎ renamed",
+    "ThreadActivity/MemberConsumptionHorizonUpdate": "👁 read marker",
     "Event/Call": "📞 call",
 }
 
@@ -57,7 +64,9 @@ def in_scope(thread_id: str) -> bool:
 def snippet(msgtype: str, content: str) -> str:
     """One-line preview of a message body, marker for non-text types, capped at _SNIPPET_LEN."""
     if msgtype in ("RichText/Html", "Text"):
-        text = strip_html(content) if msgtype == "RichText/Html" else content.strip()
+        # Tags become spaces, not nothing: `<at>Bob</at>dis` would otherwise read "Bobdis".
+        text = html.unescape(_TAG_RE.sub(" ", content)) if msgtype == "RichText/Html" else content
+        text = " ".join(text.split())
         if not text:
             # The list stub of a deleted message keeps its type but loses body and properties;
             # a body that strips to nothing is an image/attachment tag.
@@ -71,19 +80,35 @@ def snippet(msgtype: str, content: str) -> str:
 async def row_from_conversation(conv: dict[str, Any], directory: Directory) -> dict[str, Any]:
     thread_id = str(conv.get("id") or "")
     last = conv.get("lastMessage") or {}
-    sender_mri = str(last.get("from") or "")
-    directory.note_name(sender_mri, last.get("imdisplayname"))
-    sender = last.get("imdisplayname") or (await directory.display(sender_mri) if sender_mri else "")
+    msgtype = str(last.get("messagetype") or "")
+    sender = "" if _is_system(msgtype) else await sender_of(last, directory)
+    label = await directory.label(thread_id)
+    if label == thread_id:  # thread lookup failed (rate limit…): the listing carries the topic
+        label = str((conv.get("threadProperties") or {}).get("topic") or thread_id)
     return {
         "id": thread_id,
-        "label": await directory.label(thread_id),
+        "label": label,
         "last_activity": last_activity(conv),
         "last_id": str(last.get("id") or ""),
         "sender": sender,
-        "text": snippet(str(last.get("messagetype") or ""), str(last.get("content") or "")),
+        "text": snippet(msgtype, str(last.get("content") or "")),
         "seen_at": None,
         "typing": [],
     }
+
+
+def _is_system(msgtype: str) -> bool:
+    """Thread activity (member changes, read markers…) is emitted by the thread, not a person."""
+    return msgtype.startswith("ThreadActivity/")
+
+
+async def sender_of(resource: dict[str, Any], directory: Directory | None) -> str:
+    mri = str(resource.get("from") or "")
+    name = resource.get("imdisplayname")
+    if directory is None:
+        return str(name or mri)
+    directory.note_name(mri, name)
+    return str(name) if name else (await directory.display(mri) if mri else "")
 
 
 async def bootstrap(
@@ -208,18 +233,10 @@ class Board:
         if resource_type == "NewMessage":
             if msgtype in ("Control/Typing", "Control/ClearTyping"):
                 await self._typing(thread_id, resource, started=msgtype == "Control/Typing")
-            elif not msgtype.startswith("Control/"):  # read receipts & co carry no row change
+            elif not msgtype.startswith("Control/") and msgtype not in _SILENT_TYPES:
                 await self._new_message(thread_id, resource, msgtype)
         elif resource_type == "MessageUpdate":
             await self._message_update(thread_id, resource, msgtype)
-
-    async def _sender(self, resource: dict[str, Any]) -> str:
-        mri = str(resource.get("from") or "")
-        name = resource.get("imdisplayname")
-        if self.directory is None:
-            return str(name or mri)
-        self.directory.note_name(mri, name)
-        return str(name) if name else await self.directory.display(mri)
 
     async def _new_message(self, thread_id: str, resource: dict[str, Any], msgtype: str) -> None:
         row = self.rows.get(thread_id)
@@ -231,7 +248,10 @@ class Board:
                 "seen_at": self._seen.get(thread_id),
                 "typing": [],
             }
-        sender = await self._sender(resource)
+        sender = "" if _is_system(msgtype) else await sender_of(resource, self.directory)
+        if msgtype in _RELABEL_TYPES and self.directory is not None:
+            self.directory.forget(thread_id)
+            row["label"] = await self.directory.label(thread_id)
         row.update(
             last_activity=str(resource.get("composetime") or resource.get("originalarrivaltime") or ""),
             last_id=str(resource.get("id") or ""),
@@ -291,7 +311,7 @@ class Board:
         row = self.rows.get(thread_id)
         if row is None:
             return  # a thread we never listed: nothing to annotate
-        name = await self._sender(resource)
+        name = await sender_of(resource, self.directory)
         if not started:
             self._typing_stop(thread_id, name)
             self.broadcast()

@@ -18,6 +18,7 @@ import httpx
 import structlog
 
 from .config import Settings
+from .http import aget_with_retry
 
 log = structlog.get_logger()
 
@@ -117,10 +118,25 @@ class Directory:
             self._reactions.popitem(last=False)  # evict least-recently-active message
         return current - prev, prev - current
 
+    def forget(self, thread_id: str) -> None:
+        """Drop cached thread info so the next label() refetches it (rename, roster change)."""
+        self._threads.pop(thread_id, None)
+
     async def thread(self, thread_id: str) -> dict[str, Any] | None:
-        if thread_id in self._threads:  # cached (incl. negative results)
+        if thread_id in self._threads:  # cached (incl. a definitive 404)
             return self._threads[thread_id]
-        info = await self._fetch_thread(thread_id)
+        try:
+            info = await self._fetch_thread(thread_id)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 404:
+                # 429/5xx: a transient failure must not pin the bare id as the label for the
+                # whole process lifetime — retry on the next lookup instead.
+                log.debug("thread_fetch_failed", thread=thread_id, status=exc.response.status_code)
+                return None
+            info = None
+        except Exception as exc:  # noqa: BLE001 — enrichment is best-effort, never fatal
+            log.debug("thread_fetch_failed", thread=thread_id, error=str(exc))
+            return None
         self._threads[thread_id] = info
         return info
 
@@ -135,14 +151,11 @@ class Directory:
             "Accept": "application/json; ver=1.0;",
             "BehaviorOverride": "redirectAs404",
         }
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(url, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-        except Exception as exc:  # noqa: BLE001 — enrichment is best-effort, never fatal
-            log.debug("thread_fetch_failed", thread=thread_id, error=str(exc))
-            return None
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            # Parallel label resolution (web bootstrap) trips the chat-service rate limit;
+            # honour Retry-After instead of pinning the bare id. thread() decides what is cacheable.
+            resp = await aget_with_retry(client, url, headers=headers)
+            data = resp.json()
 
         members: list[dict[str, Any]] = []
         for m in data.get("members") or []:
