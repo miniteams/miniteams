@@ -289,7 +289,7 @@ def test_deep_link_formats() -> None:
         "?context=%7B%22contextType%22%3A%22chat%22%7D"
     )
     assert W.deep_link("19:e45a@thread.v2", "1", "msteams").startswith(
-        "msteams://teams.microsoft.com/l/message/"
+        "msteams://teams.cloud.microsoft/l/message/"
     )
 
 

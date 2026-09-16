@@ -67,7 +67,9 @@ page). Clicking a row opens the chat at its last message through `--opener` (def
 on an `msteams://` deep link, i.e. the desktop client; `--open-scheme https` for Teams web,
 `--opener none` to let the page follow its plain https link); opening does not mark the row
 seen. Ctrl/middle click opens the https link, through `--browser firefox` when set, else in the
-page's own browser. Each row has a **seen** button: the row is hidden until something newer lands on that
+page's own browser. `xdg-open` only works when the `msteams` handler's `.desktop` entry passes the
+URL along (`Exec=… %u`); otherwise point `--opener` at the client binary, e.g.
+`--opener "/path/to/teams-for-linux --no-sandbox"`. Each row has a **seen** button: the row is hidden until something newer lands on that
 chat (state in `~/.config/miniteams/seen.json`); "show seen" reveals hidden rows dimmed, where **unseen** undoes it. The
 process exits non-zero when the stream dies (auth expired) — re-run it.
 
