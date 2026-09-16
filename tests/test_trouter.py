@@ -64,3 +64,11 @@ def test_handshake_extracts_session_id(settings: Settings, monkeypatch) -> None:
     monkeypatch.setattr(trouter.httpx, "get", lambda *a, **k: R())
     sid = trouter.handshake(settings, {"socketio": "https://t/", "connectparams": {}}, "sk", "epid")
     assert sid == "SESSION123"
+
+
+def test_epid_is_per_consumer_and_stable(settings: Settings) -> None:
+    stream_id = trouter.get_or_create_epid(settings)
+    web_id = trouter.get_or_create_epid(settings, "endpoint_id-web")
+    assert stream_id != web_id  # a shared epid lets one process steal the other's deliveries
+    assert trouter.get_or_create_epid(settings) == stream_id
+    assert trouter.get_or_create_epid(settings, "endpoint_id-web") == web_id

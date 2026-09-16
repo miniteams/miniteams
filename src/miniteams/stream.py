@@ -263,6 +263,7 @@ async def run_forever(
     typing: bool = False,
     on_event: EventHook | None = None,
     directory: Directory | None = None,
+    epid_name: str = "endpoint_id",
 ) -> None:
     """Re-establish a full session on every disconnect (handoff §M4).
 
@@ -283,7 +284,7 @@ async def run_forever(
             aad = tokens.refresh()  # silent; raises AuthExpired when the refresh token is dead
             skype_token = exchange_skype_token(settings, aad["access_token"])["skype_token"]
             directory.set_token(skype_token, str(aad.get("id_token") or aad["access_token"]))
-            epid = get_or_create_epid(settings)
+            epid = get_or_create_epid(settings, epid_name)
             info = trouter_info(settings, skype_token, epid)
             session_id = handshake(settings, info, skype_token, epid)
             connected_at = time.monotonic()

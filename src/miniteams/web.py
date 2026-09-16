@@ -421,7 +421,10 @@ async def run(
     # The stream only returns when auth is dead: a page that silently stops updating is worse
     # than an exit, so the server goes down with it and the user re-runs.
     server = asyncio.create_task(serve_board(board, settings, bind))
-    stream = asyncio.create_task(run_forever(settings, on_event=board.on_event, directory=directory))
+    # Own endpoint id: sharing `stream`'s would make whichever registered last the only receiver.
+    stream = asyncio.create_task(
+        run_forever(settings, on_event=board.on_event, directory=directory, epid_name="endpoint_id-web")
+    )
     done, pending = await asyncio.wait({server, stream}, return_when=asyncio.FIRST_COMPLETED)
     for task in pending:
         task.cancel()
