@@ -269,6 +269,19 @@ async def test_read_marker_moves_with_devices_and_new_messages(board: W.Board) -
     assert "19:ghost@thread.v2" not in board.rows and row["read_id"] == "11"
 
 
+async def test_page_version_in_payload_and_watch_broadcasts_on_change(monkeypatch) -> None:
+    versions = iter(["v1", "v1", "v2", "v2"])
+    monkeypatch.setattr(W, "page_version", lambda: next(versions))
+    board = W.Board({})
+    assert json.loads(board.payload())["page"] == "v1"
+    sent: list[str] = []
+    monkeypatch.setattr(board, "broadcast", lambda: sent.append("b"))
+    task = asyncio.create_task(board.watch_page(interval=0.01))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    assert sent == ["b"]  # exactly one broadcast, when v1 → v2 was observed
+
+
 def test_board_payload_sorted_newest_first() -> None:
     board = W.Board(
         {
@@ -383,7 +396,7 @@ async def test_serve_redraws_when_persisted_port_is_taken(settings: Settings, mo
             "port": free,
         }
         async with websockets.connect(f"ws://127.0.0.1:{free}/ws", origin=f"http://127.0.0.1:{free}") as ws:
-            assert json.loads(await ws.recv()) == {"rows": []}
+            assert json.loads(await ws.recv())["rows"] == []
     finally:
         taken.close()
         task.cancel()

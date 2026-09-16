@@ -37,6 +37,7 @@ log = structlog.get_logger()
 _SNIPPET_LEN = 140
 _LABEL_CONCURRENCY = 8
 _STUB_PAGE = 5  # history page fetched to resolve an ambiguous listing stub
+_PAGE_POLL = 2.0  # seconds between widget.html mtime checks (dev reload)
 _TYPING_TTL = 10.0  # seconds; Teams does not always send ClearTyping
 # Thread activity that changes the label (topic, member count): drop the cached thread info.
 # Someone reading a chat is not activity: bumping the row on it would defeat "seen".
@@ -418,7 +419,18 @@ class Board:
 
     def payload(self) -> str:
         ordered = sorted(self.rows.values(), key=lambda r: r["last_activity"], reverse=True)
-        return json.dumps({"rows": ordered}, ensure_ascii=False)
+        # `page` lets an open tab notice a newer widget.html (server restart, edit) and reload.
+        return json.dumps({"rows": ordered, "page": page_version()}, ensure_ascii=False)
+
+    async def watch_page(self, interval: float = _PAGE_POLL) -> None:
+        """Broadcast when widget.html changes so open tabs reload without waiting for an event."""
+        current = page_version()
+        while True:
+            await asyncio.sleep(interval)
+            version = page_version()
+            if version != current:
+                current = version
+                self.broadcast()
 
     def broadcast(self) -> None:
         # Library helper: never awaits a slow page; a client with a full buffer just misses one
@@ -453,8 +465,19 @@ def _load_seen(path: Path | None) -> dict[str, str]:
     return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
 
 
+def _page_path() -> Path:
+    return Path(str(files("miniteams").joinpath("widget.html")))
+
+
+def page_version() -> str:
+    try:
+        return str(_page_path().stat().st_mtime_ns)
+    except OSError:
+        return ""
+
+
 def _page() -> str:
-    return files("miniteams").joinpath("widget.html").read_text(encoding="utf-8")
+    return _page_path().read_text(encoding="utf-8")
 
 
 def _process_request(ws: ServerConnection, request: Request) -> Response | None:
@@ -477,7 +500,7 @@ async def serve_board(board: Board, settings: Settings, bind: str | None) -> Non
             origins = [Origin(f"http://{host}:{port}")]
             async with serve(board.handle, host, port, origins=origins, process_request=_process_request):
                 log.info("web_listening", url=f"http://{host}:{port}/")
-                await asyncio.Future()  # until cancelled
+                await board.watch_page()  # until cancelled
         except OSError as exc:
             if bind or attempt == _BIND_ATTEMPTS - 1:
                 raise
