@@ -65,8 +65,9 @@ It binds a random `127.0.0.X:PORT` drawn once and kept in `~/.config/miniteams/w
 URL stays bookmarkable; `--bind` overrides it and refuses anything but loopback (no auth on the
 page). Clicking a row opens the chat at its last message through `--opener` (default `xdg-open`
 on an `msteams://` deep link, i.e. the desktop client; `--open-scheme https` for Teams web,
-`--opener none` to let the page follow its plain https link) and marks it seen; Ctrl/middle
-click always opens the https link in the browser. Each row has a **seen** button: the row is hidden until something newer lands on that
+`--opener none` to let the page follow its plain https link); opening does not mark the row
+seen. Ctrl/middle click opens the https link, through `--browser firefox` when set, else in the
+page's own browser. Each row has a **seen** button: the row is hidden until something newer lands on that
 chat (state in `~/.config/miniteams/seen.json`); "show seen" reveals hidden rows dimmed. The
 process exits non-zero when the stream dies (auth expired) — re-run it.
 

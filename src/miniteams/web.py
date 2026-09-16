@@ -254,6 +254,7 @@ class Board:
         seen_path: Path | None = None,
         opener: list[str] | None = None,
         open_scheme: str = "msteams",
+        browser: list[str] | None = None,
     ) -> None:
         self.rows = rows
         self.directory = directory
@@ -262,6 +263,7 @@ class Board:
         self.seen_path = seen_path
         self.opener = opener  # argv the deep link is appended to; None = the page follows its link
         self.open_scheme = open_scheme
+        self.browser = browser  # argv for the https link on Ctrl/middle click; None = page's own browser
         self.clients: set[ServerConnection] = set()
         self._typing_timers: dict[tuple[str, str], asyncio.TimerHandle] = {}
         self._seen: dict[str, str] = _load_seen(seen_path)
@@ -434,19 +436,28 @@ class Board:
         for row in ordered:
             row["link"] = deep_link(row["id"], row.get("last_id", "")) if row.get("last_id") else ""
         return json.dumps(
-            {"rows": ordered, "page": page_version(), "opener": self.opener is not None}, ensure_ascii=False
+            {
+                "rows": ordered,
+                "page": page_version(),
+                "opener": self.opener is not None,
+                "browser": self.browser is not None,
+            },
+            ensure_ascii=False,
         )
 
-    async def open_row(self, thread_id: str, at: str | None = None) -> bool:
-        """Page verb `open`: launch the configured opener on the row's deep link, and mark it seen."""
+    async def open_row(self, thread_id: str, web: bool = False) -> bool:
+        """Page verb `open`: run the opener (or, for `web`, the browser) on the row's deep link.
+
+        Opening is not reading: the row keeps its seen/unread state until the user says so."""
         row = self.rows.get(thread_id)
-        if row is None or not row.get("last_id") or self.opener is None:
+        argv = self.browser if web else self.opener
+        if row is None or not row.get("last_id") or argv is None:
             return False
-        url = deep_link(thread_id, row["last_id"], self.open_scheme)
+        url = deep_link(thread_id, row["last_id"], "https" if web else self.open_scheme)
         try:
             # argv exec, no shell: the only variable part is a URL built from ids we already hold.
             proc = await asyncio.create_subprocess_exec(
-                *self.opener,
+                *argv,
                 url,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
@@ -454,11 +465,10 @@ class Board:
                 start_new_session=True,
             )
         except OSError as exc:
-            log.warning("opener_failed", opener=self.opener[0], error=str(exc))
+            log.warning("opener_failed", opener=argv[0], error=str(exc))
             return False
         asyncio.get_running_loop().create_task(proc.wait())  # reap; xdg-open returns at once
-        log.info("opened", thread=thread_id)
-        self.mark_seen(thread_id, at)
+        log.info("opened", thread=thread_id, web=web)
         return True
 
     async def watch_page(self, interval: float = _PAGE_POLL) -> None:
@@ -490,7 +500,7 @@ class Board:
                 if isinstance(verb, dict) and isinstance(verb.get("seen"), str):
                     self.mark_seen(verb["seen"], at)
                 elif isinstance(verb, dict) and isinstance(verb.get("open"), str):
-                    await self.open_row(verb["open"], at)
+                    await self.open_row(verb["open"], web=verb.get("web") is True)
                 else:
                     log.debug("ws_client_message_ignored", data=str(raw)[:100])
         finally:
@@ -561,6 +571,7 @@ async def run(
     reactions: bool = False,
     opener: str = "xdg-open",
     open_scheme: str = "msteams",
+    browser: str = "",
 ) -> None:
     directory = Directory(settings)
     directory.set_token(skype_token, bearer)
@@ -573,6 +584,7 @@ async def run(
         seen_path=settings.config_dir / "seen.json",
         opener=None if opener in ("", "none") else opener.split(),
         open_scheme=open_scheme,
+        browser=None if browser in ("", "none") else browser.split(),
     )
     # The stream only returns when auth is dead: a page that silently stops updating is worse
     # than an exit, so the server goes down with it and the user re-runs.

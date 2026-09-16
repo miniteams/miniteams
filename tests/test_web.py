@@ -293,7 +293,9 @@ def test_deep_link_formats() -> None:
     )
 
 
-async def test_open_row_launches_opener_and_marks_seen(settings: Settings, monkeypatch) -> None:
+async def test_open_row_launches_opener_or_browser_without_marking_seen(
+    settings: Settings, monkeypatch
+) -> None:
     launched: list[tuple[str, ...]] = []
 
     class _Proc:
@@ -306,16 +308,21 @@ async def test_open_row_launches_opener_and_marks_seen(settings: Settings, monke
 
     monkeypatch.setattr(W.asyncio, "create_subprocess_exec", fake_exec)
     rows = {"t": {"id": "t", "last_activity": "2026-09-15T10:00:00Z", "last_id": "42", "seen_at": None}}
-    board = W.Board(rows, seen_path=settings.config_dir / "seen.json", opener=["xdg-open"])
-    assert await board.open_row("t", at="2026-09-15T10:00:00Z") is True
+    board = W.Board(
+        rows, seen_path=settings.config_dir / "seen.json", opener=["xdg-open"], browser=["firefox"]
+    )
+    assert await board.open_row("t") is True
     assert launched == [("xdg-open", W.deep_link("t", "42", "msteams"))]
-    assert rows["t"]["seen_at"] == "2026-09-15T10:00:00Z"
-    assert await board.open_row("nope") is False and len(launched) == 1
-    assert json.loads(board.payload())["opener"] is True
+    assert rows["t"]["seen_at"] is None  # opening is not reading
+    assert await board.open_row("t", web=True) is True
+    assert launched[-1] == ("firefox", W.deep_link("t", "42", "https"))
+    assert await board.open_row("nope") is False and len(launched) == 2
+    assert json.loads(board.payload())["opener"] is True and json.loads(board.payload())["browser"] is True
     assert json.loads(board.payload())["rows"][0]["link"] == W.deep_link("t", "42")
     # No opener configured: the verb is a no-op and the page is told to follow its own link.
     plain = W.Board(dict(rows), opener=None)
     assert await plain.open_row("t") is False and json.loads(plain.payload())["opener"] is False
+    assert await plain.open_row("t", web=True) is False and json.loads(plain.payload())["browser"] is False
 
 
 async def test_open_row_survives_missing_opener_binary(settings: Settings) -> None:

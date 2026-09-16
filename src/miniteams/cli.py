@@ -166,6 +166,7 @@ def cmd_web(settings: Settings, args: argparse.Namespace) -> int:
                 args.reactions,
                 args.opener,
                 args.open_scheme,
+                args.browser,
             )
         )
     except KeyboardInterrupt:
@@ -411,6 +412,12 @@ def main(argv: list[str] | None = None) -> int:
         choices=["msteams", "https"],
         default="msteams",
         help="deep-link scheme handed to --opener: msteams = desktop client, https = Teams web",
+    )
+    p_web.add_argument(
+        "--browser",
+        default="",
+        help="command run with the https link on Ctrl/middle click (e.g. firefox); default: the page's "
+        "own browser follows the link",
     )
     p_web.set_defaults(func=cmd_web)
 

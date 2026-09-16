@@ -207,6 +207,6 @@ def test_web_parser_defaults_and_limit_validation(monkeypatch) -> None:
     monkeypatch.setenv("MINITEAMS_TENANT_ID", "t")
     assert cli.main(["web"]) == 0
     assert seen["limit"] == 50 and seen["bind"] is None and seen["reactions"] is False
-    assert seen["opener"] == "xdg-open" and seen["open_scheme"] == "msteams"
+    assert seen["opener"] == "xdg-open" and seen["open_scheme"] == "msteams" and seen["browser"] == ""
     with pytest.raises(SystemExit):
         cli.main(["web", "--limit", "-1"])
