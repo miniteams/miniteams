@@ -66,6 +66,15 @@ def test_snippet_html_with_only_media_gets_a_marker() -> None:
     assert W.snippet("Text", "") == "🗑 deleted"
 
 
+def test_snippet_file_and_card_posts_are_not_deleted() -> None:
+    files = {"files": [{"fileName": "Facture.pdf"}, {"fileName": "notes.txt"}]}
+    assert W.snippet("RichText/Html", "", files) == "📎 Facture.pdf, notes.txt"
+    assert W.snippet("RichText/Html", "", {"files": [], "cards": [{"cardClientId": "x"}]}) == "🃏 card"
+    assert W.snippet("RichText/Html", "<p>see attached</p>", files) == "see attached"  # body wins
+    assert W.snippet("RichText/Html", "", {"files": [{}]}) == "📎 file"
+    assert W.snippet("RichText/Html", "", {}) == "🗑 deleted"
+
+
 def test_snippet_markers_for_non_text_types() -> None:
     assert W.snippet("RichText/Media_GenericFile", "<URIObject…>") == "📎 file"
     assert W.snippet("ThreadActivity/AddMember", "<addmember/>") == "👥 member added"
@@ -145,6 +154,59 @@ async def test_bootstrap_filters_scope_and_caps(quiet_directory: Directory) -> N
         "19:a@unq.gbl.spaces",
         "19:meeting_m@thread.v2",
         "19:b@thread.v2",
+    ]
+
+
+async def test_bootstrap_resolves_ambiguous_stubs_with_one_history_call(
+    quiet_directory: Directory, monkeypatch
+) -> None:
+    fetched: list[str] = []
+    full = {
+        "19:file@thread.v2": {
+            "id": "1",
+            "messagetype": "RichText/Html",
+            "content": "",
+            "properties": {"files": [{"fileName": "Facture.pdf"}]},
+            "imdisplayname": "Ed",
+        },
+        "19:gone@thread.v2": {
+            "id": "2",
+            "messagetype": "RichText/Html",
+            "content": "",
+            "properties": {"deletetime": "1"},
+        },
+        "19:moved@thread.v2": {"id": "other", "messagetype": "Text", "content": "newer"},  # id mismatch
+    }
+
+    def fake_history(settings: Any, token: str, thread_id: str, page_size: int, max_pages: int) -> list[Any]:
+        fetched.append(thread_id)
+        if thread_id == "19:down@thread.v2":
+            raise RuntimeError("503")
+        return [full[thread_id]]
+
+    monkeypatch.setattr(W, "fetch_history", fake_history)
+    stub = {"messagetype": "RichText/Html", "content": ""}
+    pages = [
+        [
+            _conv("19:file@thread.v2", "2026-09-15T10:00:00Z", id="1", **stub),
+            _conv("19:gone@thread.v2", "2026-09-15T09:00:00Z", id="2", **stub),
+            _conv("19:moved@thread.v2", "2026-09-15T08:00:00Z", id="3", **stub),
+            _conv("19:down@thread.v2", "2026-09-15T07:00:00Z", id="4", **stub),
+            _conv("19:text@thread.v2", "2026-09-15T06:00:00Z", id="5", messagetype="Text", content="hi"),
+        ]
+    ]
+    rows = await W.bootstrap(pages, quiet_directory, limit=0)
+    assert (
+        rows["19:file@thread.v2"]["text"] == "📎 Facture.pdf" and rows["19:file@thread.v2"]["sender"] == "Ed"
+    )
+    assert rows["19:gone@thread.v2"]["text"] == "🗑 deleted"
+    assert rows["19:moved@thread.v2"]["text"] == "🗑 deleted"  # stale stub: keep, do not guess
+    assert rows["19:down@thread.v2"]["text"] == "🗑 deleted"  # fetch failed: bootstrap survives
+    assert sorted(fetched) == [
+        "19:down@thread.v2",
+        "19:file@thread.v2",
+        "19:gone@thread.v2",
+        "19:moved@thread.v2",
     ]
 
 

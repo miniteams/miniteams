@@ -28,6 +28,7 @@ from websockets.typing import Origin
 from .chats import fetch_conversations, is_meeting, is_private, last_activity
 from .config import Settings
 from .directory import Directory
+from .dump import fetch_history
 from .messages import _TAG_RE, EMOJI, thread_of
 from .stream import run_forever
 
@@ -61,16 +62,27 @@ def in_scope(thread_id: str) -> bool:
     return is_private(thread_id) or is_meeting(thread_id)
 
 
-def snippet(msgtype: str, content: str) -> str:
+def snippet(msgtype: str, content: str, props: dict[str, Any] | None = None) -> str:
     """One-line preview of a message body, marker for non-text types, capped at _SNIPPET_LEN."""
+    props = props or {}
     if msgtype in ("RichText/Html", "Text"):
         # Tags become spaces, not nothing: `<at>Bob</at>dis` would otherwise read "Bobdis".
         text = html.unescape(_TAG_RE.sub(" ", content)) if msgtype == "RichText/Html" else content
         text = " ".join(text.split())
         if not text:
-            # The list stub of a deleted message keeps its type but loses body and properties;
-            # a body that strips to nothing is an image/attachment tag.
-            text = "🗑 deleted" if not content.strip() else "🖼 image" if "<img" in content else "📎 attachment"
+            # A file/card post has an empty body and its payload in properties; the list stub of
+            # a deleted message has neither; a body that strips to nothing is an image tag.
+            names = [
+                str(f.get("fileName") or "file") for f in props.get("files") or [] if isinstance(f, dict)
+            ]
+            if names:
+                text = "📎 " + ", ".join(names)
+            elif props.get("cards"):
+                text = "🃏 card"
+            elif not content.strip():
+                text = "🗑 deleted"
+            else:
+                text = "🖼 image" if "<img" in content else "📎 attachment"
     else:
         text = (_TYPE_MARKERS.get(msgtype) or f"[{msgtype.rsplit('/', 1)[-1]}]") if msgtype else ""
     text = " ".join(text.split())
@@ -91,7 +103,7 @@ async def row_from_conversation(conv: dict[str, Any], directory: Directory) -> d
         "last_activity": last_activity(conv),
         "last_id": str(last.get("id") or ""),
         "sender": sender,
-        "text": snippet(msgtype, str(last.get("content") or "")),
+        "text": snippet(msgtype, str(last.get("content") or ""), last.get("properties")),
         "seen_at": None,
         "typing": [],
     }
@@ -131,10 +143,32 @@ async def bootstrap(
 
     async def build(conv: dict[str, Any]) -> dict[str, Any]:
         async with gate:
-            return await row_from_conversation(conv, directory)
+            row = await row_from_conversation(conv, directory)
+            if row["text"] == "🗑 deleted":
+                await _resolve_stub(row, directory)
+            return row
 
     rows = await asyncio.gather(*(build(conv) for conv in picked))
     return {row["id"]: row for row in rows}
+
+
+async def _resolve_stub(row: dict[str, Any], directory: Directory) -> None:
+    """The listing's lastMessage drops `properties`, so a file/card post looks exactly like a
+    deleted message. One history call for the few ambiguous rows tells them apart."""
+    try:
+        newest = await asyncio.to_thread(
+            fetch_history, directory.settings, directory.skype_token, row["id"], 1, 1
+        )
+    except Exception as exc:  # noqa: BLE001 — cosmetic: keep the stub rather than fail bootstrap
+        log.debug("stub_resolve_failed", thread=row["id"], error=str(exc))
+        return
+    if not newest or str(newest[-1].get("id") or "") != row["last_id"]:
+        return
+    message = newest[-1]
+    msgtype = str(message.get("messagetype") or "")
+    row["text"] = snippet(msgtype, str(message.get("content") or ""), message.get("properties"))
+    if not _is_system(msgtype):
+        row["sender"] = await sender_of(message, directory)
 
 
 # --- bind address ---
@@ -256,7 +290,7 @@ class Board:
             last_activity=str(resource.get("composetime") or resource.get("originalarrivaltime") or ""),
             last_id=str(resource.get("id") or ""),
             sender=sender,
-            text=snippet(msgtype, str(resource.get("content") or "")),
+            text=snippet(msgtype, str(resource.get("content") or ""), resource.get("properties")),
         )
         self._typing_stop(thread_id, sender)  # their message is the end of their typing
         self.broadcast()
@@ -273,7 +307,7 @@ class Board:
         if props.get("deletetime"):
             row["text"] = "🗑 deleted"
         elif resource.get("skypeeditedid") or props.get("edittime"):
-            row["text"] = snippet(msgtype, str(resource.get("content") or ""))
+            row["text"] = snippet(msgtype, str(resource.get("content") or ""), props)
         else:
             return
         self.broadcast()
