@@ -83,7 +83,10 @@ def deep_link(thread_id: str, msg_id: str, scheme: str = "https") -> str:
     """
     host = "teams.cloud.microsoft" if scheme == "msteams" else "teams.microsoft.com"
     ctx = quote('{"contextType":"chat"}', safe="")
-    return f"{scheme}://{host}/l/message/{quote(thread_id, safe='')}/{msg_id}?context={ctx}"
+    thread = quote(thread_id, safe="")
+    if not msg_id:  # no message to land on (activity known only from the thread version)
+        return f"{scheme}://{host}/l/chat/{thread}/conversations?context={ctx}"
+    return f"{scheme}://{host}/l/message/{thread}/{msg_id}?context={ctx}"
 
 
 def in_scope(thread_id: str) -> bool:
@@ -453,7 +456,7 @@ class Board:
         ordered = sorted(self.rows.values(), key=lambda r: r["last_activity"], reverse=True)
         # `page` lets an open tab notice a newer widget.html (server restart, edit) and reload.
         for row in ordered:
-            row["link"] = deep_link(row["id"], row.get("last_id", "")) if row.get("last_id") else ""
+            row["link"] = deep_link(row["id"], row.get("last_id", ""))
         return json.dumps(
             {
                 "rows": ordered,
@@ -470,9 +473,9 @@ class Board:
         Opening is not reading: the row keeps its seen/unread state until the user says so."""
         row = self.rows.get(thread_id)
         argv = self.browser if web else self.opener
-        if row is None or not row.get("last_id") or argv is None:
+        if row is None or argv is None:
             return False
-        url = deep_link(thread_id, row["last_id"], "https" if web else self.open_scheme)
+        url = deep_link(thread_id, row.get("last_id", ""), "https" if web else self.open_scheme)
         try:
             # argv exec, no shell: the only variable part is a URL built from ids we already hold.
             proc = await asyncio.create_subprocess_exec(
