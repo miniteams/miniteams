@@ -73,6 +73,19 @@ def test_snippet_file_and_card_posts_are_not_deleted() -> None:
     assert W.snippet("RichText/Html", "<p>see attached</p>", files) == "see attached"  # body wins
     assert W.snippet("RichText/Html", "", {"files": [{}]}) == "📎 file"
     assert W.snippet("RichText/Html", "", {}) == "🗑 deleted"
+    # Teams ships files/cards as JSON strings: an empty '[]' is not a card.
+    assert W.snippet("RichText/Html", '<p><img src="x"></p>', {"cards": "[]", "files": "[]"}) == "🖼 image"
+    assert W.snippet("RichText/Html", "", {"cards": '[{"cardClientId": "x"}]', "files": "[]"}) == "🃏 card"
+    assert W.snippet("RichText/Html", "", {"files": '[{"fileName": "a.pdf"}]'}) == "📎 a.pdf"
+    assert W.snippet("RichText/Html", "", {"files": "not json"}) == "🗑 deleted"
+
+
+def test_snippet_renders_emoji_alt() -> None:
+    assert (
+        W.snippet("RichText/Html", '<p><emoji id="1f600_grinningface" alt="😀" title="Grinning"></emoji></p>')
+        == "😀"
+    )
+    assert W.snippet("RichText/Html", '<p>ok <emoji id="x" alt="👍" title="thumbs"></emoji></p>') == "ok 👍"
 
 
 def test_snippet_markers_for_non_text_types() -> None:

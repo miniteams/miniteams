@@ -13,6 +13,7 @@ import html
 import ipaddress
 import json
 import random
+import re
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -36,6 +37,7 @@ from .stream import run_forever
 log = structlog.get_logger()
 
 _SNIPPET_LEN = 140
+_EMOJI_ALT_RE = re.compile(r'<emoji\b[^>]*\balt="([^"]*)"[^>]*>')
 _LABEL_CONCURRENCY = 8
 _STUB_PAGE = 5  # history page fetched to resolve an ambiguous listing stub
 _PAGE_POLL = 2.0  # seconds between widget.html mtime checks (dev reload)
@@ -94,22 +96,37 @@ def in_scope(thread_id: str) -> bool:
     return is_private(thread_id) or is_meeting(thread_id)
 
 
+def _json_list(value: Any) -> list[Any]:
+    """`properties.files` / `.cards` arrive as JSON *strings* (`'[]'` is truthy) or as lists."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return []
+    return value if isinstance(value, list) else []
+
+
 def snippet(msgtype: str, content: str, props: dict[str, Any] | None = None) -> str:
     """One-line preview of a message body, marker for non-text types, capped at _SNIPPET_LEN."""
     props = props or {}
     if msgtype in ("RichText/Html", "Text"):
-        # Tags become spaces, not nothing: `<at>Bob</at>dis` would otherwise read "Bobdis".
-        text = html.unescape(_TAG_RE.sub(" ", content)) if msgtype == "RichText/Html" else content
+        # Emoji are tags whose `alt` holds the character; tags then become spaces, not nothing:
+        # `<at>Bob</at>dis` would otherwise read "Bobdis".
+        text = content
+        if msgtype == "RichText/Html":
+            text = html.unescape(_TAG_RE.sub(" ", _EMOJI_ALT_RE.sub(r"\1", content)))
         text = " ".join(text.split())
         if not text:
             # A file/card post has an empty body and its payload in properties; the list stub of
             # a deleted message has neither; a body that strips to nothing is an image tag.
             names = [
-                str(f.get("fileName") or "file") for f in props.get("files") or [] if isinstance(f, dict)
+                str(f.get("fileName") or "file")
+                for f in _json_list(props.get("files"))
+                if isinstance(f, dict)
             ]
             if names:
                 text = "📎 " + ", ".join(names)
-            elif props.get("cards"):
+            elif _json_list(props.get("cards")):
                 text = "🃏 card"
             elif not content.strip():
                 text = "🗑 deleted"
