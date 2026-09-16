@@ -58,6 +58,21 @@ _TYPE_MARKERS = {
 }
 
 
+def read_up_to(props: dict[str, Any] | None) -> str:
+    """Id of the newest message Teams considers read (`consumptionhorizon` = "<id>;<ts>;<x>")."""
+    horizon = str((props or {}).get("consumptionhorizon") or "")
+    return horizon.split(";", 1)[0]
+
+
+def is_unread(last_id: str, read_id: str) -> bool:
+    """Message ids are ms-epoch strings: newer than the horizon ⇒ unread (on every device)."""
+    if not last_id or not read_id:
+        return False  # nothing known: do not shout
+    if last_id.isdigit() and read_id.isdigit():
+        return int(last_id) > int(read_id)
+    return last_id > read_id
+
+
 def in_scope(thread_id: str) -> bool:
     """V1 widget scope = private 1:1/group + meeting chats (same default set as `archive`)."""
     return is_private(thread_id) or is_meeting(thread_id)
@@ -98,11 +113,15 @@ async def row_from_conversation(conv: dict[str, Any], directory: Directory) -> d
     label = await directory.label(thread_id)
     if label == thread_id:  # thread lookup failed (rate limit…): the listing carries the topic
         label = str((conv.get("threadProperties") or {}).get("topic") or thread_id)
+    last_id = str(last.get("id") or "")
+    read_id = read_up_to(conv.get("properties"))
     return {
         "id": thread_id,
         "label": label,
         "last_activity": last_activity(conv),
-        "last_id": str(last.get("id") or ""),
+        "last_id": last_id,
+        "read_id": read_id,
+        "unread": is_unread(last_id, read_id),
         "sender": sender,
         "text": snippet(msgtype, str(last.get("content") or ""), last.get("properties")),
         "seen_at": None,
@@ -260,19 +279,34 @@ class Board:
 
     async def on_event(self, obj: dict[str, Any]) -> None:
         resource = obj.get("resource") or {}
-        thread_id = thread_of(resource)
         resource_type = obj.get("resourceType")
+        # A ConversationUpdate is keyed by the thread itself (no conversationLink).
+        thread_id = (
+            str(resource.get("id") or "") if resource_type == "ConversationUpdate" else thread_of(resource)
+        )
         msgtype = str(resource.get("messagetype") or "")
         log.debug("web_event", thread=thread_id, resource_type=resource_type, messagetype=msgtype)
         if not in_scope(thread_id):
             return
-        if resource_type == "NewMessage":
+        if resource_type == "ConversationUpdate":
+            self._conversation_update(thread_id, resource)
+        elif resource_type == "NewMessage":
             if msgtype in ("Control/Typing", "Control/ClearTyping"):
                 await self._typing(thread_id, resource, started=msgtype == "Control/Typing")
             elif not msgtype.startswith("Control/") and msgtype not in _SILENT_TYPES:
                 await self._new_message(thread_id, resource, msgtype)
         elif resource_type == "MessageUpdate":
             await self._message_update(thread_id, resource, msgtype)
+
+    def _conversation_update(self, thread_id: str, resource: dict[str, Any]) -> None:
+        """Read marker moved (this or another device): Teams' own read state, not our `seen`."""
+        row = self.rows.get(thread_id)
+        read_id = read_up_to(resource.get("properties"))
+        if row is None or not read_id:
+            return
+        row["read_id"] = read_id
+        row["unread"] = is_unread(row.get("last_id", ""), read_id)
+        self.broadcast()
 
     async def _new_message(self, thread_id: str, resource: dict[str, Any], msgtype: str) -> None:
         row = self.rows.get(thread_id)
@@ -283,14 +317,21 @@ class Board:
                 "label": label,
                 "seen_at": self._seen.get(thread_id),
                 "typing": [],
+                "read_id": "",
             }
         sender = "" if _is_system(msgtype) else await sender_of(resource, self.directory)
         if msgtype in _RELABEL_TYPES and self.directory is not None:
             self.directory.forget(thread_id)
-            row["label"] = await self.directory.label(thread_id)
+            fresh = await self.directory.label(thread_id)
+            if fresh != thread_id:  # lookup failed (removed from the chat, 429): keep the old name
+                row["label"] = fresh
+        last_id = str(resource.get("id") or "")
         row.update(
             last_activity=str(resource.get("composetime") or resource.get("originalarrivaltime") or ""),
-            last_id=str(resource.get("id") or ""),
+            last_id=last_id,
+            # Own messages come back as unread until Teams moves the horizon (a ConversationUpdate
+            # follows within a second) — honest, and it needs no notion of "me".
+            unread=is_unread(last_id, row.get("read_id", "")),
             sender=sender,
             text=snippet(msgtype, str(resource.get("content") or ""), resource.get("properties")),
         )

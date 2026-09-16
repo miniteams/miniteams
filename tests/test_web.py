@@ -100,6 +100,8 @@ async def test_row_prefers_imdisplayname_then_directory(quiet_directory: Directo
         "label": "label:19:g@thread.v2",
         "last_activity": "2026-09-15T10:00:00Z",
         "last_id": "",
+        "read_id": "",
+        "unread": False,
         "sender": "Alice",
         "text": "hi",
         "seen_at": None,
@@ -209,6 +211,62 @@ async def test_bootstrap_resolves_ambiguous_stubs_with_one_history_call(
         "19:gone@thread.v2",
         "19:moved@thread.v2",
     ]
+
+
+def test_unread_from_consumption_horizon() -> None:
+    assert W.read_up_to({"consumptionhorizon": "1789308085736;1789370244184;175117"}) == "1789308085736"
+    assert W.read_up_to({}) == "" and W.read_up_to(None) == ""
+    assert W.is_unread("1789558193478", "1789308085736") is True
+    assert W.is_unread("1789308085736", "1789308085736") is False
+    assert W.is_unread("1789000000000", "1789308085736") is False
+    assert W.is_unread("", "1") is False and W.is_unread("1", "") is False  # unknown: never bold
+
+
+async def test_row_unread_flag_from_listing(quiet_directory: Directory) -> None:
+    conv = {
+        **_conv("19:g@thread.v2", "2026-09-15T10:00:00Z", id="200", messagetype="Text", content="x"),
+        "properties": {"consumptionhorizon": "100;1;1"},
+    }
+    row = await W.row_from_conversation(conv, quiet_directory)
+    assert (row["read_id"], row["unread"]) == ("100", True)
+    conv["properties"] = {"consumptionhorizon": "200;1;1"}
+    assert (await W.row_from_conversation(conv, quiet_directory))["unread"] is False
+
+
+async def test_read_marker_moves_with_devices_and_new_messages(board: W.Board) -> None:
+    row = board.rows["19:a@thread.v2"]
+    row["read_id"] = "10"
+    row["unread"] = False
+    await board.on_event(_msg("19:a@thread.v2", "2026-09-15T12:00:00Z", "ping", msg_id="11"))
+    assert row["unread"] is True
+    # Read on the phone: Teams pushes a ConversationUpdate keyed by the thread id.
+    update = {
+        "type": "EventMessage",
+        "resourceType": "ConversationUpdate",
+        "resource": {
+            "id": "19:a@thread.v2",
+            "properties": {"consumptionhorizon": "11;1;1"},
+            "lastMessage": {"id": "11"},
+        },
+    }
+    await board.on_event(update)
+    assert (row["read_id"], row["unread"]) == ("11", False)
+    # Unknown thread or missing horizon: ignored, no row created.
+    await board.on_event(
+        {
+            "type": "EventMessage",
+            "resourceType": "ConversationUpdate",
+            "resource": {"id": "19:ghost@thread.v2", "properties": {"consumptionhorizon": "1;1;1"}},
+        }
+    )
+    await board.on_event(
+        {
+            "type": "EventMessage",
+            "resourceType": "ConversationUpdate",
+            "resource": {"id": "19:a@thread.v2", "properties": {}},
+        }
+    )
+    assert "19:ghost@thread.v2" not in board.rows and row["read_id"] == "11"
 
 
 def test_board_payload_sorted_newest_first() -> None:
@@ -414,6 +472,11 @@ async def test_rename_and_roster_change_refresh_the_label(board: W.Board, monkey
     plain = _msg("19:a@thread.v2", "2026-09-15T13:00:00Z", "hi", msg_id="14")
     await board.on_event(plain)
     assert forgotten == ["19:a@thread.v2", "19:a@thread.v2"]  # a normal message does not refetch
+    # Removed from the chat (or rate-limited): the lookup yields the bare id → keep the old name.
+    labels = iter(["19:a@thread.v2"])
+    left = dict(joined, resource=dict(joined["resource"], id="15", messagetype="ThreadActivity/DeleteMember"))
+    await board.on_event(left)
+    assert row["label"] == "Renamed · 4p" and row["text"] == "👥 member removed"
 
 
 async def test_new_message_on_unknown_thread_creates_row(board: W.Board) -> None:
