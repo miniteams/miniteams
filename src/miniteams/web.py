@@ -283,11 +283,25 @@ class Board:
             return False
         stamp = min(at, row["last_activity"]) if at else row["last_activity"]
         self._seen[thread_id] = row["seen_at"] = stamp
+        self._save_seen()
+        self.broadcast()
+        return True
+
+    def mark_unseen(self, thread_id: str) -> bool:
+        """Undo `seen`: the row shows again until the next click."""
+        row = self.rows.get(thread_id)
+        if row is None or thread_id not in self._seen:
+            return False
+        del self._seen[thread_id]
+        row["seen_at"] = None
+        self._save_seen()
+        self.broadcast()
+        return True
+
+    def _save_seen(self) -> None:
         if self.seen_path is not None:
             self.seen_path.parent.mkdir(parents=True, exist_ok=True)
             self.seen_path.write_text(json.dumps(self._seen, ensure_ascii=False, indent=0))
-        self.broadcast()
-        return True
 
     # --- live events (stream hook) ---
 
@@ -499,6 +513,8 @@ class Board:
                 at = at if isinstance(at, str) else None
                 if isinstance(verb, dict) and isinstance(verb.get("seen"), str):
                     self.mark_seen(verb["seen"], at)
+                elif isinstance(verb, dict) and isinstance(verb.get("unseen"), str):
+                    self.mark_unseen(verb["unseen"])
                 elif isinstance(verb, dict) and isinstance(verb.get("open"), str):
                     await self.open_row(verb["open"], web=verb.get("web") is True)
                 else:

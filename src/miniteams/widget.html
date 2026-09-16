@@ -84,9 +84,10 @@
         const who = Object.assign(document.createElement("b"), { textContent: r.sender ? r.sender + ": " : "" });
         last.append(who, r.text || "");
       }
-      const seen = Object.assign(document.createElement("button"), { textContent: "seen", disabled: isSeen(r) });
+      const seen = Object.assign(document.createElement("button"), { textContent: isSeen(r) ? "unseen" : "seen" });
       // Send what was on screen: a message landing between render and click must stay visible.
-      seen.onclick = () => ws && ws.readyState === 1 && ws.send(JSON.stringify({ seen: r.id, at: r.last_activity }));
+      seen.onclick = () => ws && ws.readyState === 1 && ws.send(JSON.stringify(
+        isSeen(r) ? { unseen: r.id } : { seen: r.id, at: r.last_activity }));
       li.append(label, when, seen, last);
       return li;
     }));

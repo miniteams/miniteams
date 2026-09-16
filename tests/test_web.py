@@ -702,6 +702,17 @@ async def test_seen_persists_and_newer_message_unhides(
     assert again.rows["19:late@thread.v2"]["seen_at"] is None
 
 
+def test_unseen_undoes_seen_and_persists(settings: Settings) -> None:
+    seen_path = settings.config_dir / "seen.json"
+    rows = {"t": {"id": "t", "last_activity": "2026-09-15T10:00:00Z", "last_id": "1", "seen_at": None}}
+    board = W.Board(rows, seen_path=seen_path)
+    assert board.mark_unseen("t") is False  # nothing to undo
+    board.mark_seen("t")
+    assert board.mark_unseen("t") is True
+    assert rows["t"]["seen_at"] is None and json.loads(seen_path.read_text()) == {}
+    assert board.mark_unseen("nope") is False
+
+
 def test_load_seen_tolerates_missing_or_corrupt(settings: Settings) -> None:
     path = settings.config_dir / "seen.json"
     assert W._load_seen(None) == {} and W._load_seen(path) == {}
@@ -728,6 +739,10 @@ async def test_seen_verb_over_websocket(settings: Settings) -> None:
             await ws.send(json.dumps({"seen": "t", "at": 5}))  # bad `at` shape → ignored, id still stamped
             frame = json.loads(await ws.recv())
             assert frame["rows"][0]["seen_at"] == "2026-09-15T10:00:00Z"
+            await ws.send(json.dumps({"unseen": "t"}))
+            assert json.loads(await ws.recv())["rows"][0]["seen_at"] is None
+            await ws.send(json.dumps({"seen": "t"}))
+            await ws.recv()
         assert json.loads((settings.config_dir / "seen.json").read_text()) == {"t": "2026-09-15T10:00:00Z"}
     finally:
         task.cancel()

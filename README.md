@@ -68,7 +68,7 @@ on an `msteams://` deep link, i.e. the desktop client; `--open-scheme https` for
 `--opener none` to let the page follow its plain https link); opening does not mark the row
 seen. Ctrl/middle click opens the https link, through `--browser firefox` when set, else in the
 page's own browser. Each row has a **seen** button: the row is hidden until something newer lands on that
-chat (state in `~/.config/miniteams/seen.json`); "show seen" reveals hidden rows dimmed. The
+chat (state in `~/.config/miniteams/seen.json`); "show seen" reveals hidden rows dimmed, where **unseen** undoes it. The
 process exits non-zero when the stream dies (auth expired) — re-run it.
 
 `stream` enriches each line with thread name + participants, resolves MRIs → display names
