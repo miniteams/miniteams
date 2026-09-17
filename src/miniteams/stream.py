@@ -1,10 +1,10 @@
-"""Trouter websocket: connect → authenticate → register → keepalive → dispatch (handoff §4-5).
+"""Trouter websocket: connect → authenticate → register → keepalive → dispatch.
 
 Framing is **Socket.IO 0.9** (the raw `N:::` message types) — not modern socket.io, so we speak
 it by hand. The websocket carries `X-Skypetoken` as a connect header; `user.authenticate` and the
 registrar carry the AAD bearer in-band.
 
-`run_forever` wraps a fresh session per attempt (handoff §M4): new skype token / info / handshake
+`run_forever` wraps a fresh session per attempt: new skype token / info / handshake
 on every reconnect, exponential backoff, re-register on `trouter.message_loss` and on TTL. While a
 session lasts, the token pair on the shared `Directory` is renewed before it expires.
 """
@@ -82,7 +82,7 @@ class TrouterClient:
     @property
     def _bearer(self) -> str:
         # purple-teams sends the id_token here (teams_trouter.c: user.authenticate + registrar).
-        # The handoff narrative says access_token; the source wins. If Trouter 401s on
+        # Earlier notes said access_token; the purple-teams source wins. If Trouter 401s on
         # user.authenticate or the registrar, flip the order below.
         # Prefer the Directory's pair: the refresher renews it, the connect-time `aad` expires in ~1h.
         return self.directory.bearer or str(self.aad.get("id_token") or self.aad["access_token"])
@@ -189,7 +189,7 @@ class TrouterClient:
             return
         name = evt.get("name")
         if name == "trouter.message_loss":
-            # Backend floods this until we re-register the messaging worker (handoff §M4).
+            # Backend floods this until we re-register the messaging worker.
             await self._maybe_reregister("message_loss")
         elif not self.raw:
             log.info("named_event", name=name)
@@ -302,7 +302,7 @@ async def run_forever(
     directory: Directory | None = None,
     epid_name: str = "endpoint_id",
 ) -> None:
-    """Re-establish a full session on every disconnect (handoff §M4).
+    """Re-establish a full session on every disconnect.
 
     A fresh skype token / trouter info / handshake is minted per attempt, so surl/session rotation
     is handled by reconnecting. A connected session outlives the token, so a background task renews

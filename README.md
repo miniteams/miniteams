@@ -16,7 +16,6 @@ framing) and [`Gerenios/AADInternals`](https://github.com/Gerenios/AADInternals)
 Working. Auth (browser/device-code), live `stream` (messages, reactions, attachments,
 auto-reconnect), `chats` (recent conversations, date-window filter), `dump` (history backfill,
 `--jsonl`), and `send` are all implemented.
-See `HANDOFF.md` for the original milestone plan and protocol notes.
 
 ## Setup
 

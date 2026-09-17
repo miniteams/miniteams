@@ -1,4 +1,4 @@
-"""Skype-token exchange (handoff §2.2).
+"""Skype-token exchange.
 
 POST the AAD bearer token to the authz endpoint; the response carries the skype token used
 as `X-Skypetoken` for every trouter/registrar call. Two response shapes exist in the wild

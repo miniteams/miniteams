@@ -1,4 +1,4 @@
-"""Inbound delivery routing, body decode, and chat-message printing (handoff §5).
+"""Inbound delivery routing, body decode, and chat-message printing.
 
 Trouter delivers each event as a pseudo-HTTP request whose `body` is a stringified (and often
 gzip+base64-wrapped) JSON. Chat messages arrive on the `/messaging` endpoint as `EventMessage`
@@ -51,7 +51,7 @@ def _gunzip_b64(data: str) -> str:
 
 
 def _decode_body(req: dict[str, Any]) -> dict[str, Any] | None:
-    """Unwrap the three documented encodings (handoff §5) into the real payload object."""
+    """Unwrap the three documented encodings into the real payload object."""
     body = req.get("body")
     if not body:
         return None

@@ -1,4 +1,4 @@
-"""Thread + identity resolution, cached (handoff §M5).
+"""Thread + identity resolution, cached.
 
 A single `GET /v1/threads/<id>?view=msnp24Equivalent` (X-Skypetoken) returns the member roster
 *with* display names already bundled (`members[].friendlyName`) — so no separate profile lookup

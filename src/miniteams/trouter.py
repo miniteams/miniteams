@@ -1,4 +1,4 @@
-"""Trouter info call + session handshake (handoff §3, M1).
+"""Trouter info call + session handshake.
 
 URL building mirrors purple-teams teams_trouter.c verbatim: the `tc` JSON blob, the hardcoded
 `con_num`, per-key connectparams expansion, and the trailing-`&` quirk. Both calls authenticate
@@ -22,7 +22,7 @@ _CON_NUM = "1234567890123_1"
 
 
 def get_or_create_epid(settings: Settings, name: str = "endpoint_id") -> str:
-    """Stable endpoint GUID, reused across the info call and the registrar (handoff §2.2).
+    """Stable endpoint GUID, reused across the info call and the registrar.
 
     One file per consumer (`name`): the registrar maps an epid to a single socket, so two
     processes sharing one would silently steal each other's deliveries.
