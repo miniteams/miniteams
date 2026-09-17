@@ -5,7 +5,8 @@ it by hand. The websocket carries `X-Skypetoken` as a connect header; `user.auth
 registrar carry the AAD bearer in-band.
 
 `run_forever` wraps a fresh session per attempt (handoff §M4): new skype token / info / handshake
-on every reconnect, exponential backoff, re-register on `trouter.message_loss` and on TTL.
+on every reconnect, exponential backoff, re-register on `trouter.message_loss` and on TTL. While a
+session lasts, the token pair on the shared `Directory` is renewed before it expires.
 """
 
 import asyncio
@@ -34,6 +35,9 @@ _PING_INTERVAL = 30.0  # seconds; handshake advertised a 70s heartbeat window
 _REREGISTER_DEBOUNCE = 20.0  # seconds; collapse the message_loss flood into one re-register
 _BACKOFF_MAX = 60.0
 _STABLE_AFTER = 60.0  # a connection alive this long resets the backoff
+_TOKEN_REFRESH_RATIO = 0.8  # renew the directory's skype token at 80% of its lifetime
+_TOKEN_REFRESH_MIN = 60.0  # floor between renewals; a failed renewal retries after this
+_TOKEN_LIFETIME_FALLBACK = 1800.0  # authz response without expiresIn: assume a short lifetime
 
 EventHook = Callable[[dict[str, Any]], Awaitable[None]]  # receives each decoded EventMessage
 
@@ -80,7 +84,8 @@ class TrouterClient:
         # purple-teams sends the id_token here (teams_trouter.c: user.authenticate + registrar).
         # The handoff narrative says access_token; the source wins. If Trouter 401s on
         # user.authenticate or the registrar, flip the order below.
-        return str(self.aad.get("id_token") or self.aad["access_token"])
+        # Prefer the Directory's pair: the refresher renews it, the connect-time `aad` expires in ~1h.
+        return self.directory.bearer or str(self.aad.get("id_token") or self.aad["access_token"])
 
     def _ws_url(self) -> str:
         wss = self.info["socketio"].replace("https://", "wss://", 1)
@@ -135,7 +140,7 @@ class TrouterClient:
             },
         }
         headers = {
-            "X-Skypetoken": self.skype_token,
+            "X-Skypetoken": self.directory.skype_token or self.skype_token,
             "Authorization": f"Bearer {self._bearer}",
             "Content-Type": "application/json",
         }
@@ -256,6 +261,38 @@ class TrouterClient:
         log.info("ws_closed")
 
 
+def _lifetime(skype: dict[str, Any]) -> float:
+    return float(skype.get("expires_in") or _TOKEN_LIFETIME_FALLBACK)
+
+
+async def _refresh_directory_token(
+    settings: Settings,
+    tokens: TokenSource,
+    directory: Directory,
+    lifetime: float,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """A websocket outlives the ~1h skype token; without this every lookup and re-register 401s after."""
+    delay = lifetime * _TOKEN_REFRESH_RATIO
+    while True:
+        await sleep(max(_TOKEN_REFRESH_MIN, delay))
+        try:
+            aad = await asyncio.to_thread(tokens.refresh)
+            skype = await asyncio.to_thread(exchange_skype_token, settings, aad["access_token"])
+        except AuthExpired as exc:
+            # Retrying can't revive a dead refresh token; the session loop stops at its next reconnect.
+            log.error("directory_token_refresh_stopped", error=str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001 — transient (network, authz 5xx): retry after the floor
+            log.warning("directory_token_refresh_failed", error=str(exc), error_type=type(exc).__name__)
+            delay = _TOKEN_REFRESH_MIN
+            continue
+        directory.set_token(skype["skype_token"], str(aad.get("id_token") or aad["access_token"]))
+        lifetime = _lifetime(skype)
+        delay = lifetime * _TOKEN_REFRESH_RATIO
+        log.info("directory_token_refreshed", expires_in=lifetime)
+
+
 async def run_forever(
     settings: Settings,
     jsonl: bool = False,
@@ -267,12 +304,13 @@ async def run_forever(
 ) -> None:
     """Re-establish a full session on every disconnect (handoff §M4).
 
-    A fresh skype token / trouter info / handshake is minted per attempt, so token expiry and
-    surl/session rotation are handled by simply reconnecting. Backoff grows on rapid failures
+    A fresh skype token / trouter info / handshake is minted per attempt, so surl/session rotation
+    is handled by reconnecting. A connected session outlives the token, so a background task renews
+    the `Directory` token pair (lookups, re-registers) meanwhile. Backoff grows on rapid failures
     and resets once a connection has been stable.
     """
     force_blocking_stdout()  # inside the running loop (see _io); guards `--jsonl | jq` backpressure
-    directory = directory or Directory(settings)  # caches survive reconnects; only the token is refreshed
+    directory = directory or Directory(settings)  # caches survive reconnects; only the tokens change
     # Authenticate ONCE up front (may prompt: device-code in stream mode). Reconnects then only
     # refresh silently — never re-prompt — so a failed connect can't spin into endless logins.
     tokens = TokenSource(settings)
@@ -282,15 +320,32 @@ async def run_forever(
         connected_at: float | None = None
         try:
             aad = tokens.refresh()  # silent; raises AuthExpired when the refresh token is dead
-            skype_token = exchange_skype_token(settings, aad["access_token"])["skype_token"]
+            skype = exchange_skype_token(settings, aad["access_token"])
+            skype_token = skype["skype_token"]
             directory.set_token(skype_token, str(aad.get("id_token") or aad["access_token"]))
             epid = get_or_create_epid(settings, epid_name)
             info = trouter_info(settings, skype_token, epid)
             session_id = handshake(settings, info, skype_token, epid)
             connected_at = time.monotonic()
-            await TrouterClient(
-                settings, aad, skype_token, info, session_id, epid, directory, jsonl, raw, typing, on_event
-            ).run()
+            refresher = asyncio.create_task(
+                _refresh_directory_token(settings, tokens, directory, _lifetime(skype))
+            )
+            try:
+                await TrouterClient(
+                    settings,
+                    aad,
+                    skype_token,
+                    info,
+                    session_id,
+                    epid,
+                    directory,
+                    jsonl,
+                    raw,
+                    typing,
+                    on_event,
+                ).run()
+            finally:
+                refresher.cancel()
         except asyncio.CancelledError:
             raise
         except BrokenPipeError:

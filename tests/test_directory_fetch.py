@@ -2,6 +2,8 @@
 
 from typing import Any
 
+import httpx
+
 from miniteams import directory as directory_mod
 from miniteams.directory import Directory
 
@@ -138,3 +140,60 @@ async def test_thread_result_is_cached(directory: Directory, monkeypatch) -> Non
     await directory.thread("19:c@thread.v2")
     await directory.thread("19:c@thread.v2")
     assert calls["n"] == 1  # second call served from cache
+
+
+async def test_transient_thread_failure_is_not_refetched_inside_the_window(
+    directory: Directory, monkeypatch
+) -> None:
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(directory_mod.time, "monotonic", lambda: clock["now"])
+    rate_limited = httpx.Response(429, request=httpx.Request("GET", "https://x"))
+    shapes = {
+        "boom": lambda: _Resp(fail=True),
+        "429": lambda: (_ for _ in ()).throw(
+            httpx.HTTPStatusError("429", request=rate_limited.request, response=rate_limited)
+        ),
+    }
+    ok = {"members": [], "properties": {"topic": "T"}}
+    for name, failure in shapes.items():
+        calls = {"n": 0}
+
+        def handler(url: str, failure: Any = failure, calls: dict[str, int] = calls) -> _Resp:
+            calls["n"] += 1
+            return failure() if calls["n"] == 1 else _Resp(ok)
+
+        _patch(monkeypatch, handler)
+        thread = f"19:{name}@thread.v2"
+        assert await directory.thread(thread) is None
+        assert await directory.thread(thread) is None
+        assert calls["n"] == 1, name  # inside the window: no second fetch
+        clock["now"] += directory_mod._THREAD_RETRY_AFTER
+        assert (await directory.thread(thread) or {}).get("topic") == "T"
+        assert calls["n"] == 2, name
+
+
+async def test_new_token_and_forget_lift_the_failure_window(directory: Directory, monkeypatch) -> None:
+    calls = {"n": 0}
+
+    def handler(url: str) -> _Resp:
+        calls["n"] += 1
+        return _Resp(fail=True)
+
+    _patch(monkeypatch, handler)
+    await directory.thread("19:t@thread.v2")
+    directory.set_token("fresh")
+    await directory.thread("19:t@thread.v2")
+    directory.forget("19:t@thread.v2")
+    await directory.thread("19:t@thread.v2")
+    assert calls["n"] == 3
+
+
+async def test_failure_window_map_stays_bounded(directory: Directory, monkeypatch) -> None:
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(directory_mod.time, "monotonic", lambda: clock["now"])
+    _patch(monkeypatch, lambda url: _Resp(fail=True))
+    for i in range(3):
+        await directory.thread(f"19:{i}@thread.v2")
+        clock["now"] += directory_mod._THREAD_RETRY_AFTER  # each earlier failure expires
+    await directory.thread("19:last@thread.v2")
+    assert list(directory._thread_failed) == ["19:last@thread.v2"]

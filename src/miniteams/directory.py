@@ -5,11 +5,13 @@ A single `GET /v1/threads/<id>?view=msnp24Equivalent` (X-Skypetoken) returns the
 is needed. The topic isn't formally part of that response, but `properties.topic` is usually
 present; we read it opportunistically and fall back to the roster otherwise.
 
-Caches live for the process lifetime and survive reconnects (only the skype token is refreshed
-per session). Lookups never raise into the stream — a failed fetch degrades to the bare id.
+Caches live for the process lifetime and survive reconnects; the token pair is renewed by the
+stream while a session lasts (`set_token`). Lookups never raise into the stream — a failed fetch
+degrades to the bare id and is not retried for `_THREAD_RETRY_AFTER`.
 """
 
 import json
+import time
 from collections import OrderedDict
 from typing import Any
 from urllib.parse import quote
@@ -30,6 +32,9 @@ _SPECIAL_THREADS = {"48:notes": "Notes to self"}
 # an evicted message simply re-announces its current reactors as "added" — acceptable & rare.
 _REACTION_LRU_MAX = 4096
 
+# Lookups run inline in the event loop and a 429 retry can take ~30s: don't repeat that per message.
+_THREAD_RETRY_AFTER = 60.0
+
 
 def _mri_from_userlink(user_link: str | None) -> str:
     # userLink is a contact URL ending in the MRI, e.g. ".../v1/users/8:orgid:<guid>".
@@ -42,6 +47,7 @@ class Directory:
         self.skype_token = ""
         self.bearer = ""  # AAD id_token, for the profile lookup (Bearer auth)
         self._threads: dict[str, dict[str, Any] | None] = {}
+        self._thread_failed: dict[str, float] = {}  # thread_id → monotonic time of a transient failure
         self._names_path = settings.cache_dir / "names.json"
         self._names: dict[str, str] = self._load_names()  # MRI → display name (persisted)
         # msg_id → {key → set(MRI)}; LRU-bounded (see _REACTION_LRU_MAX) to cap memory.
@@ -63,6 +69,7 @@ class Directory:
 
     def set_token(self, skype_token: str, bearer: str = "") -> None:
         self.skype_token = skype_token
+        self._thread_failed.clear()  # an expired token may be why they failed
         if bearer:
             self.bearer = bearer
 
@@ -121,24 +128,39 @@ class Directory:
     def forget(self, thread_id: str) -> None:
         """Drop cached thread info so the next label() refetches it (rename, roster change)."""
         self._threads.pop(thread_id, None)
+        self._thread_failed.pop(thread_id, None)
 
     async def thread(self, thread_id: str) -> dict[str, Any] | None:
         if thread_id in self._threads:  # cached (incl. a definitive 404)
             return self._threads[thread_id]
+        failed_at = self._thread_failed.get(thread_id)
+        if failed_at is not None and time.monotonic() - failed_at < _THREAD_RETRY_AFTER:
+            return None
         try:
             info = await self._fetch_thread(thread_id)
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code != 404:
                 # 429/5xx: a transient failure must not pin the bare id as the label for the
-                # whole process lifetime — retry on the next lookup instead.
+                # whole process lifetime — retry once the window has passed instead.
                 log.debug("thread_fetch_failed", thread=thread_id, status=exc.response.status_code)
+                self._thread_failure(thread_id)
                 return None
             info = None
         except Exception as exc:  # noqa: BLE001 — enrichment is best-effort, never fatal
             log.debug("thread_fetch_failed", thread=thread_id, error=str(exc))
+            self._thread_failure(thread_id)
             return None
+        self._thread_failed.pop(thread_id, None)
         self._threads[thread_id] = info
         return info
+
+    def _thread_failure(self, thread_id: str) -> None:
+        now = time.monotonic()
+        # Forever-running stream: keep only failures still inside the window, so the map stays bounded.
+        self._thread_failed = {
+            t: at for t, at in self._thread_failed.items() if now - at < _THREAD_RETRY_AFTER
+        }
+        self._thread_failed[thread_id] = now
 
     async def _fetch_thread(self, thread_id: str) -> dict[str, Any] | None:
         url = (

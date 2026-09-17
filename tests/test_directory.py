@@ -4,6 +4,7 @@ from typing import Any
 
 import httpx
 
+from miniteams import directory as directory_mod
 from miniteams.directory import Directory, _mri_from_userlink
 
 
@@ -67,8 +68,11 @@ async def test_thread_caches_404_but_retries_transient_failures(directory: Direc
         raise outcomes.pop(0)
 
     monkeypatch.setattr(Directory, "_fetch_thread", fake_fetch)
-    for _ in range(3):  # 429 → retried, connect error → retried, 404 → remembered
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(directory_mod.time, "monotonic", lambda: clock["now"])
+    for _ in range(3):  # 429 → retried, connect error → retried (after the window), 404 → remembered
         assert await directory.thread("19:t@thread.v2") is None
+        clock["now"] += directory_mod._THREAD_RETRY_AFTER
     assert await directory.thread("19:t@thread.v2") is None  # no fourth fetch
     assert calls == ["19:t@thread.v2"] * 3
     assert await directory.label("19:t@thread.v2") == "19:t@thread.v2"

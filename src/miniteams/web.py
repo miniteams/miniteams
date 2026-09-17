@@ -373,8 +373,10 @@ class Board:
                 "read_id": "",
             }
         sender = "" if _is_system(msgtype) else await sender_of(resource, self.directory)
-        if msgtype in _RELABEL_TYPES and self.directory is not None:
-            self.directory.forget(thread_id)
+        # A bare-id label is a failed lookup: retry it (Directory spaces transient retries 60s apart).
+        if self.directory is not None and (msgtype in _RELABEL_TYPES or row["label"] == thread_id):
+            if msgtype in _RELABEL_TYPES:
+                self.directory.forget(thread_id)
             fresh = await self.directory.label(thread_id)
             if fresh != thread_id:  # lookup failed (removed from the chat, 429): keep the old name
                 row["label"] = fresh

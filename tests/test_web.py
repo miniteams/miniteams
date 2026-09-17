@@ -555,6 +555,25 @@ async def test_rename_and_roster_change_refresh_the_label(board: W.Board, monkey
     assert row["label"] == "Renamed · 4p" and row["text"] == "👥 member removed"
 
 
+async def test_bare_id_label_is_retried_on_next_message(board: W.Board, monkeypatch) -> None:
+    calls: list[str] = []
+    answers = iter(["19:a@thread.v2", "Alice, Bob"])  # failed lookup (expired token, 429), then ok
+
+    async def fake_label(self: Directory, thread_id: str) -> str:
+        calls.append(thread_id)
+        return next(answers)
+
+    monkeypatch.setattr(Directory, "label", fake_label)
+    row = board.rows["19:a@thread.v2"]
+    row["label"] = "19:a@thread.v2"
+    await board.on_event(_msg("19:a@thread.v2", "2026-09-15T12:00:00Z", "hi", msg_id="11"))
+    assert row["label"] == "19:a@thread.v2"
+    await board.on_event(_msg("19:a@thread.v2", "2026-09-15T12:01:00Z", "hi", msg_id="12"))
+    assert row["label"] == "Alice, Bob"
+    await board.on_event(_msg("19:a@thread.v2", "2026-09-15T12:02:00Z", "hi", msg_id="13"))
+    assert calls == ["19:a@thread.v2", "19:a@thread.v2"]  # resolved: no further lookup
+
+
 async def test_new_message_on_unknown_thread_creates_row(board: W.Board) -> None:
     await board.on_event(_msg("19:new@unq.gbl.spaces", "2026-09-15T13:00:00Z", "yo"))
     assert _order(board)[0] == "19:new@unq.gbl.spaces"

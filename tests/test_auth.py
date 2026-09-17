@@ -74,3 +74,45 @@ def test_device_code_injects_code_into_url(capsys, monkeypatch) -> None:
     assert result["access_token"] == "tok"
     err = capsys.readouterr().err
     assert "https://microsoft.com/devicelogin?otc=ABCD1234" in err
+
+
+def test_persist_cache_replaces_atomically_owner_only(tmp_path) -> None:
+    class _Cache:
+        has_state_changed = True
+
+        def serialize(self) -> str:
+            return "{}"
+
+    path = tmp_path / "msal_cache.json"
+    path.write_text("old")
+    path.chmod(0o644)
+    inode = path.stat().st_ino
+    A._persist_cache(_Cache(), path)  # type: ignore[arg-type]
+    assert path.read_text() == "{}"
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.stat().st_ino != inode  # swapped in whole, never truncated in place
+    assert [p.name for p in tmp_path.iterdir()] == ["msal_cache.json"]  # no temp left behind
+
+
+def test_persist_cache_failure_leaves_no_temp_file(tmp_path, monkeypatch) -> None:
+    class _Broken:
+        has_state_changed = True
+
+        def serialize(self) -> str:
+            raise OSError(28, "No space left on device")
+
+    class _Cache:
+        has_state_changed = True
+
+        def serialize(self) -> str:
+            return "{}"
+
+    path = tmp_path / "msal_cache.json"
+    path.write_text("old")
+    with pytest.raises(OSError):
+        A._persist_cache(_Broken(), path)  # type: ignore[arg-type]
+    monkeypatch.setattr(A.os, "replace", lambda *_a: (_ for _ in ()).throw(OSError(18, "cross-device")))
+    with pytest.raises(OSError):
+        A._persist_cache(_Cache(), path)  # type: ignore[arg-type]
+    assert [p.name for p in tmp_path.iterdir()] == ["msal_cache.json"]
+    assert path.read_text() == "old"  # the live cache is untouched by either failure

@@ -113,7 +113,10 @@ until a new message arrives; a toggle shows hidden rows anyway.
   last registrant the only receiver.
 - File/card posts render from `properties` (`📎 name`); listing stubs that look deleted are
   resolved with one history call. Topic/roster changes refresh the label; a failed lookup keeps
-  the old name; thread lookups retry on 429 and never cache a transient failure.
+  the old name; thread lookups retry on 429, and a transient failure is not refetched for 60s
+  (new token or rename lifts it). A row still on its bare id retries on its next message.
+- The directory's skype token is renewed at 80% of its lifetime while the websocket stays up
+  (it outlives the ~1h token); re-registers use the renewed pair.
 
 ## Data model impact (summary)
 

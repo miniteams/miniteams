@@ -13,7 +13,9 @@ when the refresh token is dead so the caller can stop instead of re-prompting on
 """
 
 import atexit
+import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any, TypeGuard
 
@@ -34,8 +36,16 @@ def _load_cache(path: Path) -> msal.SerializableTokenCache:
 
 def _persist_cache(cache: msal.SerializableTokenCache, path: Path) -> None:
     if cache.has_state_changed:
-        path.write_text(cache.serialize())
-        path.chmod(0o600)  # Security: token cache holds refresh tokens — owner-only.
+        # Security: the cache holds refresh tokens — created owner-only, before any byte is written.
+        # Per-writer temp + os.replace: the refresher thread and the session loop may persist at once.
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as fh:
+                fh.write(cache.serialize())
+            os.replace(tmp, path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)  # may hold a partial refresh-token payload
+            raise
 
 
 def _build_cache(settings: Settings) -> tuple[msal.SerializableTokenCache, Path]:
