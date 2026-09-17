@@ -86,6 +86,19 @@ def send_message(
     return {"clientmessageid": client_message_id, **result}
 
 
+def mark_read(settings: Settings, skype_token: str, thread_id: str, message_id: str) -> dict[str, Any]:
+    """Move Teams' own read marker of a chat to `message_id` (every device sees the chat as read)."""
+    url = (
+        f"https://{settings.contacts_host}/v1/users/ME/conversations"
+        f"/{quote(thread_id, safe='')}/properties?name=consumptionhorizon"
+    )
+    # "<id>;<now ms>;<client message id>" — the client id is unknown here; the message id passes.
+    body = {"consumptionhorizon": f"{message_id};{int(time.time() * 1000)};{message_id}"}
+    result = _check(httpx.put(url, headers=_headers(skype_token, settings), json=body, timeout=30.0), "read")
+    log.info("marked_read", thread=thread_id, message_id=message_id, status=result["status"])
+    return result
+
+
 def edit_message(
     settings: Settings,
     skype_token: str,

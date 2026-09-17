@@ -33,6 +33,7 @@ from .config import Settings
 from .directory import Directory
 from .dump import fetch_history
 from .messages import _TAG_RE, EMOJI, thread_of
+from .send import mark_read
 from .stream import run_forever
 
 log = structlog.get_logger()
@@ -448,6 +449,23 @@ class Board:
         self.broadcast()
         return True
 
+    async def mark_read(self, thread_id: str) -> bool:
+        """Page verb `read`: tell Teams the chat is read up to the row's last message.
+
+        Nothing is changed locally: Teams answers with a ConversationUpdate that moves the
+        read marker (and clears a mention) the same way a read on any other device does."""
+        row = self.rows.get(thread_id)
+        if row is None or not row.get("last_id") or self.directory is None:
+            return False
+        try:
+            await asyncio.to_thread(
+                mark_read, self.directory.settings, self.directory.skype_token, thread_id, row["last_id"]
+            )
+        except Exception as exc:  # noqa: BLE001 — a failed read marker must not drop the socket
+            log.warning("mark_read_failed", thread=thread_id, error=str(exc))
+            return False
+        return True
+
     def mark_unseen(self, thread_id: str) -> bool:
         """Undo `seen`: the row shows again until the next click."""
         row = self.rows.get(thread_id)
@@ -714,6 +732,8 @@ class Board:
                     self.mark_seen(verb["seen"], at)
                 elif isinstance(verb, dict) and isinstance(verb.get("unseen"), str):
                     self.mark_unseen(verb["unseen"])
+                elif isinstance(verb, dict) and isinstance(verb.get("read"), str):
+                    await self.mark_read(verb["read"])
                 elif isinstance(verb, dict) and isinstance(verb.get("open"), str):
                     await self.open_row(verb["open"], web=verb.get("web") is True)
                 else:

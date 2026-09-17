@@ -1268,3 +1268,22 @@ def test_payload_carries_my_display_name(quiet_directory: Directory) -> None:
     board = W.Board({}, quiet_directory, me=ME)
     assert json.loads(board.payload())["me"] == "Damien DEGOIS"
     assert json.loads(W.Board({}, quiet_directory).payload())["me"] == ""  # no me: the page shows "@you"
+
+
+async def test_read_verb_moves_teams_marker_and_survives_failure(board: W.Board, monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def fake_mark_read(settings: Any, token: str, thread_id: str, message_id: str) -> dict[str, Any]:
+        calls.append((thread_id, message_id))
+        if thread_id == "19:b@thread.v2":
+            raise RuntimeError("503")
+        return {"status": 200}
+
+    monkeypatch.setattr(W, "mark_read", fake_mark_read)
+    assert await board.mark_read("19:a@thread.v2") is True
+    assert await board.mark_read("19:b@thread.v2") is False  # logged, row untouched
+    assert await board.mark_read("19:nope@thread.v2") is False
+    board.rows["19:a@thread.v2"]["last_id"] = ""
+    assert await board.mark_read("19:a@thread.v2") is False  # nothing to point the marker at
+    assert calls == [("19:a@thread.v2", "10"), ("19:b@thread.v2", "20")]
+    assert board.rows["19:b@thread.v2"].get("unread") is not True  # local state never guessed

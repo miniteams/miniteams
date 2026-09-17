@@ -106,3 +106,19 @@ def test_exchange_skype_token_missing_raises(settings: Settings, monkeypatch) ->
     monkeypatch.setattr(skype.httpx, "post", lambda *a, **k: _Resp({"nope": 1}))
     with pytest.raises(RuntimeError, match="no skype token"):
         skype.exchange_skype_token(settings, "aad")
+
+
+def test_mark_read_puts_consumption_horizon(settings: Settings, monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_put(url: str, **kw: Any) -> _Resp:
+        captured["url"] = url
+        captured.update(kw)
+        return _Resp({}, status=200)
+
+    monkeypatch.setattr(send.httpx, "put", fake_put)
+    monkeypatch.setattr(send.time, "time", lambda: 1789470000.5)
+    send.mark_read(settings, "sk", "19:a@thread.v2", "1789466400000")
+    assert captured["url"].endswith("/conversations/19%3Aa%40thread.v2/properties?name=consumptionhorizon")
+    assert captured["json"] == {"consumptionhorizon": "1789466400000;1789470000500;1789466400000"}
+    assert captured["headers"]["X-Skypetoken"] == "sk"

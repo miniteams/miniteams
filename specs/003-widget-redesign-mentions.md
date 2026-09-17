@@ -126,6 +126,20 @@ it in Teams after the mention.
   widget: tab, theme and avatars survive reload, ⚙ menu closes on outside click / Escape, hover
   button, click-to-open still works.
 
+## Addendum — mark read in Teams (2026-09-17)
+
+A `👁` button next to `✓` (hover) tells Teams the chat is read: `PUT
+/v1/users/ME/conversations/<thread>/properties?name=consumptionhorizon` with
+`{"consumptionhorizon": "<last_id>;<now_ms>;<last_id>"}` (purple-teams shape; the third field is
+the client message id, which the row does not know — the message id is accepted in its place,
+verified live). Teams then answers with a `ConversationUpdate`, which the widget already folds
+(unread off, mention cleared). Distinct from **seen**, which stays private to the widget; "read" is
+visible on every device (and read receipts where the tenant shows them).
+
+- [ ] Clicking `👁` sends `{"read": id}`; the server PUTs with the row's `last_id`; a failed call
+      is logged and leaves the row unchanged.
+- [ ] A row without `last_id` has no `👁`.
+
 ## Data model impact (summary)
 
 None. No new files; `seen.json` unchanged in shape; page preferences in browser `localStorage`.

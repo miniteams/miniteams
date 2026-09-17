@@ -78,6 +78,7 @@
   .meta button { display: none; border: 1px solid var(--line); background: var(--panel); border-radius: 6px; height: 20px; padding: 0 6px; font-size: 12px; line-height: 18px; cursor: pointer; color: var(--dim); }
   li:hover .meta button { display: inline-block; }
   .meta button:hover { color: var(--ok); border-color: var(--ok); }
+  .meta button.read:hover { color: var(--accent); border-color: var(--accent); }
   .prev { grid-column: 2; grid-row: 2; color: var(--dim); font-size: 13px; }
   .prev b { color: var(--text); font-weight: 550; }
   li.unread .prev, li.mention .prev { color: var(--text); }
@@ -216,7 +217,12 @@
       // Send what was on screen: a message or mention landing between render and click must stay visible.
       const shownAt = m && Date.parse(r.mention.at) > Date.parse(r.last_activity) ? r.mention.at : r.last_activity;
       seenBtn.onclick = () => send(isSeen(r) && !m ? { unseen: r.id } : { seen: r.id, at: shownAt });
-      meta.append(seenBtn, Object.assign(el("span", "when", ago(r.last_activity)), { title: r.last_activity }));
+      meta.append(seenBtn);
+      if (r.last_id) {  // "read" is Teams' own marker, seen on every device — unlike the private seen
+        const readBtn = el("button", "read", "👁"); readBtn.title = "mark read in Teams";
+        readBtn.onclick = () => send({ read: r.id }); meta.append(readBtn);
+      }
+      meta.append(Object.assign(el("span", "when", ago(r.last_activity)), { title: r.last_activity }));
       const ind = el("span", "ind");
       if (m) {
         const tag = el("span", "tag " + r.mention.kind, r.mention.kind === "all" ? "@ all" : "@ you");
