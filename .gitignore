@@ -20,3 +20,9 @@ _data/
 .scratchpad/
 .claude/scratchpad/
 *.annotations.json5
+
+# local notes and runners (per-machine, never part of the project)
+/HANDOFF*.md
+/run-*.sh
+*.log
+*.bundle
