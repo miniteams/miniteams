@@ -9,6 +9,7 @@ survives restarts; the whole 127/8 is loopback on Linux, no interface setup need
 """
 
 import asyncio
+import base64
 import html
 import ipaddress
 import json
@@ -39,7 +40,7 @@ log = structlog.get_logger()
 _SNIPPET_LEN = 140
 _EMOJI_ALT_RE = re.compile(r'<emoji\b[^>]*\balt="([^"]*)"[^>]*>')
 _LABEL_CONCURRENCY = 8
-_STUB_PAGE = 5  # history page fetched to resolve an ambiguous listing stub
+_HISTORY_PAGE = 20  # history fetched per row at bootstrap: stub resolution + mention scan
 _PAGE_POLL = 2.0  # seconds between widget.html mtime checks (dev reload)
 _TYPING_TTL = 10.0  # seconds; Teams does not always send ClearTyping
 # Thread activity that changes the label (topic, member count): drop the cached thread info.
@@ -75,6 +76,72 @@ def is_unread(last_id: str, read_id: str) -> bool:
     if last_id.isdigit() and read_id.isdigit():
         return int(last_id) > int(read_id)
     return last_id > read_id
+
+
+def read_at_ms(props: dict[str, Any] | None) -> int:
+    """Time Teams last considered the chat read (2nd `consumptionhorizon` field, ms epoch).
+
+    Compared against a mention's *time* rather than its message id: an edit that adds a mention
+    keeps the original id, so an id comparison would call a late-added mention already read."""
+    horizon = str((props or {}).get("consumptionhorizon") or "")
+    parts = horizon.split(";")
+    return int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+
+
+def _ms(iso: str | None) -> int:
+    """ISO-8601 Z timestamp → ms epoch; 0 when missing or unparsable (never raises)."""
+    if not iso:
+        return 0
+    try:
+        return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() * 1000)
+    except ValueError:
+        return 0
+
+
+def _iso(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def self_mri(access_token: str) -> str:
+    """`8:orgid:<oid>` from the AAD access token's claims; "" when they cannot be read.
+
+    Our own token, already trusted for the API calls it authorises — the payload is decoded
+    without signature verification only to learn who we are (the silent refresh returns no
+    id_token)."""
+    try:
+        payload = access_token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        oid = str(claims.get("oid") or "")
+    except IndexError, ValueError, AttributeError:
+        return ""
+    return f"8:orgid:{oid}" if oid else ""
+
+
+def mention_kind(resource: dict[str, Any], me: str) -> str | None:
+    """`"me"` when the message @mentions `me` by name, `"all"` for an @everyone, else None.
+
+    `properties.mentions` is a JSON string (or list) of entries; `bot` and `share-contact`
+    entries are not mentions of a person. A message from `me` never counts."""
+    if not me or str(resource.get("from") or "").endswith(me):
+        return None
+    kind = None
+    for entry in _json_list((resource.get("properties") or {}).get("mentions")):
+        if not isinstance(entry, dict):
+            continue
+        mtype = str(entry.get("mentionType") or "")
+        if mtype == "person" and entry.get("mri") == me:
+            return "me"
+        if mtype == "everyone":
+            kind = "all"  # the entry's mri is the thread itself; a `me` entry still wins
+    return kind
+
+
+def mention_time(resource: dict[str, Any]) -> tuple[str, bool]:
+    """(ISO time the mention became visible, edited?): `edittime` (ms) when edited, else compose."""
+    edit = str((resource.get("properties") or {}).get("edittime") or "")
+    if edit.isdigit():
+        return _iso(int(edit)), True
+    return str(resource.get("composetime") or resource.get("originalarrivaltime") or ""), False
 
 
 def deep_link(thread_id: str, msg_id: str, scheme: str = "https") -> str:
@@ -154,7 +221,9 @@ async def row_from_conversation(conv: dict[str, Any], directory: Directory) -> d
         "last_activity": last_activity(conv),
         "last_id": last_id,
         "read_id": read_id,
+        "read_at": read_at_ms(conv.get("properties")),
         "unread": is_unread(last_id, read_id),
+        "mention": None,
         "sender": sender,
         "text": snippet(msgtype, str(last.get("content") or ""), last.get("properties")),
         "seen_at": None,
@@ -177,7 +246,11 @@ async def sender_of(resource: dict[str, Any], directory: Directory | None) -> st
 
 
 async def bootstrap(
-    pages: Iterable[list[dict[str, Any]]], directory: Directory, limit: int
+    pages: Iterable[list[dict[str, Any]]],
+    directory: Directory,
+    limit: int,
+    me: str = "",
+    seen: dict[str, str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """In-scope conversations from the newest-first listing, capped at `limit` (0 = walk all)."""
     picked: list[dict[str, Any]] = []
@@ -197,25 +270,77 @@ async def bootstrap(
     async def build(conv: dict[str, Any]) -> dict[str, Any]:
         async with gate:
             row = await row_from_conversation(conv, directory)
-            if row["text"] == "🗑 deleted":
-                await _resolve_stub(row, directory)
+            row["seen_at"] = (seen or {}).get(row["id"])
+            stub = row["text"] == "🗑 deleted"
+            recent = await _recent(row["id"], directory) if (stub or me) else []
+            if stub:
+                await _resolve_stub(row, recent, directory)
+            if me:
+                await _scan_mentions(row, recent, directory, me)
             return row
 
     rows = await asyncio.gather(*(build(conv) for conv in picked))
     return {row["id"]: row for row in rows}
 
 
-async def _resolve_stub(row: dict[str, Any], directory: Directory) -> None:
-    """The listing's lastMessage drops `properties`, so a file/card post looks exactly like a
-    deleted message. One history call for the few ambiguous rows tells them apart."""
+async def _recent(thread_id: str, directory: Directory) -> list[dict[str, Any]]:
+    """Last history page of a thread, chronological; [] on failure (bootstrap must survive)."""
     try:
-        # pageSize=1 skips the newest message (window artefact); ask for a few and pick by id.
-        recent = await asyncio.to_thread(
-            fetch_history, directory.settings, directory.skype_token, row["id"], _STUB_PAGE, 1
+        # pageSize=1 skips the newest message (window artefact); ask for a page and pick by id.
+        return await asyncio.to_thread(
+            fetch_history, directory.settings, directory.skype_token, thread_id, _HISTORY_PAGE, 1
         )
-    except Exception as exc:  # noqa: BLE001 — cosmetic: keep the stub rather than fail bootstrap
-        log.debug("stub_resolve_failed", thread=row["id"], error=str(exc))
-        return
+    except Exception as exc:  # noqa: BLE001 — cosmetic enrichment: keep the row as listed
+        log.debug("history_fetch_failed", thread=thread_id, error=str(exc))
+        return []
+
+
+def _mention_cleared(row: dict[str, Any], at: str) -> bool:
+    """Seen after the mention, or read in Teams after it: nothing left to highlight."""
+    at_ms = _ms(at)
+    return _ms(row.get("seen_at")) >= at_ms or int(row.get("read_at") or 0) >= at_ms
+
+
+def _mention_outranked(current: dict[str, Any] | None, kind: str) -> bool:
+    """An uncleared direct mention is kept over a newer @everyone."""
+    return current is not None and current.get("kind") == "me" and kind == "all"
+
+
+async def _mention_of(resource: dict[str, Any], kind: str, directory: Directory | None) -> dict[str, Any]:
+    at, edited = mention_time(resource)
+    msgtype = str(resource.get("messagetype") or "")
+    return {
+        "kind": kind,
+        "by": await sender_of(resource, directory),
+        "text": snippet(msgtype, str(resource.get("content") or ""), resource.get("properties")),
+        "at": at,
+        "edited": edited,
+        "msg_id": str(resource.get("id") or ""),
+    }
+
+
+async def _scan_mentions(
+    row: dict[str, Any], recent: list[dict[str, Any]], directory: Directory, me: str
+) -> None:
+    """Newest still-visible mention in the page (a direct one over @everyone), else None."""
+    best: dict[str, Any] | None = None
+    for message in recent:
+        kind = mention_kind(message, me)
+        if kind is None:
+            continue
+        at, _ = mention_time(message)
+        if _mention_cleared(row, at) or _mention_outranked(best, kind):
+            continue
+        # History is in compose order, but a mention added by edit is dated by its edit: compare
+        # by `at`, and let a direct mention replace an @everyone whatever its date.
+        if best is None or best["kind"] != kind or _ms(at) >= _ms(best["at"]):
+            best = await _mention_of(message, kind, directory)
+    row["mention"] = best
+
+
+async def _resolve_stub(row: dict[str, Any], recent: list[dict[str, Any]], directory: Directory) -> None:
+    """The listing's lastMessage drops `properties`, so a file/card post looks exactly like a
+    deleted message. The history page tells them apart."""
     message = next((m for m in recent if str(m.get("id") or "") == row["last_id"]), None)
     if message is None:
         return
@@ -280,9 +405,11 @@ class Board:
         opener: list[str] | None = None,
         open_scheme: str = "msteams",
         browser: list[str] | None = None,
+        me: str = "",
     ) -> None:
         self.rows = rows
         self.directory = directory
+        self.me = me  # own MRI: what a mention has to name
         self.reactions = reactions
         self.typing_ttl = typing_ttl
         self.seen_path = seen_path
@@ -294,6 +421,7 @@ class Board:
         self._seen: dict[str, str] = _load_seen(seen_path)
         for row in rows.values():
             row["seen_at"] = self._seen.get(row["id"])
+            row.setdefault("mention", None)
 
     # --- seen marker (page verb) ---
 
@@ -306,7 +434,14 @@ class Board:
         row = self.rows.get(thread_id)
         if row is None or not row.get("last_activity"):
             return False
-        stamp = min(at, row["last_activity"]) if at else row["last_activity"]
+        # `at` comes from the page: an unparsable value must not become the stamp (ms 0 sorts first).
+        stamp = min([at, row["last_activity"]], key=_ms) if at and _ms(at) else row["last_activity"]
+        mention = row.get("mention")
+        if mention:
+            # A mention added by editing an old message is newer than the last activity: the
+            # stamp must reach it, else the row would never leave the mention state.
+            stamp = max([stamp, mention["at"]], key=_ms)
+            row["mention"] = None
         self._seen[thread_id] = row["seen_at"] = stamp
         self._save_seen()
         self.broadcast()
@@ -358,7 +493,11 @@ class Board:
         if row is None or not read_id:
             return
         row["read_id"] = read_id
+        row["read_at"] = max(int(row.get("read_at") or 0), read_at_ms(resource.get("properties")))
         row["unread"] = is_unread(row.get("last_id", ""), read_id)
+        mention = row.get("mention")
+        if mention and _mention_cleared(row, mention["at"]):
+            row["mention"] = None
         self.broadcast()
 
     async def _new_message(self, thread_id: str, resource: dict[str, Any], msgtype: str) -> None:
@@ -371,6 +510,8 @@ class Board:
                 "seen_at": self._seen.get(thread_id),
                 "typing": [],
                 "read_id": "",
+                "read_at": 0,
+                "mention": None,
             }
         sender = "" if _is_system(msgtype) else await sender_of(resource, self.directory)
         # A bare-id label is a failed lookup: retry it (Directory spaces transient retries 60s apart).
@@ -390,6 +531,7 @@ class Board:
             sender=sender,
             text=snippet(msgtype, str(resource.get("content") or ""), resource.get("properties")),
         )
+        await self._note_mention(row, resource)
         self._typing_stop(thread_id, sender)  # their message is the end of their typing
         self.broadcast()
 
@@ -400,15 +542,43 @@ class Board:
             if self.reactions and row is not None:
                 await self._reaction(row, resource, props["emotions"])
             return
-        if row is None or row.get("last_id") != str(resource.get("id") or ""):
-            return  # edit/delete of an older message: the row shows the latest one, unchanged
-        if props.get("deletetime"):
-            row["text"] = "🗑 deleted"
-        elif resource.get("skypeeditedid") or props.get("edittime"):
-            row["text"] = snippet(msgtype, str(resource.get("content") or ""), props)
-        else:
+        if row is None:
             return
-        self.broadcast()
+        msg_id = str(resource.get("id") or "")
+        edited = bool(resource.get("skypeeditedid") or props.get("edittime"))
+        deleted = bool(props.get("deletetime"))
+        changed = False
+        if deleted:
+            # The mentioning message is gone: nothing left to point at.
+            if (row.get("mention") or {}).get("msg_id") == msg_id:
+                row["mention"] = None
+                changed = True
+        elif edited:
+            # Any message of the thread, not only the last: an edit can add a mention late.
+            changed = await self._note_mention(row, resource)
+        if row.get("last_id") == msg_id and (deleted or edited):
+            row["text"] = (
+                "🗑 deleted" if deleted else snippet(msgtype, str(resource.get("content") or ""), props)
+            )
+            changed = True
+        if changed:
+            self.broadcast()
+
+    async def _note_mention(self, row: dict[str, Any], resource: dict[str, Any]) -> bool:
+        """Fold a message's mention state into the row; True when the row changed."""
+        kind = mention_kind(resource, self.me)
+        current = row.get("mention")
+        msg_id = str(resource.get("id") or "")
+        if kind is None:
+            if current and current.get("msg_id") == msg_id:  # an edit removed the mention
+                row["mention"] = None
+                return True
+            return False
+        at, _ = mention_time(resource)
+        if _mention_cleared(row, at) or _mention_outranked(current, kind):
+            return False
+        row["mention"] = await _mention_of(resource, kind, self.directory)
+        return True
 
     async def _reaction(self, row: dict[str, Any], resource: dict[str, Any], emotions: list[Any]) -> None:
         """Newest added reaction becomes the row's last event and bumps it (opt-in, `--reactions`)."""
@@ -615,19 +785,25 @@ async def run(
     opener: str = "xdg-open",
     open_scheme: str = "msteams",
     browser: str = "",
+    me: str = "",
 ) -> None:
     directory = Directory(settings)
     directory.set_token(skype_token, bearer)
-    rows = await bootstrap(fetch_conversations(settings, skype_token), directory, limit)
-    log.info("web_bootstrap", rows=len(rows))
+    directory.me = me
+    seen_path = settings.config_dir / "seen.json"
+    rows = await bootstrap(
+        fetch_conversations(settings, skype_token), directory, limit, me, _load_seen(seen_path)
+    )
+    log.info("web_bootstrap", rows=len(rows), me=bool(me))
     board = Board(
         rows,
         directory,
         reactions=reactions,
-        seen_path=settings.config_dir / "seen.json",
+        seen_path=seen_path,
         opener=None if opener in ("", "none") else opener.split(),
         open_scheme=open_scheme,
         browser=None if browser in ("", "none") else browser.split(),
+        me=me,
     )
     # The stream only returns when auth is dead: a page that silently stops updating is worse
     # than an exit, so the server goes down with it and the user re-runs.

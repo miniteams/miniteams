@@ -151,10 +151,13 @@ def cmd_web(settings: Settings, args: argparse.Namespace) -> int:
     """Serve the live conversation-list widget on a loopback address (spec 002)."""
     import asyncio
 
-    from .web import run
+    from .web import run, self_mri
 
     aad, skype_token = _ensure_skype_token(settings)
     bearer = str(aad.get("id_token") or aad["access_token"])
+    me = self_mri(str(aad["access_token"]))
+    if not me:
+        log.warning("self_mri_unknown")  # mentions cannot be detected; the list still works
     try:
         asyncio.run(
             run(
@@ -167,6 +170,7 @@ def cmd_web(settings: Settings, args: argparse.Namespace) -> int:
                 args.opener,
                 args.open_scheme,
                 args.browser,
+                me=me,
             )
         )
     except KeyboardInterrupt:

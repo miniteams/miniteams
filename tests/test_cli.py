@@ -210,3 +210,23 @@ def test_web_parser_defaults_and_limit_validation(monkeypatch) -> None:
     assert seen["opener"] == "xdg-open" and seen["open_scheme"] == "msteams" and seen["browser"] == ""
     with pytest.raises(SystemExit):
         cli.main(["web", "--limit", "-1"])
+
+
+def test_web_passes_self_mri_from_the_access_token(monkeypatch) -> None:
+    import base64
+    import json
+
+    from miniteams import cli as C
+    from miniteams import web
+
+    body = base64.urlsafe_b64encode(json.dumps({"oid": "me-guid"}).encode()).decode().rstrip("=")
+    aad = {"access_token": f"h.{body}.s"}
+    monkeypatch.setattr(C, "_ensure_skype_token", lambda settings: (aad, "skype"))
+    got: dict[str, Any] = {}
+
+    async def fake_run(settings: Any, skype_token: str, bearer: str, *args: Any, **kw: Any) -> None:
+        got.update(kw, skype_token=skype_token, bearer=bearer)
+
+    monkeypatch.setattr(web, "run", fake_run)
+    assert C.main(["web", "--bind", "127.0.0.77:47123"]) == 0
+    assert (got["me"], got["skype_token"], got["bearer"]) == ("8:orgid:me-guid", "skype", f"h.{body}.s")

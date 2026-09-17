@@ -114,7 +114,9 @@ async def test_row_prefers_imdisplayname_then_directory(quiet_directory: Directo
         "last_activity": "2026-09-15T10:00:00Z",
         "last_id": "",
         "read_id": "",
+        "read_at": 0,
         "unread": False,
+        "mention": None,
         "sender": "Alice",
         "text": "hi",
         "seen_at": None,
@@ -780,3 +782,478 @@ async def test_seen_verb_over_websocket(settings: Settings) -> None:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+# --- mentions (spec 003, phase 1) ---
+
+ME = "8:orgid:me-guid"
+
+
+def _mentions(*entries: dict[str, Any]) -> str:
+    return json.dumps(list(entries))  # Teams ships the list as a JSON string
+
+
+def _person(mri: str) -> dict[str, Any]:
+    return {
+        "@type": "http://schema.skype.com/Mention",
+        "mentionType": "person",
+        "mri": mri,
+        "displayName": "x",
+    }
+
+
+def _everyone(thread_id: str) -> dict[str, Any]:
+    return {"mentionType": "everyone", "mri": thread_id, "displayName": "Tout le monde"}
+
+
+@pytest.fixture
+def mboard(quiet_directory: Directory, settings: Settings) -> W.Board:
+    rows = {
+        "19:a@thread.v2": {
+            "id": "19:a@thread.v2",
+            "label": "A",
+            "last_activity": "2026-09-15T10:00:00Z",
+            "last_id": "1789466400000",
+            "read_id": "1789466400000",
+            "read_at": W._ms("2026-09-15T10:00:05Z"),  # read right after the last message
+            "unread": False,
+            "sender": "Ann",
+            "text": "old",
+            "seen_at": None,
+            "typing": [],
+        }
+    }
+    return W.Board(rows, quiet_directory, seen_path=settings.config_dir / "seen.json", me=ME)
+
+
+def test_mention_kind_person_everyone_bot_contact_self() -> None:
+    props = lambda *e: {"properties": {"mentions": _mentions(*e)}}  # noqa: E731
+    assert W.mention_kind({**props(_person(ME)), "from": "8:orgid:other"}, ME) == "me"
+    assert W.mention_kind({**props(_everyone("19:t@thread.v2")), "from": "8:orgid:other"}, ME) == "all"
+    # A direct entry wins over an @everyone in the same message, whatever the order.
+    assert W.mention_kind({**props(_everyone("19:t"), _person(ME)), "from": "8:orgid:o"}, ME) == "me"
+    assert W.mention_kind(props(_person("8:orgid:someone-else")), ME) is None
+    assert W.mention_kind(props({"mentionType": "bot", "mri": "28:bot"}), ME) is None
+    assert W.mention_kind(props({"mentionType": "BOT", "mri": "28:bot"}), ME) is None
+    assert W.mention_kind(props({"mentionType": "share-contact", "mri": ME}), ME) is None
+    # Own message (from ends with the MRI, as in `https://.../contacts/8:orgid:...`).
+    assert W.mention_kind({**props(_person(ME)), "from": f"https://h/v1/users/ME/contacts/{ME}"}, ME) is None
+    # Lists (already decoded), garbage strings and no `me` at all.
+    assert W.mention_kind({"properties": {"mentions": [_person(ME)]}}, ME) == "me"
+    assert W.mention_kind({"properties": {"mentions": "not json"}}, ME) is None
+    assert W.mention_kind(props(_person(ME)), "") is None
+
+
+def test_mention_time_prefers_edittime() -> None:
+    msg = {"composetime": "2026-09-15T10:00:00Z", "properties": {"edittime": "1789470000000"}}
+    assert W.mention_time(msg) == (W._iso(1789470000000), True)
+    assert W.mention_time({"composetime": "2026-09-15T10:00:00Z"}) == ("2026-09-15T10:00:00Z", False)
+    assert W.mention_time(
+        {"originalarrivaltime": "2026-09-15T10:00:00Z", "properties": {"edittime": ""}}
+    ) == (
+        "2026-09-15T10:00:00Z",
+        False,
+    )
+
+
+def test_ms_and_read_at_parse_teams_shapes() -> None:
+    assert W._ms("2024-07-11T14:52:51.8610000Z") == 1720709571861  # 7-digit fraction
+    assert W._ms("2026-09-15T10:00:00Z") == 1789466400000
+    assert W._ms(None) == 0 and W._ms("") == 0 and W._ms("garbage") == 0
+    assert W.read_at_ms({"consumptionhorizon": "1789308085736;1789370244184;175117"}) == 1789370244184
+    assert W.read_at_ms({"consumptionhorizon": "1789308085736"}) == 0 and W.read_at_ms(None) == 0
+
+
+def test_self_mri_from_access_token() -> None:
+    import base64
+
+    def jwt(claims: dict[str, Any]) -> str:
+        body = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        return f"eyJhbGciOiJub25lIn0.{body}.sig"
+
+    assert W.self_mri(jwt({"oid": "abc-123", "upn": "x"})) == "8:orgid:abc-123"
+    assert W.self_mri(jwt({"upn": "x"})) == ""
+    assert W.self_mri("not.a-jwt") == "" and W.self_mri("") == ""
+
+
+async def test_live_mention_sets_row_and_everyone_is_outranked(mboard: W.Board) -> None:
+    t = "19:a@thread.v2"
+    await mboard.on_event(
+        _event(
+            "NewMessage",
+            t,
+            id="1789473600000",
+            composetime="2026-09-15T12:00:00Z",
+            messagetype="RichText/Html",
+            content="<p>ping <at>me</at></p>",
+            properties={"mentions": _mentions(_person(ME))},
+            **{"from": "8:orgid:bob"},
+        )
+    )
+    row = mboard.rows[t]
+    assert row["mention"] == {
+        "kind": "me",
+        "by": "Bob",
+        "text": "ping me",
+        "at": "2026-09-15T12:00:00Z",
+        "edited": False,
+        "msg_id": "1789473600000",
+    }
+    # A later @everyone does not downgrade the direct mention…
+    await mboard.on_event(
+        _msg(
+            t,
+            "2026-09-15T12:01:00Z",
+            "all hands",
+            msg_id="1789473660000",
+            properties={"mentions": _mentions(_everyone(t))},
+            **{"from": "8:orgid:bob"},
+        )
+    )
+    assert row["mention"]["kind"] == "me" and row["mention"]["msg_id"] == "1789473600000"
+    assert row["text"] == "all hands"  # …but the last message still moves on
+    # A message mentioning someone else leaves it untouched.
+    await mboard.on_event(
+        _msg(
+            t,
+            "2026-09-15T12:02:00Z",
+            "x",
+            msg_id="1789473720000",
+            properties={"mentions": _mentions(_person("8:orgid:zed"))},
+        )
+    )
+    assert row["mention"]["kind"] == "me"
+
+
+async def test_everyone_then_direct_upgrades(mboard: W.Board) -> None:
+    t = "19:a@thread.v2"
+    await mboard.on_event(
+        _msg(
+            t,
+            "2026-09-15T12:00:00Z",
+            "all",
+            msg_id="1789473600000",
+            properties={"mentions": _mentions(_everyone(t))},
+            **{"from": "8:orgid:bob"},
+        )
+    )
+    assert mboard.rows[t]["mention"]["kind"] == "all"
+    await mboard.on_event(
+        _msg(
+            t,
+            "2026-09-15T12:01:00Z",
+            "you",
+            msg_id="1789473660000",
+            properties={"mentions": _mentions(_person(ME))},
+            **{"from": "8:orgid:bob"},
+        )
+    )
+    assert mboard.rows[t]["mention"]["kind"] == "me" and mboard.rows[t]["mention"]["text"] == "you"
+
+
+async def test_edit_of_an_older_read_message_adds_a_mention(mboard: W.Board) -> None:
+    t = "19:a@thread.v2"
+    edit_ms = W._ms("2026-09-15T13:00:00Z")
+    edit = _event(
+        "MessageUpdate",
+        t,
+        id="1789460000000",
+        messagetype="RichText/Html",
+        content="<p>now <at>me</at></p>",
+        skypeeditedid="1789460000000",
+        composetime="2026-09-15T08:00:00Z",
+        properties={"edittime": str(edit_ms), "mentions": _mentions(_person(ME))},
+        **{"from": "8:orgid:bob"},
+    )
+    await mboard.on_event(edit)
+    row = mboard.rows[t]
+    assert row["mention"] == {
+        "kind": "me",
+        "by": "Bob",
+        "text": "now me",
+        "at": W._iso(edit_ms),
+        "edited": True,
+        "msg_id": "1789460000000",
+    }
+    assert (row["text"], row["last_activity"], row["unread"]) == ("old", "2026-09-15T10:00:00Z", False)
+    # The same message edited again without the mention: cleared. A different message's edit: no-op.
+    other = dict(
+        edit, resource=dict(edit["resource"], id="1789461000000", properties={"edittime": str(edit_ms)})
+    )
+    await mboard.on_event(other)
+    assert row["mention"]["msg_id"] == "1789460000000"
+    gone = dict(
+        edit, resource=dict(edit["resource"], properties={"edittime": str(edit_ms + 1)}, content="plain")
+    )
+    await mboard.on_event(gone)
+    assert row["mention"] is None
+
+
+async def test_deleting_the_mentioning_message_clears_it(mboard: W.Board) -> None:
+    t = "19:a@thread.v2"
+    await mboard.on_event(
+        _msg(
+            t,
+            "2026-09-15T12:00:00Z",
+            "you",
+            msg_id="1789473600000",
+            properties={"mentions": _mentions(_person(ME))},
+            **{"from": "8:orgid:bob"},
+        )
+    )
+    await mboard.on_event(
+        _event(
+            "MessageUpdate",
+            t,
+            id="1789473600000",
+            messagetype="Text",
+            content="",
+            properties={"deletetime": "1"},
+        )
+    )
+    assert mboard.rows[t]["mention"] is None and mboard.rows[t]["text"] == "🗑 deleted"
+
+
+async def test_seen_clears_the_mention_and_survives_restart(mboard: W.Board, settings: Settings) -> None:
+    t = "19:a@thread.v2"
+    edit_ms = W._ms("2026-09-15T13:00:00Z")
+    await mboard.on_event(
+        _event(
+            "MessageUpdate",
+            t,
+            id="1789460000000",
+            messagetype="Text",
+            content="you",
+            skypeeditedid="1789460000000",
+            composetime="2026-09-15T08:00:00Z",
+            properties={"edittime": str(edit_ms), "mentions": _mentions(_person(ME))},
+            **{"from": "8:orgid:bob"},
+        )
+    )
+    row = mboard.rows[t]
+    # The page sends the activity it displayed (older than the mention): the stamp still reaches it.
+    assert mboard.mark_seen(t, at="2026-09-15T10:00:00Z")
+    assert row["mention"] is None and W._ms(row["seen_at"]) >= edit_ms
+    # Restart: bootstrap sees the same mention in history but the seen stamp is past it.
+    seen = json.loads((settings.config_dir / "seen.json").read_text())
+    fresh = {**row, "seen_at": seen[t], "mention": None}
+    history = [
+        {
+            "id": "1789460000000",
+            "messagetype": "Text",
+            "content": "you",
+            "composetime": "2026-09-15T08:00:00Z",
+            "properties": {"edittime": str(edit_ms), "mentions": _mentions(_person(ME))},
+            "from": "8:orgid:bob",
+        }
+    ]
+    await W._scan_mentions(fresh, history, mboard.directory, ME)  # type: ignore[arg-type]
+    assert fresh["mention"] is None
+
+
+async def test_seen_clears_the_mention_but_still_caps_at_what_was_shown(mboard: W.Board) -> None:
+    """Seen always clears the mention (spec 003); a plain message that landed after the render
+    still keeps the row visible, as before."""
+    t = "19:a@thread.v2"
+    await mboard.on_event(
+        _msg(
+            t,
+            "2026-09-15T12:00:00Z",
+            "you",
+            msg_id="1789473600000",
+            properties={"mentions": _mentions(_person(ME))},
+            **{"from": "8:orgid:bob"},
+        )
+    )
+    await mboard.on_event(_msg(t, "2026-09-15T12:30:00Z", "later", msg_id="1789475400000"))
+    assert mboard.mark_seen(t, at="2026-09-15T12:00:00Z")  # the page had rendered before "later"
+    row = mboard.rows[t]
+    assert row["mention"] is None and row["seen_at"] == "2026-09-15T12:00:00Z"
+    assert W._ms(row["seen_at"]) < W._ms(row["last_activity"])  # "later" stays visible
+
+
+async def test_teams_read_marker_clears_only_after_the_mention(mboard: W.Board) -> None:
+    t = "19:a@thread.v2"
+    await mboard.on_event(
+        _msg(
+            t,
+            "2026-09-15T12:00:00Z",
+            "you",
+            msg_id="1789473600000",
+            properties={"mentions": _mentions(_person(ME))},
+            **{"from": "8:orgid:bob"},
+        )
+    )
+    before = W._ms("2026-09-15T11:59:00Z")
+    await mboard.on_event(
+        _event("ConversationUpdate", t, id=t, properties={"consumptionhorizon": f"1789473600000;{before};1"})
+    )
+    assert mboard.rows[t]["mention"]["kind"] == "me" and mboard.rows[t]["unread"] is False
+    after = W._ms("2026-09-15T12:00:30Z")
+    await mboard.on_event(
+        _event("ConversationUpdate", t, id=t, properties={"consumptionhorizon": f"1789473600000;{after};1"})
+    )
+    assert mboard.rows[t]["mention"] is None
+    # A mention that arrives after the read marker is not pre-cleared by it.
+    await mboard.on_event(
+        _msg(
+            t,
+            "2026-09-15T12:05:00Z",
+            "again",
+            msg_id="1789473900000",
+            properties={"mentions": _mentions(_person(ME))},
+            **{"from": "8:orgid:bob"},
+        )
+    )
+    assert mboard.rows[t]["mention"]["text"] == "again"
+
+
+async def test_bootstrap_scans_history_for_visible_mentions(quiet_directory: Directory, monkeypatch) -> None:
+    read_at = W._ms("2026-09-15T09:00:00Z")
+    t_new, t_read, t_seen, t_all = (
+        "19:new@thread.v2",
+        "19:read@thread.v2",
+        "19:seen@thread.v2",
+        "19:all@thread.v2",
+    )
+    history = {
+        # newest mention after the read marker → visible, direct wins over a later @everyone
+        t_new: [
+            {
+                "id": "1",
+                "messagetype": "Text",
+                "content": "you",
+                "composetime": "2026-09-15T10:00:00Z",
+                "properties": {"mentions": _mentions(_person(ME))},
+                "from": "8:orgid:bob",
+                "imdisplayname": "Bob",
+            },
+            {
+                "id": "2",
+                "messagetype": "Text",
+                "content": "all",
+                "composetime": "2026-09-15T10:30:00Z",
+                "properties": {"mentions": _mentions(_everyone(t_new))},
+                "from": "8:orgid:bob",
+            },
+        ],
+        # mentioned before the read marker → already read in Teams
+        t_read: [
+            {
+                "id": "3",
+                "messagetype": "Text",
+                "content": "you",
+                "composetime": "2026-09-15T08:00:00Z",
+                "properties": {"mentions": _mentions(_person(ME))},
+                "from": "8:orgid:bob",
+            }
+        ],
+        # mentioned after the read marker but seen in the widget after it
+        t_seen: [
+            {
+                "id": "4",
+                "messagetype": "Text",
+                "content": "you",
+                "composetime": "2026-09-15T10:00:00Z",
+                "properties": {"mentions": _mentions(_person(ME))},
+                "from": "8:orgid:bob",
+            }
+        ],
+        t_all: [
+            {
+                "id": "5",
+                "messagetype": "Text",
+                "content": "all",
+                "composetime": "2026-09-15T10:00:00Z",
+                "properties": {"mentions": _mentions(_everyone(t_all))},
+                "from": "8:orgid:bob",
+            }
+        ],
+    }
+    fetched: list[str] = []
+
+    def fake_history(settings: Any, token: str, thread_id: str, page_size: int, max_pages: int) -> list[Any]:
+        fetched.append(thread_id)
+        assert page_size == W._HISTORY_PAGE
+        return history[thread_id]
+
+    monkeypatch.setattr(W, "fetch_history", fake_history)
+    horizon = {"consumptionhorizon": f"1;{read_at};1"}
+    pages = [
+        [
+            _conv(t_new, "2026-09-15T10:30:00Z", id="2", messagetype="Text", content="all")
+            | {"properties": horizon},
+            _conv(t_read, "2026-09-15T08:00:00Z", id="3", messagetype="Text", content="you")
+            | {"properties": horizon},
+            _conv(t_seen, "2026-09-15T10:00:00Z", id="4", messagetype="Text", content="you")
+            | {"properties": horizon},
+            _conv(t_all, "2026-09-15T10:00:00Z", id="5", messagetype="Text", content="all")
+            | {"properties": horizon},
+        ]
+    ]
+    rows = await W.bootstrap(pages, quiet_directory, limit=0, me=ME, seen={t_seen: "2026-09-15T10:00:00Z"})
+    assert rows[t_new]["mention"]["kind"] == "me" and rows[t_new]["mention"]["by"] == "Bob"
+    assert rows[t_read]["mention"] is None
+    assert rows[t_seen]["mention"] is None and rows[t_seen]["seen_at"] == "2026-09-15T10:00:00Z"
+    assert rows[t_all]["mention"]["kind"] == "all"
+    assert sorted(fetched) == sorted(history)  # one history page per row, none twice
+    # Without `me` (token claims unreadable) nothing is fetched for plain rows.
+    fetched.clear()
+    rows = await W.bootstrap(pages, quiet_directory, limit=0)
+    assert fetched == [] and all(r["mention"] is None for r in rows.values())
+
+
+async def test_label_omits_self_from_roster(directory: Directory, monkeypatch) -> None:
+    directory.me = ME
+
+    async def fake_thread(self: Directory, thread_id: str) -> dict[str, Any]:
+        return {
+            "topic": None,
+            "members": [{"mri": "8:orgid:eric", "name": "Eric"}, {"mri": ME, "name": "Me"}],
+            "picture": None,
+        }
+
+    monkeypatch.setattr(Directory, "thread", fake_thread)
+    assert await directory.label("19:x@unq.gbl.spaces") == "Eric"
+
+    async def only_me(self: Directory, thread_id: str) -> dict[str, Any]:
+        return {"topic": None, "members": [{"mri": ME, "name": "Me"}], "picture": None}
+
+    monkeypatch.setattr(Directory, "thread", only_me)
+    assert await directory.label("19:solo@thread.v2") == "Me"  # never an empty label
+
+
+def test_seen_ignores_an_unparsable_at(mboard: W.Board) -> None:
+    t = "19:a@thread.v2"
+    assert mboard.mark_seen(t, at="garbage")
+    assert mboard.rows[t]["seen_at"] == "2026-09-15T10:00:00Z"
+
+
+async def test_bootstrap_scan_picks_the_newest_by_mention_time(quiet_directory: Directory) -> None:
+    """An older message edited to mention me outranks a later-composed mention: compare by `at`."""
+    edit_ms = W._ms("2026-09-15T13:00:00Z")
+    history = [
+        {
+            "id": "1",
+            "messagetype": "Text",
+            "content": "edited in",
+            "composetime": "2026-09-15T08:00:00Z",
+            "properties": {"edittime": str(edit_ms), "mentions": _mentions(_person(ME))},
+            "from": "8:orgid:bob",
+        },
+        {
+            "id": "2",
+            "messagetype": "Text",
+            "content": "composed later",
+            "composetime": "2026-09-15T10:00:00Z",
+            "properties": {"mentions": _mentions(_person(ME))},
+            "from": "8:orgid:bob",
+        },
+    ]
+    row: dict[str, Any] = {"id": "19:x@thread.v2", "seen_at": None, "read_at": 0}
+    await W._scan_mentions(row, history, quiet_directory, ME)
+    assert (row["mention"]["msg_id"], row["mention"]["edited"]) == ("1", True)
+    # Same date order without the edit: the later-composed one wins.
+    del history[0]["properties"]["edittime"]
+    await W._scan_mentions(row, history, quiet_directory, ME)
+    assert row["mention"]["msg_id"] == "2"

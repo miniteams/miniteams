@@ -46,6 +46,7 @@ class Directory:
         self.settings = settings
         self.skype_token = ""
         self.bearer = ""  # AAD id_token, for the profile lookup (Bearer auth)
+        self.me = ""  # own MRI; left out of roster-built labels (a 1:1 is named after the other)
         self._threads: dict[str, dict[str, Any] | None] = {}
         self._thread_failed: dict[str, float] = {}  # thread_id → monotonic time of a transient failure
         self._names_path = settings.cache_dir / "names.json"
@@ -214,6 +215,7 @@ class Directory:
         if info["topic"]:
             return f"{info['topic']} · {len(members)}p"
         if members:
-            names = ", ".join(m["name"] for m in members if m["name"])
+            others = [m["name"] for m in members if m["name"] and m["mri"] != self.me]
+            names = ", ".join(others or [m["name"] for m in members if m["name"]])
             return names or thread_id
         return thread_id

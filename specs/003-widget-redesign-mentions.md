@@ -28,8 +28,8 @@ it in Teams after the mention.
   - "Me" = `8:orgid:<oid>`, `oid` read from the AAD access token claims (verified: present, equals
     my MRI).
   - A message mentions me when `properties.mentions` (JSON string or list) holds an entry with
-    `mentionType: "person"` and my MRI (`kind: "me"`), or `mentionType: "everyone"` whose `mri` is
-    the thread id (`kind: "all"`). Archive: 30,273 `person`, 1,118 `everyone`; `bot` and
+    `mentionType: "person"` and my MRI (`kind: "me"`), or `mentionType: "everyone"` (`kind:
+    "all"`; its `mri` is the thread itself and is not checked — the message is in this thread). Archive: 30,273 `person`, 1,118 `everyone`; `bot` and
     `share-contact` entries are ignored.
   - Row gains `mention: {kind, by, text, at, edited}` (or `null`): `at` = `edittime` when the
     message was edited, else `composetime`; `text` = stripped snippet of the mentioning message.
@@ -142,6 +142,8 @@ None. No new files; `seen.json` unchanged in shape; page preferences in browser 
   id-based comparison would treat a late-added mention as already read.
 - Read-in-Teams clearing compares the read marker's *timestamp* field, not its message id, for the
   same reason (user choice: clear on seen **or** Teams read).
+- A re-edit of a message that already mentioned me (even a typo fix) re-surfaces the mention,
+  dated by the edit: the content changed after I saw it. Overturnable if it proves noisy.
 - Bootstrap scans 20 messages per row: enough for the usual unread backlog, bounded cost on the
   already rate-limited startup.
 - `@everyone` highlighted in a lighter style than a direct mention (user choice 2026-09-17): it
