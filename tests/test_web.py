@@ -422,7 +422,11 @@ async def test_serve_page_and_initial_rows(settings: Settings) -> None:
             assert page.status_code == 200
             assert page.headers["content-type"].startswith("text/html")
             assert "<title>miniteams</title>" in page.text
+            # View params (theme, avatars, tab) ride the query string of the same page.
+            view = await client.get(f"http://127.0.0.1:{port}/?theme=dark&avatars=0")
+            assert view.status_code == 200 and "<title>miniteams</title>" in view.text
             assert (await client.get(f"http://127.0.0.1:{port}/nope")).status_code == 404
+            assert (await client.get(f"http://127.0.0.1:{port}/nope?theme=dark")).status_code == 404
         own = f"http://127.0.0.1:{port}"  # what the served page sends; the server accepts only this
         async with websockets.connect(f"ws://127.0.0.1:{port}/ws", origin=own) as ws:
             first = json.loads(await ws.recv())
@@ -1257,3 +1261,10 @@ async def test_bootstrap_scan_picks_the_newest_by_mention_time(quiet_directory: 
     del history[0]["properties"]["edittime"]
     await W._scan_mentions(row, history, quiet_directory, ME)
     assert row["mention"]["msg_id"] == "2"
+
+
+def test_payload_carries_my_display_name(quiet_directory: Directory) -> None:
+    quiet_directory.note_name(ME, "Damien DEGOIS")
+    board = W.Board({}, quiet_directory, me=ME)
+    assert json.loads(board.payload())["me"] == "Damien DEGOIS"
+    assert json.loads(W.Board({}, quiet_directory).payload())["me"] == ""  # no me: the page shows "@you"

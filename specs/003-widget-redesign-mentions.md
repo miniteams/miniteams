@@ -1,6 +1,6 @@
 # 003 — Widget redesign + mention highlight
 
-**Status**: approved
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-09-17
 

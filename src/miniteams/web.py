@@ -410,6 +410,7 @@ class Board:
         self.rows = rows
         self.directory = directory
         self.me = me  # own MRI: what a mention has to name
+        self.me_name = directory.name_for(me) if directory and me else ""  # the page highlights it
         self.reactions = reactions
         self.typing_ttl = typing_ttl
         self.seen_path = seen_path
@@ -652,6 +653,7 @@ class Board:
                 "page": page_version(),
                 "opener": self.opener is not None,
                 "browser": self.browser is not None,
+                "me": self.me_name,
             },
             ensure_ascii=False,
         )
@@ -746,9 +748,10 @@ def _page() -> str:
 
 
 def _process_request(ws: ServerConnection, request: Request) -> Response | None:
-    if request.path == "/ws":
+    path = request.path.split("?", 1)[0]  # the page's view params (?theme=…) ride the query string
+    if path == "/ws":
         return None  # proceed with the websocket upgrade
-    if request.path == "/":
+    if path == "/":
         resp = ws.respond(HTTPStatus.OK, _page())
         del resp.headers["Content-Type"]  # respond() stamps text/plain; Headers is a multidict
         resp.headers["Content-Type"] = "text/html; charset=utf-8"

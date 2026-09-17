@@ -5,46 +5,133 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>miniteams</title>
 <style>
-  :root { color-scheme: light dark; --dim: #888; --line: #8884; --hot: #2f81f7; }
-  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; }
-  header { display: flex; gap: 1em; align-items: center; padding: .5em 1em; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: Canvas; }
-  header h1 { font-size: 1em; margin: 0; flex: 1; }
-  #status { color: var(--dim); font-size: .85em; }
-  header label { color: var(--dim); font-size: .85em; white-space: nowrap; }
-  li.hidden { opacity: .45; }
-  li.unread .label { font-weight: 700; }
-  li.unread .last { color: CanvasText; }
-  li button { grid-column: 3; grid-row: 1 / span 2; align-self: center; font: inherit; font-size: .8em; padding: .15em .5em; cursor: pointer; }
-  #status.off { color: #d33; }
-  ul { list-style: none; margin: 0; padding: 0; }
-  /* Every cell is placed explicitly: an auto-placed item next to a row-spanning one lands
-     wherever the algorithm likes (the button ended up in column 1, full width). */
-  li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; grid-template-rows: auto auto; gap: .15em .8em; padding: .5em 1em; border-bottom: 1px solid var(--line); }
-  li .label { grid-column: 1; grid-row: 1; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: inherit; text-decoration: none; }
-  li .label:hover { text-decoration: underline; }
-  li .when { grid-column: 2; grid-row: 1; color: var(--dim); font-size: .85em; white-space: nowrap; }
-  li .last { grid-column: 1 / span 2; grid-row: 2; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  li .last b { color: CanvasText; font-weight: 500; }
-  li .typing { color: var(--hot); }
+  :root {
+    color-scheme: light;
+    --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f0f2f5; --text: #1b1f24; --dim: #6b7380; --faint: #9aa1ab;
+    --line: #e3e6ea; --accent: #4f5bd5; --accent-soft: #4f5bd51a; --hot: #e5484d; --ok: #2f9e6e; --typing: #b7791f;
+    --mention: #0284c7; --mention-soft: #0ea5e91a; --on-mention: #fff;
+    --shadow: 0 1px 2px #0000000d, 0 4px 14px #0000000a;
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0f1115; --panel: #171a21; --panel-2: #1e222b; --text: #e6e8ec; --dim: #8b93a1; --faint: #5d6472;
+    --line: #262b35; --accent: #8b96ff; --accent-soft: #8b96ff22; --hot: #ff6b6f; --ok: #4cc38a; --typing: #f0b45a;
+    --mention: #7dd3fc; --mention-soft: #7dd3fc1f; --on-mention: #062a3d;
+    --shadow: 0 1px 2px #00000066, 0 6px 20px #00000055;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #0f1115; --panel: #171a21; --panel-2: #1e222b; --text: #e6e8ec; --dim: #8b93a1; --faint: #5d6472;
+      --line: #262b35; --accent: #8b96ff; --accent-soft: #8b96ff22; --hot: #ff6b6f; --ok: #4cc38a; --typing: #f0b45a;
+      --mention: #7dd3fc; --mention-soft: #7dd3fc1f; --on-mention: #062a3d;
+      --shadow: 0 1px 2px #00000066, 0 6px 20px #00000055;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  button { font: inherit; color: inherit; }
+  .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+
+  header { position: sticky; top: 0; z-index: 2; background: color-mix(in srgb, var(--bg) 85%, transparent); backdrop-filter: blur(10px);
+    padding: 10px 16px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid var(--line); }
+  h1 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -.01em; white-space: nowrap; }
+  .seg { display: inline-flex; background: var(--panel-2); border-radius: 10px; padding: 3px; gap: 2px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+  header > .seg { margin-right: auto; }
+  .seg button { border: 0; background: transparent; padding: 4px 8px; white-space: nowrap; border-radius: 8px; cursor: pointer; color: var(--dim); font-size: 12.5px; }
+  .seg button.on { background: var(--panel); color: var(--text); box-shadow: var(--shadow); font-weight: 550; }
+  .seg b { font-weight: 600; margin-left: 3px; font-size: 11px; padding: 0 6px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); }
+  .seg button.mention b { background: var(--mention-soft); color: var(--mention); }
+  #status { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); flex: none; }
+  #status.off { background: var(--hot); box-shadow: 0 0 0 3px color-mix(in srgb, var(--hot) 25%, transparent); }
+  .cog { position: relative; }
+  .cog > button { border: 0; background: transparent; color: var(--dim); font-size: 16px; width: 28px; height: 28px; border-radius: 8px; cursor: pointer; }
+  .cog > button:hover, .cog.open > button { background: var(--panel-2); color: var(--text); }
+  .menu { position: absolute; right: 0; top: 34px; width: 220px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); padding: 10px; display: grid; gap: 10px; z-index: 5; }
+  .menu h3 { margin: 0 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); font-weight: 600; }
+  .menu .seg { display: flex; }
+  .menu .seg button { flex: 1; }
+  .menu label { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; cursor: pointer; }
+  .switch { appearance: none; width: 32px; height: 18px; border-radius: 99px; background: var(--line); position: relative; cursor: pointer; transition: background .15s; margin: 0; }
+  .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: left .15s; box-shadow: 0 1px 2px #0003; }
+  .switch:checked { background: var(--accent); }
+  .switch:checked::after { left: 16px; }
+
+  ul { list-style: none; margin: 8px; padding: 0; display: grid; gap: 2px; }
+  li { display: grid; grid-template-columns: 40px minmax(0,1fr) auto; gap: 2px 10px; padding: 9px 10px; border-radius: 12px; align-items: center; position: relative; }
+  li:hover { background: var(--panel); box-shadow: var(--shadow); }
+  li.unread { box-shadow: inset 3px 0 0 var(--stripe); }
+  li.unread:hover { box-shadow: inset 3px 0 0 var(--stripe), var(--shadow); }
+  li.mention, li.mention:hover { background: var(--mention-soft); box-shadow: inset 3px 0 0 var(--mention); }
+  li.mention.all, li.mention.all:hover { background: color-mix(in srgb, var(--mention-soft) 50%, transparent); box-shadow: inset 3px 0 0 color-mix(in srgb, var(--mention) 45%, transparent); }
+  li.seen { opacity: .5; }
+  .av { grid-row: 1 / span 2; width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center; font-weight: 650; font-size: 14px; color: #fff; position: relative; }
+  .av.round { border-radius: 50%; }
+  .av small { position: absolute; right: -4px; bottom: -4px; font-size: 11px; background: var(--bg); border-radius: 6px; padding: 0 2px; line-height: 16px; }
+  .name { font-weight: 500; color: inherit; text-decoration: none; }
+  .name:hover { text-decoration: underline; }
+  li.unread .name, li.mention .name { font-weight: 700; }
+  li.mention.all .name { font-weight: 600; }
+  .meta { grid-column: 3; grid-row: 1; justify-self: end; display: flex; align-items: center; gap: 6px; }
+  .when { font-size: 12px; color: var(--faint); white-space: nowrap; }
+  li.unread .when { color: var(--accent); font-weight: 600; }
+  .meta button { display: none; border: 1px solid var(--line); background: var(--panel); border-radius: 6px; height: 20px; padding: 0 6px; font-size: 12px; line-height: 18px; cursor: pointer; color: var(--dim); }
+  li:hover .meta button { display: inline-block; }
+  .meta button:hover { color: var(--ok); border-color: var(--ok); }
+  .prev { grid-column: 2; grid-row: 2; color: var(--dim); font-size: 13px; }
+  .prev b { color: var(--text); font-weight: 550; }
+  li.unread .prev, li.mention .prev { color: var(--text); }
+  .prev .at { color: var(--mention); font-weight: 650; background: var(--mention-soft); border-radius: 4px; padding: 0 3px; }
+  .typing { color: var(--typing); font-style: italic; }
+  .ind { grid-column: 3; grid-row: 2; justify-self: end; display: flex; align-items: center; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); }
+  .tag { font-size: 11px; font-weight: 700; color: var(--on-mention); background: var(--mention); border-radius: 99px; padding: 0 7px; line-height: 18px; white-space: nowrap; }
+  .tag i { font-style: normal; font-weight: 500; opacity: .85; }
+  .tag.all { background: transparent; color: var(--mention); box-shadow: inset 0 0 0 1px var(--mention); }
+  /* Compact (avatars off): tighter rows, a hairline between them instead of the avatar rhythm. */
+  body.compact ul { gap: 0; margin: 4px 8px; }
+  body.compact li { grid-template-columns: minmax(0,1fr) auto; padding: 5px 10px; gap: 0 10px; border-radius: 8px; }
+  body.compact li + li::before { content: ""; position: absolute; left: 10px; right: 10px; top: 0; border-top: 1px solid var(--line); }
+  body.compact li:hover::before, body.compact li:hover + li::before, body.compact li.mention::before, body.compact li.mention + li::before { border-color: transparent; }
+  body.compact .name { grid-column: 1; grid-row: 1; }
+  body.compact .meta, body.compact .ind { grid-column: 2; }
+  body.compact .prev { grid-column: 1; font-size: 12.5px; }
   #empty { padding: 2em; text-align: center; color: var(--dim); }
 </style>
 </head>
 <body>
-<header><h1>miniteams</h1><label><input type="checkbox" id="unreadonly"> unread only (<span id="nunread">0</span>)</label><label><input type="checkbox" id="showhidden"> show seen (<span id="nhidden">0</span>)</label><span id="status">connecting…</span></header>
+<header>
+  <h1>miniteams</h1>
+  <div class="seg" id="tabs"></div>
+  <span id="status" title="connecting…"></span>
+  <div class="cog" id="cog"><button id="gear" title="options">⚙</button></div>
+</header>
 <ul id="rows"></ul>
 <div id="empty" hidden>nothing yet</div>
 <script>
 (() => {
   const $rows = document.getElementById("rows"), $empty = document.getElementById("empty"),
-        $status = document.getElementById("status"), $show = document.getElementById("showhidden"),
-        $nhidden = document.getElementById("nhidden"), $unread = document.getElementById("unreadonly"),
-        $nunread = document.getElementById("nunread");
-  let rows = [], ws = null, pageVersion = null, opener = false, browser = false;
-  try { $show.checked = localStorage.getItem("showhidden") === "1"; } catch (e) {}
-  $show.onchange = () => { try { localStorage.setItem("showhidden", $show.checked ? "1" : "0"); } catch (e) {} render(); };
-  try { $unread.checked = localStorage.getItem("unreadonly") === "1"; } catch (e) {}
-  $unread.onchange = () => { try { localStorage.setItem("unreadonly", $unread.checked ? "1" : "0"); } catch (e) {} render(); };
-  const isSeen = (r) => !!r.seen_at && r.seen_at >= r.last_activity;
+        $status = document.getElementById("status"), $tabs = document.getElementById("tabs"),
+        $cog = document.getElementById("cog"), $gear = document.getElementById("gear");
+  let rows = [], ws = null, pageVersion = null, opener = false, browser = false, meName = "", menuOpen = false;
+  const store = (k, v) => { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) {} return v; };
+  const TABS = { all: "Inbox", mention: "@", unread: "Unread", seen: "Seen" }, THEMES = ["auto", "light", "dark"];
+  // URL params override the stored choices without replacing them (bookmarks, screenshots).
+  const q = new URLSearchParams(location.search), pref = (k) => q.get(k) ?? store(k);
+  let tab = TABS[pref("tab")] ? pref("tab") : "all";
+  let theme = THEMES.includes(pref("theme")) ? pref("theme") : "auto";
+  let avatars = pref("avatars") !== "0";
+
+  // Parse, don't compare strings: Teams stamps 7 fraction digits, the server's mention time 3.
+  const isSeen = (r) => !!r.seen_at && Date.parse(r.seen_at) >= Date.parse(r.last_activity);
+  const mentioned = (r) => !!r.mention;  // the server clears it on seen / Teams read
+  const kind = (id) => id.includes("@unq.gbl") ? "dm" : id.includes("meeting_") ? "meeting" : "group";
+  const glyph = { group: "👥", meeting: "📅" };
+  const title = (r) => r.label.replace(/ · \d+p$/, "");
+  const initials = (r) => { const w = title(r).split(/[ ,]+/).filter((x) => /\p{L}/u.test(x));
+    return ((w[0] || "?")[0] + ((w[1] || "")[0] || "")).toUpperCase(); };
+  const hue = (s) => [...s].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7);
+  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
 
   const ago = (iso) => {
     const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
@@ -55,62 +142,116 @@
     return Math.floor(s / 86400) + "d";
   };
 
+  // The mentioning text carries my name inline (Teams strips the <at> tag): highlight it once.
+  const mentionLine = (r, into) => {
+    const m = r.mention;
+    if (m.by) into.append(el("b", null, m.by + ": "));
+    const first = (meName || "").split(" ")[0], text = m.text || "";
+    const i = m.kind === "me" && first ? text.indexOf(first) : -1;
+    if (i < 0) { into.append(el("span", "at", m.kind === "all" ? "@everyone" : "@you"), " " + text); return into; }
+    into.append(text.slice(0, i), el("span", "at", "@" + first), text.slice(i + first.length));
+    return into;
+  };
+  const preview = (r, into) => {
+    if (r.typing && r.typing.length) { into.classList.add("typing"); into.textContent = "✍ " + r.typing.join(", "); return into; }
+    if (mentioned(r)) return mentionLine(r, into);
+    if (r.sender) into.append(el("b", null, r.sender + ": "));
+    into.append(r.text || "");
+    return into;
+  };
+  const send = (obj) => ws && ws.readyState === 1 && ws.send(JSON.stringify(obj));
+  const pick = () => rows.filter((r) => tab === "all" ? !isSeen(r) || mentioned(r) : tab === "mention" ? mentioned(r) : tab === "unread" ? r.unread : isSeen(r));
+  const counts = () => ({ all: rows.filter((r) => !isSeen(r) || mentioned(r)).length, mention: rows.filter(mentioned).length,
+    unread: rows.filter((r) => r.unread).length, seen: rows.filter(isSeen).length });
+
+  const renderHeader = () => {
+    const c = counts();
+    $tabs.replaceChildren(...Object.entries(TABS).map(([k, lbl]) => {
+      const b = el("button", (tab === k ? "on " : "") + (k === "mention" ? "mention" : ""), lbl);
+      b.append(el("b", null, c[k])); b.onclick = () => { tab = k; store("tab", k); render(); }; return b;
+    }));
+    $cog.classList.toggle("open", menuOpen);
+    $cog.querySelector(".menu")?.remove();
+    if (!menuOpen) return;
+    const menu = el("div", "menu"); menu.onclick = (e) => e.stopPropagation();
+    const tbox = el("div"), tseg = el("div", "seg");
+    for (const [k, lbl] of [["auto", "◐ Auto"], ["light", "☀ Light"], ["dark", "☾ Dark"]]) {
+      const b = el("button", theme === k ? "on" : "", lbl); b.onclick = () => { theme = k; store("theme", k); render(); }; tseg.append(b);
+    }
+    tbox.append(el("h3", null, "Theme"), tseg);
+    const dbox = el("div"), lab = el("label", null, "Show avatars"), sw = el("input", "switch");
+    sw.type = "checkbox"; sw.checked = avatars; sw.onchange = () => { avatars = sw.checked; store("avatars", avatars ? "1" : "0"); render(); };
+    lab.append(sw); dbox.append(el("h3", null, "Display"), lab);
+    menu.append(tbox, dbox); $cog.append(menu);
+  };
+
   const render = () => {
-    const sorted = [...rows].sort((a, b) => (a.last_activity < b.last_activity) - (a.last_activity > b.last_activity));
-    $nhidden.textContent = sorted.filter(isSeen).length;
-    $nunread.textContent = sorted.filter((r) => r.unread).length;
-    let shown = $show.checked ? sorted : sorted.filter((r) => !isSeen(r));
-    if ($unread.checked) shown = shown.filter((r) => r.unread);
+    if (theme === "auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = theme;
+    document.body.classList.toggle("compact", !avatars);
+    rows.sort((a, b) => (a.last_activity < b.last_activity) - (a.last_activity > b.last_activity));
+    renderHeader();
+    const shown = pick();
     $rows.replaceChildren(...shown.map((r) => {
-      const li = document.createElement("li");
+      const m = mentioned(r), k = kind(r.id);
+      const li = el("li", (r.unread ? "unread " : "") + (isSeen(r) && !m ? "seen " : "") + (m ? "mention " + r.mention.kind : ""));
       li.dataset.id = r.id;
-      if (isSeen(r)) li.classList.add("hidden");
-      if (r.unread) li.classList.add("unread");
-      const label = Object.assign(document.createElement("a"), { className: "label", textContent: r.label, href: r.link || "#", target: "_blank", rel: "noopener" });
+      li.style.setProperty("--stripe", `hsl(${hue(r.id)} 62% 55%)`);
+      if (avatars) {
+        const av = el("div", "av" + (k === "dm" ? " round" : ""), initials(r));
+        av.style.background = `linear-gradient(135deg, hsl(${hue(r.id)} 62% 58%), hsl(${(hue(r.id) + 40) % 360} 62% 48%))`;
+        if (glyph[k]) av.append(el("small", null, glyph[k]));
+        li.append(av);
+      }
+      const name = Object.assign(el("a", "name truncate", title(r)), { href: r.link || "#", target: "_blank", rel: "noopener", title: r.label });
       // Plain click → the server opens the chat (desktop client); modified/middle click → the https
       // link, through the server's --browser when set, else in this browser.
       const modified = (ev) => ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.button === 1;
-      const send = (web) => ws && ws.readyState === 1 && ws.send(JSON.stringify({ open: r.id, web }));
-      label.onclick = (ev) => {
-        if (modified(ev)) { if (browser) { ev.preventDefault(); send(true); } return; }
-        if (opener) { ev.preventDefault(); send(false); }
+      name.onclick = (ev) => {
+        if (modified(ev)) { if (browser) { ev.preventDefault(); send({ open: r.id, web: true }); } return; }
+        if (opener) { ev.preventDefault(); send({ open: r.id, web: false }); }
       };
-      label.onauxclick = (ev) => { if (ev.button === 1 && browser) { ev.preventDefault(); send(true); } };
-      const when = Object.assign(document.createElement("span"), { className: "when", textContent: ago(r.last_activity), title: r.last_activity });
-      const last = document.createElement("span"); last.className = "last";
-      if (r.typing && r.typing.length) {
-        last.classList.add("typing"); last.textContent = "✍ " + r.typing.join(", ");
-      } else {
-        const who = Object.assign(document.createElement("b"), { textContent: r.sender ? r.sender + ": " : "" });
-        last.append(who, r.text || "");
-      }
-      const seen = Object.assign(document.createElement("button"), { textContent: isSeen(r) ? "unseen" : "seen" });
-      // Send what was on screen: a message landing between render and click must stay visible.
-      seen.onclick = () => ws && ws.readyState === 1 && ws.send(JSON.stringify(
-        isSeen(r) ? { unseen: r.id } : { seen: r.id, at: r.last_activity }));
-      li.append(label, when, seen, last);
+      name.onauxclick = (ev) => { if (ev.button === 1 && browser) { ev.preventDefault(); send({ open: r.id, web: true }); } };
+      const meta = el("span", "meta"), seenBtn = el("button", null, isSeen(r) && !m ? "↺" : "✓");
+      seenBtn.title = isSeen(r) && !m ? "unseen" : "mark seen";
+      // Send what was on screen: a message or mention landing between render and click must stay visible.
+      const shownAt = m && Date.parse(r.mention.at) > Date.parse(r.last_activity) ? r.mention.at : r.last_activity;
+      seenBtn.onclick = () => send(isSeen(r) && !m ? { unseen: r.id } : { seen: r.id, at: shownAt });
+      meta.append(seenBtn, Object.assign(el("span", "when", ago(r.last_activity)), { title: r.last_activity }));
+      const ind = el("span", "ind");
+      if (m) {
+        const tag = el("span", "tag " + r.mention.kind, r.mention.kind === "all" ? "@ all" : "@ you");
+        if (r.mention.edited) tag.append(el("i", null, " · edited " + ago(r.mention.at)));
+        tag.title = r.mention.at; ind.append(tag);
+      } else if (r.unread) ind.append(el("span", "dot"));
+      li.append(name, meta, preview(r, el("span", "prev truncate")), ind);
       return li;
     }));
     $empty.hidden = shown.length > 0;
   };
 
+  $gear.onclick = (e) => { e.stopPropagation(); menuOpen = !menuOpen; renderHeader(); };
+  addEventListener("click", () => { if (menuOpen) { menuOpen = false; renderHeader(); } });
+  addEventListener("keydown", (e) => { if (e.key === "Escape" && menuOpen) { menuOpen = false; renderHeader(); } });
+
   let retry = 1000;
   const connect = () => {
     ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
-    ws.onopen = () => { retry = 1000; $status.textContent = "live"; $status.classList.remove("off"); };
+    ws.onopen = () => { retry = 1000; $status.title = "live"; $status.classList.remove("off"); };
     ws.onmessage = (e) => {
-      const m = JSON.parse(e.data);
+      const msg = JSON.parse(e.data);
       // A newer widget.html on the server (restart, edit): this page is stale, reload it.
-      if (m.page) { if (pageVersion && m.page !== pageVersion) { location.reload(); return; } pageVersion = m.page; }
-      if ("opener" in m) opener = !!m.opener;
-      if ("browser" in m) browser = !!m.browser;
-      if (m.rows) { rows = m.rows; render(); }
+      if (msg.page) { if (pageVersion && msg.page !== pageVersion) { location.reload(); return; } pageVersion = msg.page; }
+      if ("opener" in msg) opener = !!msg.opener;
+      if ("browser" in msg) browser = !!msg.browser;
+      if ("me" in msg) meName = msg.me || "";
+      if (msg.rows) { rows = msg.rows; render(); }
     };
     ws.onclose = () => {
-      $status.textContent = "disconnected"; $status.classList.add("off");
+      $status.title = "disconnected"; $status.classList.add("off");
       setTimeout(connect, retry); retry = Math.min(retry * 2, 30000);  // server restarts → page recovers alone
     };
   };
+  render();
   connect();
   setInterval(render, 30000);  // keep the relative timestamps honest
 })();
