@@ -122,7 +122,7 @@
         $cog = document.getElementById("cog"), $gear = document.getElementById("gear");
   let rows = [], ws = null, pageVersion = null, opener = false, browser = false, meName = "", menuOpen = false;
   const store = (k, v) => { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) {} return v; };
-  const TABS = { all: "Inbox", mention: "@", unread: "Unread", seen: "Seen" }, THEMES = ["auto", "light", "dark"];
+  const TABS = { all: "Inbox", mention: "@", unread: "Unread", seen: "Seen", muted: "Muted" }, THEMES = ["auto", "light", "dark"];
   // URL params override the stored choices without replacing them (bookmarks, screenshots).
   const q = new URLSearchParams(location.search), pref = (k) => q.get(k) ?? store(k);
   let tab = TABS[pref("tab")] ? pref("tab") : "all";
@@ -167,9 +167,16 @@
     return into;
   };
   const send = (obj) => ws && ws.readyState === 1 && ws.send(JSON.stringify(obj));
-  const pick = () => rows.filter((r) => tab === "all" ? !isSeen(r) || mentioned(r) : tab === "mention" ? mentioned(r) : tab === "unread" ? r.unread : isSeen(r));
-  const counts = () => ({ all: rows.filter((r) => !isSeen(r) || mentioned(r)).length, mention: rows.filter(mentioned).length,
-    unread: rows.filter((r) => r.unread).length, seen: rows.filter(isSeen).length });
+  // A muted chat stays out of Inbox / Unread / Seen whatever lands on it; a mention still surfaces.
+  const filters = {
+    all: (r) => mentioned(r) || (!r.muted && !isSeen(r)),
+    mention: mentioned,
+    unread: (r) => r.unread && !r.muted,
+    seen: (r) => isSeen(r) && !r.muted,
+    muted: (r) => r.muted,
+  };
+  const pick = () => rows.filter(filters[tab]);
+  const counts = () => Object.fromEntries(Object.entries(filters).map(([k, f]) => [k, rows.filter(f).length]));
 
   const renderHeader = () => {
     const c = counts();
@@ -200,7 +207,7 @@
     const shown = pick();
     $rows.replaceChildren(...shown.map((r) => {
       const m = mentioned(r), k = kind(r.id);
-      const li = el("li", (r.unread ? "unread " : "") + (isSeen(r) && !m ? "seen " : "") + (m ? "mention " + r.mention.kind : ""));
+      const li = el("li", (r.unread ? "unread " : "") + ((isSeen(r) || r.muted) && !m ? "seen " : "") + (m ? "mention " + r.mention.kind : ""));
       li.dataset.id = r.id;
       li.style.setProperty("--stripe", `hsl(${hue(r.id)} 62% 55%)`);
       if (avatars) {
@@ -228,7 +235,9 @@
         const readBtn = el("button", "read", "👁"); readBtn.title = "mark read in Teams";
         readBtn.onclick = () => send({ read: r.id }); meta.append(readBtn);
       }
-      meta.append(Object.assign(el("span", "when", ago(r.last_activity)), { title: r.last_activity }));
+      const muteBtn = el("button", "mute", r.muted ? "🔔" : "🔕"); muteBtn.title = r.muted ? "unmute" : "mute (hide until unmuted)";
+      muteBtn.onclick = () => send(r.muted ? { unmute: r.id } : { mute: r.id });
+      meta.append(muteBtn, Object.assign(el("span", "when", ago(r.last_activity)), { title: r.last_activity }));
       const ind = el("span", "ind");
       if (m) {
         const tag = el("span", "tag " + r.mention.kind, r.mention.kind === "all" ? "@ all" : "@ you");

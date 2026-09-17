@@ -74,7 +74,8 @@ newer lands on that chat (state in `~/.config/miniteams/seen.json`); the **Seen*
 where ↺ undoes it. A message that @mentions you gets a blue stripe and an `@ you` tag (`@ all` for an
 @everyone), also when the mention was added by editing an older message; it clears once you mark the row seen
 or read the chat in Teams after the mention. The `@` tab lists mentioned rows, **Unread** follows Teams' own
-read marker. The ⚙ menu picks the theme (system by default) and hides avatars for a denser list. The
+read marker. `🔕` mutes a chat (out of Inbox whatever lands on it, listed under **Muted** until `🔔`; mentions still
+surface; state in `muted.json`). The ⚙ menu picks the theme (system by default) and hides avatars for a denser list. The
 process exits non-zero when the stream dies (auth expired) — re-run it.
 
 `stream` enriches each line with thread name + participants, resolves MRIs → display names

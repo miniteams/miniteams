@@ -403,6 +403,7 @@ class Board:
         reactions: bool = False,
         typing_ttl: float = _TYPING_TTL,
         seen_path: Path | None = None,
+        muted_path: Path | None = None,
         opener: list[str] | None = None,
         open_scheme: str = "msteams",
         browser: list[str] | None = None,
@@ -415,14 +416,17 @@ class Board:
         self.reactions = reactions
         self.typing_ttl = typing_ttl
         self.seen_path = seen_path
+        self.muted_path = muted_path
         self.opener = opener  # argv the deep link is appended to; None = the page follows its link
         self.open_scheme = open_scheme
         self.browser = browser  # argv for the https link on Ctrl/middle click; None = page's own browser
         self.clients: set[ServerConnection] = set()
         self._typing_timers: dict[tuple[str, str], asyncio.TimerHandle] = {}
         self._seen: dict[str, str] = _load_seen(seen_path)
+        self._muted: dict[str, str] = _load_seen(muted_path)  # thread → when muted (same shape)
         for row in rows.values():
             row["seen_at"] = self._seen.get(row["id"])
+            row["muted"] = row["id"] in self._muted
             row.setdefault("mention", None)
 
     # --- seen marker (page verb) ---
@@ -478,9 +482,23 @@ class Board:
         return True
 
     def _save_seen(self) -> None:
-        if self.seen_path is not None:
-            self.seen_path.parent.mkdir(parents=True, exist_ok=True)
-            self.seen_path.write_text(json.dumps(self._seen, ensure_ascii=False, indent=0))
+        _save_marks(self.seen_path, self._seen)
+
+    # --- mute (page verb) ---
+
+    def set_muted(self, thread_id: str, muted: bool) -> bool:
+        """Muted: hidden whatever lands on the chat, until unmuted; a mention still surfaces."""
+        row = self.rows.get(thread_id)
+        if row is None or (thread_id in self._muted) == muted:
+            return False
+        if muted:
+            self._muted[thread_id] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            del self._muted[thread_id]
+        row["muted"] = muted
+        _save_marks(self.muted_path, self._muted)
+        self.broadcast()
+        return True
 
     # --- live events (stream hook) ---
 
@@ -531,6 +549,7 @@ class Board:
                 "read_id": "",
                 "read_at": 0,
                 "mention": None,
+                "muted": thread_id in self._muted,
             }
         sender = "" if _is_system(msgtype) else await sender_of(resource, self.directory)
         # A bare-id label is a failed lookup: retry it (Directory spaces transient retries 60s apart).
@@ -734,12 +753,22 @@ class Board:
                     self.mark_unseen(verb["unseen"])
                 elif isinstance(verb, dict) and isinstance(verb.get("read"), str):
                     await self.mark_read(verb["read"])
+                elif isinstance(verb, dict) and isinstance(verb.get("mute"), str):
+                    self.set_muted(verb["mute"], True)
+                elif isinstance(verb, dict) and isinstance(verb.get("unmute"), str):
+                    self.set_muted(verb["unmute"], False)
                 elif isinstance(verb, dict) and isinstance(verb.get("open"), str):
                     await self.open_row(verb["open"], web=verb.get("web") is True)
                 else:
                     log.debug("ws_client_message_ignored", data=str(raw)[:100])
         finally:
             self.clients.discard(ws)
+
+
+def _save_marks(path: Path | None, marks: dict[str, str]) -> None:
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(marks, ensure_ascii=False, indent=0))
 
 
 def _load_seen(path: Path | None) -> dict[str, str]:
@@ -823,6 +852,7 @@ async def run(
         directory,
         reactions=reactions,
         seen_path=seen_path,
+        muted_path=settings.config_dir / "muted.json",
         opener=None if opener in ("", "none") else opener.split(),
         open_scheme=open_scheme,
         browser=None if browser in ("", "none") else browser.split(),

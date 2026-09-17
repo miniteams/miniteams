@@ -140,9 +140,20 @@ visible on every device (and read receipts where the tenant shows them).
       is logged and leaves the row unchanged.
 - [ ] A row without `last_id` has no `👁`.
 
+## Addendum — mute (2026-09-17)
+
+A `🔕` button (hover) mutes a chat: it leaves Inbox, Unread and Seen whatever lands on it, until
+`🔔` (in the new **Muted** tab, or on the row) unmutes it. A mention of me or an @everyone still
+surfaces in Inbox and `@`. State in `<config_dir>/muted.json` (`{thread_id: muted_at}`), widget-local
+like seen — Teams' own mute is not touched.
+
+- [ ] `{"mute": id}` hides the row from Inbox/Unread/Seen and lists it under Muted, across reload
+      and restart; `{"unmute": id}` reverses it; unknown ids are no-ops.
+- [ ] A new message on a muted chat keeps it muted; a mention on it shows in Inbox and `@`.
+
 ## Data model impact (summary)
 
-None. No new files; `seen.json` unchanged in shape; page preferences in browser `localStorage`.
+`<config_dir>/muted.json` (mute addendum); otherwise no new files; `seen.json` unchanged in shape; page preferences in browser `localStorage`.
 
 ## Open questions
 

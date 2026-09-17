@@ -779,6 +779,10 @@ async def test_seen_verb_over_websocket(settings: Settings) -> None:
             assert frame["rows"][0]["seen_at"] == "2026-09-15T10:00:00Z"
             await ws.send(json.dumps({"unseen": "t"}))
             assert json.loads(await ws.recv())["rows"][0]["seen_at"] is None
+            await ws.send(json.dumps({"mute": "t"}))
+            assert json.loads(await ws.recv())["rows"][0]["muted"] is True
+            await ws.send(json.dumps({"unmute": "t"}))
+            assert json.loads(await ws.recv())["rows"][0]["muted"] is False
             await ws.send(json.dumps({"seen": "t"}))
             await ws.recv()
         assert json.loads((settings.config_dir / "seen.json").read_text()) == {"t": "2026-09-15T10:00:00Z"}
@@ -1287,3 +1291,27 @@ async def test_read_verb_moves_teams_marker_and_survives_failure(board: W.Board,
     assert await board.mark_read("19:a@thread.v2") is False  # nothing to point the marker at
     assert calls == [("19:a@thread.v2", "10"), ("19:b@thread.v2", "20")]
     assert board.rows["19:b@thread.v2"].get("unread") is not True  # local state never guessed
+
+
+def test_mute_persists_and_unmute_undoes(settings: Settings) -> None:
+    muted_path = settings.config_dir / "muted.json"
+    rows = {"t": {"id": "t", "last_activity": "2026-09-15T10:00:00Z", "last_id": "1", "seen_at": None}}
+    board = W.Board(rows, muted_path=muted_path)
+    assert rows["t"]["muted"] is False
+    assert board.set_muted("t", False) is False  # nothing to undo
+    assert board.set_muted("t", True) is True and rows["t"]["muted"] is True
+    assert board.set_muted("t", True) is False  # already muted
+    assert list(json.loads(muted_path.read_text())) == ["t"]
+    again = W.Board({"t": dict(rows["t"], muted=False)}, muted_path=muted_path)  # restart
+    assert again.rows["t"]["muted"] is True
+    assert again.set_muted("t", False) is True and json.loads(muted_path.read_text()) == {}
+    assert board.set_muted("nope", True) is False
+
+
+async def test_live_row_on_a_muted_thread_stays_muted(board: W.Board, settings: Settings) -> None:
+    board.muted_path = settings.config_dir / "muted.json"
+    board._muted["19:new@thread.v2"] = "2026-09-15T00:00:00Z"
+    await board.on_event(_msg("19:new@thread.v2", "2026-09-15T13:00:00Z", "yo"))
+    assert board.rows["19:new@thread.v2"]["muted"] is True
+    await board.on_event(_msg("19:a@thread.v2", "2026-09-15T13:00:00Z", "yo"))
+    assert board.rows["19:a@thread.v2"]["muted"] is False
