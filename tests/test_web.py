@@ -1315,3 +1315,27 @@ async def test_live_row_on_a_muted_thread_stays_muted(board: W.Board, settings: 
     assert board.rows["19:new@thread.v2"]["muted"] is True
     await board.on_event(_msg("19:a@thread.v2", "2026-09-15T13:00:00Z", "yo"))
     assert board.rows["19:a@thread.v2"]["muted"] is False
+
+
+async def test_bootstrap_gives_a_message_id_to_rows_listed_without_one(
+    quiet_directory: Directory, monkeypatch
+) -> None:
+    """The chat-only deep link form reloads the desktop client (and drops a call): land on a message."""
+    fetched: list[str] = []
+
+    def fake_history(settings: Any, token: str, thread_id: str, page_size: int, max_pages: int) -> list[Any]:
+        fetched.append(thread_id)
+        return [
+            {"id": "7", "messagetype": "Text", "content": "old"},
+            {"id": "8", "messagetype": "Text", "content": "new"},
+        ]
+
+    monkeypatch.setattr(W, "fetch_history", fake_history)
+    bare = {"id": "19:bare@thread.v2", "lastMessage": {}, "version": 1789466400000}
+    listed = _conv("19:ok@thread.v2", "2026-09-15T10:00:00Z", id="5", messagetype="Text", content="hi")
+    rows = await W.bootstrap([[bare, listed]], quiet_directory, limit=0)
+    assert rows["19:bare@thread.v2"]["last_id"] == "8" and "/l/message/" in W.deep_link(
+        "19:bare@thread.v2", "8"
+    )
+    assert rows["19:ok@thread.v2"]["last_id"] == "5"
+    assert fetched == ["19:bare@thread.v2"]  # only the bare row costs a history call

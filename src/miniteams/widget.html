@@ -220,9 +220,11 @@
       // Plain click → the server opens the chat (desktop client); modified/middle click → the https
       // link, through the server's --browser when set, else in this browser.
       const modified = (ev) => ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.button === 1;
+      // Without a message id the only link form is chat-only, which the desktop client cannot
+      // route in page (it reloads, dropping a call): let that one open in the browser instead.
       name.onclick = (ev) => {
         if (modified(ev)) { if (browser) { ev.preventDefault(); send({ open: r.id, web: true }); } return; }
-        if (opener) { ev.preventDefault(); send({ open: r.id, web: false }); }
+        if (opener && r.last_id) { ev.preventDefault(); send({ open: r.id, web: false }); }
       };
       name.onauxclick = (ev) => { if (ev.button === 1 && browser) { ev.preventDefault(); send({ open: r.id, web: true }); } };
       const meta = el("span", "meta"), seenBtn = el("button", null, isSeen(r) && !m ? "↺" : "✓");

@@ -273,9 +273,14 @@ async def bootstrap(
             row = await row_from_conversation(conv, directory)
             row["seen_at"] = (seen or {}).get(row["id"])
             stub = row["text"] == "🗑 deleted"
-            recent = await _recent(row["id"], directory) if (stub or me) else []
+            recent = await _recent(row["id"], directory) if (stub or me or not row["last_id"]) else []
             if stub:
                 await _resolve_stub(row, recent, directory)
+            if not row["last_id"] and recent:
+                # A listing without lastMessage (activity known from the thread version only): the
+                # newest history message gives the row a target, so its deep link lands on a
+                # message. The chat-only link form makes the desktop client reload (it drops calls).
+                row["last_id"] = str(recent[-1].get("id") or "")
             if me:
                 await _scan_mentions(row, recent, directory, me)
             return row
