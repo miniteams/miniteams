@@ -36,6 +36,11 @@ _REACTION_LRU_MAX = 4096
 _THREAD_RETRY_AFTER = 60.0
 
 
+def _is_app(mri: str) -> bool:
+    """`28:<id>` MRIs are bots/apps; people are `8:orgid:<guid>`."""
+    return mri.rsplit("/", 1)[-1].startswith("28:")
+
+
 def _mri_from_userlink(user_link: str | None) -> str:
     # userLink is a contact URL ending in the MRI, e.g. ".../v1/users/8:orgid:<guid>".
     return user_link.rsplit("/", 1)[-1] if user_link else ""
@@ -215,7 +220,11 @@ class Directory:
         if info["topic"]:
             return f"{info['topic']} · {len(members)}p"
         if members:
-            others = [m["name"] for m in members if m["name"] and m["mri"] != self.me]
-            names = ", ".join(others or [m["name"] for m in members if m["name"]])
+            # Apps/bots sit in the roster as `28:` members (Jira Cloud, Confluence Cloud…):
+            # a chat is named after its people, unless there is nobody else to name it after.
+            named = [m for m in members if m["name"]]
+            others = [m["name"] for m in named if m["mri"] != self.me and not _is_app(m["mri"])]
+            apps = [m["name"] for m in named if _is_app(m["mri"])]
+            names = ", ".join(others or apps or [m["name"] for m in named])
             return names or thread_id
         return thread_id

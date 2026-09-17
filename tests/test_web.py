@@ -1339,3 +1339,28 @@ async def test_bootstrap_gives_a_message_id_to_rows_listed_without_one(
     )
     assert rows["19:ok@thread.v2"]["last_id"] == "5"
     assert fetched == ["19:bare@thread.v2"]  # only the bare row costs a history call
+
+
+async def test_label_omits_apps_and_bots_from_roster(directory: Directory, monkeypatch) -> None:
+    directory.me = ME
+    rosters = {
+        "19:dm@unq.gbl.spaces": [
+            {"mri": "8:orgid:eric", "name": "Eric"},
+            {"mri": ME, "name": "Me"},
+            {"mri": "28:4aa38041-66a2", "name": "Confluence Cloud"},
+        ],
+        "19:bot@unq.gbl.spaces": [{"mri": ME, "name": "Me"}, {"mri": "28:polly", "name": "Polly"}],
+        "19:grp@thread.v2": [
+            {"mri": "8:orgid:a", "name": "Ann"},
+            {"mri": "28:jira", "name": "Jira Cloud"},
+            {"mri": "8:orgid:b", "name": "Ben"},
+        ],
+    }
+
+    async def fake_thread(self: Directory, thread_id: str) -> dict[str, Any]:
+        return {"topic": None, "members": rosters[thread_id], "picture": None}
+
+    monkeypatch.setattr(Directory, "thread", fake_thread)
+    assert await directory.label("19:dm@unq.gbl.spaces") == "Eric"
+    assert await directory.label("19:bot@unq.gbl.spaces") == "Polly"  # nobody else: the bot names it
+    assert await directory.label("19:grp@thread.v2") == "Ann, Ben"
