@@ -42,6 +42,12 @@
   .seg button.on { background: var(--panel); color: var(--text); box-shadow: var(--shadow); font-weight: 550; }
   .seg b { font-weight: 600; margin-left: 3px; font-size: 11px; padding: 0 6px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); }
   .seg button.mention b { background: var(--mention-soft); color: var(--mention); }
+  /* Narrow widget window: the tabs are the header; the title is what gives. */
+  @media (max-width: 460px) {
+    h1 { display: none; }
+    header { gap: 8px; padding: 8px 10px; }
+    .seg button { padding: 4px 6px; }
+  }
   #status { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); flex: none; }
   #status.off { background: var(--hot); box-shadow: 0 0 0 3px color-mix(in srgb, var(--hot) 25%, transparent); }
   .cog { position: relative; }
