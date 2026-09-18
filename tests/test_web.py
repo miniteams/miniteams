@@ -1364,3 +1364,56 @@ async def test_label_omits_apps_and_bots_from_roster(directory: Directory, monke
     assert await directory.label("19:dm@unq.gbl.spaces") == "Eric"
     assert await directory.label("19:bot@unq.gbl.spaces") == "Polly"  # nobody else: the bot names it
     assert await directory.label("19:grp@thread.v2") == "Ann, Ben"
+
+
+async def test_call_events_are_not_credited_to_the_organizer(board: W.Board) -> None:
+    t = "19:a@thread.v2"
+    organizer = {"from": "https://h/v1/users/ME/contacts/8:orgid:me", "imdisplayname": ""}
+    scheduled = (
+        '<partlist alt =""></partlist><meetingDetails><organizerUpn>me@x</organizerUpn></meetingDetails>'
+    )
+    await board.on_event(
+        _event(
+            "NewMessage",
+            t,
+            id="30",
+            composetime="2026-09-15T12:00:00Z",
+            messagetype="Event/Call",
+            content=scheduled,
+            **organizer,
+        )
+    )
+    row = board.rows[t]
+    assert (row["sender"], row["text"]) == ("", "📞 call started")
+    ended = (
+        '<ended/><partlist alt="" count="2">'
+        '<part identity="8:orgid:a"><displayName>Ann</displayName></part></partlist>'
+    )
+    await board.on_event(
+        _event(
+            "NewMessage",
+            t,
+            id="31",
+            composetime="2026-09-15T12:30:00Z",
+            messagetype="Event/Call",
+            content=ended,
+            **organizer,
+        )
+    )
+    assert (row["sender"], row["text"]) == ("", "📞 call ended")
+    adhoc = (
+        '<partlist type="started" alt="">'
+        '<part identity="8:orgid:juan"><name>8:orgid:juan</name></part></partlist>'
+    )
+    await board.on_event(
+        _event(
+            "NewMessage",
+            t,
+            id="32",
+            composetime="2026-09-15T13:00:00Z",
+            messagetype="Event/Call",
+            content=adhoc,
+            **organizer,
+        )
+    )
+    assert (row["sender"], row["text"]) == ("name:8:orgid:juan", "📞 call started")

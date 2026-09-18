@@ -40,6 +40,10 @@ log = structlog.get_logger()
 
 _SNIPPET_LEN = 140
 _EMOJI_ALT_RE = re.compile(r'<emoji\b[^>]*\balt="([^"]*)"[^>]*>')
+# Ad-hoc calls name who started them; scheduled meetings carry an empty list.
+_CALL_STARTER_RE = re.compile(
+    r'<partlist[^>]*\btype\s*=\s*"started"[^>]*>.*?<part\s+identity="([^"]+)"', re.S
+)
 _LABEL_CONCURRENCY = 8
 _HISTORY_PAGE = 20  # history fetched per row at bootstrap: stub resolution + mention scan
 _PAGE_POLL = 2.0  # seconds between widget.html mtime checks (dev reload)
@@ -60,7 +64,7 @@ _TYPE_MARKERS = {
     "ThreadActivity/DeleteMember": "👥 member removed",
     "ThreadActivity/TopicUpdate": "✎ renamed",
     "ThreadActivity/MemberConsumptionHorizonUpdate": "👁 read marker",
-    "Event/Call": "📞 call",
+    "Event/Call": "📞 call started",
 }
 
 
@@ -200,6 +204,8 @@ def snippet(msgtype: str, content: str, props: dict[str, Any] | None = None) -> 
                 text = "🗑 deleted"
             else:
                 text = "🖼 image" if "<img" in content else "📎 attachment"
+    elif msgtype == "Event/Call" and "<ended/>" in content:
+        text = "📞 call ended"
     else:
         text = (_TYPE_MARKERS.get(msgtype) or f"[{msgtype.rsplit('/', 1)[-1]}]") if msgtype else ""
     text = " ".join(text.split())
@@ -238,6 +244,14 @@ def _is_system(msgtype: str) -> bool:
 
 
 async def sender_of(resource: dict[str, Any], directory: Directory | None) -> str:
+    if str(resource.get("messagetype") or "") == "Event/Call":
+        # `from` is the meeting organizer, not who joined or hung up: only an ad-hoc call's
+        # "started" part names a person; a scheduled meeting's event has nobody to credit.
+        started = _CALL_STARTER_RE.search(str(resource.get("content") or ""))
+        if not started:
+            return ""
+        mri = started.group(1)
+        return await directory.display(mri) if directory else mri
     mri = str(resource.get("from") or "")
     name = resource.get("imdisplayname")
     if directory is None:
