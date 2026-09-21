@@ -51,6 +51,36 @@ def test_snippet_strips_html_and_collapses_whitespace() -> None:
     assert W.snippet("Text", "  plain\ttext  ") == "plain text"
 
 
+def test_snippet_drops_a_leading_reply_quote() -> None:
+    quote = (
+        '<blockquote itemscope itemtype="http://schema.skype.com/Reply" itemid="177">'
+        '<strong itemprop="mri" itemid="8:orgid:x">Bob</strong>'
+        '<span itemprop="time" itemid="177"></span>'
+        '<p itemprop="preview">question</p></blockquote>'
+    )
+    assert W.snippet("RichText/Html", quote + "\n<p>ma réponse</p>") == "ma réponse"
+    # CRLF-separated variant, and the quote attributes in the other order Teams emits.
+    crlf = quote.replace("itemscope ", 'itemscope="" ')
+    assert W.snippet("RichText/Html", crlf + "\r\n<p>oui</p>") == "oui"
+    # Nothing but the quote: keep it, an empty preview says less than the quoted text.
+    assert W.snippet("RichText/Html", quote) == "Bob question"
+    # A trailing quote is the sender's own words first — left alone.
+    assert W.snippet("RichText/Html", "<p>mon texte</p>" + quote) == "mon texte Bob question"
+    # Older quotes carry no itemtype at all.
+    bare = "<blockquote>\r\n<p>la question</p>\r\n</blockquote>\r\n<p>la réponse</p>"
+    assert W.snippet("RichText/Html", bare) == "la réponse"
+
+
+def test_snippet_keeps_a_forwarded_body() -> None:
+    # A forward is a blockquote whose content is the message itself, not a quote of another one.
+    fwd = (
+        '<blockquote itemtype="http://schema.skype.com/Forward"><p>Hello</p>'
+        "<p>le contenu transféré</p></blockquote>"
+    )
+    assert W.snippet("RichText/Html", fwd) == "Hello le contenu transféré"
+    assert W.snippet("RichText/Html", fwd + "<p>fyi</p>") == "Hello le contenu transféré fyi"
+
+
 def test_snippet_truncates_with_ellipsis() -> None:
     out = W.snippet("Text", "x" * 500)
     assert len(out) == W._SNIPPET_LEN
