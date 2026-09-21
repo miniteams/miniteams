@@ -40,6 +40,8 @@ log = structlog.get_logger()
 
 _SNIPPET_LEN = 140
 _EMOJI_ALT_RE = re.compile(r'<emoji\b[^>]*\balt="([^"]*)"[^>]*>')
+# A forward is a blockquote too, but its content IS the message — only a reply quotes another.
+_REPLY_QUOTE_RE = re.compile(r"\A\s*<blockquote\b(?![^>]*Forward)[^>]*>.*?</blockquote>", re.DOTALL)
 # Ad-hoc calls name who started them; scheduled meetings carry an empty list.
 _CALL_STARTER_RE = re.compile(
     r'<partlist[^>]*\btype\s*=\s*"started"[^>]*>.*?<part\s+identity="([^"]+)"', re.S
@@ -178,15 +180,25 @@ def _json_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
+def _plain(content: str) -> str:
+    """HTML body as one line of text.
+
+    Emoji are tags whose `alt` holds the character; tags then become spaces, not nothing:
+    `<at>Bob</at>dis` would otherwise read "Bobdis".
+    """
+    return " ".join(html.unescape(_TAG_RE.sub(" ", _EMOJI_ALT_RE.sub(r"\1", content))).split())
+
+
 def snippet(msgtype: str, content: str, props: dict[str, Any] | None = None) -> str:
     """One-line preview of a message body, marker for non-text types, capped at _SNIPPET_LEN."""
     props = props or {}
     if msgtype in ("RichText/Html", "Text"):
-        # Emoji are tags whose `alt` holds the character; tags then become spaces, not nothing:
-        # `<at>Bob</at>dis` would otherwise read "Bobdis".
         text = content
         if msgtype == "RichText/Html":
-            text = html.unescape(_TAG_RE.sub(" ", _EMOJI_ALT_RE.sub(r"\1", content)))
+            # A reply repeats the quoted message before its own body; preview what was written,
+            # unless the reply is nothing but the quote.
+            body = _REPLY_QUOTE_RE.sub("", content, count=1)
+            text = _plain(body) or _plain(content)
         text = " ".join(text.split())
         if not text:
             # A file/card post has an empty body and its payload in properties; the list stub of
