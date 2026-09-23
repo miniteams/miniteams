@@ -8,6 +8,7 @@ as `X-Skypetoken` for every trouter/registrar call. Two response shapes exist in
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import structlog
@@ -37,7 +38,12 @@ def exchange_skype_token(settings: Settings, access_token: str) -> dict[str, Any
         raise RuntimeError(f"no skype token in authz response: keys={list(data)}")
 
     region = data.get("region")
-    log.info("skype_token_acquired", expires_in=expires_in, region=region)
+    # The chat service lives in the account's region: the APAC default costs ~2 s a call from the EU.
+    # An explicit MINITEAMS_CONTACTS_HOST still wins.
+    chat_host = urlparse(str((data.get("regionGtms") or {}).get("chatService") or "")).hostname
+    if chat_host and "contacts_host" not in settings.model_fields_set:
+        settings.contacts_host = chat_host
+    log.info("skype_token_acquired", expires_in=expires_in, region=region, chat_host=settings.contacts_host)
     return {"skype_token": token, "expires_in": expires_in, "region": region}
 
 
