@@ -206,7 +206,8 @@ def test_web_parser_defaults_and_limit_validation(monkeypatch) -> None:
     monkeypatch.setattr(cli, "cmd_web", lambda s, a: seen.update(vars(a)) or 0)
     monkeypatch.setenv("MINITEAMS_TENANT_ID", "t")
     assert cli.main(["web"]) == 0
-    assert seen["limit"] == 50 and seen["bind"] is None and seen["reactions"] is False
+    # None, not a number: `web` picks 400 with an archive to seed from, 250 without.
+    assert seen["limit"] is None and seen["bind"] is None and seen["reactions"] is False
     assert seen["opener"] == "xdg-open" and seen["open_scheme"] == "msteams" and seen["browser"] == ""
     with pytest.raises(SystemExit):
         cli.main(["web", "--limit", "-1"])

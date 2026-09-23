@@ -15,6 +15,8 @@ import ipaddress
 import json
 import random
 import re
+import sqlite3
+import time
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -28,6 +30,7 @@ from websockets.asyncio.server import ServerConnection, broadcast, serve
 from websockets.http11 import Request, Response
 from websockets.typing import Origin
 
+from .archive_store import read_chats
 from .chats import fetch_conversations, is_meeting, is_private, last_activity
 from .config import Settings
 from .directory import Directory
@@ -48,6 +51,14 @@ _CALL_STARTER_RE = re.compile(
 )
 _LABEL_CONCURRENCY = 8
 _HISTORY_PAGE = 20  # history fetched per row at bootstrap: stub resolution + mention scan
+_MENTION_SCAN = 50  # newest rows whose history is scanned for mentions at bootstrap
+_FIRST_CHUNK = 50  # rows the background fill paints before walking the rest of the listing
+_SEED_REREAD = 30.0  # seconds before the archive index is worth re-reading for a name
+# Default table depth: seeded rows cost no API call, a fetched one costs two.
+_LIMIT_SEEDED = 400
+_LIMIT_BARE = 250
+# Snippets that mean "the listing did not say": the archive may know better.
+_STUB_SNIPPETS = ("🗑 deleted", "📎 attachment")
 _PAGE_POLL = 2.0  # seconds between widget.html mtime checks (dev reload)
 _TYPING_TTL = 10.0  # seconds; Teams does not always send ClearTyping
 # Thread activity that changes the label (topic, member count): drop the cached thread info.
@@ -224,12 +235,80 @@ def snippet(msgtype: str, content: str, props: dict[str, Any] | None = None) -> 
     return text if len(text) <= _SNIPPET_LEN else text[: _SNIPPET_LEN - 1] + "…"
 
 
-async def row_from_conversation(conv: dict[str, Any], directory: Directory) -> dict[str, Any]:
+_APP_MRI = "28:"  # bots and app installs sit in the roster like people do
+
+
+def _seed_label(chat: dict[str, Any], me: str) -> str:
+    """The name the widget would have fetched: topic, else the roster without me.
+
+    The archive stores every participant, me included; `Directory.label` leaves me out, so reusing
+    the stored label verbatim would name every 1:1 after its two members.
+    """
+    members = [m for m in chat["participants"] if isinstance(m, dict) and m.get("name")]
+    if chat["topic"]:
+        return f"{chat['topic']} · {len(chat['participants'])}p"
+
+    def is_app(member: dict[str, Any]) -> bool:
+        return str(member.get("mri", "")).startswith(_APP_MRI)
+
+    others = [str(m["name"]) for m in members if m.get("mri") != me and not is_app(m)]
+    apps = [str(m["name"]) for m in members if is_app(m)]
+    return ", ".join(others or apps or [str(m["name"]) for m in members])
+
+
+def _index_stamp(data_dir: Path | None) -> tuple[int, int, int]:
+    """Identity of the index file's content; (0, 0, 0) when there is none to read."""
+    if data_dir is None:
+        return (0, 0, 0)
+    try:
+        st = (data_dir / "index.db").stat()
+    except OSError:
+        return (0, 0, 0)
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def seed_from_archive(data_dir: Path, me: str = "") -> dict[str, dict[str, Any]]:
+    """Per-thread row material from `index.db`: what the per-row API fetches would have bought.
+
+    An unusable archive is not an error — the caller falls back to fetching everything.
+    """
+    seeded: dict[str, dict[str, Any]] = {}
+    try:
+        # Inside the try: `read_chats` streams, so a missing or unreadable index raises on the
+        # first row, not on the call.
+        for chat in read_chats(data_dir):
+            thread_id = str(chat["id"])
+            if not in_scope(thread_id):
+                continue
+            conv = chat["raw"] if isinstance(chat["raw"], dict) else {}
+            last = conv.get("lastMessage") or {}
+            seeded[thread_id] = {
+                "label": _seed_label(chat, me),
+                "text": snippet(
+                    str(last.get("messagetype") or ""), str(last.get("content") or ""), last.get("properties")
+                ),
+                "sender": str(last.get("imdisplayname") or ""),
+                "read_id": read_up_to(conv.get("properties")),
+                "read_at": read_at_ms(conv.get("properties")),
+                "last_activity": last_activity(conv),
+                "last_id": str(last.get("id") or ""),
+            }
+    except (OSError, sqlite3.Error) as exc:
+        event = "archive_index_absent" if isinstance(exc, FileNotFoundError) else "archive_index_unusable"
+        log.info(event, data_dir=str(data_dir), error=str(exc))
+        return {}
+    log.info("archive_index_read", chats=len(seeded), data_dir=str(data_dir))
+    return seeded
+
+
+async def row_from_conversation(
+    conv: dict[str, Any], directory: Directory, label: str = ""
+) -> dict[str, Any]:
     thread_id = str(conv.get("id") or "")
     last = conv.get("lastMessage") or {}
     msgtype = str(last.get("messagetype") or "")
     sender = "" if _is_system(msgtype) else await sender_of(last, directory)
-    label = await directory.label(thread_id)
+    label = label or await directory.label(thread_id)
     if label == thread_id:  # thread lookup failed (rate limit…): the listing carries the topic
         label = str((conv.get("threadProperties") or {}).get("topic") or thread_id)
     last_id = str(last.get("id") or "")
@@ -272,14 +351,50 @@ async def sender_of(resource: dict[str, Any], directory: Directory | None) -> st
     return str(name) if name else (await directory.display(mri) if mri else "")
 
 
+def seeded_rows(seed: dict[str, dict[str, Any]], limit: int) -> dict[str, dict[str, Any]]:
+    """The newest `limit` archived chats as display rows — the first paint, before any API call.
+
+    The listing has not been walked yet, so this ordering is the archive's: a chat that moved while
+    the widget was down sorts late until the real listing lands and the table is replaced.
+    """
+    newest = sorted(
+        ((tid, row) for tid, row in seed.items() if row["last_activity"]),
+        key=lambda kv: str(kv[1]["last_activity"]),
+        reverse=True,
+    )
+    return {
+        thread_id: {
+            "id": thread_id,
+            "label": row["label"] or thread_id,
+            "last_activity": row["last_activity"],
+            "last_id": row["last_id"],
+            "read_id": row["read_id"],
+            "read_at": row["read_at"],
+            "unread": is_unread(row["last_id"], row["read_id"]),
+            "mention": None,
+            "sender": row["sender"],
+            "text": row["text"],
+            "seen_at": None,
+            "typing": [],
+        }
+        for thread_id, row in (newest[:limit] if limit else newest)
+    }
+
+
 async def bootstrap(
     pages: Iterable[list[dict[str, Any]]],
     directory: Directory,
     limit: int,
     me: str = "",
     seen: dict[str, str] | None = None,
+    seed: dict[str, dict[str, Any]] | None = None,
+    rank_offset: int = 0,
 ) -> dict[str, dict[str, Any]]:
-    """In-scope conversations from the newest-first listing, capped at `limit` (0 = walk all)."""
+    """In-scope conversations from the newest-first listing, capped at `limit` (0 = walk all).
+
+    `seed` carries what the archive already knows (see `seed_from_archive`): the listing wins on
+    every field it provides, the seed only spares the per-row fetches that would fill the gaps.
+    """
     picked: list[dict[str, Any]] = []
     for page in pages:
         for conv in page:
@@ -294,12 +409,29 @@ async def bootstrap(
     # keeps it a few seconds without hammering the chat service.
     gate = asyncio.Semaphore(_LABEL_CONCURRENCY)
 
-    async def build(conv: dict[str, Any]) -> dict[str, Any]:
+    async def build(conv: dict[str, Any], rank: int) -> dict[str, Any]:
         async with gate:
-            row = await row_from_conversation(conv, directory)
+            seeded = (seed or {}).get(str(conv.get("id") or "")) or {}
+            row = await row_from_conversation(conv, directory, label=str(seeded.get("label") or ""))
             row["seen_at"] = (seen or {}).get(row["id"])
-            stub = row["text"] == "🗑 deleted"
-            recent = await _recent(row["id"], directory) if (stub or me or not row["last_id"]) else []
+            # A listing message without `imdisplayname` costs a directory lookup; the archived copy
+            # of the same message usually carries the name.
+            row["sender"] = row["sender"] or str(seeded.get("sender") or "")
+            if not row["read_id"] and seeded.get("read_id"):
+                # The listing dropped the horizon (it happens on quiet chats); the archive kept it.
+                row["read_id"] = str(seeded["read_id"])
+                row["read_at"] = max(int(row["read_at"] or 0), int(seeded.get("read_at") or 0))
+                row["unread"] = is_unread(row["last_id"], row["read_id"])
+            stub = row["text"] in _STUB_SNIPPETS
+            if stub and seeded.get("text") and seeded["text"] not in _STUB_SNIPPETS:
+                # The listing's lastMessage has no `properties`, so a file or card post reads as a
+                # deleted one; the archived copy has them. Trust it and skip the history page.
+                row["text"] = str(seeded["text"])
+                stub = False
+            # Mentions need history, and history is the expensive part: scan the head of the list
+            # only — an older chat surfaces its mention when it next moves.
+            scan = bool(me) and rank < _MENTION_SCAN
+            recent = await _recent(row["id"], directory) if (stub or scan or not row["last_id"]) else []
             if stub:
                 await _resolve_stub(row, recent, directory)
             if not row["last_id"] and recent:
@@ -307,11 +439,11 @@ async def bootstrap(
                 # newest history message gives the row a target, so its deep link lands on a
                 # message. The chat-only link form makes the desktop client reload (it drops calls).
                 row["last_id"] = str(recent[-1].get("id") or "")
-            if me:
+            if scan:
                 await _scan_mentions(row, recent, directory, me)
             return row
 
-    rows = await asyncio.gather(*(build(conv) for conv in picked))
+    rows = await asyncio.gather(*(build(conv, rank) for rank, conv in enumerate(picked, rank_offset)))
     return {row["id"]: row for row in rows}
 
 
@@ -439,6 +571,9 @@ class Board:
         open_scheme: str = "msteams",
         browser: list[str] | None = None,
         me: str = "",
+        busy: bool = False,
+        seed: dict[str, dict[str, Any]] | None = None,
+        data_dir: Path | None = None,
     ) -> None:
         self.rows = rows
         self.directory = directory
@@ -452,6 +587,11 @@ class Board:
         self.open_scheme = open_scheme
         self.browser = browser  # argv for the https link on Ctrl/middle click; None = page's own browser
         self.clients: set[ServerConnection] = set()
+        self.busy = busy  # the page shows a spinner until the background fill says otherwise
+        self.seed = seed or {}
+        self.data_dir = data_dir
+        self._seed_read = time.monotonic()
+        self._seed_stamp = _index_stamp(data_dir)
         self._typing_timers: dict[tuple[str, str], asyncio.TimerHandle] = {}
         self._seen: dict[str, str] = _load_seen(seen_path)
         self._muted: dict[str, str] = _load_seen(muted_path)  # thread → when muted (same shape)
@@ -459,6 +599,62 @@ class Board:
             row["seen_at"] = self._seen.get(row["id"])
             row["muted"] = row["id"] in self._muted
             row.setdefault("mention", None)
+
+    async def archived_label(self, thread_id: str) -> str:
+        """The name the archive has for a chat, re-reading the index when it has moved on.
+
+        The live lookup is what names a new chat; this is the fallback when it fails (a 429, or a
+        chat we were removed from), and the archive may have learned the name after we started.
+        """
+        name = str(self.seed.get(thread_id, {}).get("label") or "")
+        if name or self.data_dir is None:
+            return name
+        stamp = _index_stamp(self.data_dir)
+        if stamp == self._seed_stamp or time.monotonic() - self._seed_read < _SEED_REREAD:
+            return ""  # same file, or too soon: re-reading it would buy nothing
+        # Claimed before the await, not after: a burst of unnamed chats (a reconnect replaying what
+        # it dropped) would otherwise start one 12 MiB read each, all of them reading the same file.
+        self._seed_read, self._seed_stamp = time.monotonic(), stamp
+        self.seed = await asyncio.to_thread(seed_from_archive, self.data_dir, self.me)
+        return str(self.seed.get(thread_id, {}).get("label") or "")
+
+    def set_busy(self, busy: bool) -> None:
+        self.busy = busy
+        self.broadcast()
+
+    def replace(self, rows: dict[str, dict[str, Any]], busy: bool = False) -> None:
+        """Swap the table for the freshly bootstrapped one, keeping what only the live page knows.
+
+        A message landing during the fill created or moved a row: its `typing` and anything newer
+        than what the fill saw must survive, or the page would visibly go backwards.
+        """
+        for thread_id, row in rows.items():
+            live = self.rows.get(thread_id)
+            if live and str(live.get("last_activity") or "") > str(row.get("last_activity") or ""):
+                continue  # the stream already knows better than the listing did
+            row["typing"] = live["typing"] if live else []
+            row["seen_at"] = self._seen.get(thread_id)
+            row["muted"] = thread_id in self._muted
+            row.setdefault("mention", None)
+            self.rows[thread_id] = row
+        self.busy = busy
+        self.broadcast()
+
+    def prune(self, keep: set[str], newer_than: str) -> int:
+        """Drop the seeded rows the live listing did not return; returns how many went.
+
+        Without this the table holds both sets — the archive's newest `--limit` chats *and* the
+        listing's — so a widget whose archive lags doubles its row count and its payload. A row the
+        stream touched since the walk started is not the listing's to disown.
+        """
+        gone = [
+            thread_id
+            for thread_id, row in self.rows.items()
+            if thread_id not in keep and str(row.get("last_activity") or "") <= newer_than
+        ]
+        for thread_id in gone:
+            del self.rows[thread_id]
+        return len(gone)
 
     # --- seen marker (page verb) ---
 
@@ -590,6 +786,8 @@ class Board:
             fresh = await self.directory.label(thread_id)
             if fresh != thread_id:  # lookup failed (removed from the chat, 429): keep the old name
                 row["label"] = fresh
+            elif row["label"] == thread_id:
+                row["label"] = await self.archived_label(thread_id) or row["label"]
         last_id = str(resource.get("id") or "")
         row.update(
             last_activity=str(resource.get("composetime") or resource.get("originalarrivaltime") or ""),
@@ -722,6 +920,7 @@ class Board:
                 "opener": self.opener is not None,
                 "browser": self.browser is not None,
                 "me": self.me_name,
+                "busy": self.busy,
             },
             ensure_ascii=False,
         )
@@ -858,28 +1057,81 @@ async def serve_board(board: Board, settings: Settings, bind: str | None) -> Non
             save_bind(settings, host, port)
 
 
+def resolve_limit(limit: int | None, seeded: bool) -> int:
+    """How deep the table goes. `--limit` wins, including `0` (no limit).
+
+    Seeded rows cost no API call, so the default goes deeper when an archive is there; without one
+    every row is fetched twice over and the same depth would mean minutes of blank page.
+    """
+    return limit if limit is not None else (_LIMIT_SEEDED if seeded else _LIMIT_BARE)
+
+
+def _listed(settings: Settings, skype_token: str, limit: int) -> list[dict[str, Any]]:
+    """In-scope conversations from the live listing, newest first, capped — one blocking walk."""
+    picked: list[dict[str, Any]] = []
+    for page in fetch_conversations(settings, skype_token):
+        for conv in page:
+            thread_id = str(conv.get("id") or "")
+            if thread_id and in_scope(thread_id) and last_activity(conv):
+                picked.append(conv)
+                if limit and len(picked) >= limit:
+                    return picked
+    return picked
+
+
+async def fill_from_listing(
+    board: Board,
+    settings: Settings,
+    skype_token: str,
+    directory: Directory,
+    limit: int,
+    me: str,
+    seen: dict[str, str],
+    seed: dict[str, dict[str, Any]],
+) -> None:
+    """Replace the seeded table with the live listing, head first; the page spins until it ends.
+
+    Two passes so a widget with no archive shows something quickly: the head carries the mention
+    scan, the tail continues at its rank so nothing is scanned twice.
+    """
+    started = _iso(int(datetime.now(UTC).timestamp() * 1000))
+    try:
+        convs = await asyncio.to_thread(_listed, settings, skype_token, limit)
+        head = min(_FIRST_CHUNK, limit or _FIRST_CHUNK)
+        board.replace(await bootstrap([convs[:head]], directory, 0, me, seen, seed), busy=True)
+        if len(convs) > head:
+            rest = await bootstrap([convs[head:]], directory, 0, me, seen, seed, rank_offset=head)
+            board.replace(rest, busy=True)
+        dropped = board.prune({str(conv.get("id") or "") for conv in convs}, started)
+        log.info("web_bootstrap", rows=len(board.rows), listed=len(convs), seeded=len(seed), dropped=dropped)
+    except Exception as exc:  # noqa: BLE001 — a failed fill leaves the seeded table, not a dead page
+        log.error("web_bootstrap_failed", error=str(exc), error_type=type(exc).__name__)
+    finally:
+        board.set_busy(False)  # a spinner that never stops is worse than no spinner
+
+
 async def run(
     settings: Settings,
     skype_token: str,
     bearer: str,
-    limit: int,
+    limit: int | None,
     bind: str | None,
     reactions: bool = False,
     opener: str = "xdg-open",
     open_scheme: str = "msteams",
     browser: str = "",
     me: str = "",
+    data_dir: Path | None = None,
 ) -> None:
     directory = Directory(settings)
     directory.set_token(skype_token, bearer)
     directory.me = me
     seen_path = settings.config_dir / "seen.json"
-    rows = await bootstrap(
-        fetch_conversations(settings, skype_token), directory, limit, me, _load_seen(seen_path)
-    )
-    log.info("web_bootstrap", rows=len(rows), me=bool(me))
+    seen = _load_seen(seen_path)
+    seed = await asyncio.to_thread(seed_from_archive, data_dir, me) if data_dir else {}
+    cap = resolve_limit(limit, seeded=bool(seed))
     board = Board(
-        rows,
+        seeded_rows(seed, cap),
         directory,
         reactions=reactions,
         seen_path=seen_path,
@@ -888,15 +1140,24 @@ async def run(
         open_scheme=open_scheme,
         browser=None if browser in ("", "none") else browser.split(),
         me=me,
+        busy=True,
+        seed=seed,
+        data_dir=data_dir,
     )
+    log.info("web_seeded", rows=len(board.rows), seeded=len(seed), limit=cap, me=bool(me))
     # The stream only returns when auth is dead: a page that silently stops updating is worse
     # than an exit, so the server goes down with it and the user re-runs.
     server = asyncio.create_task(serve_board(board, settings, bind))
+    # The page is up before the listing is walked: it fills in, it does not wait.
+    fill = asyncio.create_task(
+        fill_from_listing(board, settings, skype_token, directory, cap, me, seen, seed)
+    )
     # Own endpoint id: sharing `stream`'s would make whichever registered last the only receiver.
     stream = asyncio.create_task(
         run_forever(settings, on_event=board.on_event, directory=directory, epid_name="endpoint_id-web")
     )
     done, pending = await asyncio.wait({server, stream}, return_when=asyncio.FIRST_COMPLETED)
+    fill.cancel()  # the page is going away; a half-finished walk has nobody to tell
     for task in pending:
         task.cancel()
     for task in done:

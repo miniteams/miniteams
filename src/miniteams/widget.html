@@ -113,6 +113,12 @@
   body.compact .meta, body.compact .ind { grid-column: 2; }
   body.compact .prev { grid-column: 1; font-size: 12.5px; }
   #empty { padding: 2em; text-align: center; color: var(--dim); }
+  /* Still filling in from the live listing: the rows on screen come from the local archive. */
+  .spin { position: fixed; right: 14px; bottom: 14px; width: 16px; height: 16px; border-radius: 50%;
+    border: 2px solid var(--line); border-top-color: var(--accent); animation: spin 0.8s linear infinite;
+    background: var(--bg); box-shadow: var(--shadow); z-index: 3; }
+  @media (prefers-reduced-motion: reduce) { .spin { animation: none; border-top-color: var(--accent); } }
+  @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -126,12 +132,14 @@
 <ul id="rows"></ul>
 <span id="say" class="sr" aria-live="polite"></span>
 <div id="empty" hidden>nothing yet</div>
+<div id="spin" class="spin" hidden title="loading the live list…"></div>
 <script>
 (() => {
   const $rows = document.getElementById("rows"), $empty = document.getElementById("empty"),
         $status = document.getElementById("status"), $tabs = document.getElementById("tabs"),
         $cog = document.getElementById("cog"), $gear = document.getElementById("gear"),
         $q = document.getElementById("q"), $say = document.getElementById("say"),
+        $spin = document.getElementById("spin"),
         $header = document.querySelector("header");
   let rows = [], ws = null, pageVersion = null, opener = false, browser = false, meName = "", menuOpen = false, query = "", sel = "";
   const store = (k, v) => { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) {} return v; };
@@ -335,6 +343,7 @@
       if ("opener" in msg) opener = !!msg.opener;
       if ("browser" in msg) browser = !!msg.browser;
       if ("me" in msg) meName = msg.me || "";
+      if ("busy" in msg) $spin.hidden = !msg.busy;
       if (msg.rows) { rows = msg.rows; render(); }
     };
     ws.onclose = () => {
