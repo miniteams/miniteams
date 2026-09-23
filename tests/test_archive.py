@@ -969,3 +969,34 @@ def test_refreshing_token_mints_once_across_threads(settings: Settings, monkeypa
     for t in threads:
         t.join()
     assert exchanges == [1] and set(got) == {"sk1"}
+
+
+async def test_force_also_overrides_the_version_skip(settings: Settings, tmp_path, monkeypatch) -> None:
+    """A forced chat is topped up even when its conversation version says it is synced."""
+    data = tmp_path / "data"
+    pre = ChatStore(data, C1)
+    pre.insert_page([_msg("a1", "2026-07-01T09:00:00Z")])
+    pre.close()
+    index = Index(data)
+    index.upsert_chat(C1)
+    index.mark_backfill_done(C1)
+    index.mark_synced(C1, 42)
+    index.close()
+
+    conv = {"id": C1, "version": 42}  # no lastMessage: only the version could skip it
+    monkeypatch.setattr(AR, "fetch_conversations", lambda s, tok: iter([[conv]]))
+    api = _FakeApi({C1: [_msg("a1", "2026-07-01T09:00:00Z"), _msg("a2", "2026-07-01T10:00:00Z")]})
+    monkeypatch.setattr(AR, "iter_history_pages", api.iter_pages)
+
+    async def fake_thread(self, tid):  # noqa: ANN001
+        return {"topic": "", "members": [], "picture": None}
+
+    async def fake_label(self, tid):  # noqa: ANN001
+        return "L"
+
+    monkeypatch.setattr(AR.Directory, "thread", fake_thread)
+    monkeypatch.setattr(AR.Directory, "label", fake_label)
+    await _run(settings, data, download_media=False)
+    assert _stored_ids(data, C1) == {"a1"}  # unforced: skipped by version
+    await _run(settings, data, download_media=False, force=frozenset({C1}))
+    assert _stored_ids(data, C1) == {"a1", "a2"}
