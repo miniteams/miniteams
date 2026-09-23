@@ -1,6 +1,6 @@
 # 005 — Archive follows live events
 
-**Status**: approved
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-09-23
 
