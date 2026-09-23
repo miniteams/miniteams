@@ -1,6 +1,6 @@
 # 006 — Quick reply from the widget
 
-**Status**: in progress
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-09-23
 
