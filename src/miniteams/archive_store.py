@@ -77,7 +77,8 @@ class Index:
                 raw TEXT NOT NULL DEFAULT '{}',  -- full conversation object (lastMessage, version…)
                 backfill_done INTEGER NOT NULL DEFAULT 0,
                 last_fetch_at TEXT NOT NULL DEFAULT '',
-                history_denied_at TEXT NOT NULL DEFAULT ''  -- 403 on history; skip until forced
+                history_denied_at TEXT NOT NULL DEFAULT '',  -- 403 on history; skip until forced
+                synced_version INTEGER NOT NULL DEFAULT 0  -- conv version at the last complete pass
             )"""
         )
         # Migrate an index.db created before these columns existed.
@@ -86,6 +87,8 @@ class Index:
             self._db.execute("ALTER TABLE chats ADD COLUMN raw TEXT NOT NULL DEFAULT '{}'")
         if "history_denied_at" not in cols:
             self._db.execute("ALTER TABLE chats ADD COLUMN history_denied_at TEXT NOT NULL DEFAULT ''")
+        if "synced_version" not in cols:
+            self._db.execute("ALTER TABLE chats ADD COLUMN synced_version INTEGER NOT NULL DEFAULT 0")
         self._db.commit()
 
     def upsert_chat(
@@ -145,6 +148,14 @@ class Index:
     def touch(self, thread_id: str, when_iso: str) -> None:
         with self._db:
             self._db.execute("UPDATE chats SET last_fetch_at = ? WHERE id = ?", (when_iso, thread_id))
+
+    def synced_version(self, thread_id: str) -> int:
+        row = self._db.execute("SELECT synced_version FROM chats WHERE id = ?", (thread_id,)).fetchone()
+        return int(row[0]) if row else 0
+
+    def mark_synced(self, thread_id: str, version: int) -> None:
+        with self._db:
+            self._db.execute("UPDATE chats SET synced_version = ? WHERE id = ?", (version, thread_id))
 
     def history_denied_ids(self) -> set[str]:
         return {r[0] for r in self._db.execute("SELECT id FROM chats WHERE history_denied_at != ''")}

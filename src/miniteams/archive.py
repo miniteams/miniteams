@@ -400,8 +400,13 @@ async def archive_chat(
         newest, last = probe.newest(), last_activity(conv)
         probe.close()
         # Second granularity is enough for "unchanged"; sub-second arrivals are caught next run.
-        if newest and last and _epoch_seconds(last) <= _epoch_seconds(newest):
-            log.info("chat_unchanged", thread=thread_id, newest=newest[:19])
+        caught_up = bool(newest and last and _epoch_seconds(last) <= _epoch_seconds(newest))
+        # Meeting chats often carry no lastMessage (last_activity falls back to `version`, bumped by
+        # roster/meeting updates) or no message at all: only an unchanged version proves them idle.
+        version = int(conv.get("version") or 0)
+        if caught_up or (version and version == index.synced_version(thread_id)):
+            by = "activity" if caught_up else "version"
+            log.info("chat_unchanged", thread=thread_id, newest=(newest or "")[:19], by=by)
             index.touch(thread_id, _now_iso())
             return counts
 
@@ -448,6 +453,9 @@ async def archive_chat(
         )
         avatars_n = await _download_avatars(store, info, skype_token, bearer) if download_avatars else 0
         index.touch(thread_id, _now_iso())
+        # Recorded only after a complete pass: a failed one must not make the next run skip.
+        if conv and conv.get("version"):
+            index.mark_synced(thread_id, int(conv["version"]))
         counts = {"new": new_top + new_old, "media": media, "avatars": avatars_n}
         log.info(
             "chat_archived",
