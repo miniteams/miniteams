@@ -1,6 +1,8 @@
 """Spec 004 phase 3: the archive as a fallback name, its re-read, and a writer working next to us."""
 
+import asyncio
 import threading
+import time
 from typing import Any
 
 import pytest
@@ -104,6 +106,29 @@ async def test_the_re_read_waits_out_its_floor(
 
     assert await board.archived_label("19:late@thread.v2") == ""
     assert reads == []  # too soon after the first read
+
+
+async def test_concurrent_misses_read_the_index_once(
+    board_directory: Directory, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A reconnect replays what the stream dropped: several unnamed chats land together, and each
+    # one starting its own read of a 12 MiB index is how a fallback becomes an outage.
+    _write_index(tmp_path, "19:early@thread.v2", "Jean Martin")
+    board = W.Board({}, board_directory, seed=W.seed_from_archive(tmp_path, ME), data_dir=tmp_path, me=ME)
+    monkeypatch.setattr(W, "_SEED_REREAD", 0.0)
+    _write_index(tmp_path, "19:late@thread.v2", "Jean Dupont")  # the file moved: a re-read is due
+    reads: list[Any] = []
+
+    def slow_read(data_dir: Any, me: str = "") -> dict[str, Any]:
+        reads.append(data_dir)
+        time.sleep(0.05)  # wide enough for the others to barge in if nothing holds them
+        return {}
+
+    monkeypatch.setattr(W, "seed_from_archive", slow_read)
+
+    await asyncio.gather(*(board.archived_label(f"19:miss{i}@thread.v2") for i in range(4)))
+
+    assert len(reads) == 1
 
 
 async def test_no_archive_means_no_fallback_and_no_crash(board_directory: Directory, tmp_path: Any) -> None:

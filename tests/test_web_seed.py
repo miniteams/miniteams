@@ -201,6 +201,33 @@ async def test_listing_wins_over_the_archive(quiet_directory: Directory, tmp_pat
     assert row["last_activity"] == "2026-09-15T10:00:00Z"
 
 
+async def test_the_archive_supplies_a_read_horizon_the_listing_dropped(
+    quiet_directory: Directory, tmp_path: Any
+) -> None:
+    # A quiet chat comes back from the listing without its consumptionhorizon: with nothing to
+    # compare the last message against, every such row would claim to be read.
+    data_dir = _index_with(
+        tmp_path,
+        [
+            _chat(
+                "19:quiet@thread.v2",
+                participants=[{"mri": "8:orgid:x", "name": "Jean Martin"}],
+                raw={
+                    "properties": {"consumptionhorizon": "5;5;0"},
+                    "lastMessage": {"id": "5", "composetime": "2026-09-15T09:00:00Z"},
+                },
+            )
+        ],
+    )
+    seed = W.seed_from_archive(data_dir, ME)
+    conv = _conv("19:quiet@thread.v2", "2026-09-15T10:00:00Z", id="9", messagetype="Text", content="hi")
+
+    row = (await W.bootstrap([[conv]], quiet_directory, limit=0, seed=seed))["19:quiet@thread.v2"]
+
+    assert row["read_id"] == "5"  # from the archive, since the listing carried none
+    assert row["unread"] is True  # message 9 is newer than the horizon at 5
+
+
 async def test_archive_resolves_a_stub_without_a_history_call(
     quiet_directory: Directory, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

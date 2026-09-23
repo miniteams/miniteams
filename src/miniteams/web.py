@@ -612,8 +612,10 @@ class Board:
         stamp = _index_stamp(self.data_dir)
         if stamp == self._seed_stamp or time.monotonic() - self._seed_read < _SEED_REREAD:
             return ""  # same file, or too soon: re-reading it would buy nothing
-        self.seed = await asyncio.to_thread(seed_from_archive, self.data_dir, self.me)
+        # Claimed before the await, not after: a burst of unnamed chats (a reconnect replaying what
+        # it dropped) would otherwise start one 12 MiB read each, all of them reading the same file.
         self._seed_read, self._seed_stamp = time.monotonic(), stamp
+        self.seed = await asyncio.to_thread(seed_from_archive, self.data_dir, self.me)
         return str(self.seed.get(thread_id, {}).get("label") or "")
 
     def set_busy(self, busy: bool) -> None:
