@@ -10,6 +10,7 @@ survives restarts; the whole 127/8 is loopback on Linux, no interface setup need
 
 import asyncio
 import base64
+import contextlib
 import html
 import ipaddress
 import json
@@ -25,8 +26,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+import httpx
 import structlog
 from websockets.asyncio.server import ServerConnection, broadcast, serve
+from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 from websockets.typing import Origin
 
@@ -36,7 +39,7 @@ from .config import Settings
 from .directory import Directory
 from .dump import fetch_history
 from .messages import _TAG_RE, EMOJI, thread_of
-from .send import mark_read
+from .send import mark_read, message_html, send_message
 from .stream import run_forever
 
 log = structlog.get_logger()
@@ -60,6 +63,7 @@ _LIMIT_BARE = 250
 # Snippets that mean "the listing did not say": the archive may know better.
 _STUB_SNIPPETS = ("🗑 deleted", "📎 attachment")
 _PAGE_POLL = 2.0  # seconds between widget.html mtime checks (dev reload)
+_SEND_MAX_BYTES = 28 * 1024  # Teams' per-message limit
 _TYPING_TTL = 10.0  # seconds; Teams does not always send ClearTyping
 # Thread activity that changes the label (topic, member count): drop the cached thread info.
 # Someone reading a chat is not activity: bumping the row on it would defeat "seen".
@@ -592,6 +596,7 @@ class Board:
         self.data_dir = data_dir
         self._seed_read = time.monotonic()
         self._seed_stamp = _index_stamp(data_dir)
+        self._replies: set[asyncio.Task[None]] = set()  # the loop keeps only weak refs to tasks
         self._typing_timers: dict[tuple[str, str], asyncio.TimerHandle] = {}
         self._seen: dict[str, str] = _load_seen(seen_path)
         self._muted: dict[str, str] = _load_seen(muted_path)  # thread → when muted (same shape)
@@ -696,6 +701,47 @@ class Board:
             log.warning("mark_read_failed", thread=thread_id, error=str(exc))
             return False
         return True
+
+    async def send(self, thread_id: str, text: Any) -> str | None:
+        """Page verb `send`: post `text` to the row's chat as me. Returns the refusal/failure
+        reason, None once Teams accepted it.
+
+        The row is left alone: the Trouter echo of the sent message updates it like any other."""
+        if thread_id not in self.rows:
+            return "unknown chat"
+        if not isinstance(text, str) or not text.strip():
+            return "empty message"
+        if len(message_html(text, False).encode()) > _SEND_MAX_BYTES:
+            return "message too long"
+        if self.directory is None:
+            return "not connected"
+        try:
+            await asyncio.to_thread(
+                send_message,
+                self.directory.settings,
+                self.directory.skype_token,
+                thread_id,
+                text,
+                self.me_name,
+            )
+        except httpx.HTTPStatusError as exc:
+            log.warning("send_failed", thread=thread_id, status=exc.response.status_code)
+            return f"Teams answered {exc.response.status_code}"
+        except httpx.TransportError as exc:
+            log.warning("send_failed", thread=thread_id, error=type(exc).__name__)
+            return "network error"
+        except Exception as exc:  # noqa: BLE001 — a failed send must not drop the socket
+            log.warning("send_failed", thread=thread_id, error=str(exc))
+            return str(exc)[:200]
+        return None
+
+    async def _reply(self, ws: ServerConnection, thread_id: str, text: Any) -> None:
+        error = await self.send(thread_id, text)
+        ack = {"sent": thread_id, **({"error": error} if error else {"ok": True})}
+        # Only the sending page learns the outcome; every page sees the echoed message.
+        # A page closed during the send is not a handler failure.
+        with contextlib.suppress(ConnectionClosed):
+            await ws.send(json.dumps(ack))
 
     def mark_unseen(self, thread_id: str) -> bool:
         """Undo `seen`: the row shows again until the next click."""
@@ -987,6 +1033,11 @@ class Board:
                     self.set_muted(verb["mute"], True)
                 elif isinstance(verb, dict) and isinstance(verb.get("unmute"), str):
                     self.set_muted(verb["unmute"], False)
+                elif isinstance(verb, dict) and isinstance(verb.get("send"), str):
+                    # A send can take the whole HTTP timeout: the page's other verbs must not queue behind it.
+                    reply = asyncio.create_task(self._reply(ws, verb["send"], verb.get("text")))
+                    self._replies.add(reply)
+                    reply.add_done_callback(self._replies.discard)
                 elif isinstance(verb, dict) and isinstance(verb.get("open"), str):
                     await self.open_row(verb["open"], web=verb.get("web") is True)
                 else:

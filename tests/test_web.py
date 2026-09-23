@@ -3,6 +3,7 @@
 import asyncio
 import json
 import socket
+import time
 from typing import Any
 
 import httpx
@@ -1447,3 +1448,126 @@ async def test_call_events_are_not_credited_to_the_organizer(board: W.Board) -> 
         )
     )
     assert (row["sender"], row["text"]) == ("name:8:orgid:juan", "📞 call started")
+
+
+# --- quick reply (spec 006) ---
+
+
+async def test_send_verb_posts_as_me_and_reports_failures(board: W.Board, monkeypatch) -> None:
+    calls: list[tuple[str, str, str]] = []
+    failure: list[Exception] = []
+
+    def fake_send(settings: Any, token: str, thread_id: str, text: str, name: str) -> dict[str, Any]:
+        calls.append((thread_id, text, name))
+        if failure:
+            raise failure.pop()
+        return {"status": 201}
+
+    monkeypatch.setattr(W, "send_message", fake_send)
+    board.me_name = "Me"
+    before = json.dumps(board.rows, sort_keys=True)
+    assert await board.send("19:a@thread.v2", "ok\nje regarde") is None
+    assert calls == [("19:a@thread.v2", "ok\nje regarde", "Me")]
+    assert json.dumps(board.rows, sort_keys=True) == before  # the Trouter echo updates the row
+
+    request = httpx.Request("POST", "https://x")
+    failure.append(httpx.HTTPStatusError("403", request=request, response=httpx.Response(403)))
+    assert await board.send("19:a@thread.v2", "x") == "Teams answered 403"
+    failure.append(httpx.ConnectError("boom", request=request))
+    assert await board.send("19:a@thread.v2", "x") == "network error"
+    failure.append(RuntimeError("send rejected: Forbidden: nope"))
+    assert await board.send("19:a@thread.v2", "x") == "send rejected: Forbidden: nope"
+    assert len(calls) == 4
+
+
+@pytest.mark.parametrize(
+    ("thread", "text", "reason"),
+    [
+        ("19:nope@thread.v2", "hi", "unknown chat"),
+        ("19:a@thread.v2", "", "empty message"),
+        ("19:a@thread.v2", " \n\t", "empty message"),
+        ("19:a@thread.v2", 42, "empty message"),
+        ("19:a@thread.v2", None, "empty message"),
+        ("19:a@thread.v2", "x" * (28 * 1024 + 1), "message too long"),
+        ("19:a@thread.v2", "<" * (28 * 1024 // 4 + 1), "message too long"),  # escaping counts
+        ("19:a@thread.v2", "é" * (28 * 1024 // 2 + 1), "message too long"),  # bytes, not chars
+    ],
+)
+async def test_send_verb_refuses_without_calling_teams(
+    board: W.Board, monkeypatch, thread: str, text: Any, reason: str
+) -> None:
+    monkeypatch.setattr(W, "send_message", lambda *a: pytest.fail("no API call expected"))
+    assert await board.send(thread, text) == reason
+
+
+async def test_send_verb_at_the_size_limit_goes_through(board: W.Board, monkeypatch) -> None:
+    monkeypatch.setattr(W, "send_message", lambda *a: {"status": 201})
+    assert await board.send("19:a@thread.v2", "x" * (28 * 1024)) is None
+
+
+async def test_send_verb_without_directory_is_refused() -> None:
+    board = W.Board({"t": {"id": "t", "last_activity": "2026-09-15T10:00:00Z", "seen_at": None}})
+    assert await board.send("t", "hi") == "not connected"
+
+
+async def test_send_ack_goes_to_the_sender_only(
+    settings: Settings, quiet_directory: Directory, monkeypatch
+) -> None:
+    monkeypatch.setattr(W, "send_message", lambda *a: {"status": 201})
+    board = W.Board(
+        {"t": {"id": "t", "last_activity": "2026-09-15T10:00:00Z", "label": "L", "seen_at": None}},
+        quiet_directory,
+    )
+    port = _free_port()
+    own = f"http://127.0.0.1:{port}"
+    task = asyncio.create_task(W.serve_board(board, settings, f"127.0.0.1:{port}"))
+    try:
+        await asyncio.sleep(0.2)
+        async with (
+            websockets.connect(f"ws://127.0.0.1:{port}/ws", origin=own) as sender,
+            websockets.connect(f"ws://127.0.0.1:{port}/ws", origin=own) as other,
+        ):
+            await sender.recv()
+            await other.recv()
+            await sender.send(json.dumps({"send": "t", "text": "hi"}))
+            assert json.loads(await sender.recv()) == {"sent": "t", "ok": True}
+            await sender.send(json.dumps({"send": "t", "text": ""}))
+            assert json.loads(await sender.recv()) == {"sent": "t", "error": "empty message"}
+            await sender.send(json.dumps({"send": 7, "text": "hi"}))  # wrong shape: ignored, no ack
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(other.recv(), 0.3)
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(sender.recv(), 0.3)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_slow_send_does_not_hold_the_page_other_verbs(
+    settings: Settings, quiet_directory: Directory, monkeypatch
+) -> None:
+    def slow_send(*args: Any) -> dict[str, Any]:
+        time.sleep(1.0)
+        return {"status": 201}
+
+    monkeypatch.setattr(W, "send_message", slow_send)
+    board = W.Board(
+        {"t": {"id": "t", "last_activity": "2026-09-15T10:00:00Z", "label": "L", "seen_at": None}},
+        quiet_directory,
+    )
+    port = _free_port()
+    task = asyncio.create_task(W.serve_board(board, settings, f"127.0.0.1:{port}"))
+    try:
+        await asyncio.sleep(0.2)
+        async with websockets.connect(f"ws://127.0.0.1:{port}/ws", origin=f"http://127.0.0.1:{port}") as ws:
+            await ws.recv()
+            await ws.send(json.dumps({"send": "t", "text": "hi"}))
+            await ws.send(json.dumps({"seen": "t"}))
+            frame = json.loads(await asyncio.wait_for(ws.recv(), 0.5))  # the seen broadcast, not the ack
+            assert frame["rows"][0]["seen_at"] == "2026-09-15T10:00:00Z"
+            assert json.loads(await asyncio.wait_for(ws.recv(), 2)) == {"sent": "t", "ok": True}
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
