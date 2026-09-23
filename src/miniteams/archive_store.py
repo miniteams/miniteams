@@ -26,6 +26,23 @@ def chat_dir_name(thread_id: str) -> str:
     return _UNSAFE_RE.sub("_", thread_id)
 
 
+def message_version(message: dict[str, Any]) -> int:
+    """Message version (ms epoch string); 0 when absent so any real version beats it."""
+    try:
+        return int(message.get("version") or 0)
+    except TypeError, ValueError:
+        return 0
+
+
+def merge_dicts(old: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    """Shallow merge, one level deeper for dicts: live updates can be partial (`properties`)."""
+    merged = dict(old)
+    for key, value in patch.items():
+        prev = merged.get(key)
+        merged[key] = {**prev, **value} if isinstance(prev, dict) and isinstance(value, dict) else value
+    return merged
+
+
 def _connect(path: Path) -> sqlite3.Connection:
     db = sqlite3.connect(path)
     # WAL: readers don't block the writer, and a crash mid-transaction rolls back cleanly.
@@ -118,6 +135,35 @@ class Index:
                 values.append(json.dumps(raw, ensure_ascii=False))
             self._db.execute(f"UPDATE chats SET {', '.join(sets)} WHERE id = ?", (*values, thread_id))
 
+    def ensure_chat(self, thread_id: str) -> None:
+        """Row for a chat first seen live; the next pass fills label and roster."""
+        with self._db:
+            self._db.execute(
+                "INSERT INTO chats (id, dir) VALUES (?, ?) ON CONFLICT(id) DO NOTHING",
+                (thread_id, chat_dir_name(thread_id)),
+            )
+
+    def merge_raw(self, thread_id: str, patch: dict[str, Any]) -> None:
+        """Fold a live update into the stored conversation object.
+
+        `lastMessage` is replaced, never merged (it is another message), and only by a newer one:
+        events can arrive after the pass stored a fresher conversation object.
+        """
+        self.ensure_chat(thread_id)
+        with self._db:
+            (stored,) = self._db.execute("SELECT raw FROM chats WHERE id = ?", (thread_id,)).fetchone()
+            raw = json.loads(stored)
+            patch = dict(patch)
+            last = patch.pop("lastMessage", None)
+            raw = merge_dicts(raw, patch)
+            if isinstance(last, dict) and str(last.get("composetime") or "") >= str(
+                (raw.get("lastMessage") or {}).get("composetime") or ""
+            ):
+                raw["lastMessage"] = last
+            self._db.execute(
+                "UPDATE chats SET raw = ? WHERE id = ?", (json.dumps(raw, ensure_ascii=False), thread_id)
+            )
+
     def chats(self) -> list[dict[str, Any]]:
         rows = self._db.execute(
             "SELECT id, dir, label, topic, participants, backfill_done, last_fetch_at, raw"
@@ -204,6 +250,16 @@ class ChatStore:
                 retry_after TEXT NOT NULL DEFAULT ''
             )"""
         )
+        # Versions a live update replaced (edits, reactions, deletes): `messages.raw` holds the latest.
+        self._db.execute(
+            """CREATE TABLE IF NOT EXISTS message_versions (
+                id TEXT NOT NULL,
+                version TEXT NOT NULL,
+                raw TEXT NOT NULL,
+                replaced_at TEXT NOT NULL,
+                PRIMARY KEY (id, version)
+            )"""
+        )
         cols = {r[1] for r in self._db.execute("PRAGMA table_info(denied_assets)")}
         for name, decl in (
             ("attempts", "INTEGER NOT NULL DEFAULT 1"),
@@ -233,6 +289,52 @@ class ChatStore:
                 "INSERT OR IGNORE INTO messages (id, composetime, raw) VALUES (?, ?, ?)", rows
             )
         return self._db.total_changes - before
+
+    def apply_message(self, message: dict[str, Any], now_iso: str) -> str:
+        """Store one live message: `new`, `updated` (newer version, old raw kept) or `stale`."""
+        msg_id = str(message.get("id") or "")
+        if not msg_id:
+            log.warning("message_without_id_skipped", thread=self.thread_id)
+            return "stale"
+        with self._db:
+            row = self._db.execute("SELECT composetime, raw FROM messages WHERE id = ?", (msg_id,)).fetchone()
+            if row is None:
+                self._db.execute(
+                    "INSERT INTO messages (id, composetime, raw) VALUES (?, ?, ?)",
+                    (msg_id, str(message.get("composetime") or ""), json.dumps(message, ensure_ascii=False)),
+                )
+                return "new"
+            old = json.loads(row[1])
+            if message_version(message) <= message_version(old):
+                if 0 < message_version(message) < message_version(old):
+                    # Arrived late (buffer order, redelivery): history, not current.
+                    self._db.execute(
+                        "INSERT OR IGNORE INTO message_versions (id, version, raw, replaced_at)"
+                        " VALUES (?, ?, ?, ?)",
+                        (
+                            msg_id,
+                            str(message.get("version") or ""),
+                            json.dumps(message, ensure_ascii=False),
+                            now_iso,
+                        ),
+                    )
+                return "stale"
+            self._db.execute(
+                "INSERT OR IGNORE INTO message_versions (id, version, raw, replaced_at) VALUES (?, ?, ?, ?)",
+                (msg_id, str(old.get("version") or ""), row[1], now_iso),
+            )
+            # Live updates carry the whole message: replacing drops a removed reaction, merging
+            # would keep it. A resource without `content` would be partial, so merge that one.
+            merged = dict(message) if "content" in message else merge_dicts(old, message)
+            self._db.execute(
+                "UPDATE messages SET composetime = ?, raw = ? WHERE id = ?",
+                (
+                    str(merged.get("composetime") or row[0]),
+                    json.dumps(merged, ensure_ascii=False),
+                    msg_id,
+                ),
+            )
+            return "updated"
 
     def oldest(self) -> str | None:
         """Backfill resume cursor: composetime of the oldest stored message."""

@@ -1,5 +1,6 @@
 """Archive command (spec 001 phase 2): full run, resume, top-up overlap, discovery, isolation."""
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -894,3 +895,108 @@ async def test_media_pass_writes_recordings_manifest(settings: Settings, tmp_pat
             "composetime": "2026-08-18T10:00:00Z",
         }
     ]
+
+
+async def test_force_tops_up_an_unchanged_looking_chat(settings: Settings, tmp_path, monkeypatch) -> None:
+    """Live gap (spec 005): a message stored past a lost one makes the chat look unchanged; a
+    forced chat is topped up anyway and the hole below `newest()` is fetched."""
+    data = tmp_path / "data"
+    pre = ChatStore(data, C1)
+    pre.insert_page([_msg("a1", "2026-07-01T09:00:00Z"), _msg("a3", "2026-07-01T11:00:00Z")])
+    pre.close()
+    index = Index(data)
+    for thread in (C1, C2):
+        index.upsert_chat(thread)
+        index.mark_backfill_done(thread)
+    index.close()
+    pre2 = ChatStore(data, C2)
+    pre2.insert_page([_msg("b1", "2026-07-01T09:00:00Z")])
+    pre2.close()
+
+    convs = [
+        {"id": C1, "lastMessage": {"composetime": "2026-07-01T11:00:00Z"}},  # == stored newest
+        {"id": C2, "lastMessage": {"composetime": "2026-07-01T09:00:00Z"}},  # unchanged, not forced
+    ]
+    monkeypatch.setattr(AR, "fetch_conversations", lambda s, tok: iter([convs]))
+    api = _FakeApi(
+        {
+            C1: [_msg("a3", "2026-07-01T11:00:00Z"), _msg("a2", "2026-07-01T10:00:00Z")],
+            C2: [_msg("b2", "2026-07-01T10:00:00Z")],
+        }
+    )
+    monkeypatch.setattr(AR, "iter_history_pages", api.iter_pages)
+
+    async def fake_thread(self, tid):  # noqa: ANN001
+        return {"topic": "", "members": [], "picture": None}
+
+    async def fake_label(self, tid):  # noqa: ANN001
+        return "L"
+
+    monkeypatch.setattr(AR.Directory, "thread", fake_thread)
+    monkeypatch.setattr(AR.Directory, "label", fake_label)
+    await _run(settings, data, download_media=False, force=frozenset({C1}))
+    assert _stored_ids(data, C1) == {"a1", "a2", "a3"}  # hole filled
+    assert _stored_ids(data, C2) == {"b1"}  # not forced: fast-skipped as before
+
+
+def test_refreshing_token_mints_once_across_threads(settings: Settings, monkeypatch) -> None:
+    """`archive --live` asks from the pass thread and the event loop at once: one re-mint."""
+    import threading
+
+    exchanges: list[int] = []
+    gate = threading.Barrier(8)
+
+    class _Src:
+        def refresh(self):
+            return {"access_token": "a", "id_token": "b"}
+
+    def fake_exchange(s, at):  # noqa: ANN001
+        time.sleep(0.05)  # widen the race window
+        exchanges.append(1)
+        return {"skype_token": f"sk{len(exchanges)}", "expires_in": 3600}
+
+    monkeypatch.setattr(AR, "exchange_skype_token", fake_exchange)
+    prov = AR.RefreshingToken(settings, _Src())
+    got: list[str] = []
+
+    def worker() -> None:
+        gate.wait()
+        got.append(prov.token())
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert exchanges == [1] and set(got) == {"sk1"}
+
+
+async def test_force_also_overrides_the_version_skip(settings: Settings, tmp_path, monkeypatch) -> None:
+    """A forced chat is topped up even when its conversation version says it is synced."""
+    data = tmp_path / "data"
+    pre = ChatStore(data, C1)
+    pre.insert_page([_msg("a1", "2026-07-01T09:00:00Z")])
+    pre.close()
+    index = Index(data)
+    index.upsert_chat(C1)
+    index.mark_backfill_done(C1)
+    index.mark_synced(C1, 42)
+    index.close()
+
+    conv = {"id": C1, "version": 42}  # no lastMessage: only the version could skip it
+    monkeypatch.setattr(AR, "fetch_conversations", lambda s, tok: iter([[conv]]))
+    api = _FakeApi({C1: [_msg("a1", "2026-07-01T09:00:00Z"), _msg("a2", "2026-07-01T10:00:00Z")]})
+    monkeypatch.setattr(AR, "iter_history_pages", api.iter_pages)
+
+    async def fake_thread(self, tid):  # noqa: ANN001
+        return {"topic": "", "members": [], "picture": None}
+
+    async def fake_label(self, tid):  # noqa: ANN001
+        return "L"
+
+    monkeypatch.setattr(AR.Directory, "thread", fake_thread)
+    monkeypatch.setattr(AR.Directory, "label", fake_label)
+    await _run(settings, data, download_media=False)
+    assert _stored_ids(data, C1) == {"a1"}  # unforced: skipped by version
+    await _run(settings, data, download_media=False, force=frozenset({C1}))
+    assert _stored_ids(data, C1) == {"a1", "a2"}

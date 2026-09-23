@@ -220,3 +220,73 @@ async def test_reregister_uses_the_renewed_token_pair(
     directory.set_token("ST2", "B2")  # what the refresher does an hour later
     await client._register()
     assert (sent[0]["X-Skypetoken"], sent[0]["Authorization"]) == ("ST2", "Bearer B2")
+
+
+def _loss(etag: str) -> str:
+    indicators = [{"tag": "", "etag": etag}, {"tag": "messaging", "etag": etag}]
+    return json.dumps({"name": "trouter.message_loss", "args": [{"droppedIndicators": indicators}]})
+
+
+async def test_gap_hook_skips_the_connect_flood_and_fires_on_a_new_loss(
+    settings: Settings, directory: Directory, monkeypatch
+) -> None:
+    gaps: list[str] = []
+
+    async def on_gap(reason: str) -> None:
+        gaps.append(reason)
+
+    async def no_reregister(self, reason: str) -> None:  # noqa: ANN001
+        pass
+
+    monkeypatch.setattr(TrouterClient, "_maybe_reregister", no_reregister)
+    client = _client(settings, directory, on_gap=on_gap)
+    client._last_register = S.time.monotonic()  # just registered
+    for _ in range(5):
+        await client._on_named(_loss("T0"))  # the flood every connect opens with: one etag
+    assert gaps == []
+    await client._on_named(_loss("T1"))  # a real loss later in the session
+    await client._on_named(_loss("T1"))
+    await client._on_named(json.dumps({"name": "trouter.message_loss", "args": [{}]}))  # no etag
+    assert gaps == ["message_loss"]
+
+
+async def test_first_loss_long_after_connect_is_a_gap(
+    settings: Settings, directory: Directory, monkeypatch
+) -> None:
+    """The real re-register runs on that loss too; it must not make the loss look like a flood."""
+    gaps: list[str] = []
+
+    async def on_gap(reason: str) -> None:
+        gaps.append(reason)
+
+    async def fake_register(self) -> None:  # noqa: ANN001
+        self._last_register = S.time.monotonic()
+
+    monkeypatch.setattr(TrouterClient, "_register", fake_register)
+    client = _client(settings, directory, on_gap=on_gap)
+    client._last_register = S.time.monotonic() - S._CONNECT_FLOOD - 1
+    await client._on_named(_loss("T5"))
+    assert gaps == ["message_loss"]
+
+
+async def test_gap_hook_fires_after_registration(
+    settings: Settings, directory: Directory, monkeypatch
+) -> None:
+    order: list[str] = []
+
+    async def on_gap(reason: str) -> None:
+        order.append(f"gap:{reason}")
+
+    async def fake(self) -> None:  # noqa: ANN001
+        order.append("auth")
+
+    async def fake_register(self) -> None:  # noqa: ANN001
+        order.append("register")
+
+    monkeypatch.setattr(TrouterClient, "_authenticate", fake)
+    monkeypatch.setattr(TrouterClient, "_register", fake_register)
+    client = _client(settings, directory, on_gap=on_gap)
+    await client._on_connected()
+    for task in client._tasks:
+        task.cancel()
+    assert order == ["auth", "register", "gap:connected"]  # subscribed before the catch-up starts

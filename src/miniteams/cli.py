@@ -196,6 +196,26 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
     source = token_source(settings)
     source.acquire()
     provider = RefreshingToken(settings, source)
+    if args.live:
+        from .archive_live import run_live
+
+        try:
+            asyncio.run(
+                run_live(
+                    settings,
+                    Path(args.data_dir),
+                    token_provider=provider,
+                    include_all=args.all,
+                    download_media=not args.no_media,
+                    download_avatars=not args.no_avatars,
+                    download_videos=args.videos,
+                )
+            )
+        except KeyboardInterrupt:
+            log.info("interrupted")
+            return 0
+        log.error("archive_stopped", reason="auth_expired", hint="run `miniteams login`")
+        return 1
     net_failures = 0
     try:
         while True:
@@ -399,6 +419,12 @@ def main(argv: list[str] | None = None) -> int:
         help="re-run the archive indefinitely, sleeping SECONDS between runs (default 300); "
         "stops when authentication breaks",
     )
+    p_archive.add_argument(
+        "--live",
+        action="store_true",
+        help="follow live events: catch up once, then write each message as it arrives; "
+        "re-catches up after a disconnect (spec 005)",
+    )
     p_archive.set_defaults(func=cmd_archive)
 
     p_web = sub.add_parser("web", help="serve the live conversation-list widget (local page)")
@@ -452,6 +478,12 @@ def main(argv: list[str] | None = None) -> int:
     # every cycle, which is exactly the hammering the backoff exists to stop.
     if getattr(args, "retry_assets", False) and getattr(args, "loop", None) is not None:
         parser.error("--retry-assets is a one-shot recovery flag; it cannot be combined with --loop")
+    # --live runs forever over every chat: a single thread, a timer or a one-shot recovery contradict it.
+    if getattr(args, "live", False):
+        flags = ("loop", "thread", "assets_only", "retry_assets")
+        clash = [f for f in flags if getattr(args, f) not in (None, False)]
+        if clash:
+            parser.error(f"--live cannot be combined with --{clash[0].replace('_', '-')}")
     # Videos ride the media pass; without it the flag would be a silent no-op.
     if getattr(args, "videos", False) and getattr(args, "no_media", False):
         parser.error("--videos requires media downloads; drop --no-media")

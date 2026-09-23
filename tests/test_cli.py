@@ -244,3 +244,25 @@ def test_archive_retries_a_transient_aad_error(monkeypatch) -> None:
     )
     assert rc == 0
     assert slept == [2.0]
+
+
+@pytest.mark.parametrize("extra", [["--loop"], ["--thread", "19:x"], ["--assets-only"], ["--retry-assets"]])
+def test_archive_live_refuses_contradicting_flags(extra: list[str], capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["archive", "--live", *extra])
+    assert exc.value.code == 2 and "--live cannot be combined" in capsys.readouterr().err
+
+
+def test_archive_live_exits_1_when_the_refresh_token_dies(monkeypatch) -> None:
+    from miniteams import archive_live, auth
+
+    calls: list[dict[str, object]] = []
+
+    async def fake_run_live(settings, data_dir, **kw):  # noqa: ANN001
+        calls.append(kw)
+        return True
+
+    monkeypatch.setattr(archive_live, "run_live", fake_run_live)
+    monkeypatch.setattr(auth.TokenSource, "acquire", lambda self: {"access_token": "x"})
+    assert cli.main(["archive", "--live", "--no-media"]) == 1
+    assert calls and calls[0]["download_media"] is False
