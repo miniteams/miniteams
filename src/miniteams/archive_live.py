@@ -163,6 +163,7 @@ class LiveArchive:
     def _apply(self, kind: str, thread_id: str, resource: dict[str, Any]) -> str:
         if kind == "ConversationUpdate":
             self.index.merge_raw(thread_id, resource)
+            log.info("live_event_stored", thread=thread_id, kind=kind, outcome="merged")
             return "merged"
         self.index.ensure_chat(thread_id)
         store = ChatStore(self.data_dir, thread_id)

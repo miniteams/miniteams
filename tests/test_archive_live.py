@@ -125,11 +125,23 @@ async def test_ignores_what_the_archive_does_not_keep(live: AL.LiveArchive) -> N
     assert _stored(live, C1) == {} and live.index.chats() == []
 
 
-async def test_conversation_update_merges_into_the_index(live: AL.LiveArchive) -> None:
+class _Log:
+    """Stands in for the module logger: conftest filters info out before any capture."""
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    def __getattr__(self, level: str) -> Any:
+        return lambda event, **kw: self.events.append({"event": event, **kw})
+
+
+async def test_conversation_update_merges_into_the_index(live: AL.LiveArchive, monkeypatch) -> None:
     live.index.upsert_chat(C1, label="Alice", raw={"properties": {"consumptionhorizon": "1", "a": 1}})
     update = {"id": C1, "properties": {"consumptionhorizon": "2"}}
+    monkeypatch.setattr(AL, "log", logs := _Log())
     await live.on_event({"type": "EventMessage", "resourceType": "ConversationUpdate", "resource": update})
     assert live.index.chats()[0]["raw"]["properties"] == {"consumptionhorizon": "2", "a": 1}
+    assert [e["outcome"] for e in logs.events if e["event"] == "live_event_stored"] == ["merged"]
 
 
 async def test_new_message_moves_the_index_last_message(live: AL.LiveArchive) -> None:
