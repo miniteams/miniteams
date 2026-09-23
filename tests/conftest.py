@@ -23,6 +23,15 @@ def _quiet_logs() -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _fresh_token_sources() -> Any:
+    from miniteams import auth
+
+    auth._SOURCES.clear()
+    yield
+    auth._SOURCES.clear()
+
+
 @pytest.fixture
 def settings(tmp_path: Any) -> Settings:
     s = Settings(tenant_id="tenant-123")

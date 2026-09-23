@@ -8,7 +8,7 @@ from typing import Any
 import structlog
 
 from ._io import force_blocking_stdout
-from .auth import acquire_aad_token
+from .auth import AuthUnavailable, acquire_aad_token
 from .config import Settings
 from .logging import setup_logging
 from .send import NOTES_THREAD
@@ -187,11 +187,11 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
     import httpx
 
     from .archive import RefreshingToken, run_archive
-    from .auth import TokenSource
+    from .auth import token_source
 
     # Acquire once (may prompt), then hand a self-refreshing provider to the run: a full-account
     # archive outlives the ~45-min skype token, so it must be re-minted mid-run.
-    source = TokenSource(settings)
+    source = token_source(settings)
     source.acquire()
     provider = RefreshingToken(settings, source)
     net_failures = 0
@@ -216,16 +216,18 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
                 )
             # OSError also covers msal's transport layer: requests.exceptions.RequestException
             # subclasses it, so a reset during a token refresh lands here too.
-            except (OSError, httpx.TransportError, httpx.HTTPStatusError) as exc:
+            except (OSError, AuthUnavailable, httpx.TransportError, httpx.HTTPStatusError) as exc:
                 if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500:
                     raise  # 401/403/404 do not heal by waiting
+                reason = "auth" if isinstance(exc, AuthUnavailable) else "network"
                 net_failures += 1
                 if net_failures > _NET_RETRIES:
-                    log.error("archive_stopped", reason="network", attempts=net_failures, error=str(exc))
+                    log.error("archive_stopped", reason=reason, attempts=net_failures, error=str(exc))
                     return 1
                 delay = min(2.0**net_failures, _NET_RETRY_MAX_BACKOFF)
                 log.warning(
-                    "archive_network_retry",
+                    "archive_retry",
+                    reason=reason,
                     attempt=net_failures,
                     of=_NET_RETRIES,
                     delay=delay,
