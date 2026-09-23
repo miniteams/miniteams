@@ -1,5 +1,6 @@
 """Archive storage layer: dedup, cursors, reopen-resume, dir sanitization (spec 001 phase 1)."""
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -128,3 +129,122 @@ def test_denied_assets_migrates_pre_backoff_schema(tmp_path) -> None:
     store = ChatStore(tmp_path, "19:x@thread.v2")
     assert store.denied_urls("2099-01-01T00:00:00Z") == {GONE}  # still suppressed far in the future
     store.close()
+
+
+# --- live writes (spec 005) ---
+
+NOW = "2026-09-23T10:00:00Z"
+
+
+def _versions(store: ChatStore) -> list[tuple[str, str]]:
+    return store._db.execute("SELECT id, version FROM message_versions ORDER BY version").fetchall()
+
+
+def _raw(store: ChatStore, mid: str) -> dict[str, Any]:
+    (raw,) = store._db.execute("SELECT raw FROM messages WHERE id = ?", (mid,)).fetchone()
+    return dict(json.loads(raw))
+
+
+def test_apply_message_inserts_then_replaces_newer_version(tmp_path: Path) -> None:
+    store = ChatStore(tmp_path, THREAD)
+    assert store.apply_message(_msg("1", "2026-09-23T09:00:00Z", version="100"), NOW) == "new"
+    edited = _msg("1", "2026-09-23T09:00:00Z", version="200", properties={"edittime": "200"})
+    edited["content"] = "edited"
+    assert store.apply_message(edited, NOW) == "updated"
+    raw = _raw(store, "1")
+    assert raw["content"] == "edited" and raw["composetime"] == "2026-09-23T09:00:00Z"
+    assert _versions(store) == [("1", "100")]
+    assert store.count() == 1
+
+
+def test_apply_message_ignores_same_or_older_version(tmp_path: Path) -> None:
+    store = ChatStore(tmp_path, THREAD)
+    store.apply_message(_msg("1", "2026-09-23T09:00:00Z", version="200"), NOW)
+    assert store.apply_message({"id": "1", "version": "200", "content": "x"}, NOW) == "stale"
+    assert store.apply_message({"id": "1", "version": "150", "content": "x"}, NOW) == "stale"
+    assert store.apply_message({"id": "1", "content": "no version"}, NOW) == "stale"
+    assert _raw(store, "1")["content"] == "msg 1"
+    assert _versions(store) == [("1", "150")]  # older is history; same or unversioned is noise
+
+
+def test_apply_message_delete_keeps_original_content(tmp_path: Path) -> None:
+    store = ChatStore(tmp_path, THREAD)
+    store.apply_message(_msg("1", "2026-09-23T09:00:00Z", version="100", properties={"a": 1}), NOW)
+    store.apply_message({"id": "1", "version": "300", "content": "", "properties": {"deletetime": "3"}}, NOW)
+    raw = _raw(store, "1")
+    assert raw["content"] == "" and raw["properties"] == {"deletetime": "3"}
+    (old,) = store._db.execute("SELECT raw FROM message_versions WHERE id = '1'").fetchone()
+    assert json.loads(old)["content"] == "msg 1"
+
+
+def test_apply_message_over_history_row_without_version(tmp_path: Path) -> None:
+    store = ChatStore(tmp_path, THREAD)
+    store.insert_page([_msg("1", "2026-09-23T09:00:00Z")])  # pass-stored, no version field
+    assert store.apply_message({"id": "1", "version": "5", "content": "edited"}, NOW) == "updated"
+    assert store.apply_message({"composetime": NOW}, NOW) == "stale"  # no id
+
+
+def test_message_versions_survive_reopen(tmp_path: Path) -> None:
+    store = ChatStore(tmp_path, THREAD)
+    store.apply_message(_msg("1", NOW, version="1"), NOW)
+    store.apply_message({"id": "1", "version": "2"}, NOW)
+    store.close()
+    assert _versions(ChatStore(tmp_path, THREAD)) == [("1", "1")]
+
+
+def test_merge_raw_moves_horizon_and_keeps_other_keys(tmp_path: Path) -> None:
+    index = Index(tmp_path)
+    conv = {
+        "id": THREAD,
+        "version": 1,
+        "properties": {"consumptionhorizon": "1;1;1", "addedBy": "x"},
+        "lastMessage": {"id": "1", "composetime": "2026-09-23T09:00:00Z"},
+    }
+    index.upsert_chat(THREAD, label="Alice", raw=conv)
+    index.merge_raw(THREAD, {"properties": {"consumptionhorizon": "2;2;2"}})
+    (chat,) = index.chats()
+    assert chat["raw"]["properties"] == {"consumptionhorizon": "2;2;2", "addedBy": "x"}
+    assert chat["raw"]["version"] == 1 and chat["label"] == "Alice"
+    assert chat["raw"]["lastMessage"]["id"] == "1"
+
+
+def test_merge_raw_last_message_only_when_newer(tmp_path: Path) -> None:
+    index = Index(tmp_path)
+    index.upsert_chat(THREAD, raw={"lastMessage": {"id": "2", "composetime": "2026-09-23T09:00:00Z"}})
+    index.merge_raw(THREAD, {"lastMessage": {"id": "1", "composetime": "2026-09-23T08:00:00Z"}})
+    assert index.chats()[0]["raw"]["lastMessage"]["id"] == "2"
+    index.merge_raw(THREAD, {"lastMessage": {"id": "3", "composetime": "2026-09-23T10:00:00Z"}})
+    assert index.chats()[0]["raw"]["lastMessage"] == {"id": "3", "composetime": "2026-09-23T10:00:00Z"}
+
+
+def test_merge_raw_creates_unknown_chat(tmp_path: Path) -> None:
+    index = Index(tmp_path)
+    index.merge_raw("19:new@thread.v2", {"lastMessage": {"id": "1", "composetime": NOW}})
+    index.ensure_chat("19:new@thread.v2")  # idempotent
+    (chat,) = index.chats()
+    assert chat["id"] == "19:new@thread.v2" and chat["dir"] == "19:new@thread.v2"
+    assert chat["raw"]["lastMessage"]["id"] == "1" and not chat["backfill_done"]
+
+
+def test_apply_message_keeps_a_late_older_version(tmp_path: Path) -> None:
+    store = ChatStore(tmp_path, THREAD)
+    store.apply_message(_msg("1", NOW, version="200", content="edited"), NOW)
+    assert store.apply_message(_msg("1", NOW, version="100"), NOW) == "stale"
+    assert _raw(store, "1")["content"] == "edited"
+    assert _versions(store) == [("1", "100")]
+
+
+def test_apply_message_full_update_drops_a_removed_reaction(tmp_path: Path) -> None:
+    store = ChatStore(tmp_path, THREAD)
+    liked = {"emotions": [{"key": "like", "users": [{"mri": "8:x"}]}]}
+    store.apply_message(_msg("1", NOW, version="1", properties=liked), NOW)
+    store.apply_message(_msg("1", NOW, version="2", properties={}), NOW)  # reaction removed
+    assert _raw(store, "1")["properties"] == {}
+
+
+def test_apply_message_partial_update_merges(tmp_path: Path) -> None:
+    store = ChatStore(tmp_path, THREAD)
+    store.apply_message(_msg("1", NOW, version="1", properties={"a": 1}), NOW)
+    store.apply_message({"id": "1", "version": "2", "properties": {"b": 2}}, NOW)  # no content
+    raw = _raw(store, "1")
+    assert raw["content"] == "msg 1" and raw["properties"] == {"a": 1, "b": 2}
