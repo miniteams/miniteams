@@ -11,6 +11,7 @@ resumes with no gap and no duplicate — see `archive_store` for the storage inv
 
 import asyncio
 import json
+import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -90,6 +91,8 @@ class RefreshingToken:
         self.settings, self.source = settings, source
         self._token = self._bearer = ""
         self._deadline = 0.0
+        # `archive --live` calls it from the pass thread and the event loop: one re-mint, one pair.
+        self._lock = threading.Lock()
 
     def _ensure(self) -> None:
         if time.monotonic() < self._deadline:
@@ -101,12 +104,14 @@ class RefreshingToken:
         self._deadline = time.monotonic() + float(skype.get("expires_in") or 3600) - self._MARGIN
 
     def token(self) -> str:
-        self._ensure()
-        return self._token
+        with self._lock:
+            self._ensure()
+            return self._token
 
     def bearer(self) -> str:
-        self._ensure()
-        return self._bearer
+        with self._lock:
+            self._ensure()
+            return self._bearer
 
     def sharepoint_token(self, host: str) -> str | None:
         return self.source.sharepoint_token(host)
@@ -362,6 +367,7 @@ async def archive_chat(
     retry_assets: bool = False,
     sp_token: Callable[[str], str | None] | None = None,
     graph_token: Callable[[], str | None] | None = None,
+    force: bool = False,
 ) -> dict[str, int]:
     """Returns per-chat counts (`new`, `media`, `avatars`) for the run recap."""
     directory.set_token(skype_token, bearer)
@@ -395,7 +401,8 @@ async def archive_chat(
     # `verify_media` disables the skip so every message's assets are re-checked against disk
     # (skip-exists means only missing ones download) — covers a backfill that succeeded while
     # its media didn't (a prior --no-media run, download failures, an interrupted media pass).
-    if conv and index.backfill_done(thread_id) and not verify_media:
+    # `force` (live gap) too: a message stored past a lost one makes the chat look unchanged.
+    if conv and index.backfill_done(thread_id) and not (verify_media or force):
         probe = ChatStore(data_dir, thread_id)
         newest, last = probe.newest(), last_activity(conv)
         probe.close()
@@ -494,6 +501,7 @@ async def run_archive(
     assets_only: bool = False,
     retry_denied: bool = False,
     retry_assets: bool = False,
+    force: frozenset[str] = frozenset(),
 ) -> bool:
     """Returns True when the run stopped on AuthExpired (re-login needed), False otherwise."""
     # Absolute: downloaded media paths are turned into file:// URIs (Path.as_uri), which rejects
@@ -577,6 +585,7 @@ async def run_archive(
                     retry_assets=retry_assets,
                     sp_token=token_provider.sharepoint_token,
                     graph_token=token_provider.graph_token,
+                    force=thread_id in force,
                 )
             except httpx.HTTPStatusError as exc:
                 # A chat can enumerate while its history is 403 (meeting access revoked): a known

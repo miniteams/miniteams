@@ -31,7 +31,13 @@ chats(id TEXT PK, dir TEXT, label TEXT, topic TEXT, participants TEXT /*JSON*/,
 messages(id TEXT PK, composetime TEXT /*ISO-8601 UTC*/, raw TEXT /*JSON message*/)
 denied_assets(url TEXT PK, status INT, at TEXT,   -- give-up cache, ignore when reading
               attempts INT, retry_after TEXT)     -- '' = permanent (403); else retry past it (404)
+message_versions(id TEXT, version TEXT, raw TEXT /*JSON*/, replaced_at TEXT,
+                 PRIMARY KEY (id, version))       -- earlier versions (archive --live only)
 ```
+
+`messages.raw` is the **latest version** the archive saw. A pass stores what the history API
+returned when it ran and never rewrites it. `archive --live` replaces it on every edit, reaction or
+delete and keeps the previous `raw` in `message_versions`, so a deleted message's text is there.
 
 Index on `composetime` — always order/filter on it, never on `id`.
 
@@ -104,6 +110,13 @@ for e in props.get("emotions", []):        # real list, no re-parse
     print(e["key"], len(e["users"]))
 edited  = "edittime" in props
 deleted = "deletetime" in props or "hardDeleteTime" in props
+```
+
+Text before an edit or a delete (only for changes seen by `archive --live`):
+
+```sql
+SELECT version, json_extract(raw, '$.content') FROM message_versions
+WHERE id = :msg_id ORDER BY CAST(version AS INTEGER);
 ```
 
 ### Attachments
@@ -236,6 +249,6 @@ files fetched before that became the rule may still sit at the umask default.
 - **Coverage is not uniform.** `backfill_done = 0` means history is partial; `history_denied_at != ''`
   means the API refused it. Check before concluding "nothing was said before date X".
 - **WAL files** (`-wal`, `-shm`) are normal; open read-only (`mode=ro`) so a concurrent
-  `archive --loop` is never blocked.
+  `archive --loop` or `--live` is never blocked.
 - **Confidential by construction.** Internal names, URLs, incidents. Keep the analysis local — never
   publish an extract to an external host (artifacts, pastebins) without an explicit go-ahead.

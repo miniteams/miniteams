@@ -46,6 +46,8 @@ uv run miniteams archive --videos --verify-media       # also grab meeting recor
                                                        # (large; --verify-media sweeps existing chats)
 uv run miniteams archive --loop 600                    # re-run forever, sleeping 600s between runs
                                                        # (bare --loop = 300s); stops on auth expiry
+uv run miniteams archive --live                        # catch up, then store each message as it
+                                                       # arrives; stops on auth expiry (exit 1)
 uv run miniteams web              # local live page: conversations newest-first (see below)
 uv run miniteams web --limit 0 --bind 127.0.0.5:8765   # load every chat (with an archive that is
                                                        # every archived chat: a heavier page)
@@ -105,6 +107,14 @@ transcript still being generated. `--retry-assets` forces both, and refuses to r
 403 (revoked meeting access) is skipped on later runs; `--retry-denied` re-attempts it. Every run
 ends with an `archive_recap` log line (chats, failures, new messages, media files, avatars,
 duration). `data/` is gitignored (personal chat data).
+
+`archive --live` (spec 005) replaces the `--loop` timer with the event stream. It subscribes first,
+buffers events while a normal pass catches the archive up, then applies them and writes each new
+one as it arrives. Edits, reactions and deletes update `messages.raw`; the version they replace is
+kept in `message_versions`. Read markers land in `index.db`. A reconnect, a real
+`trouter.message_loss` or a failed write triggers a new catch-up. It uses its own Trouter endpoint,
+so it runs beside `web` and `stream`. It cannot be combined with `--loop`, `--thread`,
+`--assets-only` or `--retry-assets`.
 
 Tokens cache under `~/.config/miniteams/` (`0600`); re-runs are silent until the refresh
 token expires. Downloaded media (from `stream`) lives under `~/.cache/miniteams/media/`.

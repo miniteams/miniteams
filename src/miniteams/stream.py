@@ -38,8 +38,10 @@ _STABLE_AFTER = 60.0  # a connection alive this long resets the backoff
 _TOKEN_REFRESH_RATIO = 0.8  # renew the directory's skype token at 80% of its lifetime
 _TOKEN_REFRESH_MIN = 60.0  # floor between renewals; a failed renewal retries after this
 _TOKEN_LIFETIME_FALLBACK = 1800.0  # authz response without expiresIn: assume a short lifetime
+_CONNECT_FLOOD = 30.0  # seconds after registration in which a message_loss is the connect flood
 
 EventHook = Callable[[dict[str, Any]], Awaitable[None]]  # receives each decoded EventMessage
+GapHook = Callable[[str], Awaitable[None]]  # events may have been missed; arg = reason
 
 
 def _correlation_vector() -> str:
@@ -61,6 +63,7 @@ class TrouterClient:
         raw: bool = False,
         typing: bool = False,
         on_event: EventHook | None = None,
+        on_gap: GapHook | None = None,
     ) -> None:
         self.settings = settings
         self.aad = aad
@@ -73,6 +76,8 @@ class TrouterClient:
         self.raw = raw
         self.typing = typing
         self.on_event = on_event  # set → events go to the hook instead of stdout
+        self.on_gap = on_gap
+        self._loss_etag: str | None = None  # `messaging` etag of the last message_loss seen
         self._count = 0
         self._last_register = 0.0
         # websockets' connection type churns across releases; keep it loose deliberately.
@@ -175,6 +180,8 @@ class TrouterClient:
         log.info("ws_connected")
         await self._authenticate()
         await self._register()
+        if self.on_gap is not None:
+            await self.on_gap("connected")  # whatever happened while disconnected is unknown
         self._tasks = [
             asyncio.create_task(self._ping_loop()),
             asyncio.create_task(self._ttl_loop()),
@@ -189,10 +196,34 @@ class TrouterClient:
             return
         name = evt.get("name")
         if name == "trouter.message_loss":
+            # Before re-registering: `_on_loss` tells the connect flood by the registration time.
+            await self._on_loss(evt)
             # Backend floods this until we re-register the messaging worker.
             await self._maybe_reregister("message_loss")
         elif not self.raw:
             log.info("named_event", name=name)
+
+    async def _on_loss(self, evt: dict[str, Any]) -> None:
+        """A new `messaging` etag is a real loss. Every connect opens with a flood that repeats
+        one etag (the registration instant); the connect gap already covers that one."""
+        if self.on_gap is None:
+            return
+        etag = next(
+            (
+                str(d.get("etag"))
+                for arg in evt.get("args") or []
+                if isinstance(arg, dict)
+                for d in arg.get("droppedIndicators") or []
+                if isinstance(d, dict) and d.get("tag") == "messaging"
+            ),
+            None,
+        )
+        if etag is None or etag == self._loss_etag:
+            return
+        flood = self._loss_etag is None and time.monotonic() - self._last_register < _CONNECT_FLOOD
+        self._loss_etag = etag
+        if not flood:
+            await self.on_gap("message_loss")
 
     async def _on_delivery(self, data: str) -> None:
         """Inbound `3:::` pseudo-HTTP request. ALWAYS ack 200, then dispatch by url."""
@@ -301,6 +332,7 @@ async def run_forever(
     on_event: EventHook | None = None,
     directory: Directory | None = None,
     epid_name: str = "endpoint_id",
+    on_gap: GapHook | None = None,
 ) -> None:
     """Re-establish a full session on every disconnect.
 
@@ -343,6 +375,7 @@ async def run_forever(
                     raw,
                     typing,
                     on_event,
+                    on_gap,
                 ).run()
             finally:
                 refresher.cancel()
