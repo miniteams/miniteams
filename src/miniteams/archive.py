@@ -15,6 +15,7 @@ import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -217,6 +218,17 @@ def _backfill(
     return added
 
 
+def record_asset_failure(store: ChatStore, key: str, exc: Exception) -> None:
+    """`attachments.process` on_fail hook: remember a 403 for good, back a 404 off."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    now = _now_iso()
+    if status == 403:
+        store.mark_denied(key, 403, now)  # permanent: permission does not come back on its own
+    elif status == 404:
+        attempts = store.denied_attempts(key) + 1
+        store.mark_denied(key, 404, now, attempts, _retry_after(attempts))
+
+
 async def _download_media(
     store: ChatStore,
     skype_token: str,
@@ -262,15 +274,6 @@ async def _download_media(
             return True
         return False
 
-    def _on_fail(key: str, exc: Exception) -> None:
-        status = getattr(getattr(exc, "response", None), "status_code", None)
-        now = _now_iso()
-        if status == 403:
-            store.mark_denied(key, 403, now)  # permanent: permission does not come back on its own
-        elif status == 404:
-            attempts = store.denied_attempts(key) + 1
-            store.mark_denied(key, 404, now, attempts, _retry_after(attempts))
-
     fetched = done = 0
     start = time.monotonic()
     sem = asyncio.Semaphore(_MEDIA_CONCURRENCY)
@@ -288,7 +291,7 @@ async def _download_media(
                     sp_token=sp_token,
                     graph_token=graph_token,
                     skip_url=_skip,
-                    on_fail=_on_fail,
+                    on_fail=partial(record_asset_failure, store),
                     videos=videos,
                 )
             except Exception as exc:  # noqa: BLE001 — one message's media must not abort the pass

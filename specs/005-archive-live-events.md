@@ -73,8 +73,9 @@ touches the archive at any time: the pass, or the live applier, never both.
 - **Loss the stream wrote past**: `message_loss` arrives after the lost events, and events written
   in between push `newest()` over the hole. The catch-up that follows forces top-up (no fast-skip)
   on chats written live in the 5 minutes before the signal. That set is bounded by pruning on age.
-- Live media: `attachments.process` on each persisted message, through the same denied-asset cache
-  as the pass. A failure logs and never blocks the stream (acks go first).
+- Live media: `attachments.process` on each stored message, in a background task bounded by the
+  pass's concurrency cap, through the same denied-asset cache and failure recording as the pass.
+  A failure logs and never holds the stream; a dead refresh token stops the process.
 - Structured logs: `live_gap` (reason), `live_catchup_start` (forced, buffered),
   `live_catchup_failed`, `live_drained` (per outcome, dropped), `live_event_stored`.
 - A failed pass (network, 5xx) retries with backoff capped at 5 min, keeping its forced chats.
@@ -87,6 +88,7 @@ touches the archive at any time: the pass, or the live applier, never both.
 
 - Removing `--loop`. It stays as is; `--live` replaces it for whoever wants it.
 - Avatars on live events (the next pass fetches them).
+- `media/recordings.json` on live events: the next pass that touches the chat rewrites it.
 - Presence, calls, typing: not archive data.
 - Retrying 404-backed-off transcripts without a pass. A chat with no new activity is fast-skipped,
   same as under `--loop` today.

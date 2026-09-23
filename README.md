@@ -111,7 +111,8 @@ duration). `data/` is gitignored (personal chat data).
 `archive --live` (spec 005) replaces the `--loop` timer with the event stream. It subscribes first,
 buffers events while a normal pass catches the archive up, then applies them and writes each new
 one as it arrives. Edits, reactions and deletes update `messages.raw`; the version they replace is
-kept in `message_versions`. Read markers land in `index.db`. A reconnect, a real
+kept in `message_versions`. Attachments download in the background as each message arrives
+(`--no-media` and `--videos` apply). Read markers land in `index.db`. A reconnect, a real
 `trouter.message_loss` or a failed write triggers a new catch-up. It uses its own Trouter endpoint,
 so it runs beside `web` and `stream`. It cannot be combined with `--loop`, `--thread`,
 `--assets-only` or `--retry-assets`.

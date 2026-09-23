@@ -17,8 +17,10 @@ from typing import Any
 
 import structlog
 
-from .archive import TokenProvider, _now_iso, run_archive
+from . import attachments
+from .archive import _MEDIA_CONCURRENCY, TokenProvider, _now_iso, record_asset_failure, run_archive
 from .archive_store import ChatStore, Index, merge_dicts, message_version
+from .auth import AuthExpired
 from .chats import is_meeting, is_private
 from .config import Settings
 from .messages import thread_of
@@ -79,6 +81,8 @@ class LiveArchive:
         self._recent: OrderedDict[str, float] = OrderedDict()  # thread → last live write
         self._catchup: asyncio.Task[None] | None = None
         self._dropped = 0
+        self._media_sem = asyncio.Semaphore(_MEDIA_CONCURRENCY)
+        self._media_tasks: set[asyncio.Task[None]] = set()  # strong refs until each download ends
 
     def in_scope(self, thread_id: str) -> bool:
         return bool(thread_id) and (self.include_all or is_private(thread_id) or is_meeting(thread_id))
@@ -169,6 +173,7 @@ class LiveArchive:
         if outcome == "new":
             self.index.merge_raw(thread_id, {"lastMessage": resource})
         if outcome != "stale":
+            self._spawn_media(thread_id, resource)
             self._recent[thread_id] = time.monotonic()
             self._recent.move_to_end(thread_id)
             cutoff = time.monotonic() - _LOSS_WINDOW
@@ -176,6 +181,43 @@ class LiveArchive:
                 self._recent.popitem(last=False)
             log.info("live_event_stored", thread=thread_id, kind=kind, outcome=outcome)
         return outcome
+
+    # --- media ---
+
+    def _spawn_media(self, thread_id: str, resource: dict[str, Any]) -> None:
+        """Background download: awaiting it would hold the socket's read loop (acks, heartbeats)."""
+        content, msgtype = resource.get("content") or "", str(resource.get("messagetype") or "")
+        if not self.download_media or not attachments.extract(content, msgtype, videos=self.download_videos):
+            return
+        task = asyncio.create_task(self._media(thread_id, content, msgtype))
+        self._media_tasks.add(task)
+        task.add_done_callback(self._media_tasks.discard)
+
+    async def _media(self, thread_id: str, content: str, msgtype: str) -> None:
+        async with self._media_sem:
+            store = ChatStore(self.data_dir, thread_id)
+            try:
+                token = await asyncio.to_thread(self.provider.token)
+                files = await attachments.process(
+                    content,
+                    msgtype,
+                    token,
+                    store.media_dir,
+                    download=True,
+                    sp_token=self.provider.sharepoint_token,
+                    graph_token=self.provider.graph_token,
+                    skip_url=store.denied_urls(_now_iso()).__contains__,
+                    on_fail=partial(record_asset_failure, store),
+                    videos=self.download_videos,
+                )
+                log.info("live_media", thread=thread_id, files=sum(1 for n in files if "→" in n))
+            except AuthExpired as exc:
+                log.error("live_media_auth_expired", error=str(exc))
+                self.stopped.set()
+            except Exception as exc:  # noqa: BLE001 — media is best-effort; the next pass retries it
+                log.warning("live_media_failed", thread=thread_id, error=str(exc))
+            finally:
+                store.close()
 
     # --- catch-up ---
 

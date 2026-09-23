@@ -271,3 +271,85 @@ async def test_failed_write_while_following_triggers_a_catch_up(live: AL.LiveArc
     assert live._buffering and live._catchup is not None  # not dropped: buffered, pass scheduled
     await _settle(live)
     assert set(_stored(live, C1)) == {"m1"} and calls == ["m1", "m1"]
+
+
+# --- live media (phase 3) ---
+
+IMG = '<img itemtype="http://schema.skype.com/AMSImage" src="https://api.asm.skype.com/v1/objects/o1/views/imgo">'
+
+
+async def _media_done(live: AL.LiveArchive) -> None:
+    await asyncio.wait_for(asyncio.gather(*live._media_tasks), 5)
+
+
+async def test_live_media_downloads_into_the_chat_media_dir(live: AL.LiveArchive, monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def fake_process(content, msgtype, token, media_dir, download, **kw):  # noqa: ANN001
+        calls.append({"media_dir": media_dir, "download": download, "token": token, **kw})
+        kw["on_fail"](IMG, _http_error(403))  # one asset denied: must be remembered
+        return ["→ file"]
+
+    monkeypatch.setattr(AL.attachments, "process", fake_process)
+    await live.on_event(_new(C1, "m1", content=IMG))
+    await live.on_event(_new(C1, "m2"))  # no attachment: no download
+    await _media_done(live)
+    (call,) = calls
+    assert call["media_dir"] == live.data_dir / C1 / "media" and call["download"] is True
+    assert call["token"] == "sk"
+    store = ChatStore(live.data_dir, C1)
+    assert IMG in store.denied_urls("9999")
+    store.close()
+
+
+async def test_live_media_does_not_hold_the_stream(live: AL.LiveArchive, monkeypatch) -> None:
+    release = asyncio.Event()
+
+    async def slow_process(*a: Any, **kw: Any) -> list[str]:
+        await release.wait()
+        raise OSError("sharepoint down")
+
+    monkeypatch.setattr(AL.attachments, "process", slow_process)
+    await asyncio.wait_for(live.on_event(_new(C1, "m1", content=IMG)), 1)  # returns before the download
+    assert set(_stored(live, C1)) == {"m1"} and len(live._media_tasks) == 1
+    release.set()
+    await _media_done(live)  # the failure is logged, not raised
+    assert not live.stopped.is_set()
+
+
+async def test_live_media_skips_denied_and_honours_no_media(live: AL.LiveArchive, monkeypatch) -> None:
+    seen: list[bool] = []
+
+    async def fake_process(content, msgtype, token, media_dir, download, **kw):  # noqa: ANN001
+        seen.append(kw["skip_url"]("denied-key"))
+        return []
+
+    monkeypatch.setattr(AL.attachments, "process", fake_process)
+    store = ChatStore(live.data_dir, C1)
+    store.mark_denied("denied-key", 403, "2026-01-01T00:00:00Z")
+    store.close()
+    await live.on_event(_new(C1, "m1", content=IMG))
+    await _media_done(live)
+    assert seen == [True]
+    live.download_media = False
+    await live.on_event(_new(C1, "m2", content=IMG))
+    assert not live._media_tasks and seen == [True]
+
+
+async def test_live_media_stops_on_a_dead_refresh_token(live: AL.LiveArchive, monkeypatch) -> None:
+    from miniteams.auth import AuthExpired
+
+    def dead() -> str:
+        raise AuthExpired("refresh token revoked")
+
+    monkeypatch.setattr(live.provider, "token", dead)
+    await live.on_event(_new(C1, "m1", content=IMG))
+    await _media_done(live)
+    assert live.stopped.is_set()
+
+
+def _http_error(status: int) -> Exception:
+    import httpx
+
+    request = httpx.Request("GET", "https://x")
+    return httpx.HTTPStatusError("x", request=request, response=httpx.Response(status, request=request))
