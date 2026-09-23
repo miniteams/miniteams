@@ -32,22 +32,31 @@
   body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
   button { font: inherit; color: inherit; }
   .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
   header { position: sticky; top: 0; z-index: 2; background: color-mix(in srgb, var(--bg) 85%, transparent); backdrop-filter: blur(10px);
     padding: 10px 16px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid var(--line); }
   h1 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -.01em; white-space: nowrap; }
   .seg { display: inline-flex; background: var(--panel-2); border-radius: 10px; padding: 3px; gap: 2px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
-  header > .seg { margin-right: auto; }
+  header > .seg { margin-right: auto; flex-shrink: 0; }  /* the filter absorbs the squeeze, not the tabs */
   .seg button { border: 0; background: transparent; padding: 4px 8px; white-space: nowrap; border-radius: 8px; cursor: pointer; color: var(--dim); font-size: 12.5px; }
   .seg button.on { background: var(--panel); color: var(--text); box-shadow: var(--shadow); font-weight: 550; }
   .seg b { font-weight: 600; margin-left: 3px; font-size: 11px; padding: 0 6px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); }
   .seg button.mention b { background: var(--mention-soft); color: var(--mention); }
-  /* Narrow widget window: title, dot and ⚙ on one line, the tabs on a full-width second one. */
-  @media (max-width: 560px) {
+  #q { flex: 0 1 132px; min-width: 56px; margin: 0 auto; font: inherit; font-size: 12.5px; color: inherit; background: var(--panel-2);
+    border: 0; border-radius: 10px; padding: 4px 8px; }
+  #q::placeholder { color: var(--faint); }
+  #q:focus { outline: 2px solid var(--accent-soft); }
+  /* Narrow widget window: title, filter, dot and ⚙ on one line, the tabs on a full-width second one. */
+  @media (max-width: 640px) {
     header { flex-wrap: wrap; gap: 6px 8px; padding: 8px 10px; }
-    h1 { margin-right: auto; }
     header > .seg { order: 1; flex-basis: 100%; }
+    #q { flex-basis: 200px; }  /* its auto margins centre it: h1 keeps none, or it drifts right */
   }
+  .name mark { background: var(--accent-soft); color: var(--accent); border-radius: 4px; padding: 0 2px; }
+  li.sel { outline: 2px solid var(--accent); outline-offset: -2px; }
+  /* Arrowing up scrolls the row to the viewport top, which the sticky header covers. */
+  li { scroll-margin-top: var(--hdr, 90px); }
   #status { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); flex: none; }
   #status.off { background: var(--hot); box-shadow: 0 0 0 3px color-mix(in srgb, var(--hot) 25%, transparent); }
   .cog { position: relative; }
@@ -110,17 +119,21 @@
 <header>
   <h1>miniteams</h1>
   <div class="seg" id="tabs"></div>
+  <input id="q" type="search" placeholder="filter" autocomplete="off" spellcheck="false" aria-label="filter chats by name">
   <span id="status" title="connecting…"></span>
   <div class="cog" id="cog"><button id="gear" title="options">⚙</button></div>
 </header>
 <ul id="rows"></ul>
+<span id="say" class="sr" aria-live="polite"></span>
 <div id="empty" hidden>nothing yet</div>
 <script>
 (() => {
   const $rows = document.getElementById("rows"), $empty = document.getElementById("empty"),
         $status = document.getElementById("status"), $tabs = document.getElementById("tabs"),
-        $cog = document.getElementById("cog"), $gear = document.getElementById("gear");
-  let rows = [], ws = null, pageVersion = null, opener = false, browser = false, meName = "", menuOpen = false;
+        $cog = document.getElementById("cog"), $gear = document.getElementById("gear"),
+        $q = document.getElementById("q"), $say = document.getElementById("say"),
+        $header = document.querySelector("header");
+  let rows = [], ws = null, pageVersion = null, opener = false, browser = false, meName = "", menuOpen = false, query = "", sel = "";
   const store = (k, v) => { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) {} return v; };
   const TABS = { all: "Inbox", mention: "@", unread: "Unread", seen: "Seen", muted: "Muted" }, THEMES = ["auto", "light", "dark"];
   // URL params override the stored choices without replacing them (bookmarks, screenshots).
@@ -149,14 +162,33 @@
     return Math.floor(s / 86400) + "d";
   };
 
+  // Case- and accent-blind text, with a folded→original index map: "seb" must reach "Sébastien",
+  // and what gets highlighted is still the original spelling.
+  const fold = (str) => {
+    let out = "";
+    const map = [];
+    for (let i = 0; i < str.length; i++) {
+      const c = str[i].normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
+      out += c;
+      for (let k = 0; k < c.length; k++) map.push(i);
+    }
+    map.push(str.length);
+    return [out, map];
+  };
+
   // The mentioning text carries my name inline (Teams strips the <at> tag): highlight it once.
+  // Either form is mentioned in practice, so the full name is tried before the first name alone.
   const mentionLine = (r, into) => {
     const m = r.mention;
     if (m.by) into.append(el("b", null, m.by + ": "));
-    const first = (meName || "").split(" ")[0], text = m.text || "";
-    const i = m.kind === "me" && first ? text.indexOf(first) : -1;
-    if (i < 0) { into.append(el("span", "at", m.kind === "all" ? "@everyone" : "@you"), " " + text); return into; }
-    into.append(text.slice(0, i), el("span", "at", "@" + first), text.slice(i + first.length));
+    const text = m.text || "", full = (meName || "").trim(), [hay, map] = fold(text);
+    let from = -1, to = -1;
+    for (const cand of m.kind === "me" && full ? [full, full.split(" ")[0]] : []) {
+      const [needle] = fold(cand), j = hay.indexOf(needle);
+      if (j >= 0) { from = map[j]; to = map[j + needle.length]; break; }
+    }
+    if (from < 0) { into.append(el("span", "at", m.kind === "all" ? "@everyone" : "@you"), " " + text); return into; }
+    into.append(text.slice(0, from), el("span", "at", "@" + text.slice(from, to)), text.slice(to));
     return into;
   };
   const preview = (r, into) => {
@@ -175,8 +207,23 @@
     seen: (r) => isSeen(r) && !r.muted,
     muted: (r) => r.muted,
   };
-  const pick = () => rows.filter(filters[tab]);
-  const counts = () => Object.fromEntries(Object.entries(filters).map(([k, f]) => [k, rows.filter(f).length]));
+  // The quick filter narrows every tab, counts included: a badge must match what the list shows.
+  const named = (r) => !query || fold(title(r))[0].includes(query);
+  const pick = () => rows.filter((r) => filters[tab](r) && named(r));
+  const counts = () => Object.fromEntries(
+    Object.entries(filters).map(([k, f]) => [k, rows.filter((r) => f(r) && named(r)).length]));
+  // Every occurrence, as text nodes: a chat name is data, never markup.
+  const marked = (node, text) => {
+    const [hay, map] = fold(text);
+    let at = 0, cut = 0, i;  // `at` walks the folded text, `cut` the original one
+    while (query && (i = hay.indexOf(query, at)) >= 0) {
+      node.append(text.slice(cut, map[i]), el("mark", null, text.slice(map[i], map[i + query.length])));
+      at = i + query.length;
+      cut = map[at];
+    }
+    node.append(text.slice(cut));
+    return node;
+  };
 
   const renderHeader = () => {
     const c = counts();
@@ -184,6 +231,7 @@
       const b = el("button", (tab === k ? "on " : "") + (k === "mention" ? "mention" : ""), lbl);
       b.append(el("b", null, c[k])); b.onclick = () => { tab = k; store("tab", k); render(); }; return b;
     }));
+    document.documentElement.style.setProperty("--hdr", $header.offsetHeight + "px");
     $cog.classList.toggle("open", menuOpen);
     $cog.querySelector(".menu")?.remove();
     if (!menuOpen) return;
@@ -207,7 +255,7 @@
     const shown = pick();
     $rows.replaceChildren(...shown.map((r) => {
       const m = mentioned(r), k = kind(r.id);
-      const li = el("li", (r.unread ? "unread " : "") + ((isSeen(r) || r.muted) && !m ? "seen " : "") + (m ? "mention " + r.mention.kind : ""));
+      const li = el("li", (r.unread ? "unread " : "") + ((isSeen(r) || r.muted) && !m ? "seen " : "") + (r.id === sel ? "sel " : "") + (m ? "mention " + r.mention.kind : ""));
       li.dataset.id = r.id;
       li.style.setProperty("--stripe", `hsl(${hue(r.id)} 62% 55%)`);
       if (avatars) {
@@ -216,7 +264,7 @@
         if (glyph[k]) av.append(el("small", null, glyph[k]));
         li.append(av);
       }
-      const name = Object.assign(el("a", "name truncate", title(r)), { href: r.link || "#", target: "_blank", rel: "noopener", title: r.label });
+      const name = Object.assign(marked(el("a", "name truncate"), title(r)), { href: r.link || "#", target: "_blank", rel: "noopener", title: r.label });
       // Plain click → the server opens the chat (desktop client); modified/middle click → the https
       // link, through the server's --browser when set, else in this browser.
       const modified = (ev) => ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.button === 1;
@@ -249,9 +297,29 @@
       li.append(name, meta, preview(r, el("span", "prev truncate")), ind);
       return li;
     }));
+    $empty.textContent = query ? "no chat matches" : "nothing yet";
     $empty.hidden = shown.length > 0;
   };
 
+  $q.oninput = () => { query = fold($q.value.trim())[0]; sel = ""; render(); };
+  // Arrow keys walk the list without leaving the filter box; Enter opens the selection exactly as a
+  // plain click does — through the server, which hands the chat to the desktop client.
+  const move = (delta) => {
+    const list = pick();
+    if (!list.length) return;
+    const i = list.findIndex((r) => r.id === sel);
+    sel = list[i < 0 ? (delta > 0 ? 0 : list.length - 1) : Math.max(0, Math.min(list.length - 1, i + delta))].id;
+    render();
+    const li = $rows.querySelector("li.sel");
+    li?.scrollIntoView({ block: "nearest" });
+    $say.textContent = li?.querySelector(".name")?.textContent || "";
+  };
+  $q.onkeydown = (e) => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); move(e.key === "ArrowDown" ? 1 : -1); }
+    // No selection yet: Enter takes the top hit, the way a search box is expected to behave.
+    else if (e.key === "Enter") { ($rows.querySelector("li.sel .name") || (query ? $rows.querySelector("li .name") : null))?.click(); }
+    else if (e.key === "Escape" && (query || sel)) { $q.value = ""; query = ""; sel = ""; render(); }
+  };
   $gear.onclick = (e) => { e.stopPropagation(); menuOpen = !menuOpen; renderHeader(); };
   addEventListener("click", () => { if (menuOpen) { menuOpen = false; renderHeader(); } });
   addEventListener("keydown", (e) => { if (e.key === "Escape" && menuOpen) { menuOpen = false; renderHeader(); } });
