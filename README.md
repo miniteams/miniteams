@@ -82,7 +82,9 @@ where ↺ undoes it. A message that @mentions you gets a blue stripe and an `@ y
 @everyone), also when the mention was added by editing an older message; it clears once you mark the row seen
 or read the chat in Teams after the mention. The `@` tab lists mentioned rows, **Unread** follows Teams' own
 read marker. `🔕` mutes a chat (out of Inbox whatever lands on it, listed under **Muted** until `🔔`; mentions still
-surface; state in `muted.json`). The ⚙ menu picks the theme (system by default) and hides avatars for a denser list. The
+surface; state in `muted.json`). `✎` (or `r` on the row selected with the arrow keys, `Tab` from the filter) opens
+a reply box under the row: Enter sends it to the chat as you, Shift+Enter adds a line, Escape closes it and keeps
+the draft until the page reloads; a failed send keeps the text and shows why. The ⚙ menu picks the theme (system by default) and hides avatars for a denser list. The
 process exits non-zero when the stream dies (auth expired) — re-run it.
 
 `stream` enriches each line with thread name + participants, resolves MRIs → display names
