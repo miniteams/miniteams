@@ -1,6 +1,6 @@
 # 006 — Quick reply from the widget
 
-**Status**: approved
+**Status**: in progress
 **Requested by**: babs
 **Date**: 2026-09-23
 
