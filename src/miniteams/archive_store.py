@@ -33,6 +33,33 @@ def _connect(path: Path) -> sqlite3.Connection:
     return db
 
 
+def read_chats(data_dir: Path) -> Iterator[dict[str, Any]]:
+    """Every indexed chat, read-only, one at a time.
+
+    Not `Index.chats()`: that constructor creates the directory and the table, and a reader must
+    never bring an archive into existence — nor block the writer. Raises OSError when there is no
+    index and sqlite3.Error when it cannot be read; both mean "no archive" to the caller.
+
+    Streamed, not a list: `raw` holds the whole conversation object, so materialising the table
+    costs several times the file (67 MiB peak for a 12 MiB index) for rows the caller drops at once.
+    """
+    path = data_dir / "index.db"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        for r in db.execute("SELECT id, label, topic, participants, raw FROM chats"):
+            yield {
+                "id": r[0],
+                "label": r[1],
+                "topic": r[2],
+                "participants": json.loads(r[3] or "[]"),
+                "raw": json.loads(r[4] or "{}"),
+            }
+    finally:
+        db.close()
+
+
 class Index:
     """`data/index.db` — one row per known chat; enumeration metadata + backfill flag."""
 

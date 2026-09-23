@@ -150,6 +150,7 @@ def cmd_chats(settings: Settings, args: argparse.Namespace) -> int:
 def cmd_web(settings: Settings, args: argparse.Namespace) -> int:
     """Serve the live conversation-list widget on a loopback address (spec 002)."""
     import asyncio
+    from pathlib import Path
 
     from .web import run, self_mri
 
@@ -171,6 +172,7 @@ def cmd_web(settings: Settings, args: argparse.Namespace) -> int:
                 args.open_scheme,
                 args.browser,
                 me=me,
+                data_dir=Path(args.data_dir),
             )
         )
     except KeyboardInterrupt:
@@ -403,6 +405,7 @@ def main(argv: list[str] | None = None) -> int:
     p_web.add_argument(
         "--limit", type=_non_negative_int, default=50, help="max conversations to load (0 = no limit)"
     )
+    p_web.add_argument("--data-dir", default="data", help="archive root to seed rows from (default: ./data)")
     p_web.add_argument("--bind", help="ADDR:PORT to listen on (default: persisted random 127.0.0.X:PORT)")
     p_web.add_argument(
         "--reactions", action="store_true", help="a reaction becomes the row's last event and bumps it"

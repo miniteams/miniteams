@@ -48,6 +48,7 @@ uv run miniteams archive --loop 600                    # re-run forever, sleepin
                                                        # (bare --loop = 300s); stops on auth expiry
 uv run miniteams web              # local live page: conversations newest-first (see below)
 uv run miniteams web --limit 0 --bind 127.0.0.5:8765   # load every chat; fixed loopback address
+uv run miniteams web --data-dir /srv/teams-archive     # seed rows from an archive kept elsewhere
 uv run miniteams dump             # dump your Notes' full history (oldest → newest)
 uv run miniteams dump --thread 19:xxx@thread.v2        # dump a conversation
 uv run miniteams dump --jsonl > notes.jsonl            # full-detail JSON per line
@@ -60,7 +61,11 @@ uv run miniteams dump --jsonl > notes.jsonl            # full-detail JSON per li
 (label, last author, snippet), updated live from the Trouter stream: new messages move a row
 up, edits/deletes of the last message rewrite it, `✍ Name` shows who is typing (cleared after
 10s if Teams never says so), and with `--reactions` a reaction becomes the row's last event.
-It binds a random `127.0.0.X:PORT` drawn once and kept in `~/.config/miniteams/web.json` so the
+Rows are seeded from the archive under `--data-dir` (default `./data`, read-only): the name, snippet
+and read state of a chat `archive` already knows cost no API call, which is what makes a large
+`--limit` bearable. Without an archive the page builds every row itself and starts much slower.
+Mentions are scanned at startup on the newest rows only (50); older chats surface theirs when the
+next message lands. It binds a random `127.0.0.X:PORT` drawn once and kept in `~/.config/miniteams/web.json` so the
 URL stays bookmarkable; `--bind` overrides it and refuses anything but loopback (no auth on the
 page). Clicking a row opens the chat at its last message through `--opener` (default `xdg-open`
 on an `msteams://` deep link, i.e. the desktop client; `--open-scheme https` for Teams web,

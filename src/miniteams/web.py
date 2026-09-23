@@ -15,6 +15,7 @@ import ipaddress
 import json
 import random
 import re
+import sqlite3
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -28,6 +29,7 @@ from websockets.asyncio.server import ServerConnection, broadcast, serve
 from websockets.http11 import Request, Response
 from websockets.typing import Origin
 
+from .archive_store import read_chats
 from .chats import fetch_conversations, is_meeting, is_private, last_activity
 from .config import Settings
 from .directory import Directory
@@ -48,6 +50,9 @@ _CALL_STARTER_RE = re.compile(
 )
 _LABEL_CONCURRENCY = 8
 _HISTORY_PAGE = 20  # history fetched per row at bootstrap: stub resolution + mention scan
+_MENTION_SCAN = 50  # newest rows whose history is scanned for mentions at bootstrap
+# Snippets that mean "the listing did not say": the archive may know better.
+_STUB_SNIPPETS = ("🗑 deleted", "📎 attachment")
 _PAGE_POLL = 2.0  # seconds between widget.html mtime checks (dev reload)
 _TYPING_TTL = 10.0  # seconds; Teams does not always send ClearTyping
 # Thread activity that changes the label (topic, member count): drop the cached thread info.
@@ -224,12 +229,67 @@ def snippet(msgtype: str, content: str, props: dict[str, Any] | None = None) -> 
     return text if len(text) <= _SNIPPET_LEN else text[: _SNIPPET_LEN - 1] + "…"
 
 
-async def row_from_conversation(conv: dict[str, Any], directory: Directory) -> dict[str, Any]:
+_APP_MRI = "28:"  # bots and app installs sit in the roster like people do
+
+
+def _seed_label(chat: dict[str, Any], me: str) -> str:
+    """The name the widget would have fetched: topic, else the roster without me.
+
+    The archive stores every participant, me included; `Directory.label` leaves me out, so reusing
+    the stored label verbatim would name every 1:1 after its two members.
+    """
+    members = [m for m in chat["participants"] if isinstance(m, dict) and m.get("name")]
+    if chat["topic"]:
+        return f"{chat['topic']} · {len(chat['participants'])}p"
+
+    def is_app(member: dict[str, Any]) -> bool:
+        return str(member.get("mri", "")).startswith(_APP_MRI)
+
+    others = [str(m["name"]) for m in members if m.get("mri") != me and not is_app(m)]
+    apps = [str(m["name"]) for m in members if is_app(m)]
+    return ", ".join(others or apps or [str(m["name"]) for m in members])
+
+
+def seed_from_archive(data_dir: Path, me: str = "") -> dict[str, dict[str, Any]]:
+    """Per-thread row material from `index.db`: what the per-row API fetches would have bought.
+
+    An unusable archive is not an error — the caller falls back to fetching everything.
+    """
+    seeded: dict[str, dict[str, Any]] = {}
+    try:
+        # Inside the try: `read_chats` streams, so a missing or unreadable index raises on the
+        # first row, not on the call.
+        for chat in read_chats(data_dir):
+            thread_id = str(chat["id"])
+            if not in_scope(thread_id):
+                continue
+            conv = chat["raw"] if isinstance(chat["raw"], dict) else {}
+            last = conv.get("lastMessage") or {}
+            seeded[thread_id] = {
+                "label": _seed_label(chat, me),
+                "text": snippet(
+                    str(last.get("messagetype") or ""), str(last.get("content") or ""), last.get("properties")
+                ),
+                "sender": str(last.get("imdisplayname") or ""),
+                "read_id": read_up_to(conv.get("properties")),
+                "read_at": read_at_ms(conv.get("properties")),
+            }
+    except (OSError, sqlite3.Error) as exc:
+        event = "archive_index_absent" if isinstance(exc, FileNotFoundError) else "archive_index_unusable"
+        log.info(event, data_dir=str(data_dir), error=str(exc))
+        return {}
+    log.info("archive_index_read", chats=len(seeded), data_dir=str(data_dir))
+    return seeded
+
+
+async def row_from_conversation(
+    conv: dict[str, Any], directory: Directory, label: str = ""
+) -> dict[str, Any]:
     thread_id = str(conv.get("id") or "")
     last = conv.get("lastMessage") or {}
     msgtype = str(last.get("messagetype") or "")
     sender = "" if _is_system(msgtype) else await sender_of(last, directory)
-    label = await directory.label(thread_id)
+    label = label or await directory.label(thread_id)
     if label == thread_id:  # thread lookup failed (rate limit…): the listing carries the topic
         label = str((conv.get("threadProperties") or {}).get("topic") or thread_id)
     last_id = str(last.get("id") or "")
@@ -278,8 +338,13 @@ async def bootstrap(
     limit: int,
     me: str = "",
     seen: dict[str, str] | None = None,
+    seed: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """In-scope conversations from the newest-first listing, capped at `limit` (0 = walk all)."""
+    """In-scope conversations from the newest-first listing, capped at `limit` (0 = walk all).
+
+    `seed` carries what the archive already knows (see `seed_from_archive`): the listing wins on
+    every field it provides, the seed only spares the per-row fetches that would fill the gaps.
+    """
     picked: list[dict[str, Any]] = []
     for page in pages:
         for conv in page:
@@ -294,12 +359,29 @@ async def bootstrap(
     # keeps it a few seconds without hammering the chat service.
     gate = asyncio.Semaphore(_LABEL_CONCURRENCY)
 
-    async def build(conv: dict[str, Any]) -> dict[str, Any]:
+    async def build(conv: dict[str, Any], rank: int) -> dict[str, Any]:
         async with gate:
-            row = await row_from_conversation(conv, directory)
+            seeded = (seed or {}).get(str(conv.get("id") or "")) or {}
+            row = await row_from_conversation(conv, directory, label=str(seeded.get("label") or ""))
             row["seen_at"] = (seen or {}).get(row["id"])
-            stub = row["text"] == "🗑 deleted"
-            recent = await _recent(row["id"], directory) if (stub or me or not row["last_id"]) else []
+            # A listing message without `imdisplayname` costs a directory lookup; the archived copy
+            # of the same message usually carries the name.
+            row["sender"] = row["sender"] or str(seeded.get("sender") or "")
+            if not row["read_id"] and seeded.get("read_id"):
+                # The listing dropped the horizon (it happens on quiet chats); the archive kept it.
+                row["read_id"] = str(seeded["read_id"])
+                row["read_at"] = max(int(row["read_at"] or 0), int(seeded.get("read_at") or 0))
+                row["unread"] = is_unread(row["last_id"], row["read_id"])
+            stub = row["text"] in _STUB_SNIPPETS
+            if stub and seeded.get("text") and seeded["text"] not in _STUB_SNIPPETS:
+                # The listing's lastMessage has no `properties`, so a file or card post reads as a
+                # deleted one; the archived copy has them. Trust it and skip the history page.
+                row["text"] = str(seeded["text"])
+                stub = False
+            # Mentions need history, and history is the expensive part: scan the head of the list
+            # only — an older chat surfaces its mention when it next moves.
+            scan = bool(me) and rank < _MENTION_SCAN
+            recent = await _recent(row["id"], directory) if (stub or scan or not row["last_id"]) else []
             if stub:
                 await _resolve_stub(row, recent, directory)
             if not row["last_id"] and recent:
@@ -307,11 +389,11 @@ async def bootstrap(
                 # newest history message gives the row a target, so its deep link lands on a
                 # message. The chat-only link form makes the desktop client reload (it drops calls).
                 row["last_id"] = str(recent[-1].get("id") or "")
-            if me:
+            if scan:
                 await _scan_mentions(row, recent, directory, me)
             return row
 
-    rows = await asyncio.gather(*(build(conv) for conv in picked))
+    rows = await asyncio.gather(*(build(conv, rank) for rank, conv in enumerate(picked)))
     return {row["id"]: row for row in rows}
 
 
@@ -869,15 +951,17 @@ async def run(
     open_scheme: str = "msteams",
     browser: str = "",
     me: str = "",
+    data_dir: Path | None = None,
 ) -> None:
     directory = Directory(settings)
     directory.set_token(skype_token, bearer)
     directory.me = me
     seen_path = settings.config_dir / "seen.json"
+    seed = await asyncio.to_thread(seed_from_archive, data_dir, me) if data_dir else {}
     rows = await bootstrap(
-        fetch_conversations(settings, skype_token), directory, limit, me, _load_seen(seen_path)
+        fetch_conversations(settings, skype_token), directory, limit, me, _load_seen(seen_path), seed
     )
-    log.info("web_bootstrap", rows=len(rows), me=bool(me))
+    log.info("web_bootstrap", rows=len(rows), seeded=len(seed), me=bool(me))
     board = Board(
         rows,
         directory,
