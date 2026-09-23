@@ -230,3 +230,16 @@ def test_web_passes_self_mri_from_the_access_token(monkeypatch) -> None:
     monkeypatch.setattr(web, "run", fake_run)
     assert C.main(["web", "--bind", "127.0.0.77:47123"]) == 0
     assert (got["me"], got["skype_token"], got["bearer"]) == ("8:orgid:me-guid", "skype", f"h.{body}.s")
+
+
+def test_archive_retries_a_transient_aad_error(monkeypatch) -> None:
+    """AAD throttling or a 5xx is not a dead refresh token: back off and resume, do not stop."""
+    from miniteams.auth import AuthUnavailable
+
+    rc, slept = _archive_retry_case(
+        monkeypatch,
+        [AuthUnavailable("silent token refresh failed (temporarily_unavailable)"), False],
+        ["archive"],
+    )
+    assert rc == 0
+    assert slept == [2.0]

@@ -163,7 +163,7 @@ async def test_run_forever_renews_directory_token_and_stops_the_refresher(
     )
     monkeypatch.setattr(
         S,
-        "TokenSource",
+        "token_source",
         lambda _s: type("T", (), {"acquire": lambda self: None, "refresh": lambda self: tokens.refresh()})(),
     )
     _scripted_exchange(

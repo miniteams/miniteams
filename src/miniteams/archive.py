@@ -509,8 +509,15 @@ async def run_archive(
             # per-chat path below.
             try:
                 targets = _enumerate(settings, token_provider.token(), include_all)
-            except AuthExpired:
-                log.error("archive_auth_expired", done=0, remaining=0, hint="run `miniteams login`")
+            except AuthExpired as exc:
+                # Only the AAD code separates a dead refresh token from a throttled reply.
+                log.error(
+                    "archive_auth_expired",
+                    done=0,
+                    remaining=0,
+                    error=str(exc),
+                    hint="run `miniteams login`",
+                )
                 targets = []
                 auth_expired = True
         log.info("archive_start", chats=len(targets), data_dir=str(data_dir), assets_only=assets_only)
@@ -533,11 +540,12 @@ async def run_archive(
             # into one "chat_archive_failed" per remaining chat and a uselessly "done" run.
             try:
                 skype_token, bearer = token_provider.token(), token_provider.bearer()
-            except AuthExpired:
+            except AuthExpired as exc:
                 log.error(
                     "archive_auth_expired",
                     done=done,
                     remaining=len(targets) - done,
+                    error=str(exc),
                     hint="re-run to resume from here",
                 )
                 auth_expired = True

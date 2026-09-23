@@ -8,8 +8,10 @@ call on the Teams client then redeems it for the Teams scope (FOCI). Device-code
 so it runs on the Teams client directly. Tokens are cached on disk; re-runs are silent.
 
 `TokenSource` holds one cache/app for a process's lifetime: `acquire()` runs the full flow once
-(may prompt), `refresh()` is silent-only for a reconnect loop — it never prompts, returning None
-when the refresh token is dead so the caller can stop instead of re-prompting on every reconnect.
+(may prompt), `refresh()` is silent-only for a reconnect loop — it never prompts, raising
+`AuthExpired` when the refresh token is dead so the caller can stop instead of re-prompting on
+every reconnect. The disk cache is shared with every other miniteams process, and AAD revokes a
+refresh token the moment one of them redeems it, so the file is re-read whenever it changes.
 """
 
 import atexit
@@ -46,6 +48,22 @@ def _persist_cache(cache: msal.SerializableTokenCache, path: Path) -> None:
         except BaseException:
             tmp.unlink(missing_ok=True)  # may hold a partial refresh-token payload
             raise
+
+
+_NO_FILE = (0, 0, 0)
+
+
+def _stamp(path: Path) -> tuple[int, int, int]:
+    """Identity of the cache file's current content.
+
+    Inode first: `_persist_cache` swaps the file in with os.replace, so a writer always lands on a
+    new inode — a timestamp alone would miss a write sharing our clock tick, and never reload again.
+    """
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return _NO_FILE
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
 
 
 def _build_cache(settings: Settings) -> tuple[msal.SerializableTokenCache, Path]:
@@ -87,24 +105,77 @@ class AuthExpired(RuntimeError):
     """Silent refresh failed with no cached/refreshable token — re-auth needed, don't retry."""
 
 
+class AuthUnavailable(RuntimeError):
+    """Silent refresh failed on AAD's side — the credential may still be good, so retry."""
+
+
+# Everything else AAD can answer (temporarily_unavailable, server_error, request_throttled…)
+# heals by waiting; only these mean the cached credential itself is gone.
+_DEAD_CREDENTIAL = frozenset(
+    {"invalid_grant", "interaction_required", "invalid_client", "unauthorized_client"}
+)
+
+
 class TokenSource:
     """One MSAL cache/app for the process lifetime; see module docstring for acquire vs refresh."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._cache, self._cache_path = _build_cache(settings)
+        self._cache_stamp = _stamp(self._cache_path)
+        # `stream` refreshes from two threads (session loop + refresher task via to_thread).
+        # Reload → mint → persist has to be atomic per process: otherwise one thread reloads the
+        # file over the token the other just rotated in memory, restoring the revoked one.
+        # Re-entrant: refresh() holds it across _silent() and _persist().
+        self._lock = threading.RLock()
         self._teams = _app(settings.client_id, settings, self._cache)
 
+    def _persist(self) -> None:
+        with self._lock:
+            wrote = self._cache.has_state_changed
+            _persist_cache(self._cache, self._cache_path)
+            # Nothing written means the file is still whoever else's: claiming its stamp would mark
+            # a sibling's rotated token as already loaded, and we would never read it.
+            if wrote:
+                self._cache_stamp = _stamp(self._cache_path)
+
+    def _sync_cache(self) -> None:
+        """Re-read the cache file when another miniteams process has written it.
+
+        AAD rotates the refresh token on every redemption, so a sibling process (`web`, `stream`,
+        a second `archive`) that refreshes leaves our in-memory copy holding a revoked token. That
+        surfaces hours later as a fatal AuthExpired mid-run, while a fresh process succeeds at once
+        because it reads the rotated token from disk. Re-reading first keeps us on the live token.
+        """
+        # ponytail: last-writer-wins, no file lock — two processes minting in the same instant can
+        # still lose one update; msal_extensions' PersistedTokenCache if that ever bites.
+        with self._lock:
+            # deserialize() replaces the cache wholesale: credentials msal just put in memory (the
+            # interactive leg's seed) are not on disk yet, and reloading over them loses the login.
+            if self._cache.has_state_changed:
+                return
+            stamp = _stamp(self._cache_path)
+            if stamp == _NO_FILE or stamp == self._cache_stamp:
+                return
+            try:
+                doc = self._cache_path.read_text()
+            except OSError:
+                return  # deleted under us since _stamp(): keep the copy we hold
+            self._cache.deserialize(doc)
+            self._cache_stamp = stamp
+
     def _silent(self) -> dict[str, Any] | None:
-        accounts = self._teams.get_accounts()
-        if not accounts:
-            return None
-        # with_error: on failure returns the AAD error dict instead of None, so the user sees
-        # the real reason (e.g. interaction_required / CA policy) rather than "None: None".
-        result: dict[str, Any] | None = self._teams.acquire_token_silent_with_error(
-            self.settings.scope_list, account=accounts[0]
-        )
-        return result
+        with self._lock:
+            self._sync_cache()
+            accounts = self._teams.get_accounts()
+            if not accounts:
+                return None
+            # with_error: on failure returns the AAD error dict instead of None, so the user sees
+            # the real reason (e.g. interaction_required / CA policy) rather than "None: None".
+            result: dict[str, Any] | None = self._teams.acquire_token_silent_with_error(
+                self.settings.scope_list, account=accounts[0]
+            )
+            return result
 
     def acquire(self) -> dict[str, Any]:
         """Full flow, runs once and may prompt: silent → device-code/interactive fallback."""
@@ -147,7 +218,7 @@ class TokenSource:
                     )
                     result = _device_code_flow(self._teams, scopes)
 
-        _persist_cache(self._cache, self._cache_path)
+        self._persist()
         if not _has_token(result):
             err = result or {}
             raise RuntimeError(
@@ -157,14 +228,20 @@ class TokenSource:
 
     def refresh(self) -> dict[str, Any]:
         """Silent-only refresh for a reconnect loop; never prompts. Raises AuthExpired if dead."""
-        result = self._silent()
-        _persist_cache(self._cache, self._cache_path)
-        if not _has_token(result):
-            err = result or {}
-            raise AuthExpired(
-                f"silent token refresh failed ({err.get('error')}) — refresh token expired or revoked"
-            )
-        return result
+        with self._lock:
+            result = self._silent()
+            self._persist()
+            if not _has_token(result):
+                err = result or {}
+                code = str(err.get("error") or "")
+                # No account at all (result is None) is a dead cache too, not an AAD hiccup.
+                if result is None or code in _DEAD_CREDENTIAL:
+                    raise AuthExpired(
+                        f"silent token refresh failed ({code or 'no cached account'}) — "
+                        "refresh token expired or revoked"
+                    )
+                raise AuthUnavailable(f"silent token refresh failed ({code}) — AAD-side, retryable")
+            return result
 
     def sharepoint_token(self, host: str) -> str | None:
         """Silent SharePoint token for `host` (e.g. `contoso-my.sharepoint.com`), redeemed on the
@@ -178,14 +255,34 @@ class TokenSource:
         return self._silent_scope("https://graph.microsoft.com/.default")
 
     def _silent_scope(self, scope: str) -> str | None:
-        accounts = self._teams.get_accounts()
-        if not accounts:
-            return None
-        result = self._teams.acquire_token_silent([scope], account=accounts[0])
-        _persist_cache(self._cache, self._cache_path)
-        return result.get("access_token") if result else None
+        with self._lock:
+            self._sync_cache()
+            accounts = self._teams.get_accounts()
+            if not accounts:
+                return None
+            result = self._teams.acquire_token_silent([scope], account=accounts[0])
+            self._persist()
+            return result.get("access_token") if result else None
+
+
+_SOURCES: dict[Path, TokenSource] = {}
+_SOURCES_LOCK = threading.Lock()
+
+
+def token_source(settings: Settings) -> TokenSource:
+    """The process's TokenSource for this cache dir.
+
+    Two instances would each register an atexit writer, and atexit runs them last-registered-first:
+    the older cache lands last and puts a token AAD already revoked back on disk.
+    """
+    key = settings.config_dir.resolve()
+    with _SOURCES_LOCK:
+        source = _SOURCES.get(key)
+        if source is None:
+            source = _SOURCES[key] = TokenSource(settings)
+        return source
 
 
 def acquire_aad_token(settings: Settings) -> dict[str, Any]:
     """One-shot acquisition for non-streaming commands (dump/send)."""
-    return TokenSource(settings).acquire()
+    return token_source(settings).acquire()

@@ -22,7 +22,7 @@ import structlog
 import websockets
 
 from ._io import force_blocking_stdout
-from .auth import AuthExpired, TokenSource
+from .auth import AuthExpired, TokenSource, token_source
 from .config import Settings
 from .directory import Directory
 from .messages import decode_event, emit_raw_delivery, emit_raw_named, handle_delivery
@@ -313,7 +313,7 @@ async def run_forever(
     directory = directory or Directory(settings)  # caches survive reconnects; only the tokens change
     # Authenticate ONCE up front (may prompt: device-code in stream mode). Reconnects then only
     # refresh silently — never re-prompt — so a failed connect can't spin into endless logins.
-    tokens = TokenSource(settings)
+    tokens = token_source(settings)
     tokens.acquire()
     backoff = 1.0
     while True:
