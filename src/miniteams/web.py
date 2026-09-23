@@ -16,6 +16,7 @@ import json
 import random
 import re
 import sqlite3
+import time
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -52,6 +53,7 @@ _LABEL_CONCURRENCY = 8
 _HISTORY_PAGE = 20  # history fetched per row at bootstrap: stub resolution + mention scan
 _MENTION_SCAN = 50  # newest rows whose history is scanned for mentions at bootstrap
 _FIRST_CHUNK = 50  # rows the background fill paints before walking the rest of the listing
+_SEED_REREAD = 30.0  # seconds before the archive index is worth re-reading for a name
 # Default table depth: seeded rows cost no API call, a fetched one costs two.
 _LIMIT_SEEDED = 400
 _LIMIT_BARE = 250
@@ -252,6 +254,17 @@ def _seed_label(chat: dict[str, Any], me: str) -> str:
     others = [str(m["name"]) for m in members if m.get("mri") != me and not is_app(m)]
     apps = [str(m["name"]) for m in members if is_app(m)]
     return ", ".join(others or apps or [str(m["name"]) for m in members])
+
+
+def _index_stamp(data_dir: Path | None) -> tuple[int, int, int]:
+    """Identity of the index file's content; (0, 0, 0) when there is none to read."""
+    if data_dir is None:
+        return (0, 0, 0)
+    try:
+        st = (data_dir / "index.db").stat()
+    except OSError:
+        return (0, 0, 0)
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
 
 
 def seed_from_archive(data_dir: Path, me: str = "") -> dict[str, dict[str, Any]]:
@@ -559,6 +572,8 @@ class Board:
         browser: list[str] | None = None,
         me: str = "",
         busy: bool = False,
+        seed: dict[str, dict[str, Any]] | None = None,
+        data_dir: Path | None = None,
     ) -> None:
         self.rows = rows
         self.directory = directory
@@ -573,6 +588,10 @@ class Board:
         self.browser = browser  # argv for the https link on Ctrl/middle click; None = page's own browser
         self.clients: set[ServerConnection] = set()
         self.busy = busy  # the page shows a spinner until the background fill says otherwise
+        self.seed = seed or {}
+        self.data_dir = data_dir
+        self._seed_read = time.monotonic()
+        self._seed_stamp = _index_stamp(data_dir)
         self._typing_timers: dict[tuple[str, str], asyncio.TimerHandle] = {}
         self._seen: dict[str, str] = _load_seen(seen_path)
         self._muted: dict[str, str] = _load_seen(muted_path)  # thread → when muted (same shape)
@@ -580,6 +599,22 @@ class Board:
             row["seen_at"] = self._seen.get(row["id"])
             row["muted"] = row["id"] in self._muted
             row.setdefault("mention", None)
+
+    async def archived_label(self, thread_id: str) -> str:
+        """The name the archive has for a chat, re-reading the index when it has moved on.
+
+        The live lookup is what names a new chat; this is the fallback when it fails (a 429, or a
+        chat we were removed from), and the archive may have learned the name after we started.
+        """
+        name = str(self.seed.get(thread_id, {}).get("label") or "")
+        if name or self.data_dir is None:
+            return name
+        stamp = _index_stamp(self.data_dir)
+        if stamp == self._seed_stamp or time.monotonic() - self._seed_read < _SEED_REREAD:
+            return ""  # same file, or too soon: re-reading it would buy nothing
+        self.seed = await asyncio.to_thread(seed_from_archive, self.data_dir, self.me)
+        self._seed_read, self._seed_stamp = time.monotonic(), stamp
+        return str(self.seed.get(thread_id, {}).get("label") or "")
 
     def set_busy(self, busy: bool) -> None:
         self.busy = busy
@@ -749,6 +784,8 @@ class Board:
             fresh = await self.directory.label(thread_id)
             if fresh != thread_id:  # lookup failed (removed from the chat, 429): keep the old name
                 row["label"] = fresh
+            elif row["label"] == thread_id:
+                row["label"] = await self.archived_label(thread_id) or row["label"]
         last_id = str(resource.get("id") or "")
         row.update(
             last_activity=str(resource.get("composetime") or resource.get("originalarrivaltime") or ""),
@@ -1102,6 +1139,8 @@ async def run(
         browser=None if browser in ("", "none") else browser.split(),
         me=me,
         busy=True,
+        seed=seed,
+        data_dir=data_dir,
     )
     log.info("web_seeded", rows=len(board.rows), seeded=len(seed), limit=cap, me=bool(me))
     # The stream only returns when auth is dead: a page that silently stops updating is worse

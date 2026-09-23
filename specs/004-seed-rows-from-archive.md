@@ -1,6 +1,6 @@
 # 004 — Seed the widget's rows from the archive
 
-**Status**: draft
+**Status**: implemented (2026-09-23)
 **Requested by**: babs
 **Date**: 2026-09-23
 
@@ -45,8 +45,9 @@ field it carries. Nothing else changes: same table size (`--limit`), same broadc
   no history page when it gave a non-stub snippet.
 - **The mention scan stays** on the newest 50 rows, seeded or not — dropping it would silently undo
   spec 003 for anything received while the widget was down. ~50 history fetches instead of 250.
-- **Refresh**: re-read when the index mtime moves, at most once every 30 s, to catch labels of chats
-  the archive learned about after startup.
+- **Refresh**: when a live label lookup fails (429, or a chat we were removed from), the archive is
+  asked instead; the index is re-read only if its inode/mtime/size moved and the last read is older
+  than 30 s, so an unnamed message storm cannot turn into a read storm.
 - **Progressive start**: the page is served as soon as the seed is ready and says so with a small
   floating spinner, bottom right, while the live listing and the mention scan are still in flight.
   The spinner clears on the broadcast that follows them. No per-row marker — whether a row came from
@@ -66,6 +67,7 @@ of API calls differs.
 | `index.db` unreadable (permissions, corrupt, wrong schema) | Same, logged as `archive_index_unusable` with the error. |
 | Index partial (first archive pass still running) | Seeds what it holds; the rest is fetched as today. |
 | Index written concurrently by `archive` | Read-only, WAL: no lock, no wait. |
+| Archive lagging behind the listing | Rows the listing does not return are pruned, so the table never holds both sets; a chat the stream brought in during the walk is kept. |
 
 ## Out of scope
 
@@ -92,6 +94,8 @@ of API calls differs.
 7. `web` starts while a concurrent `archive` run writes the index.
 8. The spinner is visible from the first paint until the listing and the mention scan have landed,
    and never sticks: it clears on the broadcast, and on failure of either background step.
+9. The merged table never exceeds `--limit`, and a chat a live message created during the fill is
+   not dropped by the prune.
 
 ## Phases
 
@@ -99,8 +103,8 @@ of API calls differs.
    Done when a test seeds a table from a temporary index and criteria 2-4 hold.
 2. **Progressive start** — serve on seed, listing and mention scan in the background, spinner and
    its clearing, `--limit` default to 400. Done when criteria 1 and 8 hold.
-3. **Edges** — mtime refresh, mention scan bounded to the head, the fallback table above. Done when
-   criteria 5-7 hold, each with a test.
+3. **Edges** — archived name as the fallback for a failed lookup with its guarded re-read, the
+   prune, the fallback table above. Done when criteria 5-7 and 9 hold, each with a test.
 
 ## Open questions
 
