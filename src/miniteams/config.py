@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     authz_url: str = "https://teams.microsoft.com/api/authsvc/v1.0/authz"
 
     # --- chat-service metadata (libteams.h TEAMS_CONTACTS_HOST, TFW) ---
+    # Fallback only: the skype token exchange switches it to the account's region (see skype.py).
     contacts_host: str = "apac.ng.msg.teams.microsoft.com"
     # Batched MRI → display-name lookup (teams_contacts.c TEAMS_PROFILES_PREFIX). Bearer id_token.
     profiles_url: str = (

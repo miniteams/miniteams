@@ -22,6 +22,9 @@ from .config import Settings
 
 log = structlog.get_logger()
 
+# Kept open: a fresh TLS handshake per send doubles its latency. httpx clients are thread-safe.
+_CLIENT = httpx.Client(timeout=30.0)
+
 # "Notes to self" — the write-safe default target.
 NOTES_THREAD = "48:notes"
 
@@ -80,7 +83,7 @@ def send_message(
         "contenttype": "text",
         "imdisplayname": display_name,
     }
-    resp = httpx.post(f"{base}/messages", headers=_headers(skype_token, settings), json=body, timeout=30.0)
+    resp = _CLIENT.post(f"{base}/messages", headers=_headers(skype_token, settings), json=body)
     result = _check(resp, "send")
     log.info("message_sent", thread=thread_id, clientmessageid=client_message_id, status=result["status"])
     return {"clientmessageid": client_message_id, **result}
@@ -94,7 +97,7 @@ def mark_read(settings: Settings, skype_token: str, thread_id: str, message_id: 
     )
     # "<id>;<now ms>;<client message id>" — the client id is unknown here; the message id passes.
     body = {"consumptionhorizon": f"{message_id};{int(time.time() * 1000)};{message_id}"}
-    result = _check(httpx.put(url, headers=_headers(skype_token, settings), json=body, timeout=30.0), "read")
+    result = _check(_CLIENT.put(url, headers=_headers(skype_token, settings), json=body), "read")
     log.info("marked_read", thread=thread_id, message_id=message_id, status=result["status"])
     return result
 
@@ -118,6 +121,6 @@ def edit_message(
         "contenttype": "text",
         "skypeeditedid": message_id,
     }
-    result = _check(httpx.put(url, headers=_headers(skype_token, settings), json=body, timeout=30.0), "edit")
+    result = _check(_CLIENT.put(url, headers=_headers(skype_token, settings), json=body), "edit")
     log.info("message_edited", thread=thread_id, message_id=message_id, status=result["status"])
     return result
