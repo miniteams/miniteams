@@ -37,7 +37,7 @@ def parse_message_link(value: str) -> tuple[str, str] | None:
     return unquote(match.group(1)), unquote(match.group(2))
 
 
-def _content(text: str, is_html: bool) -> str:
+def message_html(text: str, is_html: bool) -> str:
     # messagetype is RichText/Html; plain text is escaped (newlines → <br>), --html sent verbatim.
     return text if is_html else html.escape(text).replace("\n", "<br>")
 
@@ -75,7 +75,7 @@ def send_message(
     client_message_id = str(int(time.time() * 1000))
     body = {
         "clientmessageid": client_message_id,
-        "content": _content(text, is_html),
+        "content": message_html(text, is_html),
         "messagetype": "RichText/Html",
         "contenttype": "text",
         "imdisplayname": display_name,
@@ -113,7 +113,7 @@ def edit_message(
         f"/{quote(thread_id, safe='')}/messages/{quote(message_id, safe='')}"
     )
     body = {
-        "content": _content(text, is_html),
+        "content": message_html(text, is_html),
         "messagetype": "RichText/Html",
         "contenttype": "text",
         "skypeeditedid": message_id,
