@@ -25,7 +25,7 @@ data/
 -- index.db
 chats(id TEXT PK, dir TEXT, label TEXT, topic TEXT, participants TEXT /*JSON*/,
       raw TEXT /*JSON conversation object*/, backfill_done INT, last_fetch_at TEXT,
-      history_denied_at TEXT)
+      history_denied_at TEXT, synced_version INT /*conv version at the last complete pass*/)
 
 -- <thread>/messages.db
 messages(id TEXT PK, composetime TEXT /*ISO-8601 UTC*/, raw TEXT /*JSON message*/)

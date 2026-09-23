@@ -359,6 +359,18 @@ def test_refreshing_token_reexchanges_before_expiry(settings: Settings, monkeypa
     assert len(exchanges) == 2
 
 
+def _spy_log(monkeypatch) -> list[tuple[str, str, dict[str, Any]]]:
+    """Record archive log calls; the test config filters info out before any capture."""
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    class _Log:
+        def __getattr__(self, level):  # noqa: ANN001
+            return lambda event, **kw: events.append((level, event, kw))
+
+    monkeypatch.setattr(AR, "log", _Log())
+    return events
+
+
 async def test_resume_skips_unchanged_chat(settings: Settings, tmp_path, monkeypatch) -> None:
     """A backfilled chat whose enumeration lastMessage <= stored newest is skipped entirely:
     no thread fetch, no history call, no media/avatar rescan."""
@@ -383,10 +395,93 @@ async def test_resume_skips_unchanged_chat(settings: Settings, tmp_path, monkeyp
         return {"topic": "", "members": [], "picture": None}
 
     monkeypatch.setattr(AR.Directory, "thread", fake_thread)
+    events = _spy_log(monkeypatch)
     await _run(settings, data)
 
     assert hist_calls == []  # no top-up / backfill request
+    assert [kw["by"] for _, event, kw in events if event == "chat_unchanged"] == ["activity"]
     assert thread_fetched == []  # thread metadata not even fetched
+
+
+def _seed_synced(data: Path, msgs: list[dict[str, Any]], version: int) -> None:
+    pre = ChatStore(data, C1)
+    pre.insert_page(msgs)
+    pre.close()
+    index = Index(data)
+    index.upsert_chat(C1)
+    index.mark_backfill_done(C1)
+    index.mark_synced(C1, version)
+    index.close()
+
+
+def _count_history(monkeypatch) -> list[str]:
+    calls: list[str] = []
+    monkeypatch.setattr(AR, "iter_history_pages", lambda *a, **k: calls.append("x") or iter([]))
+    return calls
+
+
+@pytest.mark.parametrize(
+    "msgs",
+    [[_msg("a1", "2026-07-01T09:00:00Z")], []],
+    ids=["no-last-message", "empty-store"],
+)
+async def test_resume_skips_chat_with_unchanged_version(settings, tmp_path, monkeypatch, msgs) -> None:
+    """Meeting chats: no lastMessage (version fallback is newer than any message) or no message
+    at all. The timestamp check can never pass; an unchanged version must still skip."""
+    data = tmp_path / "data"
+    _seed_synced(data, msgs, version=1790000000000)  # 2026-09: after the stored message
+    hist = _count_history(monkeypatch)
+    conv = {"id": C1, "version": 1790000000000}
+    monkeypatch.setattr(AR, "fetch_conversations", lambda s, tok: iter([[conv]]))
+    _wire_directory(monkeypatch)
+    events = _spy_log(monkeypatch)
+    await _run(settings, data)
+    assert hist == []
+    assert [kw["by"] for _, event, kw in events if event == "chat_unchanged"] == ["version"]
+
+
+async def test_resume_fetches_chat_whose_version_moved(settings, tmp_path, monkeypatch) -> None:
+    data = tmp_path / "data"
+    _seed_synced(data, [_msg("a1", "2026-07-01T09:00:00Z")], version=1790000000000)
+    hist = _count_history(monkeypatch)
+    conv = {"id": C1, "version": 1790000000001}
+    monkeypatch.setattr(AR, "fetch_conversations", lambda s, tok: iter([[conv]]))
+    _wire_directory(monkeypatch)
+    await _run(settings, data)
+    assert hist  # top-up ran
+    index = Index(data)
+    assert index.synced_version(C1) == 1790000000001  # recorded after the complete pass
+    index.close()
+
+
+async def test_failed_pass_does_not_record_version(settings, tmp_path, monkeypatch) -> None:
+    """The version is the skip proof: storing it before the pass completes would freeze a chat
+    whose fetch failed."""
+    data = tmp_path / "data"
+    _seed_synced(data, [_msg("a1", "2026-07-01T09:00:00Z")], version=1790000000000)
+
+    def boom(*a, **k):  # noqa: ANN002, ANN003
+        raise RuntimeError("history down")
+
+    monkeypatch.setattr(AR, "iter_history_pages", boom)
+    conv = {"id": C1, "version": 1790000000001}
+    monkeypatch.setattr(AR, "fetch_conversations", lambda s, tok: iter([[conv]]))
+    _wire_directory(monkeypatch)
+    await _run(settings, data)  # run_archive logs chat_archive_failed and carries on
+    index = Index(data)
+    assert index.synced_version(C1) == 1790000000000
+    index.close()
+
+
+def _wire_directory(monkeypatch) -> None:
+    async def fake_thread(self, tid):  # noqa: ANN001
+        return {"topic": "", "members": [], "picture": None}
+
+    async def fake_label(self, tid):  # noqa: ANN001
+        return "L"
+
+    monkeypatch.setattr(AR.Directory, "thread", fake_thread)
+    monkeypatch.setattr(AR.Directory, "label", fake_label)
 
 
 async def test_verify_media_forces_pass_on_unchanged_chat(settings: Settings, tmp_path, monkeypatch) -> None:
@@ -404,15 +499,7 @@ async def test_verify_media_forces_pass_on_unchanged_chat(settings: Settings, tm
     conv = {"id": C1, "lastMessage": {"composetime": "2026-07-01T09:00:00Z"}}  # unchanged
     monkeypatch.setattr(AR, "fetch_conversations", lambda s, tok: iter([[conv]]))
     monkeypatch.setattr(AR, "iter_history_pages", _FakeApi({C1: []}).iter_pages)
-
-    async def fake_thread(self, tid):  # noqa: ANN001
-        return {"topic": "", "members": [], "picture": None}
-
-    async def fake_label(self, tid):  # noqa: ANN001
-        return "L"
-
-    monkeypatch.setattr(AR.Directory, "thread", fake_thread)
-    monkeypatch.setattr(AR.Directory, "label", fake_label)
+    _wire_directory(monkeypatch)
 
     media_ran = []
     monkeypatch.setattr(AR, "_download_media", lambda *a, **k: media_ran.append(1) or _acount())
