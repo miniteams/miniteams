@@ -51,6 +51,10 @@ _CALL_STARTER_RE = re.compile(
 _LABEL_CONCURRENCY = 8
 _HISTORY_PAGE = 20  # history fetched per row at bootstrap: stub resolution + mention scan
 _MENTION_SCAN = 50  # newest rows whose history is scanned for mentions at bootstrap
+_FIRST_CHUNK = 50  # rows the background fill paints before walking the rest of the listing
+# Default table depth: seeded rows cost no API call, a fetched one costs two.
+_LIMIT_SEEDED = 400
+_LIMIT_BARE = 250
 # Snippets that mean "the listing did not say": the archive may know better.
 _STUB_SNIPPETS = ("🗑 deleted", "📎 attachment")
 _PAGE_POLL = 2.0  # seconds between widget.html mtime checks (dev reload)
@@ -273,6 +277,8 @@ def seed_from_archive(data_dir: Path, me: str = "") -> dict[str, dict[str, Any]]
                 "sender": str(last.get("imdisplayname") or ""),
                 "read_id": read_up_to(conv.get("properties")),
                 "read_at": read_at_ms(conv.get("properties")),
+                "last_activity": last_activity(conv),
+                "last_id": str(last.get("id") or ""),
             }
     except (OSError, sqlite3.Error) as exc:
         event = "archive_index_absent" if isinstance(exc, FileNotFoundError) else "archive_index_unusable"
@@ -332,6 +338,36 @@ async def sender_of(resource: dict[str, Any], directory: Directory | None) -> st
     return str(name) if name else (await directory.display(mri) if mri else "")
 
 
+def seeded_rows(seed: dict[str, dict[str, Any]], limit: int) -> dict[str, dict[str, Any]]:
+    """The newest `limit` archived chats as display rows — the first paint, before any API call.
+
+    The listing has not been walked yet, so this ordering is the archive's: a chat that moved while
+    the widget was down sorts late until the real listing lands and the table is replaced.
+    """
+    newest = sorted(
+        ((tid, row) for tid, row in seed.items() if row["last_activity"]),
+        key=lambda kv: str(kv[1]["last_activity"]),
+        reverse=True,
+    )
+    return {
+        thread_id: {
+            "id": thread_id,
+            "label": row["label"] or thread_id,
+            "last_activity": row["last_activity"],
+            "last_id": row["last_id"],
+            "read_id": row["read_id"],
+            "read_at": row["read_at"],
+            "unread": is_unread(row["last_id"], row["read_id"]),
+            "mention": None,
+            "sender": row["sender"],
+            "text": row["text"],
+            "seen_at": None,
+            "typing": [],
+        }
+        for thread_id, row in (newest[:limit] if limit else newest)
+    }
+
+
 async def bootstrap(
     pages: Iterable[list[dict[str, Any]]],
     directory: Directory,
@@ -339,6 +375,7 @@ async def bootstrap(
     me: str = "",
     seen: dict[str, str] | None = None,
     seed: dict[str, dict[str, Any]] | None = None,
+    rank_offset: int = 0,
 ) -> dict[str, dict[str, Any]]:
     """In-scope conversations from the newest-first listing, capped at `limit` (0 = walk all).
 
@@ -393,7 +430,7 @@ async def bootstrap(
                 await _scan_mentions(row, recent, directory, me)
             return row
 
-    rows = await asyncio.gather(*(build(conv, rank) for rank, conv in enumerate(picked)))
+    rows = await asyncio.gather(*(build(conv, rank) for rank, conv in enumerate(picked, rank_offset)))
     return {row["id"]: row for row in rows}
 
 
@@ -521,6 +558,7 @@ class Board:
         open_scheme: str = "msteams",
         browser: list[str] | None = None,
         me: str = "",
+        busy: bool = False,
     ) -> None:
         self.rows = rows
         self.directory = directory
@@ -534,6 +572,7 @@ class Board:
         self.open_scheme = open_scheme
         self.browser = browser  # argv for the https link on Ctrl/middle click; None = page's own browser
         self.clients: set[ServerConnection] = set()
+        self.busy = busy  # the page shows a spinner until the background fill says otherwise
         self._typing_timers: dict[tuple[str, str], asyncio.TimerHandle] = {}
         self._seen: dict[str, str] = _load_seen(seen_path)
         self._muted: dict[str, str] = _load_seen(muted_path)  # thread → when muted (same shape)
@@ -541,6 +580,44 @@ class Board:
             row["seen_at"] = self._seen.get(row["id"])
             row["muted"] = row["id"] in self._muted
             row.setdefault("mention", None)
+
+    def set_busy(self, busy: bool) -> None:
+        self.busy = busy
+        self.broadcast()
+
+    def replace(self, rows: dict[str, dict[str, Any]], busy: bool = False) -> None:
+        """Swap the table for the freshly bootstrapped one, keeping what only the live page knows.
+
+        A message landing during the fill created or moved a row: its `typing` and anything newer
+        than what the fill saw must survive, or the page would visibly go backwards.
+        """
+        for thread_id, row in rows.items():
+            live = self.rows.get(thread_id)
+            if live and str(live.get("last_activity") or "") > str(row.get("last_activity") or ""):
+                continue  # the stream already knows better than the listing did
+            row["typing"] = live["typing"] if live else []
+            row["seen_at"] = self._seen.get(thread_id)
+            row["muted"] = thread_id in self._muted
+            row.setdefault("mention", None)
+            self.rows[thread_id] = row
+        self.busy = busy
+        self.broadcast()
+
+    def prune(self, keep: set[str], newer_than: str) -> int:
+        """Drop the seeded rows the live listing did not return; returns how many went.
+
+        Without this the table holds both sets — the archive's newest `--limit` chats *and* the
+        listing's — so a widget whose archive lags doubles its row count and its payload. A row the
+        stream touched since the walk started is not the listing's to disown.
+        """
+        gone = [
+            thread_id
+            for thread_id, row in self.rows.items()
+            if thread_id not in keep and str(row.get("last_activity") or "") <= newer_than
+        ]
+        for thread_id in gone:
+            del self.rows[thread_id]
+        return len(gone)
 
     # --- seen marker (page verb) ---
 
@@ -804,6 +881,7 @@ class Board:
                 "opener": self.opener is not None,
                 "browser": self.browser is not None,
                 "me": self.me_name,
+                "busy": self.busy,
             },
             ensure_ascii=False,
         )
@@ -940,11 +1018,64 @@ async def serve_board(board: Board, settings: Settings, bind: str | None) -> Non
             save_bind(settings, host, port)
 
 
+def resolve_limit(limit: int | None, seeded: bool) -> int:
+    """How deep the table goes. `--limit` wins, including `0` (no limit).
+
+    Seeded rows cost no API call, so the default goes deeper when an archive is there; without one
+    every row is fetched twice over and the same depth would mean minutes of blank page.
+    """
+    return limit if limit is not None else (_LIMIT_SEEDED if seeded else _LIMIT_BARE)
+
+
+def _listed(settings: Settings, skype_token: str, limit: int) -> list[dict[str, Any]]:
+    """In-scope conversations from the live listing, newest first, capped — one blocking walk."""
+    picked: list[dict[str, Any]] = []
+    for page in fetch_conversations(settings, skype_token):
+        for conv in page:
+            thread_id = str(conv.get("id") or "")
+            if thread_id and in_scope(thread_id) and last_activity(conv):
+                picked.append(conv)
+                if limit and len(picked) >= limit:
+                    return picked
+    return picked
+
+
+async def fill_from_listing(
+    board: Board,
+    settings: Settings,
+    skype_token: str,
+    directory: Directory,
+    limit: int,
+    me: str,
+    seen: dict[str, str],
+    seed: dict[str, dict[str, Any]],
+) -> None:
+    """Replace the seeded table with the live listing, head first; the page spins until it ends.
+
+    Two passes so a widget with no archive shows something quickly: the head carries the mention
+    scan, the tail continues at its rank so nothing is scanned twice.
+    """
+    started = _iso(int(datetime.now(UTC).timestamp() * 1000))
+    try:
+        convs = await asyncio.to_thread(_listed, settings, skype_token, limit)
+        head = min(_FIRST_CHUNK, limit or _FIRST_CHUNK)
+        board.replace(await bootstrap([convs[:head]], directory, 0, me, seen, seed), busy=True)
+        if len(convs) > head:
+            rest = await bootstrap([convs[head:]], directory, 0, me, seen, seed, rank_offset=head)
+            board.replace(rest, busy=True)
+        dropped = board.prune({str(conv.get("id") or "") for conv in convs}, started)
+        log.info("web_bootstrap", rows=len(board.rows), listed=len(convs), seeded=len(seed), dropped=dropped)
+    except Exception as exc:  # noqa: BLE001 — a failed fill leaves the seeded table, not a dead page
+        log.error("web_bootstrap_failed", error=str(exc), error_type=type(exc).__name__)
+    finally:
+        board.set_busy(False)  # a spinner that never stops is worse than no spinner
+
+
 async def run(
     settings: Settings,
     skype_token: str,
     bearer: str,
-    limit: int,
+    limit: int | None,
     bind: str | None,
     reactions: bool = False,
     opener: str = "xdg-open",
@@ -957,13 +1088,11 @@ async def run(
     directory.set_token(skype_token, bearer)
     directory.me = me
     seen_path = settings.config_dir / "seen.json"
+    seen = _load_seen(seen_path)
     seed = await asyncio.to_thread(seed_from_archive, data_dir, me) if data_dir else {}
-    rows = await bootstrap(
-        fetch_conversations(settings, skype_token), directory, limit, me, _load_seen(seen_path), seed
-    )
-    log.info("web_bootstrap", rows=len(rows), seeded=len(seed), me=bool(me))
+    cap = resolve_limit(limit, seeded=bool(seed))
     board = Board(
-        rows,
+        seeded_rows(seed, cap),
         directory,
         reactions=reactions,
         seen_path=seen_path,
@@ -972,15 +1101,22 @@ async def run(
         open_scheme=open_scheme,
         browser=None if browser in ("", "none") else browser.split(),
         me=me,
+        busy=True,
     )
+    log.info("web_seeded", rows=len(board.rows), seeded=len(seed), limit=cap, me=bool(me))
     # The stream only returns when auth is dead: a page that silently stops updating is worse
     # than an exit, so the server goes down with it and the user re-runs.
     server = asyncio.create_task(serve_board(board, settings, bind))
+    # The page is up before the listing is walked: it fills in, it does not wait.
+    fill = asyncio.create_task(
+        fill_from_listing(board, settings, skype_token, directory, cap, me, seen, seed)
+    )
     # Own endpoint id: sharing `stream`'s would make whichever registered last the only receiver.
     stream = asyncio.create_task(
         run_forever(settings, on_event=board.on_event, directory=directory, epid_name="endpoint_id-web")
     )
     done, pending = await asyncio.wait({server, stream}, return_when=asyncio.FIRST_COMPLETED)
+    fill.cancel()  # the page is going away; a half-finished walk has nobody to tell
     for task in pending:
         task.cancel()
     for task in done:

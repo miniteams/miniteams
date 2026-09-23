@@ -403,7 +403,10 @@ def main(argv: list[str] | None = None) -> int:
 
     p_web = sub.add_parser("web", help="serve the live conversation-list widget (local page)")
     p_web.add_argument(
-        "--limit", type=_non_negative_int, default=50, help="max conversations to load (0 = no limit)"
+        "--limit",
+        type=_non_negative_int,
+        default=None,
+        help="max conversations to load (0 = no limit; default 400 with an archive, 250 without)",
     )
     p_web.add_argument("--data-dir", default="data", help="archive root to seed rows from (default: ./data)")
     p_web.add_argument("--bind", help="ADDR:PORT to listen on (default: persisted random 127.0.0.X:PORT)")
