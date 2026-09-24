@@ -365,3 +365,16 @@ def _http_error(status: int) -> Exception:
 
     request = httpx.Request("GET", "https://x")
     return httpx.HTTPStatusError("x", request=request, response=httpx.Response(status, request=request))
+
+
+async def test_run_live_reconciles_on_a_timer(settings: Settings, tmp_path, monkeypatch) -> None:
+    """The safety net for events Trouter drops without saying so: a pass runs every interval."""
+    passes: list[frozenset[str]] = []
+    monkeypatch.setattr(AL.LiveArchive, "_pass", lambda self, force: passes.append(force) or False)
+
+    async def fake_forever(s, **kw):  # noqa: ANN001
+        await asyncio.sleep(0.5)
+
+    monkeypatch.setattr(AL, "run_forever", fake_forever)
+    await AL.run_live(settings, tmp_path / "data", token_provider=StaticToken("sk"), reconcile=0.1)
+    assert len(passes) >= 2

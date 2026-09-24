@@ -246,7 +246,16 @@ def test_archive_retries_a_transient_aad_error(monkeypatch) -> None:
     assert slept == [2.0]
 
 
-@pytest.mark.parametrize("extra", [["--loop"], ["--thread", "19:x"], ["--assets-only"], ["--retry-assets"]])
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--loop"],
+        ["--thread", "19:x"],
+        ["--assets-only"],
+        ["--retry-assets"],
+        ["--recheck-since", "2026-09-22"],
+    ],
+)
 def test_archive_live_refuses_contradicting_flags(extra: list[str], capsys) -> None:
     with pytest.raises(SystemExit) as exc:
         cli.main(["archive", "--live", *extra])
@@ -266,3 +275,35 @@ def test_archive_live_exits_1_when_the_refresh_token_dies(monkeypatch) -> None:
     monkeypatch.setattr(auth.TokenSource, "acquire", lambda self: {"access_token": "x"})
     assert cli.main(["archive", "--live", "--no-media"]) == 1
     assert calls and calls[0]["download_media"] is False
+    assert calls[0]["reconcile"] == 1800
+    assert cli.main(["archive", "--live", "60"]) == 1
+    assert calls[1]["reconcile"] == 60
+
+
+def test_recheck_since_is_one_shot_and_validated(capsys) -> None:
+    for argv in (
+        ["--recheck-since", "2026-09-22", "--loop"],
+        ["--recheck-since", "yesterday"],
+        ["--recheck-since", "2026-09-22", "--assets-only"],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["archive", *argv])
+        assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "cannot be combined with --loop" in err and "invalid" in err
+    assert "cannot be combined with --assets-only" in err
+
+
+def test_recheck_since_reaches_the_run_as_a_utc_floor(monkeypatch) -> None:
+    from miniteams import archive, auth
+
+    seen: dict[str, object] = {}
+
+    async def fake_run_archive(settings, data_dir, **kw):  # noqa: ANN001
+        seen.update(kw)
+        return False
+
+    monkeypatch.setattr(archive, "run_archive", fake_run_archive)
+    monkeypatch.setattr(auth.TokenSource, "acquire", lambda self: {"access_token": "x"})
+    assert cli.main(["archive", "--recheck-since", "2026-09-22T02:00:00+02:00"]) == 0
+    assert seen["recheck_since"] == "2026-09-22T00:00:00"

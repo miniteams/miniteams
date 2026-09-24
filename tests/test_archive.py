@@ -1000,3 +1000,123 @@ async def test_force_also_overrides_the_version_skip(settings: Settings, tmp_pat
     assert _stored_ids(data, C1) == {"a1"}  # unforced: skipped by version
     await _run(settings, data, download_media=False, force=frozenset({C1}))
     assert _stored_ids(data, C1) == {"a1", "a2"}
+
+
+def _backfilled(data: Path, thread_id: str) -> None:
+    index = Index(data)
+    index.upsert_chat(thread_id)
+    index.mark_backfill_done(thread_id)
+    index.close()
+
+
+async def test_a_live_write_does_not_hide_a_message_the_stream_missed(
+    settings: Settings, tmp_path, monkeypatch
+) -> None:
+    """Trouter lost m2 without a gap signal, then delivered m3 live: the next pass still fetches m2."""
+    full = [_msg(f"m{i}", f"2026-07-0{i}T09:00:00Z") for i in (1, 2, 3)]
+    data = tmp_path / "data"
+    pre = ChatStore(data, C1)
+    pre.insert_page([full[0]])
+    pre.apply_message(full[2], "2026-07-03T09:00:01Z")
+    pre.close()
+    _backfilled(data, C1)
+    _wire(monkeypatch, _FakeApi({C1: full}), [C1])
+    conv = {"id": C1, "lastMessage": {"composetime": full[2]["composetime"]}}
+    monkeypatch.setattr(AR, "fetch_conversations", lambda s, tok: iter([[conv]]))
+    monkeypatch.setattr(AR, "_PAGE_SIZE", 1)
+    await _run(settings, data)
+
+    assert _stored_ids(data, C1) == {"m1", "m2", "m3"}
+
+
+async def test_an_interrupted_top_up_leaves_no_gap(settings: Settings, tmp_path, monkeypatch) -> None:
+    full = [_msg(f"m{i}", f"2026-07-0{i}T09:00:00Z") for i in range(1, 6)]
+    data = tmp_path / "data"
+    pre = ChatStore(data, C1)
+    pre.insert_page([full[0]])
+    pre.close()
+    _backfilled(data, C1)
+    api = _FakeApi({C1: full})
+    _wire(monkeypatch, api, [C1])
+    monkeypatch.setattr(AR, "_PAGE_SIZE", 1)
+
+    def first_page_then_reset(*a, **k):  # noqa: ANN002, ANN003
+        pages = api.iter_pages(*a, **k)
+        yield next(pages)
+        raise RuntimeError("connection reset")
+
+    monkeypatch.setattr(AR, "iter_history_pages", first_page_then_reset)
+    await _run(settings, data)
+    assert _stored_ids(data, C1) == {"m1", "m5"}
+
+    monkeypatch.setattr(AR, "iter_history_pages", api.iter_pages)
+    await _run(settings, data)
+    assert _stored_ids(data, C1) == {f"m{i}" for i in range(1, 6)}
+
+
+async def test_recheck_since_walks_back_to_the_date_on_chats_active_since(
+    settings: Settings, tmp_path, monkeypatch
+) -> None:
+    """An archive already holding a hole under its newest message (rows written live before the
+    watermark existed) gets it filled; chats idle since the date keep their fast-skip."""
+    full = [_msg(f"m{i}", f"2026-07-0{i}T09:00:00Z") for i in (1, 2, 3)]
+    old = _msg("b1", "2026-06-01T09:00:00Z")
+    data = tmp_path / "data"
+    pre = ChatStore(data, C1)
+    pre.insert_page([full[2], full[0]])
+    pre.close()
+    pre = ChatStore(data, C2)
+    pre.insert_page([old])
+    pre.close()
+    _backfilled(data, C1)
+    _backfilled(data, C2)
+    api = _FakeApi({C1: full, C2: [old]})
+    _wire(monkeypatch, api, [C1, C2])
+    convs = [
+        {"id": C1, "lastMessage": {"composetime": full[2]["composetime"]}},
+        {"id": C2, "lastMessage": {"composetime": old["composetime"]}},
+    ]
+    monkeypatch.setattr(AR, "fetch_conversations", lambda s, tok: iter([convs]))
+    monkeypatch.setattr(AR, "_PAGE_SIZE", 1)
+
+    await _run(settings, data)
+    assert _stored_ids(data, C1) == {"m1", "m3"}  # fast-skipped: the hole is invisible
+
+    await _run(settings, data, recheck_since="2026-07-01T00:00:00")
+    assert _stored_ids(data, C1) == {"m1", "m2", "m3"}
+    assert {thread for thread, _ in api.calls} == {C1}
+
+
+async def test_a_chat_holding_only_live_rows_is_walked_in_full(
+    settings: Settings, tmp_path, monkeypatch
+) -> None:
+    """A meeting chat backfilled while still empty, then written live: nothing bounds its top-up."""
+    full = [_msg(f"m{i}", f"2026-07-0{i}T09:00:00Z") for i in (1, 2)]
+    data = tmp_path / "data"
+    pre = ChatStore(data, C1)
+    pre.apply_message(full[1], "2026-07-02T09:00:01Z")
+    pre.close()
+    _backfilled(data, C1)
+    _wire(monkeypatch, _FakeApi({C1: full}), [C1])
+    monkeypatch.setattr(AR, "_PAGE_SIZE", 1)
+    await _run(settings, data)
+
+    assert _stored_ids(data, C1) == {"m1", "m2"}
+    store = ChatStore(data, C1)
+    assert store.newest() == full[1]["composetime"]  # the walk confirmed the live row
+    store.close()
+
+
+async def test_recheck_since_applies_to_a_named_thread(settings: Settings, tmp_path, monkeypatch) -> None:
+    """--thread carries no activity to compare: naming the chat is the request to recheck it."""
+    full = [_msg(f"m{i}", f"2026-07-0{i}T09:00:00Z") for i in (1, 2, 3)]
+    data = tmp_path / "data"
+    pre = ChatStore(data, C1)
+    pre.insert_page([full[2], full[0]])
+    pre.close()
+    _backfilled(data, C1)
+    _wire(monkeypatch, _FakeApi({C1: full}), [C1])
+    monkeypatch.setattr(AR, "_PAGE_SIZE", 1)
+    await _run(settings, data, thread=C1, recheck_since="2026-07-01T00:00:00")
+
+    assert _stored_ids(data, C1) == {"m1", "m2", "m3"}
