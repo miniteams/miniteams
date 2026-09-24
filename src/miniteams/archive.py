@@ -165,15 +165,27 @@ def _enumerate(settings: Settings, skype_token: str, include_all: bool) -> list[
     return targets
 
 
-def _topup(settings: Settings, skype_token: str, thread_id: str, store: ChatStore, label: str) -> int:
-    """Fetch messages newer than what's stored; stop as soon as a page overlaps the stored top."""
-    known_newest = store.newest()
-    if not known_newest:
+def _topup(
+    settings: Settings,
+    skype_token: str,
+    thread_id: str,
+    store: ChatStore,
+    label: str,
+    floor: str | None = None,
+) -> int:
+    """Fetch messages newer than the top-up bound; stop as soon as a page overlaps it. `floor`
+    (--recheck-since) lowers the bound to re-walk what an older archive may have skipped."""
+    if not store.oldest():
         return 0  # empty store → backfill does the full pull; nothing to top up
+    # No bound (only live rows so far) walks the whole history: none of it is proven.
+    bound = min(filter(None, (store.newest(), floor)), default=None)
     added = pages = 0
+    top = ""
     start = time.monotonic()
     for messages in iter_history_pages(settings, skype_token, thread_id, _PAGE_SIZE, 0):
-        added += store.insert_page(messages)
+        # Pending until the walk reaches the bound: a reset mid-walk must not lift `newest()`.
+        added += store.insert_page(messages, pending=True)
+        top = top or str(messages[0].get("composetime", ""))
         pages += 1
         oldest_in_page = str(messages[-1].get("composetime", ""))  # newest-first → last is oldest
         log.info(
@@ -185,9 +197,11 @@ def _topup(settings: Settings, skype_token: str, thread_id: str, store: ChatStor
             oldest=oldest_in_page[:19],
             msgs_per_s=_rate(added, start),
         )
-        if oldest_in_page <= known_newest:
+        if bound and oldest_in_page <= bound:
             break  # reached messages already stored — everything older is known
         time.sleep(_INTER_PAGE_DELAY)
+    if top:
+        store.confirm(top)
     return added
 
 
@@ -371,6 +385,7 @@ async def archive_chat(
     sp_token: Callable[[str], str | None] | None = None,
     graph_token: Callable[[], str | None] | None = None,
     force: bool = False,
+    floor: str | None = None,
 ) -> dict[str, int]:
     """Returns per-chat counts (`new`, `media`, `avatars`) for the run recap."""
     directory.set_token(skype_token, bearer)
@@ -405,7 +420,7 @@ async def archive_chat(
     # (skip-exists means only missing ones download) — covers a backfill that succeeded while
     # its media didn't (a prior --no-media run, download failures, an interrupted media pass).
     # `force` (live gap) too: a message stored past a lost one makes the chat look unchanged.
-    if conv and index.backfill_done(thread_id) and not (verify_media or force):
+    if conv and index.backfill_done(thread_id) and not (verify_media or force or floor):
         probe = ChatStore(data_dir, thread_id)
         newest, last = probe.newest(), last_activity(conv)
         probe.close()
@@ -441,7 +456,7 @@ async def archive_chat(
     store = ChatStore(data_dir, thread_id)
     start = time.monotonic()
     try:
-        new_top = _topup(settings, skype_token, thread_id, store, label)
+        new_top = _topup(settings, skype_token, thread_id, store, label, floor)
         new_old = 0
         # Empty store must re-backfill even when flagged done: a meeting chat archived BEFORE its
         # meeting drains an empty history and gets marked done — top-up then starts from nothing
@@ -505,8 +520,10 @@ async def run_archive(
     retry_denied: bool = False,
     retry_assets: bool = False,
     force: frozenset[str] = frozenset(),
+    recheck_since: str | None = None,
 ) -> bool:
-    """Returns True when the run stopped on AuthExpired (re-login needed), False otherwise."""
+    """Returns True when the run stopped on AuthExpired (re-login needed), False otherwise.
+    `recheck_since` re-walks every chat active since that UTC time down to it."""
     # Absolute: downloaded media paths are turned into file:// URIs (Path.as_uri), which rejects
     # relative paths — a relative --data-dir would otherwise fail every attachment.
     data_dir = data_dir.resolve()
@@ -589,6 +606,10 @@ async def run_archive(
                     sp_token=token_provider.sharepoint_token,
                     graph_token=token_provider.graph_token,
                     force=thread_id in force,
+                    # --thread carries no activity: naming the chat is the request to recheck it.
+                    floor=recheck_since
+                    if recheck_since and (thread or last_activity(conv) >= recheck_since)
+                    else None,
                 )
             except httpx.HTTPStatusError as exc:
                 # A chat can enumerate while its history is 403 (meeting access revoked): a known

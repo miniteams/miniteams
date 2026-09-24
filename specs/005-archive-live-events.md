@@ -30,14 +30,17 @@ dies, then stops cleanly with exit code 1, like `--loop`.
 
 ## Why buffer instead of writing live during the catch-up
 
-Top-up stops at the first page that overlaps `newest()`. If a live message lands in a chat before
-the pass reaches it, `newest()` jumps past the gap and top-up stops early, so the gap is never
-fetched. Buffering keeps `newest()` below every unfetched message. It also means a single writer
-touches the archive at any time: the pass, or the live applier, never both.
+Top-up stops at the first page that overlaps `newest()`. A live write must not lift `newest()`, or
+the gap under it is never fetched. Buffering alone does not ensure that: a chat that fails during
+the pass, or an event Trouter drops without a `message_loss`, still leaves a live row above a hole.
+So live rows are `pending` and `newest()` ignores them (amended 2026-09-24): only a top-up that
+walked down to its bound confirms what it covered. Buffering keeps a single writer: the pass, or
+the live applier, never both.
 
 ## Scope
 
-- `archive --live`. It excludes `--loop`, `--thread`, `--assets-only` and `--retry-assets`.
+- `archive --live [SECONDS]`. It excludes `--loop`, `--thread`, `--assets-only`, `--retry-assets`
+  and `--recheck-since`. A reconcile pass runs every SECONDS (default 1800).
   `--all`, `--no-media`, `--videos`, `--no-avatars` and `--data-dir` keep their meaning.
 - Own Trouter endpoint (`epid_name="endpoint_id-archive"`), so it runs next to `web` and `stream`
   without either stealing the other's registration.
@@ -114,8 +117,8 @@ touches the archive at any time: the pass, or the live applier, never both.
    ends up with no gap.
 9. The process runs past two skype-token lifetimes without a 401. A dead refresh token stops it with
    `archive_stopped reason=auth_expired` and exit code 1.
-10. `--live` combined with `--loop`, `--thread`, `--assets-only` or `--retry-assets` is refused by
-    the parser.
+10. `--live` combined with `--loop`, `--thread`, `--assets-only`, `--retry-assets` or
+    `--recheck-since` is refused by the parser.
 
 ## Phases
 
@@ -173,6 +176,9 @@ touches the archive at any time: the pass, or the live applier, never both.
   only one writer of this process touches the archive at a time.
 - One process, stream in the event loop, pass in a worker thread. The pass makes blocking HTTP calls
   and `time.sleep`; on the loop it would stall the acks and Trouter would drop the socket.
+- Live rows stay `pending` until a complete top-up covers them; a reconcile pass every 30 min
+  bounds how long a silently dropped event stays missing. `--recheck-since` repairs archives
+  written live before that. Decided 2026-09-24, after a review found both loss paths.
 - Spec number 005: 004 is taken by the seed work on `feat/seed-rows-from-archive`.
 - Conflict risk with 004 is low: it reads `index.db`, this one writes new keys into `raw` and adds
   store methods. Merge 004 first if both are ready.

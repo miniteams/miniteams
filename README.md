@@ -47,7 +47,10 @@ uv run miniteams archive --videos --verify-media       # also grab meeting recor
 uv run miniteams archive --loop 600                    # re-run forever, sleeping 600s between runs
                                                        # (bare --loop = 300s); stops on auth expiry
 uv run miniteams archive --live                        # catch up, then store each message as it
-                                                       # arrives; stops on auth expiry (exit 1)
+                                                       # arrives, plus a pass every 1800s (--live N);
+                                                       # stops on auth expiry (exit 1)
+uv run miniteams archive --recheck-since 2026-09-22    # one-shot: re-walk chats active since the
+                                                       # date down to it, filling any hole
 uv run miniteams web              # local live page: conversations newest-first (see below)
 uv run miniteams web --limit 0 --bind 127.0.0.5:8765   # load every chat (with an archive that is
                                                        # every archived chat: a heavier page)
@@ -113,9 +116,16 @@ buffers events while a normal pass catches the archive up, then applies them and
 one as it arrives. Edits, reactions and deletes update `messages.raw`; the version they replace is
 kept in `message_versions`. Attachments download in the background as each message arrives
 (`--no-media` and `--videos` apply). Read markers land in `index.db`. A reconnect, a real
-`trouter.message_loss` or a failed write triggers a new catch-up. It uses its own Trouter endpoint,
+`trouter.message_loss`, a failed write or the reconcile timer (`--live SECONDS`, default 1800)
+triggers a new catch-up. A live write stays pending until a pass tops the chat up past it, so a
+message the stream dropped without saying so is still fetched by the next pass. It uses its own Trouter endpoint,
 so it runs beside `web` and `stream`. It cannot be combined with `--loop`, `--thread`,
-`--assets-only` or `--retry-assets`.
+`--assets-only`, `--retry-assets` or `--recheck-since`.
+
+The top-up stops at the newest message a complete walk reached. `--recheck-since WHEN` lowers
+that bound to WHEN for every chat active since then: a one-shot repair for an archive that holds
+a hole under a newer message, e.g. rows `--live` wrote before that bound existed. It only adds
+missing messages; an edit missed meanwhile stays at the stored version.
 
 Tokens cache under `~/.config/miniteams/` (`0600`); re-runs are silent until the refresh
 token expires. Downloaded media (from `stream`) lives under `~/.cache/miniteams/media/`.

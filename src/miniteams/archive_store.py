@@ -231,9 +231,13 @@ class ChatStore:
             """CREATE TABLE IF NOT EXISTS messages (
                 id TEXT PRIMARY KEY,
                 composetime TEXT NOT NULL,
-                raw TEXT NOT NULL
+                raw TEXT NOT NULL,
+                pending INTEGER NOT NULL DEFAULT 0  -- not yet covered by a complete top-up walk
             )"""
         )
+        if "pending" not in {r[1] for r in self._db.execute("PRAGMA table_info(messages)")}:
+            # Rows written live before this column are indistinguishable: `archive --recheck-since`.
+            self._db.execute("ALTER TABLE messages ADD COLUMN pending INTEGER NOT NULL DEFAULT 0")
         self._db.execute("CREATE INDEX IF NOT EXISTS idx_messages_composetime ON messages (composetime)")
         # Negative cache for assets the archive gave up on; `--retry-assets` forces them all.
         # 403 (deleted object, lost share permission) is permanent — `retry_after` stays ''.
@@ -270,7 +274,7 @@ class ChatStore:
                 self._db.execute(f"ALTER TABLE denied_assets ADD COLUMN {name} {decl}")
         self._db.commit()
 
-    def insert_page(self, messages: list[dict[str, Any]]) -> int:
+    def insert_page(self, messages: list[dict[str, Any]], *, pending: bool = False) -> int:
         """Store one API page atomically; returns how many were actually new."""
         rows = []
         for message in messages:
@@ -280,13 +284,18 @@ class ChatStore:
                 log.warning("message_without_id_skipped", thread=self.thread_id)
                 continue
             rows.append(
-                (msg_id, str(message.get("composetime") or ""), json.dumps(message, ensure_ascii=False))
+                (
+                    msg_id,
+                    str(message.get("composetime") or ""),
+                    json.dumps(message, ensure_ascii=False),
+                    int(pending),
+                )
             )
         # total_changes delta, not COUNT(*) before/after: COUNT is O(rows) and this runs per page.
         before = self._db.total_changes
         with self._db:
             self._db.executemany(
-                "INSERT OR IGNORE INTO messages (id, composetime, raw) VALUES (?, ?, ?)", rows
+                "INSERT OR IGNORE INTO messages (id, composetime, raw, pending) VALUES (?, ?, ?, ?)", rows
             )
         return self._db.total_changes - before
 
@@ -300,7 +309,8 @@ class ChatStore:
             row = self._db.execute("SELECT composetime, raw FROM messages WHERE id = ?", (msg_id,)).fetchone()
             if row is None:
                 self._db.execute(
-                    "INSERT INTO messages (id, composetime, raw) VALUES (?, ?, ?)",
+                    # Pending: a live message says nothing of the ones before it (see `newest`).
+                    "INSERT INTO messages (id, composetime, raw, pending) VALUES (?, ?, ?, 1)",
                     (msg_id, str(message.get("composetime") or ""), json.dumps(message, ensure_ascii=False)),
                 )
                 return "new"
@@ -342,9 +352,17 @@ class ChatStore:
         return row[0] if row and row[0] else None
 
     def newest(self) -> str | None:
-        """Top-up overlap bound: composetime of the newest stored message."""
-        row = self._db.execute("SELECT MAX(composetime) FROM messages").fetchone()
+        """Top-up overlap bound: composetime of the newest message a complete walk reached. A live
+        write or a half-done top-up can hold a newer one past a hole the next top-up must cross."""
+        row = self._db.execute("SELECT MAX(composetime) FROM messages WHERE pending = 0").fetchone()
         return row[0] if row and row[0] else None
+
+    def confirm(self, upto: str) -> None:
+        """A top-up walked down to the bound without a hole: everything up to `upto` is covered."""
+        with self._db:
+            self._db.execute(
+                "UPDATE messages SET pending = 0 WHERE pending = 1 AND composetime <= ?", (upto,)
+            )
 
     def iter_messages(self) -> Iterator[dict[str, Any]]:
         """Yield every stored message (raw JSON), oldest first."""

@@ -1,9 +1,8 @@
 """Archive follows the live stream (spec 005): subscribe, buffer, catch up, drain, follow.
 
-Events are buffered, not written, while a catch-up pass runs: top-up stops at the first page
-overlapping `newest()`, so a live write landing before the pass reaches its chat would lift
-`newest()` over the gap and the gap would never be fetched. Buffering also keeps a single writer:
-the pass, or the live applier, never both.
+Live writes are pending (`ChatStore.newest` ignores them), so the next top-up still crosses any
+message Trouter dropped without a gap signal; a reconcile pass on a timer bounds how long that
+takes. Events are buffered, not written, while a pass runs: a single writer, never both.
 """
 
 import asyncio
@@ -284,6 +283,13 @@ class LiveArchive:
         self._dropped = 0
         return True
 
+    async def reconcile(self, every: float) -> None:
+        """Pass on a timer: the only catch-up for losses the stream never reports."""
+        while True:
+            await asyncio.sleep(every)
+            if self._catchup is None or self._catchup.done():
+                await self.on_gap("reconcile")
+
     def close(self) -> None:
         self.index.close()
 
@@ -297,6 +303,7 @@ async def run_live(
     download_media: bool = True,
     download_avatars: bool = True,
     download_videos: bool = False,
+    reconcile: float = 1800.0,
 ) -> bool:
     """Returns True when it stopped on a dead refresh token (re-login needed)."""
     live = LiveArchive(
@@ -312,10 +319,11 @@ async def run_live(
         run_forever(settings, on_event=live.on_event, on_gap=live.on_gap, epid_name="endpoint_id-archive")
     )
     stop = asyncio.create_task(live.stopped.wait())
+    timer = asyncio.create_task(live.reconcile(reconcile))
     try:
         await asyncio.wait({stream, stop}, return_when=asyncio.FIRST_COMPLETED)
     finally:
-        for task in (stream, stop, live._catchup):
+        for task in (stream, stop, timer, live._catchup):
             if task is not None:
                 task.cancel()
         live.close()

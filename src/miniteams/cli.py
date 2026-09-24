@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import sys
+from datetime import UTC
 from typing import Any
 
 import structlog
@@ -209,6 +210,7 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
                     download_media=not args.no_media,
                     download_avatars=not args.no_avatars,
                     download_videos=args.videos,
+                    reconcile=args.live,
                 )
             )
         except KeyboardInterrupt:
@@ -234,6 +236,7 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
                         assets_only=args.assets_only,
                         retry_denied=args.retry_denied,
                         retry_assets=args.retry_assets,
+                        recheck_since=args.recheck_since,
                     )
                 )
             # OSError also covers msal's transport layer: requests.exceptions.RequestException
@@ -293,6 +296,16 @@ def _positive_int(value: str) -> int:
     if n < 1:
         raise argparse.ArgumentTypeError("must be >= 1")
     return n
+
+
+def _utc_floor(value: str) -> str:
+    """ISO date/datetime → UTC `YYYY-MM-DDTHH:MM:SS`, comparable as text with message timestamps."""
+    from .chats import parse_when
+
+    try:
+        return parse_when(value).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid ISO date/datetime: {value!r}") from exc
 
 
 def _non_negative_int(value: str) -> int:
@@ -421,9 +434,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_archive.add_argument(
         "--live",
-        action="store_true",
+        type=_positive_int,
+        nargs="?",
+        const=1800,
+        metavar="SECONDS",
         help="follow live events: catch up once, then write each message as it arrives; "
-        "re-catches up after a disconnect (spec 005)",
+        "re-catches up after a disconnect and every SECONDS (default 1800) (spec 005)",
+    )
+    p_archive.add_argument(
+        "--recheck-since",
+        type=_utc_floor,
+        metavar="WHEN",
+        help="one-shot: re-walk the history of every chat active since WHEN (ISO date/datetime) "
+        "down to it, filling any hole under the newest stored message",
     )
     p_archive.set_defaults(func=cmd_archive)
 
@@ -476,11 +499,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     # A one-shot override on a timer stops being an override: it would re-request every dead asset
     # every cycle, which is exactly the hammering the backoff exists to stop.
-    if getattr(args, "retry_assets", False) and getattr(args, "loop", None) is not None:
-        parser.error("--retry-assets is a one-shot recovery flag; it cannot be combined with --loop")
+    for flag in ("retry_assets", "recheck_since"):
+        if getattr(args, flag, None) and getattr(args, "loop", None) is not None:
+            name = flag.replace("_", "-")
+            parser.error(f"--{name} is a one-shot recovery flag; it cannot be combined with --loop")
+    # --assets-only never fetches history: the recheck would silently do nothing.
+    if getattr(args, "recheck_since", None) and getattr(args, "assets_only", False):
+        parser.error("--recheck-since walks history; it cannot be combined with --assets-only")
     # --live runs forever over every chat: a single thread, a timer or a one-shot recovery contradict it.
     if getattr(args, "live", False):
-        flags = ("loop", "thread", "assets_only", "retry_assets")
+        flags = ("loop", "thread", "assets_only", "retry_assets", "recheck_since")
         clash = [f for f in flags if getattr(args, f) not in (None, False)]
         if clash:
             parser.error(f"--live cannot be combined with --{clash[0].replace('_', '-')}")
