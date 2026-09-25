@@ -81,7 +81,8 @@ on an `msteams://` deep link, i.e. the desktop client; `--open-scheme https` for
 seen. Ctrl/middle click opens the https link, through `--browser firefox` when set, else in the
 page's own browser. `xdg-open` only works when the `msteams` handler's `.desktop` entry passes the
 URL along (`Exec=… %u`); otherwise point `--opener` at the client binary, e.g.
-`--opener "/path/to/teams-for-linux --no-sandbox"`. Hovering a row shows its **seen** button (✓): the row leaves the Inbox until something
+`--opener "/path/to/teams-for-linux --no-sandbox"`. Hovering a preview cut by the row width shows the whole message (up to 1000 characters).
+Hovering a row shows its **seen** button (✓): the row leaves the Inbox until something
 newer lands on that chat (state in `~/.config/miniteams/seen.json`); the **Seen** tab lists those rows dimmed,
 where ↺ undoes it. A message that @mentions you gets a blue stripe and an `@ you` tag (`@ all` for an
 @everyone), also when the mention was added by editing an older message; it clears once you mark the row seen
