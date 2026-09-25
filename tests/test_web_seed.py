@@ -124,6 +124,39 @@ def test_seed_carries_snippet_sender_and_read_horizon(tmp_path: Any) -> None:
     assert row["read_id"] == "1790000000000"
 
 
+def test_seed_names_our_own_last_message_you(tmp_path: Any) -> None:
+    last = {"id": "1", "composetime": "2026-09-01T10:00:00Z", "messagetype": "Text", "content": "ok"}
+    data_dir = _index_with(
+        tmp_path,
+        [
+            _chat(
+                "19:a_b@unq.gbl.spaces",
+                raw={
+                    "lastMessage": {
+                        **last,
+                        "from": f"https://h/contacts/{ME}",
+                        "imdisplayname": "Damien DEGOIS",
+                    }
+                },
+            ),
+            _chat(
+                "19:c_d@unq.gbl.spaces",
+                raw={
+                    "lastMessage": {
+                        **last,
+                        "from": "https://h/contacts/8:orgid:x",
+                        "imdisplayname": "Jean Martin",
+                    }
+                },
+            ),
+        ],
+    )
+    seed = W.seed_from_archive(data_dir, ME)
+    assert seed["19:a_b@unq.gbl.spaces"]["sender"] == "You"
+    assert seed["19:c_d@unq.gbl.spaces"]["sender"] == "Jean Martin"
+    assert W.seed_from_archive(data_dir, "")["19:a_b@unq.gbl.spaces"]["sender"] == "Damien DEGOIS"
+
+
 def test_seed_skips_out_of_scope_and_degrades_on_a_missing_or_corrupt_index(tmp_path: Any) -> None:
     data_dir = _index_with(tmp_path / "ok", [_chat("19:channel@thread.tacv2", topic="Team")])
     assert W.seed_from_archive(data_dir, ME) == {}  # channels are not widget material

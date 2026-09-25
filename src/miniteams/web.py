@@ -44,6 +44,7 @@ from .stream import run_forever
 
 log = structlog.get_logger()
 
+_YOU = "You"  # own messages, as Teams' chat list shows them
 _SNIPPET_LEN = 1000  # the row tooltip shows it whole; CSS truncates the visible line
 _EMOJI_ALT_RE = re.compile(r'<emoji\b[^>]*\balt="([^"]*)"[^>]*>')
 # A forward is a blockquote too, but its content IS the message — only a reply quotes another.
@@ -291,7 +292,9 @@ def seed_from_archive(data_dir: Path, me: str = "") -> dict[str, dict[str, Any]]
                 "text": snippet(
                     str(last.get("messagetype") or ""), str(last.get("content") or ""), last.get("properties")
                 ),
-                "sender": str(last.get("imdisplayname") or ""),
+                "sender": _YOU
+                if _is_me(str(last.get("from") or ""), me)
+                else str(last.get("imdisplayname") or ""),
                 "read_id": read_up_to(conv.get("properties")),
                 "read_at": read_at_ms(conv.get("properties")),
                 "last_activity": last_activity(conv),
@@ -338,6 +341,11 @@ def _is_system(msgtype: str) -> bool:
     return msgtype.startswith("ThreadActivity/")
 
 
+def _is_me(mri: str, me: str) -> bool:
+    """`from` is a contact URL ending in the MRI; a call event names the bare MRI."""
+    return bool(me) and mri.rsplit("/", 1)[-1] == me
+
+
 async def sender_of(resource: dict[str, Any], directory: Directory | None) -> str:
     if str(resource.get("messagetype") or "") == "Event/Call":
         # `from` is the meeting organizer, not who joined or hung up: only an ad-hoc call's
@@ -346,12 +354,16 @@ async def sender_of(resource: dict[str, Any], directory: Directory | None) -> st
         if not started:
             return ""
         mri = started.group(1)
-        return await directory.display(mri) if directory else mri
+        if directory is None:
+            return mri
+        return _YOU if _is_me(mri, directory.me) else await directory.display(mri)
     mri = str(resource.get("from") or "")
     name = resource.get("imdisplayname")
     if directory is None:
         return str(name or mri)
     directory.note_name(mri, name)
+    if _is_me(mri, directory.me):
+        return _YOU
     return str(name) if name else (await directory.display(mri) if mri else "")
 
 
