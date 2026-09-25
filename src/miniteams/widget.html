@@ -316,7 +316,10 @@
         if (r.mention.edited) tag.append(el("i", null, " · edited " + ago(r.mention.at)));
         tag.title = r.mention.at; ind.append(tag);
       } else if (r.unread) ind.append(el("span", "dot"));
-      li.append(name, meta, preview(r, el("span", "prev truncate")), ind);
+      const prev = preview(r, el("span", "prev truncate"));
+      // Only a line the row width cut gets the whole text on hover; width is known at hover time.
+      prev.onmouseenter = () => { prev.title = prev.scrollWidth > prev.clientWidth ? prev.textContent : ""; };
+      li.append(name, meta, prev, ind);
       return li;
     });
     // The rows move around the composer, never the composer: detaching it would drop its focus

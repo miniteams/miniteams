@@ -44,7 +44,7 @@ from .stream import run_forever
 
 log = structlog.get_logger()
 
-_SNIPPET_LEN = 140
+_SNIPPET_LEN = 1000  # the row tooltip shows it whole; CSS truncates the visible line
 _EMOJI_ALT_RE = re.compile(r'<emoji\b[^>]*\balt="([^"]*)"[^>]*>')
 # A forward is a blockquote too, but its content IS the message — only a reply quotes another.
 _REPLY_QUOTE_RE = re.compile(r"\A\s*<blockquote\b(?![^>]*Forward)[^>]*>.*?</blockquote>", re.DOTALL)

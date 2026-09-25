@@ -83,7 +83,8 @@ def test_snippet_keeps_a_forwarded_body() -> None:
 
 
 def test_snippet_truncates_with_ellipsis() -> None:
-    out = W.snippet("Text", "x" * 500)
+    assert W.snippet("Text", "y" * 900) == "y" * 900  # a long message reaches the tooltip whole
+    out = W.snippet("Text", "x" * (W._SNIPPET_LEN * 2))
     assert len(out) == W._SNIPPET_LEN
     assert out.endswith("…")
     assert W.snippet("Text", "x" * W._SNIPPET_LEN) == "x" * W._SNIPPET_LEN  # boundary: untouched
