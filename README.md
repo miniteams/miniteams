@@ -64,7 +64,7 @@ uv run miniteams dump --jsonl > notes.jsonl            # full-detail JSON per li
 + attachment refs + reactions), every message type, no media download — pipe-friendly.
 
 `web` serves a single page listing private, group and meeting chats newest-message-first
-(label, last author, snippet), updated live from the Trouter stream: new messages move a row
+(label, last author — `You` for your own — snippet), updated live from the Trouter stream: new messages move a row
 up, edits/deletes of the last message rewrite it, `✍ Name` shows who is typing (cleared after
 10s if Teams never says so), and with `--reactions` a reaction becomes the row's last event.
 Rows are seeded from the archive under `--data-dir` (default `./data`, read-only): the name, snippet

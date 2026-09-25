@@ -1572,3 +1572,21 @@ async def test_slow_send_does_not_hold_the_page_other_verbs(
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+async def test_own_messages_read_you(quiet_directory: Directory) -> None:
+    """Like Teams' chat list: our own last message is "You", whatever our display name."""
+    me = "8:orgid:me-guid"
+    mine = {"from": f"https://h/v1/users/ME/contacts/{me}", "imdisplayname": "Damien DEGOIS"}
+    theirs = {"from": "https://h/v1/users/ME/contacts/8:orgid:ann", "imdisplayname": "Ann"}
+    started = '<partlist type="started" alt=""><part identity="{}"><name>x</name></part></partlist>'
+    call = {"messagetype": "Event/Call", "from": theirs["from"]}
+
+    assert await W.sender_of(mine, quiet_directory) == "Damien DEGOIS"  # own MRI unknown: no guess
+    quiet_directory.me = me
+    assert await W.sender_of(mine, quiet_directory) == "You"
+    assert await W.sender_of(theirs, quiet_directory) == "Ann"
+    assert await W.sender_of({**call, "content": started.format(me)}, quiet_directory) == "You"
+    ann_call = {**call, "content": started.format("8:orgid:ann")}
+    assert await W.sender_of(ann_call, quiet_directory) == "name:8:orgid:ann"
+    assert await W.sender_of({"from": "", "imdisplayname": ""}, quiet_directory) == ""
