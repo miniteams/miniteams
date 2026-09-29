@@ -39,7 +39,8 @@ uv run miniteams send --file test.html --html     # raw RichText/Html (formatted
 uv run miniteams update <msg-id-or-deep-link> "fixed text"   # edit a sent message
 uv run miniteams react <msg-id-or-deep-link> like    # react (heart, laugh, 1f525_fire…)
 uv run miniteams react <msg-id-or-deep-link> like --remove   # take it back
-uv run miniteams archive          # resumable local archive of private chats + meetings under ./data
+uv run miniteams archive          # resumable local archive under ./data: private chats, meetings,
+                                  # and your own `48:` conversations (Notes, feeds)
 uv run miniteams archive --thread 19:xxx@thread.v2     # archive one conversation
 uv run miniteams archive --no-media                    # messages only, skip attachments
 uv run miniteams archive --verify-media                # re-check every asset on disk, fetch missing
@@ -101,6 +102,11 @@ process exits non-zero when the stream dies (auth expired) — re-run it.
 (`✏ …`) and deletes (`🗑 …`). `--typing` adds `✍ is typing / stopped` indicators.
 `stream --jsonl` = per-event JSON; `stream --raw` = full firehose NDJSON of every frame (all
 endpoints, presence/calls, named events), decoded.
+
+`archive` keeps private chats, meeting chats and your own `48:` conversations: Notes, scheduled
+and parked drafts, and the activity feeds (mentions, notifications, saved, …). `--all` adds
+channels. A draft you cancel loses its text on Teams' side; the archive keeps the version it saw
+before.
 
 `archive` builds a resumable local archive under `./data/`: `index.db` (chat metadata) plus
 one folder per conversation with a `messages.db` (every message as raw API JSON, keyed by id)

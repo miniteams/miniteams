@@ -424,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
     p_archive = sub.add_parser("archive", help="build/refresh a resumable local chat archive")
     p_archive.add_argument("--data-dir", default="data", help="archive root (default: ./data)")
     p_archive.add_argument("--thread", help="archive only this conversation (skip enumeration)")
-    p_archive.add_argument("--all", action="store_true", help="include channels and meeting chats too")
+    p_archive.add_argument("--all", action="store_true", help="include channels too")
     p_archive.add_argument(
         "--no-media", action="store_true", help="skip downloading attachments (messages only)"
     )

@@ -25,7 +25,17 @@ from .http import aget_with_retry
 log = structlog.get_logger()
 
 # MRI prefix → friendly label for special threads that have no real roster/topic.
-_SPECIAL_THREADS = {"48:notes": "Notes to self"}
+_SPECIAL_THREADS = {
+    "48:notes": "Notes to self",
+    "48:drafts": "Drafts",
+    "48:annotations": "Annotations",
+    "48:calllogs": "Call logs",
+    "48:mentions": "Mentions",
+    "48:notifications": "Notifications",
+    "48:saved": "Saved",
+    "48:starred": "Starred",
+    "48:threads": "Followed threads",
+}
 
 # Reaction state is per-message and `run_forever` runs indefinitely, so an unbounded dict leaks.
 # Diffs only need the *recent* messages' prior state; cap to an LRU window. A reaction landing on
