@@ -35,7 +35,9 @@ no selection.
 - The eight conversations other than drafts go through the existing path: history call, top-up,
   backfill, media, `index.db` row, `messages.db`.
 - `48:drafts` has its own fetch. The history call refuses it (400 `Invalid threadId`), so the pass
-  reads `GET /v1/users/ME/drafts` and follows `_metadata.syncState` until a page is empty.
+  reads `GET /v1/users/ME/drafts`, 200 per page, the most the service takes. The next page is
+  the query of `_metadata.backwardLink` applied to that same path: the link itself names the
+  conversation path, which answers 400.
 - Drafts are stored like messages, in `data/48:drafts/messages.db`, keyed by draft id.
 - The whole draft list is read on every pass. A draft whose `version` changed replaces the stored
   row, and the previous `raw` goes to `message_versions`, as `archive --live` does for edits.
@@ -124,3 +126,6 @@ None.
 - Drafts are re-read in full on every pass. The list is short, one request in the common case.
 - The draft fetch uses the regional host and the skype token, which read the list. The proxy
   host and the ic3 token are for writes.
+- Only the query of `backwardLink` is reused, so the token never goes to a host the response
+  named.
+- The media pass runs on drafts as on any chat.

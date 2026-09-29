@@ -28,6 +28,7 @@ from .auth import AuthExpired, TokenSource
 from .chats import DRAFTS_THREAD, fetch_conversations, in_archive_scope, last_activity
 from .config import Settings
 from .directory import Directory
+from .drafts import iter_draft_pages
 from .dump import _epoch_seconds, iter_history_pages
 from .skype import exchange_skype_token
 
@@ -159,7 +160,7 @@ def _enumerate(settings: Settings, skype_token: str, include_all: bool) -> list[
         seen += len(page)
         for conv in page:
             thread_id = str(conv.get("id") or "")
-            if in_archive_scope(thread_id, include_all) and thread_id != DRAFTS_THREAD:
+            if in_archive_scope(thread_id, include_all):
                 targets.append(conv)
         log.info("enumerate_progress", pages=pages, scanned=seen, matched=len(targets))
     return targets
@@ -230,6 +231,20 @@ def _backfill(
     # Loop drained naturally (short/empty page) — max_pages is 0, so this is a true end of history.
     index.mark_backfill_done(thread_id)
     return added
+
+
+def _refresh_drafts(settings: Settings, skype_token: str, store: ChatStore, label: str) -> int:
+    """Re-read the whole drafts store; a draft whose version moved keeps its old raw as history."""
+    outcomes = {"new": 0, "updated": 0, "stale": 0}
+    now = _now_iso()
+    for drafts in iter_draft_pages(settings, skype_token):
+        for draft in drafts:
+            outcomes[store.apply_message(draft, now)] += 1
+        time.sleep(_INTER_PAGE_DELAY)
+    # Nothing to top up later: every pass reads the whole store, so no row stays pending.
+    store.confirm(now)
+    log.info("drafts_refreshed", chat=label, thread=store.thread_id, **outcomes)
+    return outcomes["new"] + outcomes["updated"]
 
 
 def record_asset_failure(store: ChatStore, key: str, exc: Exception) -> None:
@@ -420,7 +435,8 @@ async def archive_chat(
     # (skip-exists means only missing ones download) — covers a backfill that succeeded while
     # its media didn't (a prior --no-media run, download failures, an interrupted media pass).
     # `force` (live gap) too: a message stored past a lost one makes the chat look unchanged.
-    if conv and index.backfill_done(thread_id) and not (verify_media or force or floor):
+    drafts = thread_id == DRAFTS_THREAD
+    if conv and index.backfill_done(thread_id) and not (verify_media or force or floor or drafts):
         probe = ChatStore(data_dir, thread_id)
         newest, last = probe.newest(), last_activity(conv)
         probe.close()
@@ -456,12 +472,18 @@ async def archive_chat(
     store = ChatStore(data_dir, thread_id)
     start = time.monotonic()
     try:
-        new_top = _topup(settings, skype_token, thread_id, store, label, floor)
+        new_top = (
+            _refresh_drafts(settings, skype_token, store, label)
+            if drafts
+            else _topup(settings, skype_token, thread_id, store, label, floor)
+        )
         new_old = 0
         # Empty store must re-backfill even when flagged done: a meeting chat archived BEFORE its
         # meeting drains an empty history and gets marked done — top-up then starts from nothing
         # (no overlap bound) and would never fetch, freezing the chat empty forever.
-        if not index.backfill_done(thread_id) or not store.count():
+        if drafts:
+            index.mark_backfill_done(thread_id)
+        elif not index.backfill_done(thread_id) or not store.count():
             new_old = _backfill(settings, skype_token, thread_id, store, index, label)
         media = (
             await _download_media(

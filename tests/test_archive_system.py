@@ -1,18 +1,20 @@
-"""The `48:` conversations in the archive (spec 007): scope, empty feeds, media, live, widget."""
+"""The `48:` conversations in the archive (spec 007): scope, feeds, media, live, widget, drafts."""
 
 import json
 import re
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from test_archive import _FakeApi, _msg, _run, _spy_log, _stored_ids, _wire
 
 from miniteams import archive as AR
 from miniteams import archive_live as AL
 from miniteams import chats, directory
+from miniteams import drafts as D
 from miniteams import web as W
-from miniteams.archive_store import Index
+from miniteams.archive_store import ChatStore, Index
 from miniteams.config import Settings
 
 SRC = Path(AR.__file__).parent
@@ -71,18 +73,20 @@ def test_every_48_conversation_has_a_label() -> None:
     assert all(label and not label.startswith("48:") for label in directory._SPECIAL_THREADS.values())
 
 
-async def test_a_pass_archives_the_history_readable_ones(settings: Settings, tmp_path, monkeypatch) -> None:
+async def test_a_pass_archives_all_nine(settings: Settings, tmp_path, monkeypatch) -> None:
     api = _FakeApi({t: [_msg(f"{t}-1", "2026-07-01T09:00:00Z")] for t in HISTORY})
-    _wire(monkeypatch, api, [*HISTORY, "19:ch@thread.tacv2"])
+    _wire(monkeypatch, api, [*HISTORY, DRAFTS, "19:ch@thread.tacv2"])
+    _DraftsApi(_page([_draft("d1")])).install(monkeypatch)
     data = tmp_path / "data"
     await _run(settings, data)
 
     index = Index(data)
     stored = {c["id"] for c in index.chats()}
     index.close()
-    assert stored == set(HISTORY)  # the channel stays behind --all
+    assert stored == {*HISTORY, DRAFTS}  # the channel stays behind --all
     for thread_id in HISTORY:
         assert _stored_ids(data, thread_id) == {f"{thread_id}-1"}
+    assert _stored_ids(data, DRAFTS) == {"d1"}
 
 
 async def test_a_second_pass_adds_nothing(settings: Settings, tmp_path, monkeypatch) -> None:
@@ -118,11 +122,18 @@ async def test_an_empty_feed_gets_its_row_and_is_not_a_failure(
     assert _stored_ids(data, "48:saved") == set()
 
 
-async def test_drafts_never_reach_the_history_call(settings: Settings, tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("named", [False, True])
+async def test_drafts_never_reach_the_history_call(
+    settings: Settings, tmp_path, monkeypatch, named: bool
+) -> None:
     api = _FakeApi({})
     _wire(monkeypatch, api, [DRAFTS, NOTES])
-    await _run(settings, tmp_path / "data")
+    drafts = _DraftsApi(_page([_draft("d1")])).install(monkeypatch)
+    await _run(settings, tmp_path / "data", thread=DRAFTS if named else None)
+
     assert DRAFTS not in {thread for thread, _ in api.calls}
+    assert len(drafts.urls) == 1
+    assert _stored_ids(tmp_path / "data", DRAFTS) == {"d1"}
 
 
 IMG = '<img itemtype="http://schema.skype.com/AMSImage" src="https://api.asm.skype.com/v1/objects/o1/views/imgo">'
@@ -200,3 +211,184 @@ def test_the_widget_ignores_archived_48_conversations(tmp_path) -> None:
     assert before == {}
     assert set(W.seed_from_archive(data, "8:orgid:me")) == {"19:a_b@unq.gbl.spaces"}
     assert json.dumps(W.seed_from_archive(data, "8:orgid:me")).count("48:") == 0
+
+
+# --- drafts ---
+
+BACK = "https://h/v1/users/ME/conversations/48:drafts/messages?startTime=0&syncState={}&pageSize=200"
+_REAL_CLIENT = httpx.Client  # a test installs the fake twice: the second must not wrap the first
+
+
+def _draft(draft_id: str, version: int = 1, content: str = "text", **props: Any) -> dict[str, Any]:
+    return {
+        "id": draft_id,
+        "version": str(version),
+        "composetime": "2026-07-01T09:00:00.1230000Z",
+        "draftType": "ScheduledDraft",
+        "innerThreadId": "19:a_b@unq.gbl.spaces",
+        "draftDetails": {"sendAt": "1790755200000"},
+        "content": content,
+        "properties": props,
+    }
+
+
+def _page(drafts: list[dict[str, Any]], back: str = "") -> dict[str, Any]:
+    meta = {"syncState": BACK.format("sync"), **({"backwardLink": BACK.format(back)} if back else {})}
+    return {"_metadata": meta, "drafts": drafts}
+
+
+class _DraftsApi:
+    """The drafts endpoint behind a real httpx client: canned pages in order, requests recorded."""
+
+    def __init__(self, *pages: dict[str, Any], status: int = 200) -> None:
+        self.pages, self.status = list(pages), status
+        self.urls: list[str] = []
+
+    def _answer(self, request: httpx.Request) -> httpx.Response:
+        self.urls.append(str(request.url))
+        assert request.url.path == "/v1/users/ME/drafts"  # the conversation path answers 400
+        assert request.headers["X-Skypetoken"] == "sk"
+        if self.status != 200:
+            return httpx.Response(self.status, json={"errorCode": self.status})
+        return httpx.Response(200, json=self.pages.pop(0) if self.pages else {"drafts": []})
+
+    def install(self, monkeypatch) -> _DraftsApi:
+        transport = httpx.MockTransport(self._answer)
+        monkeypatch.setattr(D.httpx, "Client", lambda **kw: _REAL_CLIENT(transport=transport, **kw))
+        return self
+
+
+def _rows(data: Path, table: str) -> dict[str, dict[str, Any]]:
+    store = ChatStore(data, DRAFTS)
+    try:
+        key = "id" if table == "messages" else "id || '@' || version"
+        return {r[0]: json.loads(r[1]) for r in store._db.execute(f"SELECT {key}, raw FROM {table}")}
+    finally:
+        store.close()
+
+
+async def _pass(settings: Settings, data: Path, monkeypatch, *pages: dict[str, Any]) -> _DraftsApi:
+    _wire(monkeypatch, _FakeApi({}), [DRAFTS])
+    api = _DraftsApi(*pages).install(monkeypatch)
+    await _run(settings, data)
+    return api
+
+
+async def test_drafts_are_read_across_pages(settings: Settings, tmp_path, monkeypatch) -> None:
+    data = tmp_path / "data"
+    api = await _pass(
+        settings,
+        data,
+        monkeypatch,
+        _page([_draft("d3"), _draft("d2")], back="p2"),
+        _page([_draft("d1")]),
+    )
+
+    assert set(_rows(data, "messages")) == {"d1", "d2", "d3"}
+    assert [url.split("?", 1)[1] for url in api.urls] == [
+        "pageSize=200",
+        "startTime=0&syncState=p2&pageSize=200",  # the query of backwardLink, on the drafts path
+    ]
+
+
+@pytest.mark.parametrize("second", [_page([_draft("d1")], back="p2"), _page([], back="p3")])
+async def test_the_draft_walk_ends_on_a_repeated_link_or_an_empty_page(
+    settings: Settings, tmp_path, monkeypatch, second: dict[str, Any]
+) -> None:
+    data = tmp_path / "data"
+    api = await _pass(settings, data, monkeypatch, _page([_draft("d2")], back="p2"), second)
+    assert len(api.urls) == 2
+
+
+async def test_an_unchanged_draft_is_not_rewritten(settings: Settings, tmp_path, monkeypatch) -> None:
+    data = tmp_path / "data"
+    await _pass(settings, data, monkeypatch, _page([_draft("d1")]))
+    events = _spy_log(monkeypatch)
+    await _pass(settings, data, monkeypatch, _page([_draft("d1")]))
+
+    assert _rows(data, "message_versions") == {}
+    refreshed = next(kw for _, event, kw in events if event == "drafts_refreshed")
+    assert (refreshed["new"], refreshed["updated"], refreshed["stale"]) == (0, 0, 1)
+    recap = next(kw for _, event, kw in events if event == "archive_recap")
+    assert recap["new_messages"] == 0
+
+
+async def test_an_edited_draft_keeps_its_old_version(settings: Settings, tmp_path, monkeypatch) -> None:
+    data = tmp_path / "data"
+    await _pass(settings, data, monkeypatch, _page([_draft("d1", 1, "first")]))
+    await _pass(settings, data, monkeypatch, _page([_draft("d1", 2, "second", edittime="1")]))
+
+    assert _rows(data, "messages")["d1"]["content"] == "second"
+    assert _rows(data, "message_versions")["d1@1"]["content"] == "first"
+
+
+async def test_a_cancelled_draft_keeps_its_text(settings: Settings, tmp_path, monkeypatch) -> None:
+    data = tmp_path / "data"
+    await _pass(settings, data, monkeypatch, _page([_draft("d1", 1, "say this")]))
+    await _pass(settings, data, monkeypatch, _page([_draft("d1", 3, "", deletetime="1")]))
+
+    tombstone = _rows(data, "messages")["d1"]
+    assert tombstone["content"] == "" and "deletetime" in tombstone["properties"]
+    assert _rows(data, "message_versions")["d1@1"]["content"] == "say this"
+
+
+async def test_no_draft_row_stays_pending(settings: Settings, tmp_path, monkeypatch) -> None:
+    data = tmp_path / "data"
+    await _pass(settings, data, monkeypatch, _page([_draft("d1")]))
+    store = ChatStore(data, DRAFTS)
+    try:
+        assert store._db.execute("SELECT COUNT(*) FROM messages WHERE pending = 1").fetchone()[0] == 0
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("status", [400, 500])
+async def test_a_failing_draft_call_is_counted_and_spares_the_rest(
+    settings: Settings, tmp_path, monkeypatch, status: int
+) -> None:
+    data = tmp_path / "data"
+    _wire(monkeypatch, _FakeApi({NOTES: [_msg("n1", "2026-07-01T09:00:00Z")]}), [DRAFTS, NOTES])
+    _DraftsApi(status=status).install(monkeypatch)
+    events = _spy_log(monkeypatch)
+    await _run(settings, data)
+
+    recap = next(kw for _, event, kw in events if event == "archive_recap")
+    assert (recap["chats"], recap["failed"]) == (2, 1)
+    assert [kw["thread"] for _, event, kw in events if event == "chat_archive_failed"] == [DRAFTS]
+    assert _stored_ids(data, NOTES) == {"n1"}
+
+
+async def test_an_empty_draft_store_is_not_a_failure(settings: Settings, tmp_path, monkeypatch) -> None:
+    data = tmp_path / "data"
+    events = _spy_log(monkeypatch)
+    await _pass(settings, data, monkeypatch, _page([]))
+
+    recap = next(kw for _, event, kw in events if event == "archive_recap")
+    assert (recap["chats"], recap["failed"]) == (1, 0)
+    assert _rows(data, "messages") == {}
+
+
+async def test_drafts_are_re_read_when_the_conversation_looks_unchanged(
+    settings: Settings, tmp_path, monkeypatch
+) -> None:
+    # The listing's `version` and `lastMessage` are what let other chats skip a pass.
+    conv = {"id": DRAFTS, "version": 7, "lastMessage": {"composetime": "2026-07-01T09:00:00.1230000Z"}}
+    data = tmp_path / "data"
+    for page in (_page([_draft("d1", 1, "first")]), _page([_draft("d1", 2, "second")])):
+        _wire(monkeypatch, _FakeApi({}), [])
+        monkeypatch.setattr(AR, "fetch_conversations", lambda s, tok: iter([[conv]]))
+        _DraftsApi(page).install(monkeypatch)
+        await _run(settings, data)
+
+    assert _rows(data, "messages")["d1"]["content"] == "second"
+
+
+async def test_a_draft_walk_cut_by_the_page_cap_says_so(settings: Settings, tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(D, "_MAX_PAGES", 1)
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(D.log, "warning", lambda event, **kw: events.append((event, kw)))
+    data = tmp_path / "data"
+    await _pass(settings, data, monkeypatch, _page([_draft("d2")], back="p2"), _page([_draft("d1")]))
+
+    assert set(_rows(data, "messages")) == {"d2"}
+    assert events == [("drafts_truncated", {"pages": 1})]

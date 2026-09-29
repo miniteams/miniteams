@@ -24,8 +24,7 @@ log = structlog.get_logger()
 
 _PAGE_SIZE = 100
 _MAX_PAGES = 50  # safety cap on backwardLink walking
-# The history call refuses it (400 `Invalid threadId`): drafts have their own endpoint.
-DRAFTS_THREAD = "48:drafts"
+DRAFTS_THREAD = "48:drafts"  # listed by `drafts.iter_draft_pages`, not by the history call
 
 
 def parse_when(value: str, *, end: bool = False) -> datetime:
