@@ -1,4 +1,4 @@
-"""CLI input resolution for send/update (no network: auth + write calls are mocked)."""
+"""CLI input resolution for send/update/react (no network: auth + write calls are mocked)."""
 
 import argparse
 from typing import Any
@@ -49,6 +49,40 @@ def test_cmd_update_deeplink_overrides_thread(settings: Settings, monkeypatch) -
     rc = cli.cmd_update(settings, _ns(target=url, text="new", file=None, thread="OTHER", html=False))
     assert rc == 0
     assert seen == {"thread": "48:notes", "mid": "123", "text": "new"}
+
+
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [
+        ("https://teams.cloud.microsoft/l/message/19:a@thread.v2/42?context=x", ("19:a@thread.v2", "42")),
+        ("42", ("OTHER", "42")),
+    ],
+)
+def test_cmd_react_resolves_target(settings: Settings, monkeypatch, target: str, expected) -> None:
+    monkeypatch.setattr(cli, "_ensure_skype_token", lambda s: ({}, "sk"))
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(
+        "miniteams.send.react",
+        lambda s, tok, thread, mid, key, *, remove: seen.update(where=(thread, mid), key=key, remove=remove),
+    )
+    rc = cli.cmd_react(settings, _ns(target=target, key="heart", remove=True, thread="OTHER"))
+    assert rc == 0
+    assert seen == {"where": expected, "key": "heart", "remove": True}
+
+
+def test_react_parser_defaults(monkeypatch) -> None:
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "cmd_react", lambda s, a: seen.update(vars(a)) or 0)
+    assert cli.main(["react", "42", "like"]) == 0
+    assert (seen["target"], seen["key"], seen["remove"], seen["thread"]) == ("42", "like", False, "48:notes")
+
+
+@pytest.mark.parametrize("key", ["Like", "", "1F525_fire", "like ", "heart,like"])
+def test_react_rejects_malformed_key(key: str, capsys, monkeypatch) -> None:
+    monkeypatch.setattr(cli, "cmd_react", lambda s, a: pytest.fail("reached the Teams call"))
+    with pytest.raises(SystemExit):
+        cli.main(["react", "42", key])
+    assert "Teams emoji id" in capsys.readouterr().err
 
 
 def test_retry_assets_cannot_be_looped(capsys, monkeypatch) -> None:

@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import re
 import sys
 from datetime import UTC
 from typing import Any
@@ -92,18 +93,20 @@ def cmd_send(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def _message_target(args: argparse.Namespace) -> tuple[str, str]:
+    """(thread, message id) from a Teams deep link, else a bare message id + --thread."""
+    from .send import parse_message_link
+
+    return parse_message_link(args.target) or (args.thread, args.target)
+
+
 def cmd_update(settings: Settings, args: argparse.Namespace) -> int:
     """Edit a previously-sent message, identified by id or a Teams deep link."""
     from pathlib import Path
 
-    from .send import edit_message, parse_message_link
+    from .send import edit_message
 
-    link = parse_message_link(args.target)
-    if link:
-        thread_id, message_id = link
-    else:
-        thread_id, message_id = args.thread, args.target  # bare message id + --thread
-
+    thread_id, message_id = _message_target(args)
     if args.file:
         text = Path(args.file).read_text(encoding="utf-8")
     elif args.text is not None:
@@ -115,6 +118,19 @@ def cmd_update(settings: Settings, args: argparse.Namespace) -> int:
     _, skype_token = _ensure_skype_token(settings)
     edit_message(settings, skype_token, thread_id, message_id, text, is_html=args.html)
     print(f"edited → {thread_id}/{message_id}", file=sys.stderr)
+    return 0
+
+
+def cmd_react(settings: Settings, args: argparse.Namespace) -> int:
+    """Add or remove your reaction on a message, identified by id or a Teams deep link."""
+    from .send import react
+
+    thread_id, message_id = _message_target(args)
+    _, skype_token = _ensure_skype_token(settings)
+    react(settings, skype_token, thread_id, message_id, args.key, remove=args.remove)
+    print(
+        f"{'unreacted' if args.remove else 'reacted'} {args.key} → {thread_id}/{message_id}", file=sys.stderr
+    )
     return 0
 
 
@@ -308,6 +324,13 @@ def _utc_floor(value: str) -> str:
         raise argparse.ArgumentTypeError(f"invalid ISO date/datetime: {value!r}") from exc
 
 
+def _reaction_key(value: str) -> str:
+    # Keys are case-sensitive: `Like` would post a separate reaction with a broken image.
+    if not re.fullmatch(r"[0-9a-z_]+", value):
+        raise argparse.ArgumentTypeError("a Teams emoji id: lowercase letters, digits and _")
+    return value
+
+
 def _non_negative_int(value: str) -> int:
     n = int(value)
     if n < 0:
@@ -372,6 +395,21 @@ def main(argv: list[str] | None = None) -> int:
         help="thread id when target is a bare message id (default: Notes to self)",
     )
     p_update.set_defaults(func=cmd_update)
+
+    p_react = sub.add_parser("react", help="add or remove your reaction on a message (id or deep link)")
+    p_react.add_argument("target", help="message id, or a /l/message/<thread>/<id> Teams link")
+    p_react.add_argument(
+        "key",
+        type=_reaction_key,
+        help="reaction key: like, heart, laugh, surprised, sad, angry, or e.g. 1f525_fire",
+    )
+    p_react.add_argument("--remove", action="store_true", help="remove your reaction instead")
+    p_react.add_argument(
+        "--thread",
+        default=NOTES_THREAD,
+        help="thread id when target is a bare message id (default: Notes to self)",
+    )
+    p_react.set_defaults(func=cmd_react)
 
     p_chats = sub.add_parser("chats", help="list recent private chats (newest activity first)")
     p_chats.add_argument("--limit", type=int, default=20, help="max chats to list (0 = no limit)")

@@ -1,8 +1,8 @@
-"""Outbound message send + edit (chat-service REST, skype token).
+"""Outbound message send, edit and reactions (chat-service REST, skype token).
 
 Plain REST against the chat service — NOT the Trouter socket (that channel is receive-only).
-A sent/edited message echoes back over the live stream (same `clientmessageid`), so a concurrent
-`stream` shows it too.
+A sent/edited message echoes back over the live stream (same `clientmessageid`), a reaction as a
+`MessageUpdate` of its message, so a concurrent `stream` shows both.
 
 `send_message` mirrors purple-teams `teams_send_message`. `edit_message` is reconstructed from
 the inbound `MessageUpdate` + `skypeeditedid` wire format (purple-teams only *consumes* edits) and
@@ -57,7 +57,17 @@ def _headers(skype_token: str, settings: Settings) -> dict[str, str]:
 
 
 def _check(resp: httpx.Response, action: str) -> dict[str, Any]:
-    resp.raise_for_status()
+    if resp.is_error:
+        # raise_for_status() drops the body, and the body holds the reason (MessageAlreadyDeleted…).
+        try:
+            reason = str(resp.json().get("message") or "")
+        except ValueError, AttributeError:  # non-JSON (gateway page) or non-object body
+            reason = ""
+        raise httpx.HTTPStatusError(
+            f"{action} failed: HTTP {resp.status_code} {reason or resp.reason_phrase}"[:300],
+            request=resp.request,
+            response=resp,
+        )
     data = resp.json() if resp.content else {}
     if isinstance(data, dict) and data.get("errorCode"):  # 2xx with an error envelope
         raise RuntimeError(f"{action} rejected: {data.get('errorCode')}: {data.get('message')}")
@@ -123,4 +133,28 @@ def edit_message(
     }
     result = _check(_CLIENT.put(url, headers=_headers(skype_token, settings), json=body), "edit")
     log.info("message_edited", thread=thread_id, message_id=message_id, status=result["status"])
+    return result
+
+
+def react(
+    settings: Settings,
+    skype_token: str,
+    thread_id: str,
+    message_id: str,
+    key: str,
+    *,
+    remove: bool = False,
+) -> dict[str, Any]:
+    """Add (PUT) or remove (DELETE) your `key` reaction (`like`, `heart`, `1f525_fire`…, case-sensitive)."""
+    url = (
+        f"https://{settings.contacts_host}/v1/users/ME/conversations/{quote(thread_id, safe='')}"
+        f"/messages/{quote(message_id, safe='')}/properties?name=emotions"
+    )
+    body = {"emotions": {"key": key, "value": int(time.time() * 1000)}}
+    # httpx.Client.delete() takes no body; the chat service needs one to know which key to drop.
+    resp = _CLIENT.request(
+        "DELETE" if remove else "PUT", url, headers=_headers(skype_token, settings), json=body
+    )
+    result = _check(resp, "unreact" if remove else "react")
+    log.info("message_reacted", thread=thread_id, message_id=message_id, key=key, removed=remove)
     return result
