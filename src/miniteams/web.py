@@ -182,7 +182,7 @@ def deep_link(thread_id: str, msg_id: str, scheme: str = "https") -> str:
 
 
 def in_scope(thread_id: str) -> bool:
-    """V1 widget scope = private 1:1/group + meeting chats (same default set as `archive`)."""
+    """V1 widget scope = private 1:1/group + meeting chats."""
     return is_private(thread_id) or is_meeting(thread_id)
 
 

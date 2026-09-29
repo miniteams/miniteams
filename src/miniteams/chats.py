@@ -24,6 +24,8 @@ log = structlog.get_logger()
 
 _PAGE_SIZE = 100
 _MAX_PAGES = 50  # safety cap on backwardLink walking
+# The history call refuses it (400 `Invalid threadId`): drafts have their own endpoint.
+DRAFTS_THREAD = "48:drafts"
 
 
 def parse_when(value: str, *, end: bool = False) -> datetime:
@@ -50,6 +52,18 @@ def is_private(thread_id: str) -> bool:
     if "@unq.gbl.spaces" in thread_id:
         return True
     return thread_id.endswith("@thread.v2") and not is_meeting(thread_id)
+
+
+def is_system(thread_id: str) -> bool:
+    """Teams' own per-user conversations: `48:notes`, `48:drafts` and the activity feeds."""
+    return thread_id.startswith("48:")
+
+
+def in_archive_scope(thread_id: str, include_all: bool = False) -> bool:
+    """What `archive` keeps: private, meeting and `48:` conversations; `--all` adds the rest."""
+    return bool(thread_id) and (
+        include_all or is_private(thread_id) or is_meeting(thread_id) or is_system(thread_id)
+    )
 
 
 def _version_iso(conv: dict[str, Any]) -> str:

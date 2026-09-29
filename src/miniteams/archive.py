@@ -25,7 +25,7 @@ import structlog
 from . import attachments, avatars
 from .archive_store import ChatStore, Index
 from .auth import AuthExpired, TokenSource
-from .chats import fetch_conversations, is_meeting, is_private, last_activity
+from .chats import DRAFTS_THREAD, fetch_conversations, in_archive_scope, last_activity
 from .config import Settings
 from .directory import Directory
 from .dump import _epoch_seconds, iter_history_pages
@@ -147,8 +147,8 @@ def _rate(n: int, start: float) -> float:
 
 
 def _enumerate(settings: Settings, skype_token: str, include_all: bool) -> list[dict[str, Any]]:
-    """Archive scope: private chats (1:1 + groups) AND meeting chats by default; --all adds
-    channels and everything else. Broader than the `chats` browse view, which stays meeting-free.
+    """Archive scope (`chats.in_archive_scope`): private, meeting and `48:` conversations by
+    default; --all adds channels. Broader than the `chats` browse view, which stays meeting-free.
 
     Returns the full conversation objects (not just ids) so their metadata — `lastMessage`,
     `version`, … — is persisted verbatim in index.db."""
@@ -159,7 +159,7 @@ def _enumerate(settings: Settings, skype_token: str, include_all: bool) -> list[
         seen += len(page)
         for conv in page:
             thread_id = str(conv.get("id") or "")
-            if thread_id and (include_all or is_private(thread_id) or is_meeting(thread_id)):
+            if in_archive_scope(thread_id, include_all) and thread_id != DRAFTS_THREAD:
                 targets.append(conv)
         log.info("enumerate_progress", pages=pages, scanned=seen, matched=len(targets))
     return targets

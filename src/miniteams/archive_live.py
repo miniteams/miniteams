@@ -20,7 +20,7 @@ from . import attachments
 from .archive import _MEDIA_CONCURRENCY, TokenProvider, _now_iso, record_asset_failure, run_archive
 from .archive_store import ChatStore, Index, merge_dicts, message_version
 from .auth import AuthExpired
-from .chats import is_meeting, is_private
+from .chats import in_archive_scope
 from .config import Settings
 from .messages import thread_of
 from .stream import run_forever
@@ -84,7 +84,7 @@ class LiveArchive:
         self._media_tasks: set[asyncio.Task[None]] = set()  # strong refs until each download ends
 
     def in_scope(self, thread_id: str) -> bool:
-        return bool(thread_id) and (self.include_all or is_private(thread_id) or is_meeting(thread_id))
+        return in_archive_scope(thread_id, self.include_all)
 
     # --- stream hooks ---
 
