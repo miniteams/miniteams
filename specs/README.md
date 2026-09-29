@@ -8,4 +8,4 @@
 | [004](004-seed-rows-from-archive.md) | Seed the widget's rows from the archive | implemented |
 | [005](005-archive-live-events.md) | Archive follows live events (`archive --live`) | shipped |
 | [006](006-widget-quick-reply.md) | Quick reply from the widget | shipped |
-| [007](007-archive-pseudo-conversations.md) | Archive the `48:` conversations, drafts included | in progress |
+| [007](007-archive-pseudo-conversations.md) | Archive the `48:` conversations, drafts included | implemented |

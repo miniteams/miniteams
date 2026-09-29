@@ -1,6 +1,6 @@
 # 007 — Archive the `48:` conversations, drafts included
 
-**Status**: in progress
+**Status**: implemented
 **Requested by**: babs
 **Date**: 2026-09-30
 **Order**: built before 008
@@ -20,7 +20,7 @@ no selection.
 |---|---|
 | `48:notes` | Notes to self, with media |
 | `48:drafts` | scheduled and parked drafts |
-| `48:annotations` | reactions and similar marks |
+| `48:annotations` | annotated messages |
 | `48:calllogs` | call log, with recording and transcript entries |
 | `48:mentions` | messages that mention you |
 | `48:notifications` | activity feed |
@@ -117,7 +117,7 @@ None.
   conversations. Overturnable.
 - Media follows the flags of the pass for all nine. Measured in phase 1 without `--videos`:
   `48:calllogs` downloads nothing, and nearly all the bytes come from `48:annotations`, which
-  carries the files attached to posts you reacted to. No skip rule: "no filter" stands.
+  carries the files attached to the messages it lists. No skip rule: "no filter" stands.
   With `--videos`, `48:calllogs` was not measured.
 - Live checks run on a scratch data dir, not on the real archive (babs, 2026-09-30).
 - `48:mentions`, `48:notifications`, `48:saved`, `48:starred` and `48:threads` hold copies of

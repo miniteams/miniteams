@@ -19,6 +19,25 @@ data/
 
 `index.db` is the entry point: never guess a thread id, look it up by `label`/`topic`.
 
+### Your own `48:` conversations
+
+Archived on every pass, same layout as a chat (`data/48:notes/messages.db`, …).
+
+| Id | Holds | Copies of other chats |
+|---|---|---|
+| `48:notes` | Notes to self | no |
+| `48:drafts` | scheduled and parked drafts | no |
+| `48:annotations` | annotated messages, with their files | yes |
+| `48:calllogs` | call log | no |
+| `48:mentions` | messages that mention you | yes |
+| `48:notifications` | activity feed | yes |
+| `48:saved` | saved messages | yes |
+| `48:starred` | bookmarks | yes |
+| `48:threads` | followed threads | yes |
+
+Searching across chats, leave out the ones that hold copies, or every hit counts twice:
+`where id not like '48:%' or id in ('48:notes')`.
+
 ## Schemas
 
 ```sql
@@ -118,6 +137,34 @@ Text before an edit or a delete (only for changes seen by `archive --live`):
 SELECT version, json_extract(raw, '$.content') FROM message_versions
 WHERE id = :msg_id ORDER BY CAST(version AS INTEGER);
 ```
+
+### Drafts and scheduled messages
+
+`data/48:drafts/messages.db` holds one row per draft, as old as the last pass. Teams keeps a draft
+after it was sent or cancelled, so filter on state:
+
+| State | Test |
+|---|---|
+| cancelled | `content` empty |
+| pending | `draftDetails.sendAt` (epoch ms) in the future |
+| sent | `sendAt` in the past |
+
+```python
+import json, sqlite3, time
+
+def pending_drafts(data_dir="data"):
+    """Yield (draft_id, target_thread, send_at_ms, html) for drafts still waiting."""
+    con = sqlite3.connect(f"file:{data_dir}/48:drafts/messages.db?mode=ro", uri=True)
+    now = time.time() * 1000
+    for (raw,) in con.execute("select raw from messages"):
+        d = json.loads(raw)
+        send_at = int((d.get("draftDetails") or {}).get("sendAt") or 0)
+        if (d.get("content") or "").strip() and send_at > now:
+            yield d["id"], d["innerThreadId"], send_at, d["content"]
+```
+
+`innerThreadId` is the chat the draft goes to. The text of a draft that was edited or cancelled
+between two passes is in `message_versions`, same query as for a message.
 
 ### Attachments
 
