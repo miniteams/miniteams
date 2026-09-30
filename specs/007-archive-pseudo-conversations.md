@@ -1,6 +1,6 @@
 # 007 — Archive the `48:` conversations, drafts included
 
-**Status**: implemented
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-09-30
 **Order**: built before 008
