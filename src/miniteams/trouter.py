@@ -27,7 +27,7 @@ def get_or_create_epid(settings: Settings, name: str = "endpoint_id") -> str:
     One file per consumer (`name`): the registrar maps an epid to a single socket, so two
     processes sharing one would silently steal each other's deliveries.
     """
-    path = settings.config_dir / name
+    path = settings.config_dir / f"{name}{settings.endpoint_suffix}"
     if path.exists():
         return path.read_text().strip()
     settings.config_dir.mkdir(parents=True, exist_ok=True)

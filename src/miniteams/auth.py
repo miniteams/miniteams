@@ -243,11 +243,34 @@ class TokenSource:
                 raise AuthUnavailable(f"silent token refresh failed ({code}) — AAD-side, retryable")
             return result
 
+    def start_device_flow(self) -> dict[str, Any]:
+        """Open a device-code sign-in on the Teams client; the caller shows the URL and code and
+        finishes it with `finish_device_flow`. Nothing is printed: the MCP server owns stdout."""
+        flow = self._teams.initiate_device_flow(scopes=self.settings.scope_list)
+        if "user_code" not in flow:
+            raise RuntimeError(
+                f"device flow init failed: {flow.get('error')}: {flow.get('error_description')}"
+            )
+        flow.setdefault("verification_uri_complete", f"{flow['verification_uri']}?otc={flow['user_code']}")
+        return dict(flow)
+
+    def finish_device_flow(self, flow: dict[str, Any]) -> dict[str, Any]:
+        """Block until the user signed in or the flow expired; persist the credential on success."""
+        result = dict(self._teams.acquire_token_by_device_flow(flow))
+        with self._lock:
+            self._persist()
+        return result
+
     def sharepoint_token(self, host: str) -> str | None:
         """Silent SharePoint token for `host` (e.g. `contoso-my.sharepoint.com`), redeemed on the
         Teams client via FOCI — no extra consent. Used to fetch meeting transcripts/recordings
         stored on OneDrive/SharePoint. Returns None if unavailable (never prompts)."""
         return self._silent_scope(f"https://{host}/.default")
+
+    def ic3_token(self) -> str | None:
+        """Silent token for the chat-service proxy (`teams.cloud.microsoft/api/chatsvc`), which the
+        drafts store needs for writes. FOCI, no consent. Returns None if unavailable (never prompts)."""
+        return self._silent_scope("https://ic3.teams.office.com/.default")
 
     def graph_token(self) -> str | None:
         """Silent Microsoft Graph token (FOCI, no consent). Used for the /shares API to fetch

@@ -42,6 +42,7 @@ _CONNECT_FLOOD = 30.0  # seconds after registration in which a message_loss is t
 
 EventHook = Callable[[dict[str, Any]], Awaitable[None]]  # receives each decoded EventMessage
 GapHook = Callable[[str], Awaitable[None]]  # events may have been missed; arg = reason
+AliveHook = Callable[[], Awaitable[None]]  # the socket is up: at connect and on every keepalive
 
 
 def _correlation_vector() -> str:
@@ -64,6 +65,7 @@ class TrouterClient:
         typing: bool = False,
         on_event: EventHook | None = None,
         on_gap: GapHook | None = None,
+        on_alive: AliveHook | None = None,
     ) -> None:
         self.settings = settings
         self.aad = aad
@@ -77,6 +79,7 @@ class TrouterClient:
         self.typing = typing
         self.on_event = on_event  # set → events go to the hook instead of stdout
         self.on_gap = on_gap
+        self.on_alive = on_alive
         self._loss_etag: str | None = None  # `messaging` etag of the last message_loss seen
         self._count = 0
         self._last_register = 0.0
@@ -169,6 +172,15 @@ class TrouterClient:
             await asyncio.sleep(_PING_INTERVAL)
             await self._send_regular({"name": "ping"})
             log.debug("ping_sent", count=self._count)
+            await self._alive()
+
+    async def _alive(self) -> None:
+        if self.on_alive is None:
+            return
+        try:
+            await self.on_alive()
+        except Exception as exc:  # noqa: BLE001 — a liveness note must not drop the socket
+            log.warning("alive_hook_failed", error=str(exc))
 
     async def _ttl_loop(self) -> None:
         interval = max(self.settings.trouter_ttl - 10, 60)
@@ -182,6 +194,7 @@ class TrouterClient:
         await self._register()
         if self.on_gap is not None:
             await self.on_gap("connected")  # whatever happened while disconnected is unknown
+        await self._alive()
         self._tasks = [
             asyncio.create_task(self._ping_loop()),
             asyncio.create_task(self._ttl_loop()),
@@ -333,6 +346,7 @@ async def run_forever(
     directory: Directory | None = None,
     epid_name: str = "endpoint_id",
     on_gap: GapHook | None = None,
+    on_alive: AliveHook | None = None,
 ) -> None:
     """Re-establish a full session on every disconnect.
 
@@ -376,6 +390,7 @@ async def run_forever(
                     typing,
                     on_event,
                     on_gap,
+                    on_alive,
                 ).run()
             finally:
                 refresher.cancel()

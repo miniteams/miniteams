@@ -26,3 +26,6 @@ _data/
 /run-*.sh
 *.log
 *.bundle
+
+# MCP registration for local runs (per machine)
+/.mcp.json

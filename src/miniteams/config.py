@@ -84,6 +84,9 @@ class Settings(BaseSettings):
     download_media: bool = True  # fetch inbound image/file bytes to media_dir
     log_level: str = "INFO"
     config_dir: Path = Field(default_factory=_default_config_dir)  # tokens, epid (state)
+    # The registrar keeps one socket per endpoint id: a test run that shares the real instance's id
+    # steals its deliveries. A suffix gives it its own ids while sharing the token cache.
+    endpoint_suffix: str = ""
     cache_dir: Path = Field(default_factory=_default_cache_dir)  # regenerable downloads
 
     @property

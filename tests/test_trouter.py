@@ -72,3 +72,14 @@ def test_epid_is_per_consumer_and_stable(settings: Settings) -> None:
     assert stream_id != web_id  # a shared epid lets one process steal the other's deliveries
     assert trouter.get_or_create_epid(settings) == stream_id
     assert trouter.get_or_create_epid(settings, "endpoint_id-web") == web_id
+
+
+def test_endpoint_suffix_gives_a_run_its_own_ids(settings) -> None:  # noqa: ANN001
+    from miniteams.trouter import get_or_create_epid
+
+    real = get_or_create_epid(settings, "endpoint_id-web")
+    settings.endpoint_suffix = "-test"
+    test = get_or_create_epid(settings, "endpoint_id-web")
+    assert test != real
+    assert get_or_create_epid(settings, "endpoint_id-web") == test  # stable across calls
+    assert {p.name for p in settings.config_dir.iterdir()} == {"endpoint_id-web", "endpoint_id-web-test"}
