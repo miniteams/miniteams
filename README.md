@@ -98,6 +98,12 @@ a reply box under the row: Enter sends it to the chat as you, Shift+Enter adds a
 the draft until the page reloads; a failed send keeps the text and shows why. The ⚙ menu picks the theme (system by default) and hides avatars for a denser list. The
 process exits non-zero when the stream dies (auth expired) — re-run it.
 
+Open it as a standalone window on the persisted bind:
+
+```sh
+chromium --app="http://$(jq -r '"\(.host):\(.port)"' ~/.config/miniteams/web.json)/"
+```
+
 `stream` enriches each line with thread name + participants, resolves MRIs → display names
 (cached in `~/.cache/miniteams/names.json`), downloads images/files to `~/.cache/miniteams/media/`
 (full-res + optimized, shown as `file://`), and renders reactions (`↳ 👍 Alice reacted`), edits
