@@ -325,9 +325,9 @@ def _utc_floor(value: str) -> str:
 
 
 def _reaction_key(value: str) -> str:
-    # Keys are case-sensitive: `Like` would post a separate reaction with a broken image.
-    if not re.fullmatch(r"[0-9a-z_]+", value):
-        raise argparse.ArgumentTypeError("a Teams emoji id: lowercase letters, digits and _")
+    # Keys are opaque (`yes-tone1`, `starMSER`, `name;0-frc-d4-<hash>`); only blanks are surely wrong.
+    if not value or re.search(r"\s", value):
+        raise argparse.ArgumentTypeError("a Teams reaction key, without spaces")
     return value
 
 

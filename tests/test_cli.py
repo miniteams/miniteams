@@ -77,12 +77,23 @@ def test_react_parser_defaults(monkeypatch) -> None:
     assert (seen["target"], seen["key"], seen["remove"], seen["thread"]) == ("42", "like", False, "48:notes")
 
 
-@pytest.mark.parametrize("key", ["Like", "", "1F525_fire", "like ", "heart,like"])
-def test_react_rejects_malformed_key(key: str, capsys, monkeypatch) -> None:
+@pytest.mark.parametrize("key", ["", " ", "like ", "a b", "like\t"])
+def test_react_rejects_blank_key(key: str, capsys, monkeypatch) -> None:
     monkeypatch.setattr(cli, "cmd_react", lambda s, a: pytest.fail("reached the Teams call"))
     with pytest.raises(SystemExit):
         cli.main(["react", "42", key])
-    assert "Teams emoji id" in capsys.readouterr().err
+    assert "without spaces" in capsys.readouterr().err
+
+
+# Real keys seen in reactions: skin tone, mixed case, custom emoji.
+@pytest.mark.parametrize(
+    "key", ["yes-tone1", "starMSER", "ah-denis;0-frc-d4-2de7f26db42058a360d77508b203b9fc"]
+)
+def test_react_accepts_real_keys(key: str, monkeypatch) -> None:
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "cmd_react", lambda s, a: seen.update(vars(a)) or 0)
+    assert cli.main(["react", "42", key]) == 0
+    assert seen["key"] == key
 
 
 def test_retry_assets_cannot_be_looped(capsys, monkeypatch) -> None:
