@@ -134,6 +134,25 @@ def cmd_react(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_emojis(settings: Settings, args: argparse.Namespace) -> int:
+    """List the organisation's custom emojis with their creator and creation date."""
+    import asyncio
+
+    from .auth import token_source
+    from .emojis import list_emojis
+
+    aad, skype_token = _ensure_skype_token(settings)
+    csa_token = token_source(settings).csa_token()
+    if not csa_token:
+        log.error("csa_token_unavailable", hint="run `miniteams login`")
+        return 1
+    bearer = str(aad.get("id_token") or aad["access_token"])
+    asyncio.run(
+        list_emojis(settings, skype_token, bearer, csa_token, jsonl=args.jsonl, download=args.download)
+    )
+    return 0
+
+
 def cmd_dump(settings: Settings, args: argparse.Namespace) -> int:
     """Dump a conversation's full message history (default: your Notes)."""
     import asyncio
@@ -325,9 +344,9 @@ def _utc_floor(value: str) -> str:
 
 
 def _reaction_key(value: str) -> str:
-    # Keys are case-sensitive: `Like` would post a separate reaction with a broken image.
-    if not re.fullmatch(r"[0-9a-z_]+", value):
-        raise argparse.ArgumentTypeError("a Teams emoji id: lowercase letters, digits and _")
+    # Keys are opaque (`yes-tone1`, `starMSER`, `name;0-frc-d4-<hash>`); only blanks are surely wrong.
+    if not value or re.search(r"\s", value):
+        raise argparse.ArgumentTypeError("a Teams reaction key, without spaces")
     return value
 
 
@@ -401,7 +420,8 @@ def main(argv: list[str] | None = None) -> int:
     p_react.add_argument(
         "key",
         type=_reaction_key,
-        help="reaction key: like, heart, laugh, surprised, sad, angry, or e.g. 1f525_fire",
+        help="reaction key (case-sensitive): like, heart, laugh, 1f525_fire, yes-tone1, or a custom "
+        "emoji's key from `emojis`",
     )
     p_react.add_argument("--remove", action="store_true", help="remove your reaction instead")
     p_react.add_argument(
@@ -410,6 +430,13 @@ def main(argv: list[str] | None = None) -> int:
         help="thread id when target is a bare message id (default: Notes to self)",
     )
     p_react.set_defaults(func=cmd_react)
+
+    p_emojis = sub.add_parser("emojis", help="list the organisation's custom emojis (creator, date)")
+    p_emojis.add_argument("--jsonl", action="store_true", help="one JSON object per emoji")
+    p_emojis.add_argument(
+        "--download", action="store_true", help="save each image under the cache dir (emojis/)"
+    )
+    p_emojis.set_defaults(func=cmd_emojis)
 
     p_chats = sub.add_parser("chats", help="list recent private chats (newest activity first)")
     p_chats.add_argument("--limit", type=int, default=20, help="max chats to list (0 = no limit)")

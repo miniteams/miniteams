@@ -254,6 +254,11 @@ class TokenSource:
         SharePoint-hosted files shared into chats. Returns None if unavailable (never prompts)."""
         return self._silent_scope("https://graph.microsoft.com/.default")
 
+    def csa_token(self) -> str | None:
+        """Silent chat-service aggregator token (FOCI, no consent), e.g. for custom emojis.
+        Returns None if unavailable (never prompts)."""
+        return self._silent_scope("https://chatsvcagg.teams.microsoft.com/.default")
+
     def _silent_scope(self, scope: str) -> str | None:
         with self._lock:
             self._sync_cache()

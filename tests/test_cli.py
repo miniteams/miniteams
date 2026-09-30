@@ -77,12 +77,32 @@ def test_react_parser_defaults(monkeypatch) -> None:
     assert (seen["target"], seen["key"], seen["remove"], seen["thread"]) == ("42", "like", False, "48:notes")
 
 
-@pytest.mark.parametrize("key", ["Like", "", "1F525_fire", "like ", "heart,like"])
-def test_react_rejects_malformed_key(key: str, capsys, monkeypatch) -> None:
+@pytest.mark.parametrize("key", ["", " ", "like ", "a b", "like\t"])
+def test_react_rejects_blank_key(key: str, capsys, monkeypatch) -> None:
     monkeypatch.setattr(cli, "cmd_react", lambda s, a: pytest.fail("reached the Teams call"))
     with pytest.raises(SystemExit):
         cli.main(["react", "42", key])
-    assert "Teams emoji id" in capsys.readouterr().err
+    assert "without spaces" in capsys.readouterr().err
+
+
+# Real keys seen in reactions: skin tone, mixed case, custom emoji.
+@pytest.mark.parametrize(
+    "key", ["yes-tone1", "starMSER", "ah-denis;0-frc-d4-2de7f26db42058a360d77508b203b9fc"]
+)
+def test_react_accepts_real_keys(key: str, monkeypatch) -> None:
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "cmd_react", lambda s, a: seen.update(vars(a)) or 0)
+    assert cli.main(["react", "42", key]) == 0
+    assert seen["key"] == key
+
+
+def test_cmd_emojis_without_csa_token_returns_1(settings: Settings, monkeypatch) -> None:
+    from miniteams import auth, emojis
+
+    monkeypatch.setattr(cli, "_ensure_skype_token", lambda s: ({"access_token": "a"}, "sk"))
+    monkeypatch.setattr(auth, "token_source", lambda s: argparse.Namespace(csa_token=lambda: None))
+    monkeypatch.setattr(emojis, "list_emojis", lambda *a, **k: pytest.fail("listed without a token"))
+    assert cli.cmd_emojis(settings, _ns(jsonl=False, download=False)) == 1
 
 
 def test_retry_assets_cannot_be_looped(capsys, monkeypatch) -> None:

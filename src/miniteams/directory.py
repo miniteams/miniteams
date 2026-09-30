@@ -93,13 +93,17 @@ class Directory:
         if mri and name:
             self._names[mri] = name
 
+    def _unknown(self, mri: str) -> bool:
+        return self._names.get(mri) == mri.split(":")[-1]  # the negative-cache marker
+
     def name_for(self, mri: str) -> str:
         # Strip the "8:orgid:" style prefix for an unresolved MRI.
         return self._names.get(mri) or mri.split(":")[-1]
 
-    async def _resolve(self, mris: list[str]) -> None:
-        """Batched MRI → display-name lookup; caches results (incl. negatives, to avoid refetch)."""
-        todo = sorted({m for m in mris if m and m not in self._names})
+    async def resolve(self, mris: list[str], *, refresh: bool = False) -> None:
+        """Batched MRI → display-name lookup; caches results (incl. negatives, to avoid refetch).
+        `refresh` re-asks for negatives too: a user unknown once may resolve now."""
+        todo = sorted({m for m in mris if m and (m not in self._names or (refresh and self._unknown(m)))})
         if not todo or not self.bearer:
             return
         headers = {
@@ -127,7 +131,7 @@ class Directory:
     async def display(self, mri: str) -> str:
         """Resolve an MRI to a display name (cached); falls back to the stripped id."""
         if mri not in self._names and self.bearer and mri.startswith("8:orgid:"):
-            await self._resolve([mri])
+            await self.resolve([mri])
         return self.name_for(mri)
 
     def reaction_diff(self, msg_id: str, key: str, users: list[str]) -> tuple[set[str], set[str]]:
@@ -203,7 +207,7 @@ class Directory:
             members.append({"mri": mri, "name": name, "role": m.get("role")})
 
         # Resolve roster members the thread didn't name (bare-guid MRIs) in one batched call.
-        await self._resolve([m["mri"] for m in members if not m["name"]])
+        await self.resolve([m["mri"] for m in members if not m["name"]])
         for m in members:
             m["name"] = m["name"] or self.name_for(m["mri"])
         self._save_names()  # persist friendlyName-sourced names too

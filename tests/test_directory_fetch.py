@@ -3,6 +3,7 @@
 from typing import Any
 
 import httpx
+import pytest
 
 from miniteams import directory as directory_mod
 from miniteams.directory import Directory
@@ -106,6 +107,29 @@ async def test_display_negative_caches_unresolved(directory: Directory, monkeypa
     assert await directory.display("8:orgid:zzz") == "zzz"  # stripped fallback
     assert await directory.display("8:orgid:zzz") == "zzz"
     assert calls["n"] == 1  # negative-cached, not re-fetched
+
+
+@pytest.mark.parametrize(("refresh", "calls"), [(False, 0), (True, 1)])
+async def test_resolve_refresh_retries_negatives(
+    directory: Directory, monkeypatch, refresh: bool, calls: int
+) -> None:
+    """A user unknown to an old lookup (not yet visible, a transient partial answer) stays unknown
+    forever unless a caller that shows every name asks again."""
+    directory.set_token("sk", bearer="id-tok")
+    directory.note_name("8:orgid:zzz", "zzz")  # negative-cache marker
+    directory.note_name("8:orgid:bob", "Bob")
+    asked: list[Any] = []
+
+    class _Client(_AsyncClientPost):
+        async def post(self, url: str, headers: Any = None, json: Any = None) -> _Resp:
+            asked.append(json)
+            return _Resp({"value": [{"mri": "8:orgid:zzz", "displayName": "Zoe"}]})
+
+    monkeypatch.setattr(directory_mod.httpx, "AsyncClient", lambda *a, **k: _Client(None))
+    await directory.resolve(["8:orgid:zzz", "8:orgid:bob"], refresh=refresh)
+    assert asked == [["8:orgid:zzz"]] * calls  # a known name is never re-asked
+    assert directory.name_for("8:orgid:zzz") == ("Zoe" if refresh else "zzz")
+    assert directory.name_for("8:orgid:bob") == "Bob"
 
 
 async def test_names_cache_persists_across_instances(settings, monkeypatch) -> None:
