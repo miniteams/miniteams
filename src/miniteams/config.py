@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     # --- chat-service metadata (libteams.h TEAMS_CONTACTS_HOST, TFW) ---
     # Fallback only: the skype token exchange switches it to the account's region (see skype.py).
     contacts_host: str = "apac.ng.msg.teams.microsoft.com"
+    # Chat-service aggregator (custom emojis); same fallback-only rule as contacts_host.
+    csa_url: str = "https://teams.microsoft.com/api/csa/emea"
     # Batched MRI → display-name lookup (teams_contacts.c TEAMS_PROFILES_PREFIX). Bearer id_token.
     profiles_url: str = (
         "https://teams.microsoft.com/api/mt/beta/users/fetchShortProfile"

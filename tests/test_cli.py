@@ -96,6 +96,15 @@ def test_react_accepts_real_keys(key: str, monkeypatch) -> None:
     assert seen["key"] == key
 
 
+def test_cmd_emojis_without_csa_token_returns_1(settings: Settings, monkeypatch) -> None:
+    from miniteams import auth, emojis
+
+    monkeypatch.setattr(cli, "_ensure_skype_token", lambda s: ({"access_token": "a"}, "sk"))
+    monkeypatch.setattr(auth, "token_source", lambda s: argparse.Namespace(csa_token=lambda: None))
+    monkeypatch.setattr(emojis, "list_emojis", lambda *a, **k: pytest.fail("listed without a token"))
+    assert cli.cmd_emojis(settings, _ns(jsonl=False, download=False)) == 1
+
+
 def test_retry_assets_cannot_be_looped(capsys, monkeypatch) -> None:
     """A one-shot override on a timer would re-request every dead asset every cycle."""
     import pytest

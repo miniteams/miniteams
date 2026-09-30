@@ -40,9 +40,13 @@ def exchange_skype_token(settings: Settings, access_token: str) -> dict[str, Any
     region = data.get("region")
     # The chat service lives in the account's region: the APAC default costs ~2 s a call from the EU.
     # An explicit MINITEAMS_CONTACTS_HOST still wins.
-    chat_host = urlparse(str((data.get("regionGtms") or {}).get("chatService") or "")).hostname
+    gtms = data.get("regionGtms") or {}
+    chat_host = urlparse(str(gtms.get("chatService") or "")).hostname
     if chat_host and "contacts_host" not in settings.model_fields_set:
         settings.contacts_host = chat_host
+    csa_url = str(gtms.get("chatSvcAggAfd") or "").rstrip("/")
+    if csa_url.startswith("https://") and "csa_url" not in settings.model_fields_set:
+        settings.csa_url = csa_url
     log.info("skype_token_acquired", expires_in=expires_in, region=region, chat_host=settings.contacts_host)
     return {"skype_token": token, "expires_in": expires_in, "region": region}
 

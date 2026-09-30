@@ -204,3 +204,35 @@ def test_http_error_keeps_teams_reason_and_type(
     with pytest.raises(httpx.HTTPStatusError, match=reason) as exc:
         send.react(settings, "sk", "t", "1", "like")
     assert exc.value.response.status_code == resp.status_code
+
+
+def test_exchange_skype_token_follows_the_csa_region(settings: Settings, monkeypatch) -> None:
+    region = {"chatSvcAggAfd": "https://teams.microsoft.com/api/csa/amer/"}
+    monkeypatch.setattr(
+        skype.httpx, "post", lambda *a, **k: _Resp({"tokens": {"skypeToken": "ST"}, "regionGtms": region})
+    )
+    skype.exchange_skype_token(settings, "aad")
+    assert settings.csa_url == "https://teams.microsoft.com/api/csa/amer"
+
+
+@pytest.mark.parametrize(
+    "region", [{}, {"chatSvcAggAfd": ""}, {"chatSvcAggAfd": "http://downgraded.example/api/csa/x"}]
+)
+def test_exchange_skype_token_keeps_the_default_csa(settings: Settings, monkeypatch, region) -> None:
+    default = settings.csa_url
+    monkeypatch.setattr(
+        skype.httpx, "post", lambda *a, **k: _Resp({"tokens": {"skypeToken": "ST"}, "regionGtms": region})
+    )
+    skype.exchange_skype_token(settings, "aad")
+    assert settings.csa_url == default
+
+
+def test_exchange_skype_token_keeps_an_explicit_csa(monkeypatch) -> None:
+    monkeypatch.setenv("MINITEAMS_CSA_URL", "https://pinned.example/api/csa/x")
+    pinned = Settings(tenant_id="t")
+    region = {"chatSvcAggAfd": "https://teams.microsoft.com/api/csa/amer"}
+    monkeypatch.setattr(
+        skype.httpx, "post", lambda *a, **k: _Resp({"tokens": {"skypeToken": "ST"}, "regionGtms": region})
+    )
+    skype.exchange_skype_token(pinned, "aad")
+    assert pinned.csa_url == "https://pinned.example/api/csa/x"

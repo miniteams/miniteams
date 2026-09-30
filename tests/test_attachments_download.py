@@ -924,8 +924,8 @@ async def test_concurrent_same_ams_object_downloads_once(settings: Settings, mon
     url = f"{_OBJ}/video"
     settings.media_dir.mkdir(parents=True, exist_ok=True)
     paths = await asyncio.gather(
-        A._fetch_image(client, "sk", url, settings.media_dir, suffix=".video"),
-        A._fetch_image(client, "sk", url, settings.media_dir, suffix=".video"),
+        A.fetch_image(client, "sk", url, settings.media_dir, suffix=".video"),
+        A.fetch_image(client, "sk", url, settings.media_dir, suffix=".video"),
     )
     assert len(calls) == 1  # loser waited, then took the skip-if-exists path
     assert paths[0] == paths[1]
@@ -1040,8 +1040,6 @@ async def test_ams_stream_429_is_retried(settings: Settings) -> None:
         return _Resp(content=b"IMG", headers={"content-type": "image/png"})
 
     settings.media_dir.mkdir(parents=True, exist_ok=True)
-    path = await A._fetch_image(
-        _AsyncClient(handler), "sk", f"{_OBJ}/imgpsh_fullsize", settings.media_dir, ""
-    )
+    path = await A.fetch_image(_AsyncClient(handler), "sk", f"{_OBJ}/imgpsh_fullsize", settings.media_dir, "")
     assert len(calls) == 2
     assert Path(path).read_bytes() == b"IMG"

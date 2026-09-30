@@ -39,6 +39,8 @@ uv run miniteams send --file test.html --html     # raw RichText/Html (formatted
 uv run miniteams update <msg-id-or-deep-link> "fixed text"   # edit a sent message
 uv run miniteams react <msg-id-or-deep-link> like    # react (heart, laugh, 1f525_fire…)
 uv run miniteams react <msg-id-or-deep-link> like --remove   # take it back
+uv run miniteams emojis           # org custom emojis: creation date, name, creator
+uv run miniteams emojis --jsonl --download   # + reaction key, image saved under ~/.cache/miniteams/emojis/
 uv run miniteams archive          # resumable local archive under ./data: private chats, meetings,
                                   # and your own `48:` conversations (Notes, feeds)
 uv run miniteams archive --thread 19:xxx@thread.v2     # archive one conversation

@@ -231,7 +231,7 @@ async def _serialized(key: str) -> AsyncGenerator[None]:
             del _dl_refs[key], _dl_locks[key]
 
 
-async def _fetch_image(client: httpx.AsyncClient, token: str, url: str, media_dir: Path, suffix: str) -> str:
+async def fetch_image(client: httpx.AsyncClient, token: str, url: str, media_dir: Path, suffix: str) -> str:
     stem = f"{_object_id(url)}{suffix}"
     async with _serialized(str(media_dir / stem)):
         cached = _existing(media_dir, stem)
@@ -392,14 +392,14 @@ async def _download_image(
     on_fail: Callable[[str, Exception], None] | None = None,
 ) -> tuple[str, str | None]:
     """Fetch the optimized view (as referenced) and the full-resolution view; return (optim, full)."""
-    optim = await _fetch_image(client, token, src, media_dir, suffix="")
+    optim = await fetch_image(client, token, src, media_dir, suffix="")
     full_url = _VIEW_RE.sub(f"/views/{_FULL_VIEW}", src)
     # The full view has its own URL: a denied one must be skipped/recorded on that URL, or a
     # message whose optimized view is fine would re-poll a 403 full view on every run.
     if full_url == src or (skip_url and skip_url(full_url)):
         return optim, None
     try:
-        full = await _fetch_image(client, token, full_url, media_dir, suffix=".full")
+        full = await fetch_image(client, token, full_url, media_dir, suffix=".full")
     except Exception as exc:  # noqa: BLE001 — full view may 404; the optimized one still stands
         log.debug("full_image_failed", url=full_url, error=str(exc))
         if on_fail:
@@ -477,7 +477,7 @@ async def process(
                     notes.append(f"[video: {url}]")
                     continue
                 try:
-                    path = await _fetch_image(client, token, url, media_dir, suffix=".video")
+                    path = await fetch_image(client, token, url, media_dir, suffix=".video")
                     notes.append(f"[video: {url} → {Path(path).resolve().as_uri()}]")
                 except Exception as exc:  # noqa: BLE001 — best-effort; ref-only on failure
                     log.debug("ams_video_failed", url=url, error=str(exc))
@@ -537,7 +537,7 @@ async def process(
                     notes.append(f"[image: {url} → {primary}{extra}]")
                 elif kind == "transcript":
                     # Direct /views/transcript GET, named by content-type (vtt/json/txt).
-                    path = await _fetch_image(client, token, url, media_dir, suffix=".transcript")
+                    path = await fetch_image(client, token, url, media_dir, suffix=".transcript")
                     notes.append(f"[transcript: {url} → {Path(path).resolve().as_uri()}]")
                 else:
                     fpath, name, size = await _download_file(client, token, url, media_dir)
