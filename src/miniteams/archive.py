@@ -11,6 +11,7 @@ resumes with no gap and no duplicate — see `archive_store` for the storage inv
 
 import asyncio
 import json
+import sqlite3
 import threading
 import time
 from collections.abc import Callable
@@ -91,7 +92,7 @@ class RefreshingToken:
 
     def __init__(self, settings: Settings, source: TokenSource) -> None:
         self.settings, self.source = settings, source
-        self._token = self._bearer = ""
+        self._token = self._bearer = self.region = ""
         self._deadline = 0.0
         # `archive --live` calls it from the pass thread and the event loop: one re-mint, one pair.
         self._lock = threading.Lock()
@@ -103,6 +104,7 @@ class RefreshingToken:
         skype = exchange_skype_token(self.settings, aad["access_token"])
         self._token = skype["skype_token"]
         self._bearer = str(aad.get("id_token") or aad["access_token"])
+        self.region = str(skype.get("region") or "")
         self._deadline = time.monotonic() + float(skype.get("expires_in") or 3600) - self._MARGIN
 
     def token(self) -> str:
@@ -124,6 +126,15 @@ class RefreshingToken:
 
 def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def note_meta(index: Index, **rows: str) -> None:
+    """Archiver liveness rows for readers. Best-effort: a locked index must never stop a pass."""
+    for key, value in rows.items():
+        try:
+            index.set_meta(key, value)
+        except sqlite3.Error as exc:
+            log.warning("meta_write_failed", key=key, error=str(exc))
 
 
 def _reached_start(oldest_iso: str | None, created_at_ms: Any) -> bool | None:
@@ -555,6 +566,7 @@ async def run_archive(
     totals = {"new": 0, "media": 0, "avatars": 0}
     failed = denied = 0
     auth_expired = False
+    note_meta(index, archiver_state="syncing", sync_started_at=_now_iso())
     try:
         if thread:
             targets: list[dict[str, Any]] = [{"id": thread}]
@@ -667,6 +679,9 @@ async def run_archive(
             duration_s=round(time.monotonic() - run_start, 1),
             auth_expired=auth_expired,
         )
+        # A pass that stopped on a dead credential proves nothing about the archiver being alive.
+        if not auth_expired:
+            note_meta(index, archiver_seen=_now_iso(), archiver_state="idle")
     finally:
         index.close()
     return auth_expired

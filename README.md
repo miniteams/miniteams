@@ -60,10 +60,28 @@ uv run miniteams web              # local live page: conversations newest-first 
 uv run miniteams web --limit 0 --bind 127.0.0.5:8765   # load every chat (with an archive that is
                                                        # every archived chat: a heavier page)
 uv run miniteams web --data-dir /srv/teams-archive     # seed rows from an archive kept elsewhere
+uv run miniteams mcp              # MCP server over stdio for an agent (spec 008; see below)
 uv run miniteams dump             # dump your Notes' full history (oldest → newest)
 uv run miniteams dump --thread 19:xxx@thread.v2        # dump a conversation
 uv run miniteams dump --jsonl > notes.jsonl            # full-detail JSON per line
 ```
+
+`mcp` serves your Teams to an MCP client over stdin/stdout (spec 008). Reads come from the
+archive: `find_chats` (label, topic, participant, kind), `read_messages` (plain text, date window,
+`next_since` cursor), `search_messages` (substring, case and accents ignored, 7 days back by
+default, feeds left out) and `read_transcript` (recordings, then turns). Results say where they come
+from (`source`) and carry the archiver's heartbeat (`archiver_seen`, `archiver_state`,
+`sync_started_at`, written by `archive` into `index.db`), so an agent can tell a stopped archiver
+from a quiet one. When the archive cannot be reached (no `index.db`, or no answer in 3 s) the
+first three read from the API instead, with `source: "api"`. `send_message` and `update_message`
+write to Teams as you; with `send_at` (ISO 8601 with an offset, 5 seconds to 125 days ahead)
+`send_message` schedules instead, and `list_scheduled`, `update_scheduled` and `cancel_scheduled`
+manage what Teams is holding (`docs/scheduled-send-wire.md`). `--read-only` keeps every writing tool
+out of the list. Nothing needs a token until the
+API is called; a dead credential makes that call return a device-code URL, and `login` reports the
+same flow. The server needs the project's `.env` and `data/`, so register it as
+`uv run --directory /path/to/miniteams miniteams mcp` (a gitignored `.mcp.json` at the repo root
+does it for Claude Code).
 
 `dump --jsonl` emits one full-detail record per message (raw resource + resolved sender/thread
 + attachment refs + reactions), every message type, no media download — pipe-friendly.
@@ -152,7 +170,9 @@ token expires. Downloaded media (from `stream`) lives under `~/.cache/miniteams/
 
 ## Config
 
-All via `MINITEAMS_*` env vars / `.env` (see `.env.example`). Defaults are the purple-teams
+All via `MINITEAMS_*` env vars / `.env` (see `.env.example`). `MINITEAMS_ENDPOINT_SUFFIX=-test` gives a
+second `web`, `stream` or `archive --live` its own Trouter endpoint ids, so it does not take the
+deliveries of the one already running. Defaults are the purple-teams
 **work/TFW** constants — override only if auth starts returning 4xx, after re-capturing from a
 live browser session.
 

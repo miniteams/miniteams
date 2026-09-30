@@ -308,6 +308,15 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
         return 0
 
 
+def cmd_mcp(settings: Settings, args: argparse.Namespace) -> int:
+    """Serve the MCP tools over stdin/stdout (spec 008)."""
+    from pathlib import Path
+
+    from .mcp import Server
+
+    return Server(settings, Path(args.data_dir), read_only=args.read_only).serve()
+
+
 def cmd_stream(settings: Settings, args: argparse.Namespace) -> int:
     """Full chain → websocket → authenticate → register → stream, with auto-reconnect (M2-M4)."""
     import asyncio
@@ -546,6 +555,11 @@ def main(argv: list[str] | None = None) -> int:
         "own browser follows the link",
     )
     p_web.set_defaults(func=cmd_web)
+
+    p_mcp = sub.add_parser("mcp", help="serve the MCP tools over stdio (for Claude Code and co)")
+    p_mcp.add_argument("--data-dir", default="data", help="archive root to read (default: ./data)")
+    p_mcp.add_argument("--read-only", action="store_true", help="expose no tool that writes to Teams")
+    p_mcp.set_defaults(func=cmd_mcp)
 
     p_stream = sub.add_parser("stream", help="stream live incoming chat events (M2+)")
     p_stream.add_argument(

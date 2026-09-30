@@ -65,14 +65,40 @@ def read_chats(data_dir: Path) -> Iterator[dict[str, Any]]:
         raise FileNotFoundError(path)
     db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
-        for r in db.execute("SELECT id, label, topic, participants, raw FROM chats"):
+        for r in db.execute(
+            "SELECT id, label, topic, participants, raw, backfill_done, history_denied_at, last_fetch_at, dir"
+            " FROM chats"
+        ):
             yield {
                 "id": r[0],
                 "label": r[1],
                 "topic": r[2],
                 "participants": json.loads(r[3] or "[]"),
                 "raw": json.loads(r[4] or "{}"),
+                "backfill_done": bool(r[5]),
+                "history_denied": bool(r[6]),
+                "synced_at": r[7] or "",
+                "dir": r[8] or "",
             }
+    finally:
+        db.close()
+
+
+def read_meta(data_dir: Path) -> dict[str, str]:
+    """The archiver's `meta` rows, read-only; `{}` for an index without the table.
+
+    Same rule as `read_chats`: a reader never creates the archive. Raises OSError when there is no
+    index and sqlite3.Error when it cannot be read.
+    """
+    path = data_dir / "index.db"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if "meta" not in tables:
+            return {}
+        return {str(k): str(v) for k, v in db.execute("SELECT key, value FROM meta")}
     finally:
         db.close()
 
@@ -106,7 +132,17 @@ class Index:
             self._db.execute("ALTER TABLE chats ADD COLUMN history_denied_at TEXT NOT NULL DEFAULT ''")
         if "synced_version" not in cols:
             self._db.execute("ALTER TABLE chats ADD COLUMN synced_version INTEGER NOT NULL DEFAULT 0")
+        # Archiver liveness for readers (spec 008): archiver_seen, archiver_state, sync_started_at.
+        self._db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         self._db.commit()
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._db:
+            self._db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+
+    def get_meta(self, key: str) -> str:
+        row = self._db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return str(row[0]) if row else ""
 
     def upsert_chat(
         self,

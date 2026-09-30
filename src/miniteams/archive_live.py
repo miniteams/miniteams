@@ -17,7 +17,7 @@ from typing import Any
 import structlog
 
 from . import attachments
-from .archive import _MEDIA_CONCURRENCY, TokenProvider, _now_iso, record_asset_failure, run_archive
+from .archive import _MEDIA_CONCURRENCY, TokenProvider, _now_iso, note_meta, record_asset_failure, run_archive
 from .archive_store import ChatStore, Index, merge_dicts, message_version
 from .auth import AuthExpired
 from .chats import in_archive_scope
@@ -87,6 +87,10 @@ class LiveArchive:
         return in_archive_scope(thread_id, self.include_all)
 
     # --- stream hooks ---
+
+    async def on_alive(self) -> None:
+        """Heartbeat for readers: the socket is up, so events reach the archive."""
+        note_meta(self.index, archiver_seen=_now_iso())
 
     async def on_gap(self, reason: str) -> None:
         log.info("live_gap", reason=reason, buffering=self._buffering)
@@ -279,6 +283,7 @@ class LiveArchive:
             counts[outcome] = counts.get(outcome, 0) + 1
             await asyncio.sleep(0)  # a long buffer must not starve the socket's heartbeat echo
         self._buffering = False
+        note_meta(self.index, archiver_state="following")
         log.info("live_drained", dropped=self._dropped, **counts)
         self._dropped = 0
         return True
@@ -316,7 +321,13 @@ async def run_live(
         download_videos=download_videos,
     )
     stream = asyncio.create_task(
-        run_forever(settings, on_event=live.on_event, on_gap=live.on_gap, epid_name="endpoint_id-archive")
+        run_forever(
+            settings,
+            on_event=live.on_event,
+            on_gap=live.on_gap,
+            on_alive=live.on_alive,
+            epid_name="endpoint_id-archive",
+        )
     )
     stop = asyncio.create_task(live.stopped.wait())
     timer = asyncio.create_task(live.reconcile(reconcile))
