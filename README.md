@@ -61,6 +61,8 @@ uv run miniteams web --limit 0 --bind 127.0.0.5:8765   # load every chat (with a
                                                        # every archived chat: a heavier page)
 uv run miniteams web --data-dir /srv/teams-archive     # seed rows from an archive kept elsewhere
 uv run miniteams mcp              # MCP server over stdio for an agent (spec 008; see below)
+uv run miniteams watch --thread 19:xxx@thread.v2 --once   # one JSON line per matching live event
+                                                       # (spec 009; docs/watch.md)
 uv run miniteams dump             # dump your Notes' full history (oldest → newest)
 uv run miniteams dump --thread 19:xxx@thread.v2        # dump a conversation
 uv run miniteams dump --jsonl > notes.jsonl            # full-detail JSON per line
@@ -121,6 +123,12 @@ Open it as a standalone window on the persisted bind:
 ```sh
 chromium --app="http://$(jq -r '"\(.host):\(.port)"' ~/.config/miniteams/web.json)/"
 ```
+
+`watch` follows the stream and prints one JSON line per event matching its criteria: `--thread`,
+`--from me|others|anyone`, `--event message|reaction`, `--after MSG` (also catches up from the
+chat's history), `--reaction KEY`, `--once`, `--note`. Built for Claude Code's Monitor tool, which
+turns each line into an event in the session; `docs/watch.md` has the call and the service lines
+(`gap`, `suppressed`, `stopped`).
 
 `stream` enriches each line with thread name + participants, resolves MRIs → display names
 (cached in `~/.cache/miniteams/names.json`), downloads images/files to `~/.cache/miniteams/media/`

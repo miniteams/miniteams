@@ -39,6 +39,7 @@ from .drafts import (
 )
 from .mcp_api import ApiReader
 from .send import NOTES_THREAD, edit_message, message_html, send_message
+from .watch import note_sent
 from .web import _SEND_MAX_BYTES, self_mri
 from .web import _plain as plain_text
 
@@ -656,6 +657,7 @@ def _schedule(server: Server, thread_id: str, text: str, send_at_ms: int) -> dic
     name = server.session.display_name()
     message = new_draft_message(message_html(text, False), server.session.mri(), name, client_id)
     draft_id = _write(lambda: store.create(draft_payload(inner, message, send_at_ms)), "schedule")
+    note_sent(server.settings, client_id)  # Teams will send it with this client id: a watch on me skips it
     return {"thread_id": thread_id, "scheduled_id": draft_id, "send_at": _iso_ms(send_at_ms)}
 
 
@@ -669,6 +671,7 @@ def _send_message(server: Server, args: dict[str, Any]) -> dict[str, Any]:
     skype_token, _ = server.session.tokens()
     name = server.session.display_name()
     sent = _write(lambda: send_message(server.settings, skype_token, thread_id, text, name), "send")
+    note_sent(server.settings, str(sent.get("clientmessageid") or ""))  # so a watch on me skips it
     return {
         "thread_id": thread_id,
         "clientmessageid": sent.get("clientmessageid", ""),

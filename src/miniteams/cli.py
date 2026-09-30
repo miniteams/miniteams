@@ -308,6 +308,18 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
         return 0
 
 
+def cmd_watch(settings: Settings, args: argparse.Namespace) -> int:
+    """Print one JSON line per live event matching the criteria (spec 009)."""
+    import asyncio
+
+    from .watch import run_watch
+
+    try:
+        return asyncio.run(run_watch(settings, args.watch))
+    except KeyboardInterrupt:
+        return 0
+
+
 def cmd_mcp(settings: Settings, args: argparse.Namespace) -> int:
     """Serve the MCP tools over stdin/stdout (spec 008)."""
     from pathlib import Path
@@ -556,6 +568,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_web.set_defaults(func=cmd_web)
 
+    p_watch = sub.add_parser("watch", help="one JSON line per live event matching the criteria (spec 009)")
+    p_watch.add_argument("--event", choices=["message", "reaction"], default="message")
+    p_watch.add_argument("--thread", default="", help="only this chat (a chat id)")
+    p_watch.add_argument("--from", dest="sender", choices=["me", "others", "anyone"], default="anyone")
+    p_watch.add_argument(
+        "--after", default="", help="only messages newer than this message id; also catches up"
+    )
+    p_watch.add_argument("--reaction", default="", help="only this emotion key (like, heart, ...)")
+    p_watch.add_argument("--once", action="store_true", help="exit after the first match")
+    p_watch.add_argument("--note", default="", help="free text repeated in every line")
+    p_watch.set_defaults(func=cmd_watch)
+
     p_mcp = sub.add_parser("mcp", help="serve the MCP tools over stdio (for Claude Code and co)")
     p_mcp.add_argument("--data-dir", default="data", help="archive root to read (default: ./data)")
     p_mcp.add_argument("--read-only", action="store_true", help="expose no tool that writes to Teams")
@@ -591,6 +615,16 @@ def main(argv: list[str] | None = None) -> int:
         clash = [f for f in flags if getattr(args, f) not in (None, False)]
         if clash:
             parser.error(f"--live cannot be combined with --{clash[0].replace('_', '-')}")
+    if getattr(args, "func", None) is cmd_watch:
+        from .watch import Watch
+
+        args.watch = Watch(
+            args.event, args.thread, args.sender, args.after, args.reaction, args.once, args.note
+        )
+        try:
+            args.watch.validate()
+        except ValueError as exc:
+            parser.error(str(exc))
     # Videos ride the media pass; without it the flag would be a silent no-op.
     if getattr(args, "videos", False) and getattr(args, "no_media", False):
         parser.error("--videos requires media downloads; drop --no-media")
