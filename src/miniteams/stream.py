@@ -347,6 +347,8 @@ async def run_forever(
     epid_name: str = "endpoint_id",
     on_gap: GapHook | None = None,
     on_alive: AliveHook | None = None,
+    epid: str | None = None,
+    prompt: bool = True,
 ) -> None:
     """Re-establish a full session on every disconnect.
 
@@ -360,7 +362,10 @@ async def run_forever(
     # Authenticate ONCE up front (may prompt: device-code in stream mode). Reconnects then only
     # refresh silently — never re-prompt — so a failed connect can't spin into endless logins.
     tokens = token_source(settings)
-    tokens.acquire()
+    if prompt:
+        tokens.acquire()
+    else:
+        tokens.refresh()  # silent only: a watch owns stdout and cannot show a device code
     backoff = 1.0
     while True:
         connected_at: float | None = None
@@ -369,7 +374,7 @@ async def run_forever(
             skype = exchange_skype_token(settings, aad["access_token"])
             skype_token = skype["skype_token"]
             directory.set_token(skype_token, str(aad.get("id_token") or aad["access_token"]))
-            epid = get_or_create_epid(settings, epid_name)
+            epid = epid or get_or_create_epid(settings, epid_name)
             info = trouter_info(settings, skype_token, epid)
             session_id = handshake(settings, info, skype_token, epid)
             connected_at = time.monotonic()
