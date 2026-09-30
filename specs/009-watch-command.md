@@ -1,6 +1,6 @@
 # 009 — `miniteams watch`: events on declared criteria
 
-**Status**: in progress
+**Status**: implemented
 **Requested by**: babs
 **Date**: 2026-09-30
 **Order**: built after 008
