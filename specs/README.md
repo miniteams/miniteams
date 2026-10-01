@@ -11,3 +11,4 @@
 | [007](007-archive-pseudo-conversations.md) | Archive the `48:` conversations, drafts included | shipped |
 | [008](008-mcp-stdio.md) | MCP server over stdio (`miniteams mcp`) | shipped |
 | [009](009-watch-command.md) | `miniteams watch`: events on declared criteria | shipped |
+| [010](010-typing-indicator.md) | Outgoing typing indicator (`miniteams typing`) | implemented |

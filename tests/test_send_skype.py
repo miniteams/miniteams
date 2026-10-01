@@ -56,6 +56,26 @@ def test_send_message_html_mode_sends_raw(settings: Settings, monkeypatch) -> No
     assert captured["json"]["content"] == "<b>hi</b> & <i>x</i>"  # verbatim, not escaped
 
 
+def test_send_typing_builds_request(settings: Settings, monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_post(url: str, **kw: Any) -> _Resp:
+        captured["url"] = url
+        captured.update(kw)
+        return _Resp({}, status=201)
+
+    monkeypatch.setattr(send._CLIENT, "post", fake_post)
+    assert send.send_typing(settings, "sk", "19:a@thread.v2") == {"status": 201}
+
+    assert captured["url"].endswith("/v1/users/ME/conversations/19%3Aa%40thread.v2/messages")
+    assert captured["headers"]["X-Skypetoken"] == "sk"
+    assert captured["json"] == {
+        "messagetype": "Control/Typing",
+        "contenttype": "Application/Message",
+        "content": "",
+    }
+
+
 def test_parse_message_link() -> None:
     url = (
         "https://teams.cloud.microsoft/l/message/48:notes/1781920776714"

@@ -1,4 +1,4 @@
-"""CLI input resolution for send/update/react (no network: auth + write calls are mocked)."""
+"""CLI input resolution for send/update/react/typing (no network: auth + write calls are mocked)."""
 
 import argparse
 from typing import Any
@@ -94,6 +94,69 @@ def test_react_accepts_real_keys(key: str, monkeypatch) -> None:
     monkeypatch.setattr(cli, "cmd_react", lambda s, a: seen.update(vars(a)) or 0)
     assert cli.main(["react", "42", key]) == 0
     assert seen["key"] == key
+
+
+def _typing_clock(monkeypatch) -> tuple[list[float], list[str]]:
+    """Fake clock + mocked send: (send times, threads) for a `cmd_typing` run."""
+    import time
+
+    now = [0.0]
+    sent_at: list[float] = []
+    threads: list[str] = []
+    monkeypatch.setattr(cli, "_ensure_skype_token", lambda s: ({}, "sk"))
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(time, "sleep", lambda s: now.__setitem__(0, now[0] + s))
+    monkeypatch.setattr(
+        "miniteams.send.send_typing",
+        lambda s, tok, thread: (sent_at.append(now[0]), threads.append(thread)),
+    )
+    return sent_at, threads
+
+
+@pytest.mark.parametrize(
+    ("duration", "expected"),
+    [
+        (0, [0.0]),
+        (5, [0.0]),  # the first send already covers one resend interval
+        (6, [0.0, 5.0]),
+        (20, [0.0, 5.0, 10.0, 15.0]),
+    ],
+)
+def test_cmd_typing_resends_until_the_duration_is_covered(
+    settings: Settings, monkeypatch, duration: int, expected: list[float]
+) -> None:
+    sent_at, threads = _typing_clock(monkeypatch)
+    assert cli.cmd_typing(settings, _ns(thread="19:a@thread.v2", duration=duration)) == 0
+    assert sent_at == expected
+    assert set(threads) == {"19:a@thread.v2"}
+
+
+def test_cmd_typing_stops_on_ctrl_c(settings: Settings, monkeypatch) -> None:
+    import time
+
+    sent_at, _ = _typing_clock(monkeypatch)
+
+    def interrupt(seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(time, "sleep", interrupt)
+    assert cli.cmd_typing(settings, _ns(thread="48:notes", duration=60)) == 0
+    assert sent_at == [0.0]
+
+
+def test_typing_parser_defaults(monkeypatch) -> None:
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "cmd_typing", lambda s, a: seen.update(vars(a)) or 0)
+    assert cli.main(["typing"]) == 0
+    assert (seen["thread"], seen["duration"]) == ("48:notes", 0)
+    assert cli.main(["typing", "--thread", "19:a@thread.v2", "--for", "30"]) == 0
+    assert (seen["thread"], seen["duration"]) == ("19:a@thread.v2", 30)
+
+
+def test_typing_rejects_negative_duration(monkeypatch) -> None:
+    monkeypatch.setattr(cli, "cmd_typing", lambda s, a: pytest.fail("reached the Teams call"))
+    with pytest.raises(SystemExit):
+        cli.main(["typing", "--for", "-1"])
 
 
 def test_cmd_emojis_without_csa_token_returns_1(settings: Settings, monkeypatch) -> None:

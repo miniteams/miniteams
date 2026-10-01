@@ -93,6 +93,31 @@ def cmd_send(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+# Re-sent every 5 s, the indicator stayed up without a gap in the Teams client (2026-10-01).
+_TYPING_RESEND = 5.0
+
+
+def cmd_typing(settings: Settings, args: argparse.Namespace) -> int:
+    """Show your typing indicator in a chat: once, or held for about --for seconds."""
+    import time
+
+    from .send import send_typing
+
+    _, skype_token = _ensure_skype_token(settings)
+    # ponytail: the skype token is not refreshed, a hold longer than its ~45 min life fails.
+    deadline = time.monotonic() + args.duration
+    try:
+        while True:
+            send_typing(settings, skype_token, args.thread)
+            if deadline - time.monotonic() <= _TYPING_RESEND:
+                break
+            time.sleep(_TYPING_RESEND)
+    except KeyboardInterrupt:
+        log.info("interrupted")
+    print(f"typing → {args.thread}", file=sys.stderr)
+    return 0
+
+
 def _message_target(args: argparse.Namespace) -> tuple[str, str]:
     """(thread, message id) from a Teams deep link, else a bare message id + --thread."""
     from .send import parse_message_link
@@ -451,6 +476,22 @@ def main(argv: list[str] | None = None) -> int:
         help="thread id when target is a bare message id (default: Notes to self)",
     )
     p_react.set_defaults(func=cmd_react)
+
+    p_typing = sub.add_parser("typing", help="show your typing indicator in a chat (default: your Notes)")
+    p_typing.add_argument(
+        "--thread",
+        default=NOTES_THREAD,
+        help="target conversation/thread id (default: Notes to self)",
+    )
+    p_typing.add_argument(
+        "--for",
+        dest="duration",
+        type=_non_negative_int,
+        default=0,
+        metavar="SECONDS",
+        help="keep the indicator up for about this long (default: a single send); Ctrl-C stops it",
+    )
+    p_typing.set_defaults(func=cmd_typing)
 
     p_emojis = sub.add_parser("emojis", help="list the organisation's custom emojis (creator, date)")
     p_emojis.add_argument("--jsonl", action="store_true", help="one JSON object per emoji")
