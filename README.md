@@ -39,6 +39,7 @@ uv run miniteams send --file test.html --html     # raw RichText/Html (formatted
 uv run miniteams update <msg-id-or-deep-link> "fixed text"   # edit a sent message
 uv run miniteams react <msg-id-or-deep-link> like    # react (heart, laugh, 1f525_fire…)
 uv run miniteams react <msg-id-or-deep-link> like --remove   # take it back
+uv run miniteams typing --thread 19:xxx@thread.v2 --for 30   # show "is typing…" there for ~30 s
 uv run miniteams emojis           # org custom emojis: creation date, name, creator
 uv run miniteams emojis --jsonl --download   # + reaction key, image saved under ~/.cache/miniteams/emojis/
 uv run miniteams archive          # resumable local archive under ./data: private chats, meetings,
@@ -174,7 +175,8 @@ Tokens cache under `~/.config/miniteams/` (`0600`); re-runs are silent until the
 token expires. Downloaded media (from `stream`) lives under `~/.cache/miniteams/media/`.
 
 > **send writes to real chats as you.** Default target is `48:notes` (your own Notes), but
-> `--thread` can post anywhere. The rest of the tool is read-only.
+> `--thread` can post anywhere. `typing` shows your indicator the same way. The rest of the tool is
+> read-only.
 
 ## Config
 

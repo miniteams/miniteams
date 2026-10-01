@@ -1,10 +1,11 @@
-"""Outbound message send, edit and reactions (chat-service REST, skype token).
+"""Outbound message send, edit, reactions and typing indicator (chat-service REST, skype token).
 
 Plain REST against the chat service — NOT the Trouter socket (that channel is receive-only).
 A sent/edited message echoes back over the live stream (same `clientmessageid`), a reaction as a
 `MessageUpdate` of its message, so a concurrent `stream` shows both.
 
-`send_message` mirrors purple-teams `teams_send_message`. `edit_message` is reconstructed from
+`send_message` mirrors purple-teams `teams_send_message`, `send_typing` its
+`teams_conv_send_typing_to_channel`. `edit_message` is reconstructed from
 the inbound `MessageUpdate` + `skypeeditedid` wire format (purple-teams only *consumes* edits) and
 the SkPy client: PUT the message id with `skypeeditedid` set to it — confirmed against live Teams.
 """
@@ -97,6 +98,16 @@ def send_message(
     result = _check(resp, "send")
     log.info("message_sent", thread=thread_id, clientmessageid=client_message_id, status=result["status"])
     return {"clientmessageid": client_message_id, **result}
+
+
+def send_typing(settings: Settings, skype_token: str, thread_id: str) -> dict[str, Any]:
+    """Show "… is typing" to the chat's other members; it expires on their side unless re-sent."""
+    url = f"https://{settings.contacts_host}/v1/users/ME/conversations/{quote(thread_id, safe='')}/messages"
+    # No `Control/ClearTyping` counterpart: purple-teams dropped it, the indicator expires by itself.
+    body = {"messagetype": "Control/Typing", "contenttype": "Application/Message", "content": ""}
+    result = _check(_CLIENT.post(url, headers=_headers(skype_token, settings), json=body), "typing")
+    log.debug("typing_sent", thread=thread_id, status=result["status"])
+    return result
 
 
 def mark_read(settings: Settings, skype_token: str, thread_id: str, message_id: str) -> dict[str, Any]:
