@@ -3,10 +3,15 @@
 Allowlist, never denylist: a tag or attribute not named here is dropped and its text kept.
 """
 
+import base64
+import binascii
 import html
+import json
 import re
+from collections.abc import Callable
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote, urlsplit
 
 from .attachments import _existing, _object_id
@@ -158,3 +163,285 @@ def sanitize(
     parser = _Sanitizer(thread_id, media_dir, me, mentions or {})
     parser.feed(content)
     return parser.result()
+
+
+# Adaptive Cards (spec 011 "Cards"): rendered from the card JSON, every string escaped here, so
+# no tag or attribute below can come from the payload.
+_MD_MAX = 10_000
+_CARD_DEPTH = 8
+_CARD_NODES = 300
+_MSG_CARDS = 20
+_MSG_MD = 50_000
+_CODESNIPPET = "application/vnd.microsoft.card.codesnippet"
+# Bounded inner spans keep every pattern linear on hostile text (no nested quantifiers).
+_MD_INLINE = re.compile(
+    r"\[([^\[\]\n]{1,500})\]\(([^()\[\]\s]{1,2000})\)"
+    r"|\*\*([^*\n]{1,500})\*\*"
+    r"|(?<![\w_])_([^_\n]{1,500})_(?![\w_])"
+)
+_MD_BULLET = re.compile(r"[-*] (.*)")
+_MD_NUMBER = re.compile(r"\d{1,3}\. (.*)")
+_SWIFT_RE = re.compile(r'<Swift\b[^>]{0,200}?\bb64\s*=\s*(["\'])(.*?)\1', re.I | re.S)
+_SIZES = {"small": "s-small", "medium": "s-medium", "large": "s-large", "extralarge": "s-large"}
+_CHILDREN = {"Container": "items", "Column": "items", "ImageSet": "images"}
+MediaUrl = Callable[[str], str | None]
+
+
+def _link(url: object, inner: str, cls: str = "") -> str:
+    """`inner` inside an http(s) link, or `inner` alone for any other URL."""
+    href = _web_url(url) if isinstance(url, str) else None
+    if href is None:
+        return inner
+    extra = _attr("class", cls) if cls else ""
+    return f'<a{extra}{_attr("href", href)} rel="noopener" target="_blank">{inner}</a>'
+
+
+def _md_inline(text: str) -> str:
+    out, pos = [], 0
+    for m in _MD_INLINE.finditer(text):
+        out.append(html.escape(text[pos : m.start()]))
+        label, url, bold, italic = m.groups()
+        if label is not None:
+            out.append(_link(url, html.escape(label)))
+        elif bold is not None:
+            out.append(f"<b>{html.escape(bold)}</b>")
+        else:
+            out.append(f"<i>{html.escape(italic)}</i>")
+        pos = m.end()
+    out.append(html.escape(text[pos:]))
+    return "".join(out)
+
+
+def markdown_html(text: str) -> str:
+    """The Teams card markdown subset: **bold**, _italic_, [text](url), `- ` and `1. ` lists."""
+    out: list[str] = []
+    lines: list[str] = []  # pending plain lines, joined by <br>
+    list_tag = ""
+    for raw in text[:_MD_MAX].splitlines():
+        line = raw.strip()
+        item = _MD_BULLET.fullmatch(line) or _MD_NUMBER.fullmatch(line)
+        tag = ("ul" if item.re is _MD_BULLET else "ol") if item else ""
+        if tag != list_tag:
+            if list_tag:
+                out.append(f"</{list_tag}>")
+            if tag:
+                out.append("<br>".join(lines))
+                lines = []
+                out.append(f"<{tag}>")
+            list_tag = tag
+        if item:
+            out.append(f"<li>{_md_inline(item.group(1))}</li>")
+        else:
+            lines.append(_md_inline(line))
+    if list_tag:
+        out.append(f"</{list_tag}>")
+    out.append("<br>".join(lines))
+    return "".join(out)
+
+
+class _CardRenderer:
+    def __init__(self, media: MediaUrl | None) -> None:
+        self.media = media
+        self.nodes = 0  # per card
+        self.md_left = _MSG_MD  # per message
+
+    def md(self, text: str) -> str:
+        text = text[: min(_MD_MAX, self.md_left)]
+        self.md_left -= len(text)
+        return markdown_html(text)
+
+    def tb(self, cls: str, text: str) -> str:
+        """A text block, or nothing once the markdown budget is spent: an empty div would still
+        count as rendered content and hide the card's fallback."""
+        inner = self.md(text)
+        return f'<div class="{cls}">{inner}</div>' if inner else ""
+
+    def many(self, items: object, depth: int, fn: Callable[[dict[str, Any], int], str]) -> str:
+        if not isinstance(items, list) or depth > _CARD_DEPTH:
+            return ""
+        out = []
+        for item in items:
+            if self.nodes >= _CARD_NODES:
+                break
+            self.nodes += 1
+            if isinstance(item, dict):
+                out.append(fn(item, depth))
+        return "".join(out)
+
+    def card(self, card: dict[str, Any], depth: int = 0, content_type: str = "") -> str:
+        title = _str(card.get("title"))
+        head = f'<div class="tb w-bolder">{html.escape(title)}</div>' if title else ""
+        if content_type == _CODESNIPPET:
+            code = _str(card.get("text"))[:_MD_MAX]
+            return head + (f"<pre><code>{html.escape(code)}</code></pre>" if code else "")
+        if card.get("type") != "AdaptiveCard" and "body" not in card:
+            return self.legacy(card, head, depth)
+        body = self.many(card.get("body"), depth + 1, self.element)
+        acts = self.many(card.get("actions"), depth + 1, self.action)
+        return body + (f'<div class="acts">{acts}</div>' if acts else "")
+
+    def legacy(self, card: dict[str, Any], head: str, depth: int) -> str:
+        """Hero/thumbnail/O365 MessageCard: title, markdown text, MessageCard sections."""
+        text = _str(card.get("text"))
+        out = head + (self.tb("tb", text) if text else "")
+        return out + self.many(card.get("sections"), depth + 1, self.section)
+
+    def section(self, sec: dict[str, Any], depth: int) -> str:
+        out = ""
+        if title := _str(sec.get("activityTitle")):
+            out += self.tb("tb w-bolder", title)
+        if text := _str(sec.get("text")):
+            out += self.tb("tb", text)
+        rows = self.many(sec.get("facts"), depth + 1, self.fact)
+        return out + (f'<table class="facts">{rows}</table>' if rows else "")
+
+    def fact(self, fact: dict[str, Any], depth: int) -> str:
+        title = html.escape(_str(fact.get("title")) or _str(fact.get("name")))
+        return f"<tr><th>{title}</th><td>{self.md(_str(fact.get('value')))}</td></tr>"
+
+    def element(self, el: dict[str, Any], depth: int) -> str:
+        kind = el.get("type")
+        if kind == "TextBlock":
+            text = _str(el.get("text"))
+            if not text:
+                return ""
+            cls = ["tb"]
+            if _str(el.get("weight")).lower() == "bolder":
+                cls.append("w-bolder")
+            if size := _SIZES.get(_str(el.get("size")).lower()):
+                cls.append(size)
+            if el.get("isSubtle") is True:
+                cls.append("subtle")
+            # div, not p: the markdown may hold a list, which a <p> cannot contain.
+            return self.tb(" ".join(cls), text)
+        if kind == "RichTextBlock":
+            runs = self.many(el.get("inlines"), depth + 1, self.run)
+            return f"<p>{runs}</p>" if runs else ""
+        if kind == "ColumnSet":
+            cols = self.many(el.get("columns"), depth + 1, self.element)
+            return f'<div class="cols">{cols}</div>' if cols else ""
+        if isinstance(kind, str) and kind in _CHILDREN:
+            inner = self.many(el.get(_CHILDREN[kind]), depth + 1, self.element)
+            if not inner:
+                return ""
+            box = f'<div class="{"col" if kind == "Column" else "ct"}">{inner}</div>'
+            # A link around links would nest <a>, which the browser splits apart.
+            return box if "<a " in inner else _link(_open_url(el.get("selectAction")), box)
+        if kind == "FactSet":
+            rows = self.many(el.get("facts"), depth + 1, self.fact)
+            return f'<table class="facts">{rows}</table>' if rows else ""
+        if kind == "Image":
+            img = self.image(el)
+            return _link(_open_url(el.get("selectAction")), img) if img else ""
+        if kind == "ActionSet":
+            acts = self.many(el.get("actions"), depth + 1, self.action)
+            return f'<div class="acts">{acts}</div>' if acts else ""
+        for key in ("text", "title", "label", "placeholder"):
+            if text := _str(el.get(key)):
+                return f"<p>{html.escape(text)}</p>"
+        return ""
+
+    def run(self, run: dict[str, Any], depth: int) -> str:
+        text = html.escape(_str(run.get("text"))).replace("\n", "<br>")
+        if not text:
+            return ""
+        if _str(run.get("weight")).lower() == "bolder":
+            text = f"<b>{text}</b>"
+        if run.get("italic") is True:
+            text = f"<i>{text}</i>"
+        if run.get("strikethrough") is True:
+            text = f"<s>{text}</s>"
+        return _link(_open_url(run.get("selectAction")), text)
+
+    def image(self, el: dict[str, Any]) -> str:
+        alt = _str(el.get("altText"))
+        url = _str(el.get("url"))
+        local = self.media(url) if self.media and url else None
+        if local and local.startswith("/media/"):
+            return f"<img{_attr('src', local)}{_attr('alt', alt)}>"
+        return f"<p>{html.escape(alt)}</p>" if alt else ""
+
+    def action(self, act: dict[str, Any], depth: int) -> str:
+        title = html.escape(_str(act.get("title")))
+        kind = act.get("type")
+        if kind == "Action.ShowCard" and isinstance(act.get("card"), dict):
+            inner = self.card(act["card"], depth)
+            return f"<details><summary>{title}</summary>{inner}</details>" if title or inner else ""
+        if not title:
+            return ""
+        url = act.get("url") if kind == "Action.OpenUrl" else None
+        return _link(url, title, "act") if _web_url(_str(url)) else f'<span class="act">{title}</span>'
+
+
+def _str(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _open_url(action: object) -> object:
+    return action.get("url") if isinstance(action, dict) and action.get("type") == "Action.OpenUrl" else None
+
+
+def card_html(card: dict[str, Any], media_url: MediaUrl | None = None, content_type: str = "") -> str:
+    """One card content dict (its attachment's `content_type`) → `div.card`; `media_url` maps an
+    image URL to its archived `/media/...` path, anything else renders the alt text."""
+    return f'<div class="card">{_CardRenderer(media_url).card(card, content_type=content_type)}</div>'
+
+
+def _json(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except ValueError, RecursionError:
+        return None
+
+
+def card_from_message(message: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """The cards a message carries, as `{"content", "type", "app", "fallback"}`; None when none.
+
+    `Media_Card` puts them base64 in `<Swift b64>`, `RichText/Html` in `properties.cards`."""
+    found: list[dict[str, Any]] = []
+    swift = _SWIFT_RE.search(_str(message.get("content")))
+    if swift:
+        try:
+            data = _json(base64.b64decode(html.unescape(swift.group(2))).decode("utf-8"))
+        except binascii.Error, ValueError:
+            data = None
+        if isinstance(data, dict):
+            summary = _str(data.get("summary"))
+            atts = data.get("attachments")
+            found += (
+                [{**a, "summary": summary} for a in atts if isinstance(a, dict)]
+                if isinstance(atts, list)
+                else []
+            )
+            if not found and summary:
+                found.append({"summary": summary})
+    props = message.get("properties")
+    cards = _json(props.get("cards")) if isinstance(props, dict) else None
+    if isinstance(cards, list):
+        found += [c for c in cards if isinstance(c, dict)]
+    out = []
+    for att in found:
+        content = att.get("content")
+        content = content if isinstance(content, dict) else {}
+        fallback = _str(att.get("summary")) or _str(content.get("fallbackText"))
+        kind = _str(att.get("contentType"))
+        out.append({"content": content, "type": kind, "app": _str(att.get("appName")), "fallback": fallback})
+    return out or None
+
+
+def cards_html(message: dict[str, Any], media_url: MediaUrl | None = None) -> str:
+    """Every card of `message` rendered, its app name on top; a body that renders nothing shows
+    the card's summary or fallbackText instead."""
+    out = []
+    renderer = _CardRenderer(media_url)
+    for card in (card_from_message(message) or [])[:_MSG_CARDS]:
+        renderer.nodes = 0
+        body = renderer.card(card["content"], content_type=card["type"])
+        if not body and card["fallback"]:
+            body = f'<p class="card-fallback">{html.escape(card["fallback"])}</p>'
+        if body:
+            app = f'<div class="card-app">{html.escape(card["app"])}</div>' if card["app"] else ""
+            out.append(f'<div class="card">{app}{body}</div>')
+    return "".join(out)
