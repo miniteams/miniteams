@@ -21,6 +21,7 @@ import random
 import re
 import sqlite3
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from datetime import UTC, datetime
 from http import HTTPStatus
@@ -37,10 +38,15 @@ from websockets.http11 import Request, Response
 from websockets.typing import Origin
 
 from .archive_store import find_chat_dir, read_chats, read_messages, read_page
+from .auth import token_source
 from .chats import fetch_conversations, is_meeting, is_private, last_activity
+from .compose import ASYNCGW_HOST, compose_html
 from .config import Settings
 from .directory import Directory
 from .dump import _epoch_seconds, fetch_history
+from .emoji_table import SHORTCODES
+from .emojis import cached_image, fetch_metadata, ids_by_name
+from .emojis import rows as emoji_rows
 from .messages import _TAG_RE, EMOJI, thread_of
 from .render import cards_html, media_url, sanitize
 from .send import delete_message, edit_message, mark_read, message_html, react, send_message
@@ -88,6 +94,22 @@ _SCRIPT_RE = re.compile(r"<script>(.*?)</script>", re.DOTALL)
 _SILENT_TYPES = {"ThreadActivity/MemberConsumptionHorizonUpdate"}
 _RELABEL_TYPES = {"ThreadActivity/TopicUpdate", "ThreadActivity/AddMember", "ThreadActivity/DeleteMember"}
 _BIND_ATTEMPTS = 3  # redraws when the persisted port turns out taken
+_COMPLETE_ITEMS = 12  # completion list length
+_COMPLETE_Q_MAX = 64
+_ROSTER_TTL = 600.0  # seconds a roster is trusted: members join and leave without a board event
+_ROSTER_MAX = 256  # threads whose roster age is remembered; the stream runs for days
+_EMOJI_REFRESH = 6 * 3600.0
+_EMOJI_RETRY = 120.0  # first retry after a failed custom set fetch, doubled up to _EMOJI_RETRY_MAX
+_EMOJI_RETRY_MAX = 3600.0
+_EMOJI_FAILED_TTL = 900.0  # seconds a failed image download is not retried: the page asks per keystroke
+_EMOJI_FAILED_MAX = 512
+_EMOJI_NAME_RE = re.compile(r"[A-Za-z0-9_+-]{1,64}")  # what compose expands between colons
+_EMOJI_ID_RE = re.compile(r"[\w-]{1,128}", re.ASCII)
+_FORMATS = ("inline", "full")
+# The page may not load the asyncgw URL (it needs the skype token): previews point at /emoji/<id>.
+_ASYNCGW_SRC_RE = re.compile(
+    rf'src="https://{re.escape(ASYNCGW_HOST)}/v1/objects/([\w-]+)/views/imgt2_anim"', re.ASCII
+)
 # Non-text last messages: a short marker instead of the raw HTML/card payload.
 _TYPE_MARKERS = {
     "RichText/Media_GenericFile": "📎 file",
@@ -718,6 +740,10 @@ class Board:
         self._history_busy: set[ServerConnection] = set()  # sockets with a history answer pending
         self._action_busy: set[ServerConnection] = set()  # sockets with a message action pending
         self._search_busy: set[ServerConnection] = set()  # sockets with a search pending
+        self.custom_emojis: dict[str, str] = {}  # name → AMS object id; empty until fetched
+        self._roster_at: OrderedDict[str, float] = OrderedDict()  # thread → when its roster was fetched
+        self._roster_fetch: dict[str, asyncio.Task[list[dict[str, Any]] | None]] = {}  # in flight
+        self._emoji_failed: dict[str, float] = {}  # image id → when its download failed
         self._seen: dict[str, str] = _load_seen(seen_path)
         self._muted: dict[str, str] = _load_seen(muted_path)  # thread → when muted (same shape)
         for row in rows.values():
@@ -823,10 +849,17 @@ class Board:
         return True
 
     async def send(
-        self, thread_id: str, text: Any, ws: ServerConnection | None = None, quote: Any = None
+        self,
+        thread_id: str,
+        text: Any,
+        ws: ServerConnection | None = None,
+        quote: Any = None,
+        mentions: Any = None,
+        fmt: Any = None,
     ) -> str | None:
         """Page verb `send`: post `text` to the row's chat (or the chat `ws` follows) as me, after
-        one Reply block per `quote` id. Returns the refusal/failure reason, None once Teams accepted it.
+        one Reply block per `quote` id, with `mentions` (`{name, mri, everyone?}`) and markdown per
+        `fmt` (spec 012). Returns the refusal/failure reason, None once Teams accepted it.
 
         The row is left alone: the Trouter echo of the sent message updates it like any other."""
         if not self._may_post(ws, thread_id):
@@ -841,8 +874,23 @@ class Board:
         ids_ok = all(isinstance(q, str) and _MSG_ID_RE.fullmatch(q) for q in quote)
         if not ids_ok or len(set(quote)) < len(quote):
             return "invalid quote"
+        mentions = [] if mentions is None else mentions
+        if not isinstance(mentions, list) or not all(_mention_shape(m) for m in mentions):
+            return "invalid mention"
+        fmt = "inline" if fmt is None else fmt
+        if fmt not in _FORMATS:
+            return "invalid format"
         if self.directory is None:
             return "not connected"
+        if mentions:
+            resolved = await self._resolved(thread_id, mentions)
+            if resolved is None:
+                return "unknown mention"
+            mentions = resolved
+        try:
+            content, props = compose_html(text, mentions, self.custom_emojis, full=fmt == "full")
+        except ValueError as exc:
+            return str(exc)
         try:
             extra: dict[str, Any] = {}
             if quote:
@@ -854,10 +902,14 @@ class Board:
                     for q in quote
                 ):
                     return "cannot quote this message"
-                text = "".join(self._reply_quote(copies[q]) for q in quote) + message_html(text, False)
-                if len(text.encode()) > _SEND_MAX_BYTES:
-                    return "message too long"
-                extra["is_html"] = True
+                content = "".join(self._reply_quote(copies[q]) for q in quote) + content
+            if len(content.encode()) > _SEND_MAX_BYTES:
+                return "message too long"
+            # Plain text keeps today's call: send_message escapes it itself, to the same bytes.
+            if quote or props or content != message_html(text, False):
+                text, extra["is_html"] = content, True
+            if props:
+                extra["properties"] = props
             await asyncio.to_thread(
                 send_message,
                 self.directory.settings,
@@ -872,6 +924,151 @@ class Board:
             log.warning("send_failed", thread=thread_id, error=reason, error_type=type(exc).__name__)
             return reason
         return None
+
+    # --- composer completion (spec 012) ---
+
+    async def _members(self, thread_id: str) -> list[dict[str, Any]] | None:
+        """The thread's roster, refetched once older than _ROSTER_TTL; None when it cannot be had.
+
+        Directory keeps the roster itself; this only ages it, as the stream does not report every change.
+        Concurrent callers share one fetch: the page asks on every keystroke.
+        """
+        if self.directory is None:
+            return None
+        task = self._roster_fetch.get(thread_id)
+        if task is None:
+            fetch = self._fetch_members(self.directory, thread_id)
+            task = self._roster_fetch[thread_id] = asyncio.create_task(fetch)
+            task.add_done_callback(lambda _: self._roster_fetch.pop(thread_id, None))
+        # Shielded: a page closing mid-lookup must not cancel the fetch other callers wait on.
+        return await asyncio.shield(task)
+
+    async def _fetch_members(self, directory: Directory, thread_id: str) -> list[dict[str, Any]] | None:
+        now = time.monotonic()
+        at = self._roster_at.pop(thread_id, None)
+        if at is None or now - at > _ROSTER_TTL:
+            directory.forget(thread_id)
+            at = now
+        # Stamped on failure too: Directory spaces retries, a forget per keystroke would defeat that.
+        self._roster_at[thread_id] = at
+        while len(self._roster_at) > _ROSTER_MAX:
+            self._roster_at.popitem(last=False)
+        info = await directory.thread(thread_id)
+        return None if info is None else list(info["members"])
+
+    async def _resolved(self, thread_id: str, mentions: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+        """The mentions with the roster's name as `label`; None when one is not a human of the thread
+        (or everyone of a group), or its typed name is not that member's."""
+        from .mcp import _fold
+
+        members = await self._members(thread_id)
+        if members is None:
+            return None
+        humans = _humans(members)
+        out: list[dict[str, Any]] = []
+        for m in mentions:
+            if m.get("everyone"):
+                name = m["name"]
+                ok = m["mri"] == thread_id and len(humans) > 2 and _fold(name) == "everyone"
+            else:
+                name = humans.get(m["mri"], "")
+                ok = bool(name) and _fold(name) == _fold(m["name"])
+            if not ok:
+                return None
+            out.append({**m, "label": name})
+        return out
+
+    async def complete(self, ws: ServerConnection | None, request: dict[str, Any]) -> dict[str, Any]:
+        """Page verb `complete`: up to _COMPLETE_ITEMS emojis or members of a chat matching prefix `q`."""
+        kind, q = request["complete"], request.get("q")
+        head = {"complete": kind, "q": q if isinstance(q, str) else None}
+        if not isinstance(q, str) or len(q) > _COMPLETE_Q_MAX or (kind == "emoji" and not q):
+            return {**head, "error": "invalid query"}
+        if kind == "emoji":
+            return {**head, "items": self._emoji_items(q.casefold())}
+        if kind != "member":
+            return {**head, "error": "invalid kind"}
+        thread_id = request.get("thread")
+        if not isinstance(thread_id, str) or not self._may_post(ws, thread_id):
+            return {**head, "error": "unknown chat"}
+        members = await self._members(thread_id)
+        if members is None:
+            return {**head, "error": "chat members unavailable"}
+        return {**head, "items": _member_items(_humans(members), thread_id, self.me, q)}
+
+    def _emoji_items(self, prefix: str) -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = [
+            {"name": name, "char": char} for name, char in SHORTCODES.items() if name.startswith(prefix)
+        ]
+        # A custom name the built-in table shadows would send the built-in character.
+        found += [
+            {"name": name, "custom": oid, "src": f"/emoji/{oid}"}
+            for name, oid in self.custom_emojis.items()
+            if name.casefold().startswith(prefix) and name not in SHORTCODES
+        ]
+        return sorted(found, key=lambda it: str(it["name"]).casefold())[:_COMPLETE_ITEMS]
+
+    def preview(self, text: Any, fmt: Any) -> dict[str, Any]:
+        """Page verb `preview`: the HTML `send` would post, mentions left as typed."""
+        fmt = "inline" if fmt is None else fmt
+        if not isinstance(text, str) or fmt not in _FORMATS:
+            return {"preview": "", "error": "invalid preview"}
+        try:
+            content, _ = compose_html(text, [], self.custom_emojis, full=fmt == "full")
+        except ValueError as exc:
+            return {"preview": "", "error": str(exc)}
+        return {"preview": _ASYNCGW_SRC_RE.sub(r'src="/emoji/\1"', content)}
+
+    async def emoji_file(self, oid: str) -> tuple[bytes, str] | None:
+        """`/emoji/<id>`: (body, content type) of a known custom emoji's image, None for anything else."""
+        if (
+            not _EMOJI_ID_RE.fullmatch(oid)
+            or oid not in self.custom_emojis.values()
+            or self.directory is None
+        ):
+            return None
+        now = time.monotonic()
+        failed_at = self._emoji_failed.get(oid)
+        if failed_at is not None and now - failed_at < _EMOJI_FAILED_TTL:
+            return None
+        settings = self.directory.settings
+        path = await cached_image(settings, self.directory.skype_token, oid)
+        if path is None:
+            self._emoji_failed = {
+                k: at for k, at in self._emoji_failed.items() if now - at < _EMOJI_FAILED_TTL and k != oid
+            }
+            self._emoji_failed[oid] = now
+            while len(self._emoji_failed) > _EMOJI_FAILED_MAX:
+                del self._emoji_failed[next(iter(self._emoji_failed))]  # oldest first
+            return None
+        return await asyncio.to_thread(_emoji_body, settings.cache_dir / "emojis", path)
+
+    async def refresh_custom_emojis(
+        self,
+        interval: float = _EMOJI_REFRESH,
+        retry: float = _EMOJI_RETRY,
+        retry_max: float = _EMOJI_RETRY_MAX,
+    ) -> None:
+        """Fetch the organisation's custom emojis now and every `interval`; a failure keeps the last set
+        and is retried after `retry`, doubled per failure up to `retry_max`."""
+        wait = retry
+        while True:
+            pause = interval
+            if self.directory is not None:
+                try:
+                    settings, token = self.directory.settings, self.directory.skype_token
+                    self.custom_emojis = await asyncio.to_thread(_custom_emojis, settings, token)
+                    log.info("custom_emojis_loaded", count=len(self.custom_emojis))
+                    wait = retry
+                except Exception as exc:  # noqa: BLE001 — the built-in set still completes
+                    log.warning(
+                        "custom_emojis_unavailable",
+                        error=_failure(exc),
+                        error_type=type(exc).__name__,
+                        retry_in=wait,
+                    )
+                    pause, wait = wait, min(wait * 2, retry_max)
+            await asyncio.sleep(pause)
 
     # --- chat view (spec 011) ---
 
@@ -1186,9 +1383,11 @@ class Board:
         with contextlib.suppress(ConnectionClosed):
             await ws.send(json.dumps(answer, ensure_ascii=False))
 
-    async def _sent(self, ws: ServerConnection, thread_id: str, text: Any, quote: Any) -> dict[str, Any]:
+    async def _sent(self, ws: ServerConnection, thread_id: str, verb: dict[str, Any]) -> dict[str, Any]:
         # Only the sending page learns the outcome; every page sees the echoed message.
-        error = await self.send(thread_id, text, ws, quote)
+        error = await self.send(
+            thread_id, verb.get("text"), ws, verb.get("quote"), verb.get("mentions"), verb.get("format")
+        )
         return {"sent": thread_id, **({"error": error} if error else {"ok": True})}
 
     async def _one_at_a_time(
@@ -1538,9 +1737,7 @@ class Board:
                     self.set_muted(verb["unmute"], False)
                 elif isinstance(verb, dict) and isinstance(verb.get("send"), str):
                     # A send can take the whole HTTP timeout: the page's other verbs must not queue behind it.
-                    sent = functools.partial(
-                        self._sent, ws, verb["send"], verb.get("text"), verb.get("quote")
-                    )
+                    sent = functools.partial(self._sent, ws, verb["send"], verb)
                     # Quotes cost a lookup: they count as a message action.
                     quoted = verb.get("quote")
                     work = self._one_at_a_time(ws, {"sent": verb["send"]}, sent) if quoted else sent()
@@ -1561,6 +1758,13 @@ class Board:
                     self._background(
                         self._answer(ws, self._one_at_a_time(ws, head, found, self._search_busy))
                     )
+                elif isinstance(verb, dict) and isinstance(verb.get("complete"), str):
+                    # A roster fetch is a network round trip: the page's typing must not wait on it.
+                    self._background(self._answer(ws, self.complete(ws, verb)))
+                elif isinstance(verb, dict) and "preview" in verb:
+                    shown = self.preview(verb["preview"], verb.get("format"))
+                    with contextlib.suppress(ConnectionClosed):
+                        await ws.send(json.dumps(shown, ensure_ascii=False))
                 elif isinstance(verb, dict) and verb.get("board") is True:
                     # A split chat page shows the list too: from now on it gets the board's rows,
                     # exactly what the widget gets.
@@ -1612,6 +1816,57 @@ def _text_error(text: Any) -> str | None:
     if len(message_html(text, False).encode()) > _SEND_MAX_BYTES:
         return "message too long"
     return None
+
+
+def _mention_shape(mention: Any) -> bool:
+    return (
+        isinstance(mention, dict)
+        and isinstance(mention.get("name"), str)
+        and isinstance(mention.get("mri"), str)
+        and isinstance(mention.get("everyone", False), bool)
+    )
+
+
+def _humans(members: list[dict[str, Any]]) -> dict[str, str]:
+    """Roster → {mri: display name} of its people; bots and apps left out."""
+    return {str(m["mri"]): str(m["name"] or "") for m in members if not str(m["mri"]).startswith(_APP_MRI)}
+
+
+def _member_items(humans: dict[str, str], thread_id: str, me: str, q: str) -> list[dict[str, Any]]:
+    """Humans but me whose full, first or last name starts with `q` (accents folded); everyone first
+    on groups."""
+    from .mcp import _fold
+
+    prefix = _fold(q)
+    items: list[dict[str, Any]] = []
+    if len(humans) > 2 and "everyone".startswith(prefix):
+        items.append({"name": "everyone", "mri": thread_id, "everyone": True})
+    for mri, name in humans.items():
+        folded = _fold(name)
+        if name and not _is_me(mri, me) and any(p.startswith(prefix) for p in (folded, *folded.split())):
+            items.append({"name": name, "mri": mri})
+    return items[:_COMPLETE_ITEMS]
+
+
+def _custom_emojis(settings: Settings, skype_token: str) -> dict[str, str]:
+    """{name: AMS object id} of the organisation's custom emojis. Blocking: worker thread."""
+    csa_token = token_source(settings).csa_token()
+    if not csa_token:
+        raise RuntimeError("no chat-service token (run `miniteams login`)")
+    found = ids_by_name(emoji_rows(fetch_metadata(settings, skype_token, csa_token)))
+    return {name: oid for name, oid in found.items() if _EMOJI_NAME_RE.fullmatch(name)}
+
+
+def _emoji_body(cache: Path, path: Path) -> tuple[bytes, str] | None:
+    try:
+        target = path.resolve(strict=True)
+        if target.parent != cache.resolve(strict=True) or target.name.endswith(".part"):
+            return None
+        if target.stat().st_size > _MEDIA_MAX:
+            return None
+        return target.read_bytes(), mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    except OSError:
+        return None
 
 
 def _failure(exc: Exception) -> str:
@@ -1707,6 +1962,18 @@ async def _process_request(
             }
             return _respond(
                 ws, body, {"Content-Type": ctype, "Cache-Control": "private, max-age=3600"} | safe
+            )
+    if own_host and path.startswith("/emoji/"):
+        found = await board.emoji_file(path.removeprefix("/emoji/"))
+        if found is not None:
+            body, ctype = found
+            safe = {
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "sandbox",
+                "Cross-Origin-Resource-Policy": "same-origin",
+            }
+            return _respond(
+                ws, body, {"Content-Type": ctype, "Cache-Control": "private, max-age=86400"} | safe
             )
     return ws.respond(HTTPStatus.NOT_FOUND, "not found\n")
 
@@ -1831,8 +2098,10 @@ async def run(
     stream = asyncio.create_task(
         run_forever(settings, on_event=board.on_event, directory=directory, epid_name="endpoint_id-web")
     )
+    emojis = asyncio.create_task(board.refresh_custom_emojis())
     done, pending = await asyncio.wait({server, stream}, return_when=asyncio.FIRST_COMPLETED)
     fill.cancel()  # the page is going away; a half-finished walk has nobody to tell
+    emojis.cancel()
     for task in pending:
         task.cancel()
     for task in done:

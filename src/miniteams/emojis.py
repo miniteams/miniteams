@@ -6,6 +6,7 @@ its picker. Graph beta `teamwork/messaging/customEmojis` has the same data but n
 object (`documentId`), fetched like a chat image.
 """
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -99,6 +100,25 @@ async def list_emojis(
                 image = f"  {r['image']}" if r.get("image") else ""
                 await emit(f"{r['created'][:10]}  {r['name']}  ({r['creator']}){image}\n")
     log.info("custom_emojis_listed", count=len(emojis))
+
+
+def ids_by_name(emojis: list[dict[str, Any]]) -> dict[str, str]:
+    """`rows()` → {name: AMS object id}; the id is the key's tail when the entry has no documentId."""
+    out: dict[str, str] = {}
+    for r in emojis:
+        oid = r["document_id"] or r["key"].partition(";")[2]
+        if r["name"] and oid:
+            out.setdefault(r["name"], oid)
+    return out
+
+
+async def cached_image(settings: Settings, skype_token: str, document_id: str) -> Path | None:
+    """The emoji's image under the cache dir, downloaded on first use; None when it cannot be had."""
+    dest = settings.cache_dir / "emojis"
+    await asyncio.to_thread(dest.mkdir, parents=True, exist_ok=True)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        found = await _image(client, skype_token, document_id, dest)
+    return Path(found) if found else None
 
 
 async def _image(client: httpx.AsyncClient, skype_token: str, document_id: str, dest: Path) -> str:

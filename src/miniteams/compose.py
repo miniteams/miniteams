@@ -11,7 +11,7 @@ from typing import Any
 
 from .emoji_table import SHORTCODES
 
-MAX_TEXT = 28_000  # Teams refuses messages past ~28 KB anyway
+MAX_TEXT = 28 * 1024  # Teams refuses messages past 28 KB anyway
 # Tenant region host, as on every CustomEmoji in the archive; other regions pass `asyncgw_host`.
 ASYNCGW_HOST = "fr-prod.asyncgw.teams.microsoft.com"
 
@@ -39,8 +39,9 @@ def _inline(line: str, on_text: OnText) -> str:
 
     Recursion stays shallow: a span's content cannot hold its own marker (the nearest one closes it).
     """
-    # ponytail: an unclosed `[`/`(` run re-scans to the line end (memchr); 7 ms at MAX_TEXT, cache if raised.
     find = line.find
+    # Past the last `]` or `)` a link cannot close: an unclosed `[`/`(` run must not re-scan to the end.
+    last_close, last_paren = line.rfind("]"), line.rfind(")")
 
     def closer(i: int, marker: str) -> int:
         # Intra-word or space-padded markers stay literal: `2*3*4`, `snake_case_name`, `a * b`.
@@ -68,8 +69,13 @@ def _inline(line: str, on_text: OnText) -> str:
             if end > i + 1:
                 hit = f"<code>{html.escape(line[i + 1 : end])}</code>", end + 1
         elif ch == "[":
-            close = find("]", i + 1)
-            if close > i + 1 and close != bad_link and line.startswith("(", close + 1):
+            close = find("]", i + 1) if i < last_close else -1
+            if (
+                close > i + 1
+                and close != bad_link
+                and close + 2 <= last_paren
+                and line.startswith("(", close + 1)
+            ):
                 end = find(")", close + 2)
                 url = line[close + 2 : end]
                 if end > 0 and url.count("(") == 1:  # one balanced pair: wiki-style `Foo_(bar)`
@@ -161,10 +167,10 @@ def compose_html(
 ) -> tuple[str, dict[str, Any] | None]:
     """Composer text → (content HTML, message `properties` or None).
 
-    `mentions`: picked `{name, mri, everyone?}`; `emojis`: custom name → AMS object id. `@Name`
-    matches when `@` starts a word and the name is followed by the end or a non-word character;
-    names are tried longest first, case-sensitive, so `@Ann Lee` wins over `@Ann`. Code, link
-    labels and URLs are never expanded.
+    `mentions`: picked `{name, mri, label?, everyone?}`, `name` as typed and `label` as shown (default
+    `name`); `emojis`: custom name → AMS object id. `@Name` matches when `@` starts a word and
+    the name is followed by the end or a non-word character; names are tried longest first,
+    case-sensitive, so `@Ann Lee` wins over `@Ann`. Code, link labels and URLs are never expanded.
 
     Trusts every `mri` as given: the caller checks each against the thread roster (the thread id
     for everyone). More than MAX_MENTIONS entries or a name past MAX_NAME raises ValueError.
@@ -174,8 +180,8 @@ def compose_html(
     by_name: dict[str, dict[str, Any]] = {}
     for mention in mentions:
         if name := str(mention.get("name") or ""):
-            if len(name) > MAX_NAME:
-                raise ValueError(f"mention name too long ({len(name)} > {MAX_NAME} characters)")
+            if max(len(name), len(str(mention.get("label") or ""))) > MAX_NAME:
+                raise ValueError(f"mention name too long (> {MAX_NAME} characters)")
             by_name.setdefault(name, mention)
     alternatives = "|".join(re.escape(n) for n in sorted(by_name, key=len, reverse=True))
     mention_re = rf"(?<!\w)@(?P<name>{alternatives})(?!\w)|" if alternatives else ""
@@ -189,7 +195,7 @@ def compose_html(
         if (name := m.group("name") if alternatives else None) is not None:
             picked = by_name[name]
             everyone = bool(picked.get("everyone"))
-            label = "Everyone" if everyone else name
+            label = "Everyone" if everyone else str(picked.get("label") or name)
             entries.append(
                 {
                     "@type": _MENTION,

@@ -1,6 +1,7 @@
 """Composer text → Teams HTML: markdown subset, emojis, mentions (spec 012)."""
 
 import gc
+import html
 import json
 import time
 from collections.abc import Callable
@@ -165,6 +166,15 @@ def test_mention_list_and_names_are_capped() -> None:
     compose_html("hi", [{"name": "x" * compose.MAX_NAME, "mri": "m"}], {})
     with pytest.raises(ValueError, match="name too long"):
         compose_html("hi", [{"name": "x" * (compose.MAX_NAME + 1), "mri": "m"}], {})
+    with pytest.raises(ValueError, match="name too long"):
+        compose_html("hi", [{"name": "x", "label": "x" * (compose.MAX_NAME + 1), "mri": "m"}], {})
+
+
+def test_mention_label_is_shown_name_is_matched() -> None:
+    """`name` finds `@name` in the text; `label` is what the span and displayName read."""
+    html, props = compose_html("@ann lee hi", [{"name": "ann lee", "label": "Ann Lee", "mri": "m"}], {})
+    assert html.endswith('itemid="0">Ann Lee</span> hi')
+    assert props is not None and json.loads(props["mentions"])[0]["displayName"] == "Ann Lee"
 
 
 def test_mentions_and_emojis_inside_formatting_still_expand() -> None:
@@ -284,6 +294,9 @@ def test_nested_markers() -> None:
 
 
 def test_input_is_capped() -> None:
+    """The cap is Teams' 28 KB: a text at the limit composes, one character more does not."""
+    assert compose.MAX_TEXT == 28 * 1024
+    assert compose_html("x" * compose.MAX_TEXT, [], {})[0] == "x" * compose.MAX_TEXT
     with pytest.raises(ValueError, match="too long"):
         markdown_html("x" * (compose.MAX_TEXT + 1), False)
     with pytest.raises(ValueError, match="too long"):
@@ -294,7 +307,7 @@ def _best_ms(fn: Callable[[], object]) -> float:
     gc.disable()
     try:
         runs = []
-        for _ in range(3):
+        for _ in range(7):  # best of 7: a 1 ms run is at the mercy of one scheduler hiccup
             start = time.perf_counter()
             fn()
             runs.append(time.perf_counter() - start)
@@ -311,11 +324,20 @@ def test_hostile_runs_stay_linear(unit: str) -> None:
     """Doubling a hostile input must not quadruple the time (quadratic would ratio ~4)."""
 
     def ratio(fn: Callable[[str], object]) -> float:
-        small, big = (unit * (n // len(unit)) for n in (10_000, 20_000))
+        small, big = (unit * (n // len(unit)) for n in (14_000, 28_000))
         return _best_ms(lambda: fn(big)) / max(_best_ms(lambda: fn(small)), 0.05)
 
     assert ratio(lambda t: markdown_html(t, True)) < 3
     assert ratio(lambda t: compose_html(t, [{"name": "A", "mri": "m"}], {"a": "x"})) < 3
+
+
+@pytest.mark.parametrize("unit", ["[x](", "[("])
+def test_unclosed_links_scan_each_line_once(unit: str) -> None:
+    """Beyond the 28 KB cap the per-line scan is what keeps `[` linear: an unclosed `[x](` or `[(` run
+    re-scanning to the end of the line shows as a ~3.6 ratio at this size, a single scan as ~2."""
+    small, big = (unit * (n // len(unit)) for n in (80_000, 160_000))
+    slow = _best_ms(lambda: compose._inline(big, html.escape))
+    assert slow / _best_ms(lambda: compose._inline(small, html.escape)) < 3
 
 
 def test_labels_sharing_one_bad_url_stay_linear() -> None:
