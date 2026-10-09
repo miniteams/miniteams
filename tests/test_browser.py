@@ -949,7 +949,7 @@ async def test_a_long_open_busy_chat_keeps_the_page_bounded(chat: Pages) -> None
     reloads them."""
     page = await _open_long(chat)
     # Straight into the page's handler: 520 relays through the server would only slow the test down.
-    await _inject(page, [{"msg": _live(i)} for i in range(520)])
+    await _inject(page, [{"msg": _live(i), "thread": X} for i in range(520)])
     ids = await _ids(page)
     assert (len(ids), ids[0], ids[-1]) == (600, "170", "n519")
     assert await page.evaluate(_AT_BOTTOM)
@@ -1162,7 +1162,7 @@ async def test_trim_keeps_an_open_editor(chat: Pages) -> None:
     page = await _open_long(chat)
     await (await _edit(page, "160")).fill("half-way")
     await _scroll(page, "l.scrollHeight")
-    await _inject(page, [{"msg": _live(i)} for i in range(520)])
+    await _inject(page, [{"msg": _live(i), "thread": X} for i in range(520)])
     ids = await _ids(page)
     assert (ids[0], len(ids)) == ("160", 610)
     assert await page.locator('[data-id="160"] .editor').input_value() == "half-way"
@@ -1497,3 +1497,300 @@ async def test_editing_my_message_leaves_its_card_out(chat: Pages) -> None:
     assert "CARDTEXT" in await page.locator('[data-id="3"] .html .card').inner_text()
     box = await _edit(page, "3")
     assert await box.input_value() == "hello"
+
+
+# --- split navigation (011 phase 6) ---
+
+
+def _row(thread_id: str, label: str, i: int) -> dict[str, Any]:
+    return {
+        "id": thread_id,
+        "label": label,
+        "last_activity": _at(i),
+        "last_id": str(i),
+        "read_id": str(i),
+        "unread": False,
+        "mention": None,
+        "sender": "Ann Lee",
+        "text": f"snippet {label}",
+        "seen_at": None,
+        "muted": False,
+        "typing": [],
+    }
+
+
+@pytest.fixture
+async def split(board: W.Board, chat: Pages) -> Pages:
+    """The chat fixture with three archived chats on the board (B, not archived, stays off it)."""
+    board.rows.clear()
+    board.rows.update(
+        {T: _row(T, "Fictional T", 3), L: _row(L, "Fictional L", 39), R: _row(R, "Fictional R", 1)}
+    )
+    return chat
+
+
+async def _open_split(pages: Pages, thread_id: str = T, **ctx: Any) -> Page:
+    page = await pages.open(_chat(thread_id) + "?chatnav=split", **ctx)
+    await _handled(page, "history")
+    await page.wait_for_selector("#rows li", state="attached")  # a narrow window keeps the list folded
+    return page
+
+
+async def _row_ids(page: Page) -> list[str]:
+    return list(await page.locator("#rows li").evaluate_all("ls => ls.map(l => l.dataset.id)"))
+
+
+async def _switch(page: Page, thread_id: str) -> None:
+    since = await _frames(page)
+    await page.locator(f'#rows li[data-id="{thread_id}"] a.name').click()
+    await _handled(page, "history", since)
+
+
+async def test_split_shows_the_list_and_switches_in_place(board: W.Board, split: Pages) -> None:
+    """011-AC21: the live list beside the chat, newest first, no ◀; a click follows the other chat, shows
+    its history, changes URL and title without a page load; Back returns to the previous chat."""
+    page = await _open_split(split)
+    assert await _row_ids(page) == [L, T, R]
+    assert await page.locator("#rows li.cur").get_attribute("data-id") == T
+    assert (
+        await page.locator("#rows li").first.locator(".prev").inner_text() == "Ann Lee: snippet Fictional L"
+    )
+    assert not await page.locator("#back").is_visible()
+    assert not await page.locator("#menu").is_visible()
+    await page.evaluate("window.__same = 1")
+    await _switch(page, L)
+    assert page.url.endswith(_chat(L) + "?chatnav=split")
+    assert await page.title() == "Fictional L · miniteams"
+    assert (await _ids(page))[-1] == "39"
+    assert await page.locator("#rows li.cur").get_attribute("data-id") == L
+    assert [tid for tid, _ in board._follows.values()] == [L]
+    since = await _frames(page)
+    await page.go_back()
+    await _handled(page, "history", since)
+    assert page.url.endswith(_chat(T) + "?chatnav=split")
+    assert await _ids(page) == ["1", "2", "3"]
+    await page.wait_for_function("document.title === 'Fictional T · miniteams'")
+    assert await page.evaluate("window.__same") == 1  # never reloaded
+    since = await _frames(page)
+    await page.go_forward()
+    await _handled(page, "history", since)
+    assert (await _ids(page))[-1] == "39"
+
+
+async def test_split_setting_is_read_from_storage(split: Pages) -> None:
+    """011-AC21: the widget's stored `chatnav` turns the split on, without the URL param."""
+    page = await split.open(_chat(T))
+    await page.evaluate("localStorage.setItem('chatnav', 'split')")
+    await page.reload()
+    await page.wait_for_selector("#rows li")
+    assert await _row_ids(page) == [L, T, R]
+
+
+async def test_split_keeps_drafts_quotes_and_editors_per_chat(board: W.Board, split: Pages) -> None:
+    """011-AC22: each chat keeps its unsent draft, quotes and open editor across switches; the left chat's
+    live events no longer render."""
+    page = await _open_split(split)
+    await page.locator('[data-id="1"] [data-act=reply]').dispatch_event("click")
+    await page.locator("#reply").fill("draft for T")
+    await page.locator('[data-id="3"] [data-act=edit]').dispatch_event("click")
+    await page.locator(".editor").fill("edit in T")
+    await _switch(page, L)
+    assert await page.locator("#reply").input_value() == ""
+    assert await _quote_ids(page) == []
+    await page.locator("#reply").fill("draft for L")
+    await board.on_event(_event("NewMessage", T, **_m("90", _at(90), "<p>old chat</p>")))
+    await board.on_event(_event("NewMessage", T, messagetype="Control/Typing"))
+    await board.on_event(_event("NewMessage", L, **_m("91", _at(91), "<p>this chat</p>")))
+    await page.wait_for_selector('[data-id="91"]')
+    assert await page.locator('[data-id="90"]').count() == 0
+    assert await page.locator("#typing").inner_text() == ""
+    await _switch(page, T)
+    assert await page.locator("#reply").input_value() == "draft for T"
+    assert await _quote_ids(page) == ["1"]
+    assert await page.locator('[data-id="3"] .editor').input_value() == "edit in T"
+    await _switch(page, L)
+    assert await page.locator("#reply").input_value() == "draft for L"
+
+
+async def test_split_drops_frames_and_answers_of_the_left_chat(split: Pages) -> None:
+    """011-AC22: once switched, frames and answers naming the left chat change nothing on screen, while a
+    frame of the new chat relayed before its follow answer still renders."""
+    page = await _open_split(split)
+    await page.locator("#reply").fill("draft for T")
+    await page.evaluate("window.__ws.send = () => {}")  # the server never hears of the switch
+    await page.locator(f'#rows li[data-id="{L}"] a.name').click()
+    await _inject(page, [{"msg": _live(95), "thread": T}, {"typing": "Ann Lee", "on": True, "thread": T}])
+    await _inject(page, [{"msg": _live(98), "thread": L}])
+    page_of = {"before": None, "older": False, "newer": False, "source": "archive"}
+    await _inject(page, [{"history": L, "messages": [_live(96)], **page_of}])
+    assert await _ids(page) == ["n96", "n98"]
+    await _inject(page, [{"history": T, "messages": [_live(97)], **page_of}])
+    await _inject(page, [{"follow": T, "ok": True, "label": "Stale"}])
+    await page.locator("#find").fill("x")
+    await page.locator("#find").press("Enter")
+    hit = {"id": "1", "at": _at(1), "name": "Ann Lee", "text": "x"}
+    await _inject(page, [{"search": T, "q": "x", "hits": [hit]}, {"sent": T, "ok": True}])
+    assert await _ids(page) == ["n96", "n98"]
+    assert await page.locator("#typing").inner_text() == ""
+    assert await page.title() == "Fictional L · miniteams"
+    assert await page.locator("#hits").is_hidden()
+    await page.locator(f'#rows li[data-id="{T}"] a.name').click()
+    assert await page.locator("#reply").input_value() == "draft for T"
+
+
+def _swallow(page: Page, verb: str) -> Awaitable[None]:
+    """The page's `verb` frames never reach the server; every other one does."""
+    script = (
+        "v => { const s = window.__ws.send.bind(window.__ws);"
+        " window.__ws.send = (d) => { if (!(v in JSON.parse(d))) s(d); }; }"
+    )
+    return page.evaluate(script, verb)
+
+
+async def test_split_a_save_in_flight_is_not_reopened_and_its_failure_waits(split: Pages) -> None:
+    """011-AC22: an edit saving when its chat is left is not stashed with stale text; its failure, answered
+    while away, shows on that chat's line on return."""
+    page = await _open_split(split)
+    await _swallow(page, "edit")
+    await (await _edit(page, "3")).fill("saving this")
+    await page.locator(".editor").press("Enter")
+    await _switch(page, L)
+    await _inject(page, [{"edit": T, "msg": "3", "error": "boom"}])
+    assert await page.locator("#err").inner_text() == ""
+    await _switch(page, T)
+    assert await page.locator(".editor").count() == 0
+    assert await page.locator("#err").inner_text() == "edit: boom"
+
+
+async def test_split_busy_answers_say_why(split: Pages) -> None:
+    """011-AC22: a send or action refused as busy (another one runs on the socket) says so in words."""
+    page = await _open_split(split)
+    await _swallow(page, "send")
+    await page.locator("#reply").fill("hold on")
+    await page.locator("#reply").press("Enter")
+    await _inject(page, [{"sent": T, "error": "busy"}])
+    assert await page.locator("#err").inner_text() == "another action is still running, try again"
+    assert await page.locator("#reply").input_value() == "hold on"
+    await _inject(page, [{"react": T, "msg": "1", "error": "busy"}])
+    assert await page.locator("#err").inner_text() == "reaction: another action is still running, try again"
+
+
+async def test_split_list_is_reachable_by_keyboard_and_keeps_focus(board: W.Board, split: Pages) -> None:
+    """011-AC23: Tab from a row's name reaches its seen and mute buttons, shown; a broadcast or a tab
+    switch keeps the focus where it was; the shown tab and the current row are announced."""
+    page = await _open_split(split)
+    await page.locator(f'#rows li[data-id="{L}"] a.name').focus()
+    await page.keyboard.press("Tab")
+    seen = page.locator(f'#rows li[data-id="{L}"] [data-k="seen"]')
+    assert await seen.evaluate("b => b === document.activeElement && getComputedStyle(b).opacity === '1'")
+    board.broadcast()
+    await page.wait_for_function("window.__frames.filter(f => 'rows' in f).length >= 2")
+    assert await seen.evaluate("b => b === document.activeElement")
+    await page.keyboard.press("Tab")
+    await page.keyboard.press("Enter")
+    await page.wait_for_function(f"!document.querySelector('#rows li[data-id={json.dumps(L)}]')")
+    assert board.rows[L]["muted"] is True
+    unread = page.get_by_role("button", name="Unread")
+    await unread.focus()
+    await page.keyboard.press("Enter")
+    assert await page.locator('#tabs [data-k="tab:unread"]').evaluate("b => b === document.activeElement")
+    assert await unread.get_attribute("aria-pressed") == "true"
+    await page.get_by_role("button", name="Inbox").click()
+    assert await page.locator(f'#rows li[data-id="{T}"]').get_attribute("aria-current") == "page"
+    assert await page.locator("#rows li[aria-current]").count() == 1
+
+
+async def test_split_list_updates_live_and_its_actions_work(board: W.Board, split: Pages) -> None:
+    """011-AC23: a new message moves its row up with the unread mark, a mention shows its tag; seen and
+    mute from the list reach the board."""
+    page = await _open_split(split)
+    await board.on_event(_event("NewMessage", R, **_m("200", _at(200), "<p>fresh news</p>")))
+    await page.wait_for_function(f"document.querySelector('#rows li').dataset.id === {json.dumps(R)}")
+    top = page.locator("#rows li").first
+    assert "unread" in (await top.get_attribute("class") or "")
+    assert await top.locator(".dot").count() == 1
+    assert "fresh news" in await top.locator(".prev").inner_text()
+    mention = json.dumps([{"mentionType": "person", "mri": ME}])
+    await board.on_event(
+        _event("NewMessage", L, **_m("201", _at(201), "<p>hey</p>", properties={"mentions": mention}))
+    )
+    await page.wait_for_selector(f'#rows li.mention[data-id="{L}"] .tag')
+    await page.locator(f'#rows li[data-id="{R}"]').hover()
+    await page.locator(f'#rows li[data-id="{R}"] .meta button').first.click()
+    await page.wait_for_function(f"!document.querySelector('#rows li[data-id={json.dumps(R)}]')")
+    assert board.rows[R]["seen_at"] == _at(200)
+    await page.locator(f'#rows li[data-id="{T}"]').hover()
+    await page.locator(f'#rows li[data-id="{T}"] .mute').click()
+    await page.wait_for_function(f"!document.querySelector('#rows li[data-id={json.dumps(T)}]')")
+    assert board.rows[T]["muted"] is True
+    await page.get_by_role("button", name="Muted").click()
+    assert await _row_ids(page) == [T]
+    await page.locator("#filter").fill("zzz")
+    assert await page.locator("#nochat").inner_text() == "no chat matches"
+
+
+async def test_split_narrow_window_folds_the_list(split: Pages) -> None:
+    """011-AC21: below ~700px the list hides behind ☰, which stays clickable while it is open; Escape, a
+    click beside it and picking a chat each fold it."""
+    page = await _open_split(split, viewport={"width": 600, "height": 700})
+    side = page.locator("#side")
+    assert not await side.is_visible()
+    await page.click("#menu")
+    assert await side.is_visible()
+    await page.click("#menu")  # a real click: fails if the open list covers ☰
+    assert not await side.is_visible()
+    await page.click("#menu")
+    await page.get_by_role("button", name="Unread").click()  # re-renders the list under the click
+    assert await side.is_visible()
+    await page.get_by_role("button", name="Inbox").click()
+    await page.keyboard.press("Escape")
+    assert not await side.is_visible()
+    await page.click("#menu")
+    await page.mouse.click(550, 400)
+    assert not await side.is_visible()
+    assert page.url.endswith(_chat(T) + "?chatnav=split")
+    await page.click("#menu")
+    await _switch(page, L)
+    assert not await side.is_visible()
+    assert page.url.endswith(_chat(L) + "?chatnav=split")
+
+
+@pytest.mark.parametrize("browser", [True, False], ids=["browser", "no-browser"])
+async def test_split_middle_click_opens_a_new_tab(
+    board: W.Board, split: Pages, monkeypatch: pytest.MonkeyPatch, browser: bool
+) -> None:
+    """011-AC21: middle click on a row opens that chat in a new tab, through --browser when set; the
+    shown chat does not change."""
+    opened: list[tuple[str, bool]] = []
+
+    async def spy(
+        thread_id: str, web: bool = False, ws: Any = None, msg_id: str = "", chat: bool = False
+    ) -> bool:
+        opened.append((thread_id, chat))
+        return True
+
+    monkeypatch.setattr(board, "open_row", spy)
+    board.browser = ["firefox"] if browser else None
+    page = await _open_split(split)
+    name = page.locator(f'#rows li[data-id="{L}"] a.name')
+    if browser:
+        await name.click(button="middle")
+        await _until(opened, 1)
+        assert opened == [(L, True)]
+    else:
+        async with page.context.expect_page() as tab:
+            await name.click(button="middle")
+        new = await tab.value
+        await new.wait_for_url(f"http://{split.host}{_chat(L)}")
+        await new.close()
+    assert page.url.endswith(_chat(T) + "?chatnav=split")
+
+
+async def test_list_mode_has_no_side_pane(split: Pages) -> None:
+    """011-AC21: with `chatnav` at `list` (default) the page is unchanged: ◀, no list, no board rows."""
+    page = await split.open(_chat(T))
+    await _handled(page, "history")
+    assert await page.locator("#back").is_visible()
+    assert not await page.locator("#side").is_visible()
+    assert not await page.locator("#menu").is_visible()
+    assert await page.evaluate("window.__frames.some(f => 'rows' in f)") is False

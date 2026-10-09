@@ -120,7 +120,9 @@ the draft until the page reloads; a failed send keeps the text and shows why. Th
 **Middle click** to `Teams web` (default, as above) or `Chat here`: `/chat/<thread>`, this
 page's own view of the chat (history, live updates, reply box, Open in Teams), through `--browser` when
 set, else in a new tab. On `/?nav=chat` the board is a chat picker, and the chat page's ◀ goes there: a click on a row opens that chat page in the same
-tab, a middle click in a new one, and Ctrl click opens Teams as before. The
+tab, a middle click in a new one, and Ctrl click opens Teams as before. With ⚙ **Chat navigation** at
+`Split` (default `List`), the chat page shows that list on its left instead of ◀: a click switches chats in
+place (Back returns), each chat keeps its draft and quotes, and below 700px the list folds behind ☰. The
 process exits non-zero when the stream dies (auth expired) — re-run it.
 
 Open it as a standalone window on the persisted bind:

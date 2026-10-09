@@ -1172,7 +1172,8 @@ class Board:
     def _relay(self, thread_id: str, frame: dict[str, Any]) -> None:
         followers = [ws for ws, (tid, _) in self._follows.items() if tid == thread_id]
         if followers:
-            broadcast(followers, json.dumps(frame, ensure_ascii=False))
+            # Named: a page switching chats may still receive frames of the one it left.
+            broadcast(followers, json.dumps({**frame, "thread": thread_id}, ensure_ascii=False))
 
     def _background(self, work: Coroutine[Any, Any, None]) -> None:
         task = asyncio.create_task(work)
@@ -1510,7 +1511,8 @@ class Board:
         broadcast(self.clients, self.payload())
 
     async def handle(self, ws: ServerConnection) -> None:
-        # A chat page (`/ws?chat`) only needs its own chat: the board's rows never reach it.
+        # A chat page (`/ws?chat`) only needs its own chat: the board's rows reach it only once it
+        # asks (`board`, split layout).
         board_page = ws.request is None or urlsplit(ws.request.path).query != "chat"
         if board_page:
             self.clients.add(ws)
@@ -1559,6 +1561,13 @@ class Board:
                     self._background(
                         self._answer(ws, self._one_at_a_time(ws, head, found, self._search_busy))
                     )
+                elif isinstance(verb, dict) and verb.get("board") is True:
+                    # A split chat page shows the list too: from now on it gets the board's rows,
+                    # exactly what the widget gets.
+                    if ws not in self.clients:
+                        self.clients.add(ws)
+                        with contextlib.suppress(ConnectionClosed):
+                            await ws.send(self.payload())
                 elif isinstance(verb, dict) and isinstance(verb.get("follow"), str):
                     await self._answer(ws, self.follow(ws, verb["follow"]))
                 elif isinstance(verb, dict) and isinstance(verb.get("open"), str):

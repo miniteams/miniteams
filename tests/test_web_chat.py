@@ -554,9 +554,9 @@ async def test_follow_relays_messages_edits_deletes_reactions_and_typing(
         assert "html" not in edit  # partial update: the page keeps the body it shows
 
         await board.on_event(_event("NewMessage", T, messagetype="Control/Typing"))
-        assert await _frame(ws) == {"typing": "Ann Lee", "on": True}
+        assert await _frame(ws) == {"typing": "Ann Lee", "on": True, "thread": T}
         await board.on_event(_event("NewMessage", T, messagetype="Control/ClearTyping"))
-        assert await _frame(ws) == {"typing": "Ann Lee", "on": False}
+        assert await _frame(ws) == {"typing": "Ann Lee", "on": False, "thread": T}
 
 
 async def test_follow_relays_only_its_thread_and_skips_noise(board: W.Board, settings: Settings) -> None:
@@ -728,7 +728,7 @@ async def test_relay_failure_does_not_cost_the_board_its_update(
         )
         assert board.rows[B]["last_id"] == "9"
         await board.on_event(_event("NewMessage", B, messagetype="Control/Typing"))
-        assert await _frame(ws) == {"typing": "Ann Lee", "on": True}
+        assert await _frame(ws) == {"typing": "Ann Lee", "on": True, "thread": B}
 
 
 async def test_typing_relay_names_who_stopped_and_expires(
@@ -743,17 +743,21 @@ async def test_typing_relay_names_who_stopped_and_expires(
         await _frame(ws)
         await board.on_event(_event("NewMessage", C, messagetype="Control/Typing"))
         await board.on_event(_event("NewMessage", C, messagetype="Control/Typing", **bob))
-        assert await _frame(ws) == {"typing": "Ann Lee", "on": True}
-        assert await _frame(ws) == {"typing": "Bob Day", "on": True}
+        assert await _frame(ws) == {"typing": "Ann Lee", "on": True, "thread": C}
+        assert await _frame(ws) == {"typing": "Bob Day", "on": True, "thread": C}
         await board.on_event(_event("NewMessage", C, messagetype="Control/ClearTyping", **bob))
-        assert await _frame(ws) == {"typing": "Bob Day", "on": False}
-        assert await _frame(ws) == {"typing": "Ann Lee", "on": False}  # Ann never cleared: expiry
+        assert await _frame(ws) == {"typing": "Bob Day", "on": False, "thread": C}
+        assert await _frame(ws) == {
+            "typing": "Ann Lee",
+            "on": False,
+            "thread": C,
+        }  # Ann never cleared: expiry
         await board.on_event(_event("NewMessage", C, messagetype="Control/Typing"))
-        assert await _frame(ws) == {"typing": "Ann Lee", "on": True}
+        assert await _frame(ws) == {"typing": "Ann Lee", "on": True, "thread": C}
         await board.on_event(
             _event("NewMessage", C, id="9", composetime=_at(9), messagetype="Text", content="x")
         )
-        assert await _frame(ws) == {"typing": "Ann Lee", "on": False}
+        assert await _frame(ws) == {"typing": "Ann Lee", "on": False, "thread": C}
         assert (await _frame(ws))["msg"]["id"] == "9"
         await _silent(ws, 0.4)  # the expiry was cancelled: no second clear
 
@@ -951,6 +955,81 @@ async def test_chat_socket_never_receives_the_board(board: W.Board, settings: Se
         assert json.loads(await asyncio.wait_for(chat.recv(), 2))["msg"]["id"] == "9"
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(chat.recv(), 0.3)
+
+
+async def test_a_split_chat_socket_subscribes_to_the_board(board: W.Board, settings: Settings) -> None:
+    """011-AC23: `board` gives a chat socket the widget's payload and every later broadcast; seen and
+    mute work from it; a chat socket that did not ask still gets no rows."""
+    async with _served(board, settings) as host, _chat_socket(host) as split, _chat_socket(host) as plain:
+        await split.send(json.dumps({"follow": T}))
+        assert (await _frame(split))["follow"] == T
+        await split.send(json.dumps({"board": True}))
+        first = json.loads(await asyncio.wait_for(split.recv(), 2))
+        assert first == json.loads(board.payload())
+        assert [r["id"] for r in first["rows"]] == [B]
+        await split.send(json.dumps({"board": True}))  # twice: still one subscription, no second payload
+        await split.send(json.dumps({"seen": B, "at": _at(1)}))
+        assert json.loads(await asyncio.wait_for(split.recv(), 2))["rows"][0]["seen_at"] == _at(1)
+        await split.send(json.dumps({"mute": B}))
+        assert json.loads(await asyncio.wait_for(split.recv(), 2))["rows"][0]["muted"] is True
+        await split.send(json.dumps({"unmute": B}))
+        assert json.loads(await asyncio.wait_for(split.recv(), 2))["rows"][0]["muted"] is False
+        await split.send(json.dumps({"unseen": B}))
+        assert json.loads(await asyncio.wait_for(split.recv(), 2))["rows"][0]["seen_at"] is None
+        # A new message on a row that is not followed: its row moves, no message frame of it.
+        await board.on_event(
+            _event("NewMessage", B, id="7", composetime=_at(7), messagetype="Text", content="hi")
+        )
+        frame = json.loads(await asyncio.wait_for(split.recv(), 2))
+        assert set(frame) == {"rows", "page", "opener", "browser", "me", "busy"}
+        assert (frame["rows"][0]["last_activity"], frame["rows"][0]["text"]) == (_at(7), "hi")
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(split.recv(), 0.3)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(plain.recv(), 0.3)
+        assert len(board.clients) == 1
+    for _ in range(50):
+        if not board.clients:
+            break
+        await asyncio.sleep(0.02)
+    assert board.clients == set()
+
+
+async def test_switching_the_followed_chat_stops_the_old_relay(board: W.Board, settings: Settings) -> None:
+    """011-AC22: after `follow` on another chat, the previous one's live events no longer reach the socket."""
+    async with _served(board, settings) as host, _chat_socket(host) as ws:
+        await ws.send(json.dumps({"follow": T}))
+        assert (await _frame(ws))["follow"] == T
+        await ws.send(json.dumps({"follow": B}))
+        assert (await _frame(ws))["follow"] == B
+        await board.on_event(_event("NewMessage", T, messagetype="Control/Typing"))
+        await board.on_event(
+            _event("NewMessage", T, id="8", composetime=_at(8), messagetype="Text", content="old")
+        )
+        await board.on_event(
+            _event("NewMessage", B, id="9", composetime=_at(9), messagetype="Text", content="new")
+        )
+        assert (await _frame(ws))["msg"]["id"] == "9"  # the first frame relayed is the new chat's
+
+
+async def test_relayed_frames_name_their_chat(board: W.Board, settings: Settings) -> None:
+    """011-AC22: message, edit and typing frames carry `thread`: a page that switched drops the left one's."""
+    async with _served(board, settings) as host, _chat_socket(host) as ws:
+        await ws.send(json.dumps({"follow": T}))
+        assert (await _frame(ws))["follow"] == T
+        new = {"id": "9", "composetime": _at(9), "messagetype": "Text", "content": "x"}
+        await board.on_event(_event("NewMessage", T, **new))
+        await board.on_event(_event("MessageUpdate", T, **{**new, "content": "y"}))
+        await board.on_event(_event("NewMessage", T, messagetype="Control/Typing"))
+        await board.on_event(_event("NewMessage", T, messagetype="Control/ClearTyping"))
+        frames = [await _frame(ws) for _ in range(4)]
+        assert [next(k for k in ("msg", "edit", "typing") if k in f) for f in frames] == [
+            "msg",
+            "edit",
+            "typing",
+            "typing",
+        ]
+        assert {f["thread"] for f in frames} == {T}
 
 
 async def test_follow_names_a_board_chat_and_tells_the_opener(
