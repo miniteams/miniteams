@@ -838,7 +838,7 @@ class Board:
         if self.directory is None:
             return "not connected"
         try:
-            extra = {}
+            extra: dict[str, Any] = {}
             if quote:
                 copies = await asyncio.to_thread(self._server_copies, thread_id, quote)
                 if any(q not in copies for q in quote):

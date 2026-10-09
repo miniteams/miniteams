@@ -1,7 +1,9 @@
 """Outbound send + skype-token exchange (httpx mocked)."""
 
+import json
 from typing import Any
 
+import httpx
 import pytest
 
 from miniteams import send, skype
@@ -54,6 +56,29 @@ def test_send_message_html_mode_sends_raw(settings: Settings, monkeypatch) -> No
     monkeypatch.setattr(send._CLIENT, "post", fake_post)
     send.send_message(settings, "sk", "48:notes", "<b>hi</b> & <i>x</i>", "Me", is_html=True)
     assert captured["json"]["content"] == "<b>hi</b> & <i>x</i>"  # verbatim, not escaped
+
+
+def test_send_message_properties_in_body(settings: Settings, monkeypatch) -> None:
+    """012-AC7: `properties` goes in the body as given; without it the body is byte-identical."""
+    bodies: list[bytes] = []
+
+    def fake_post(url: str, **kw: Any) -> _Resp:
+        bodies.append(httpx.Request("POST", url, json=kw["json"]).content)
+        return _Resp({}, status=201)
+
+    monkeypatch.setattr(send._CLIENT, "post", fake_post)
+    monkeypatch.setattr(send.time, "time", lambda: 1781920776.714)
+    props = {"mentions": '[{"itemid": 0}]'}
+    send.send_message(settings, "sk", "48:notes", "hi", "Me")
+    send.send_message(settings, "sk", "48:notes", "hi", "Me", properties=None)
+    send.send_message(settings, "sk", "48:notes", "hi", "Me", properties=props)
+
+    today = (
+        b'{"clientmessageid":"1781920776714","content":"hi","messagetype":"RichText/Html",'
+        b'"contenttype":"text","imdisplayname":"Me"}'
+    )
+    assert bodies[0] == bodies[1] == today
+    assert json.loads(bodies[2]) == {**json.loads(today), "properties": props}
 
 
 def test_send_typing_builds_request(settings: Settings, monkeypatch) -> None:

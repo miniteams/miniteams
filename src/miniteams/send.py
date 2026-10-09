@@ -84,17 +84,20 @@ def send_message(
     display_name: str,
     *,
     is_html: bool = False,
+    properties: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     base = f"https://{settings.contacts_host}/v1/users/ME/conversations/{quote(thread_id, safe='')}"
     # JS-style epoch milliseconds; also the de-dup key for the self-echo over Trouter.
     client_message_id = str(int(time.time() * 1000))
-    body = {
+    body: dict[str, Any] = {
         "clientmessageid": client_message_id,
         "content": message_html(text, is_html),
         "messagetype": "RichText/Html",
         "contenttype": "text",
         "imdisplayname": display_name,
     }
+    if properties is not None:
+        body["properties"] = properties
     resp = _CLIENT.post(f"{base}/messages", headers=_headers(skype_token, settings), json=body)
     result = _check(resp, "send")
     log.info("message_sent", thread=thread_id, clientmessageid=client_message_id, status=result["status"])

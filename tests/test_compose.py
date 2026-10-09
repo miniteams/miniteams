@@ -1,0 +1,329 @@
+"""Composer text → Teams HTML: markdown subset, emojis, mentions (spec 012)."""
+
+import gc
+import json
+import time
+from collections.abc import Callable
+from typing import Any
+
+import pytest
+
+from miniteams import compose, send
+from miniteams.compose import compose_html, markdown_html
+
+ANN = {"name": "Ann Lee", "mri": "8:orgid:ann"}
+EVERYONE = {"name": "everyone", "mri": "19:grp@thread.v2", "everyone": True}
+
+
+def _span(n: int, text: str) -> str:
+    return f'<span itemtype="http://schema.skype.com/Mention" itemscope="" itemid="{n}">{text}</span>'
+
+
+def _mentions(props: dict[str, Any] | None) -> list[dict[str, Any]]:
+    assert props is not None and set(props) == {"mentions"}
+    entries: list[dict[str, Any]] = json.loads(props["mentions"])
+    return entries
+
+
+# --- emojis ---------------------------------------------------------------------------------------
+
+
+def test_known_shortcode_expands_unknown_stays() -> None:
+    """012-AC3: `ok :fire: :nope:` → `ok 🔥 :nope:`, no properties."""
+    assert compose_html("ok :fire: :nope:", [], {}) == ("ok 🔥 :nope:", None)
+
+
+def test_custom_emoji_becomes_the_teams_img() -> None:
+    """012-AC3: a custom name → the CustomEmoji <img> with `<name>;<id>` and the asyncgw src."""
+    html, _ = compose_html("go :party:!", [], {"party": "0-frc-d1-abc"}, asyncgw_host="gw.example")
+    assert html == (
+        'go <img alt="party" itemid="party;0-frc-d1-abc" itemtype="http://schema.skype.com/CustomEmoji"'
+        ' src="https://gw.example/v1/objects/0-frc-d1-abc/views/imgt2_anim"'
+        ' style="width:20px; height:20px">!'
+    )
+    assert compose_html(":party:", [], {"party": "x"})[0].count(compose.ASYNCGW_HOST) == 1
+
+
+def test_escaping_is_unchanged_around_emojis() -> None:
+    """012-AC3: `<` → `&lt;`, newline → `<br>`, as `message_html` does today."""
+    assert compose_html("a<b :fire:\nc&d", [], {})[0] == "a&lt;b 🔥<br>c&amp;d"
+    plain = "a<b> & 'q' \"x\"\nline two"
+    assert markdown_html(plain, False) == markdown_html(plain, True) == send.message_html(plain, False)
+
+
+@pytest.mark.parametrize("text", [":)", "at 10:30:", "a :: b", ": fire:", ":fire :", "::"])
+def test_colons_that_are_not_a_known_name_stay(text: str) -> None:
+    assert compose_html(text, [], {})[0] == text
+
+
+def test_unknown_name_gives_its_closing_colon_back() -> None:
+    assert compose_html("10:30:fire: :fire::zap:", [], {})[0] == "10:30🔥 🔥⚡"
+
+
+# --- mentions -------------------------------------------------------------------------------------
+
+
+def test_every_occurrence_is_a_numbered_mention() -> None:
+    """012-AC4: two `@Ann Lee` → spans 0 and 1, two entries in text order."""
+    html, props = compose_html("@Ann Lee and @Ann Lee", [ANN], {})
+    assert html == f"{_span(0, 'Ann Lee')} and {_span(1, 'Ann Lee')}"
+    assert _mentions(props) == [
+        {
+            "@type": "http://schema.skype.com/Mention",
+            "itemid": n,
+            "mri": "8:orgid:ann",
+            "mentionType": "person",
+            "displayName": "Ann Lee",
+        }
+        for n in (0, 1)
+    ]
+
+
+def test_picked_mention_absent_from_text_is_dropped() -> None:
+    """012-AC4: a picked mention whose `@Name` is gone yields no entry."""
+    assert compose_html("hello Ann Lee", [ANN], {}) == ("hello Ann Lee", None)
+    _, props = compose_html("@Bob Ray hi", [ANN, {"name": "Bob Ray", "mri": "8:orgid:bob"}], {})
+    assert [e["mri"] for e in _mentions(props)] == ["8:orgid:bob"]
+
+
+def test_everyone_mention() -> None:
+    """012-AC5: `@everyone` → a span reading `Everyone`, mentionType everyone, mri = thread id."""
+    html, props = compose_html("hi @everyone!", [EVERYONE], {})
+    assert html == f"hi {_span(0, 'Everyone')}!"
+    assert _mentions(props) == [
+        {
+            "@type": "http://schema.skype.com/Mention",
+            "itemid": 0,
+            "mri": "19:grp@thread.v2",
+            "mentionType": "everyone",
+            "displayName": "Everyone",
+        }
+    ]
+
+
+def test_longest_name_wins_and_a_prefix_name_still_matches_alone() -> None:
+    ann = {"name": "Ann", "mri": "8:orgid:a"}
+    html, props = compose_html("@Ann Lee, @Ann, @Ann Leeds, @Annie", [ann, ANN], {})
+    assert html == f"{_span(0, 'Ann Lee')}, {_span(1, 'Ann')}, {_span(2, 'Ann')} Leeds, @Annie"
+    assert [e["mri"] for e in _mentions(props)] == ["8:orgid:ann", "8:orgid:a", "8:orgid:a"]
+
+
+def test_name_with_regex_and_html_metacharacters() -> None:
+    team = {"name": "A+ (team) <qa>", "mri": "8:orgid:t"}
+    html, props = compose_html("@A+ (team) <qa> and @AA+ (team) <qa>", [team], {})
+    assert html == f"{_span(0, 'A+ (team) &lt;qa&gt;')} and @AA+ (team) &lt;qa&gt;"
+    assert len(_mentions(props)) == 1
+
+
+def test_at_inside_a_word_is_not_a_mention() -> None:
+    assert compose_html("mail bob@Ann Lee", [ANN], {}) == ("mail bob@Ann Lee", None)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("`@Ann Lee :fire:`", "<code>@Ann Lee :fire:</code>"),
+        ("[@Ann Lee :fire:](https://x.test)", '<a href="https://x.test">@Ann Lee :fire:</a>'),
+    ],
+)
+def test_no_expansion_inside_code_or_link_labels(text: str, expected: str) -> None:
+    assert compose_html(text, [ANN], {}) == (expected, None)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "see https://x.test/a:fire:b now",
+        "see https://x.test/@Ann Lee now",
+        "https://x.test/:zap:",
+        ":fire:https://x.test/:x:",
+    ],
+)
+def test_no_expansion_inside_bare_urls(text: str) -> None:
+    html, props = compose_html(text, [ANN], {"x": "1"})
+    assert props is None
+    assert html == text.replace(":fire:", "🔥", text.startswith(":fire:"))
+    assert compose_html(text + " :fire:", [], {})[0].endswith(" 🔥")
+
+
+def test_mention_fields_are_coerced_to_strings() -> None:
+    _, props = compose_html("@7 hi", [{"name": 7, "mri": 42}], {})
+    assert _mentions(props)[0] | {"@type": ""} == {
+        "@type": "",
+        "itemid": 0,
+        "mri": "42",
+        "mentionType": "person",
+        "displayName": "7",
+    }
+
+
+def test_mention_list_and_names_are_capped() -> None:
+    many = [{"name": f"N{n}", "mri": f"m{n}"} for n in range(compose.MAX_MENTIONS)]
+    compose_html("@N0", many, {})
+    with pytest.raises(ValueError, match="too many mentions"):
+        compose_html("@N0", [*many, {"name": "Extra", "mri": "x"}], {})
+    compose_html("hi", [{"name": "x" * compose.MAX_NAME, "mri": "m"}], {})
+    with pytest.raises(ValueError, match="name too long"):
+        compose_html("hi", [{"name": "x" * (compose.MAX_NAME + 1), "mri": "m"}], {})
+
+
+def test_mentions_and_emojis_inside_formatting_still_expand() -> None:
+    html, props = compose_html("**@Ann Lee** _:fire:_", [ANN], {})
+    assert html == f"<b>{_span(0, 'Ann Lee')}</b> <i>🔥</i>"
+    assert len(_mentions(props)) == 1
+
+
+# --- formatting -----------------------------------------------------------------------------------
+
+
+def test_inline_set() -> None:
+    """012-AC11: bold, both italics, strike, code, https link."""
+    assert markdown_html("**a** *b* _c_ ~~d~~ `e` [f](https://x)", False) == (
+        '<b>a</b> <i>b</i> <i>c</i> <s>d</s> <code>e</code> <a href="https://x">f</a>'
+    )
+
+
+def test_inline_mode_leaves_block_syntax_as_text() -> None:
+    """012-AC11: with `inline`, `> q` and `- item` stay text."""
+    assert markdown_html("> q\n- item\n1. one\n```\nx\n```", False) == (
+        "&gt; q<br>- item<br>1. one<br>```<br>x<br>```"
+    )
+
+
+def test_full_fenced_block_is_escaped_and_never_expanded() -> None:
+    """012-AC12: fenced block → <pre><code>, content escaped, no emoji or mention inside."""
+    html, props = compose_html(
+        "see:\n```py\n<a> :fire: @Ann Lee **b**\n  x\n```\nend :fire:", [ANN], {}, full=True
+    )
+    assert html == "see:<pre><code>&lt;a&gt; :fire: @Ann Lee **b**\n  x</code></pre>end 🔥"
+    assert props is None
+
+
+def test_full_quotes_and_lists() -> None:
+    """012-AC12: `> ` lines → <blockquote>, `- `/`* ` runs → <ul>, `1. ` runs → <ol>."""
+    text = "intro\n> one\n> **two**\n- a\n* b\n1. x\n12. y\ntail\nlast"
+    assert markdown_html(text, True) == (
+        "intro<blockquote>one<br><b>two</b></blockquote><ul><li>a</li><li>b</li></ul>"
+        "<ol><li>x</li><li>y</li></ol>tail<br>last"
+    )
+
+
+def test_unclosed_fence_stays_text() -> None:
+    assert markdown_html("```\ncode", True) == "```<br>code"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "2*3*4",
+        "snake_case_name",
+        "**",
+        "a ** b",
+        "**open",
+        "`open",
+        "~~open",
+        "_open",
+        "* not italic *",
+        "x*y*",
+        "*a*b",
+        "2**3**4",
+        "a**b**",
+        "**a**b",
+        "_a_b c",
+        "[x](ftp://host)",
+        "[](https://x)",
+        "[x] (https://x)",
+    ],
+)
+def test_unclosed_or_intra_word_markers_stay_as_typed(text: str) -> None:
+    """012-AC13: unclosed, intra-word or non-http markup is left as typed."""
+    assert markdown_html(text, False) == text
+
+
+def test_javascript_link_and_typed_html_are_text() -> None:
+    """012-AC13: `[x](javascript:…)` stays text, `<b>` typed by hand is escaped."""
+    assert markdown_html("[x](javascript:alert(1)) <b>hi</b>", True) == (
+        "[x](javascript:alert(1)) &lt;b&gt;hi&lt;/b&gt;"
+    )
+    assert (
+        markdown_html('[x](https://a.test/"onmouseover=y)', False)
+        == "[x](https://a.test/&quot;onmouseover=y)"
+    )
+
+
+def test_inline_code_is_escaped() -> None:
+    assert markdown_html("`<b>&`", False) == "<code>&lt;b&gt;&amp;</code>"
+
+
+def test_link_url_may_hold_one_balanced_paren_pair() -> None:
+    assert markdown_html("[w](https://w.test/wiki/Foo_(bar)) x", False) == (
+        '<a href="https://w.test/wiki/Foo_(bar)">w</a> x'
+    )
+    assert markdown_html("[w](https://w.test/a(b)c) x", False) == '<a href="https://w.test/a(b)c">w</a> x'
+    for literal in ("[w](https://w.test/(a)(b))", "[w](https://w.test/((a))", "[w](https://w.test/(a"):
+        assert markdown_html(literal, False) == literal
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_no_markdown_inside_bare_urls(full: bool) -> None:
+    assert markdown_html("https://x.test/_a_ https://x.test/*b* *c*", full) == (
+        "https://x.test/_a_ https://x.test/*b* <i>c</i>"
+    )
+    assert markdown_html("https:// _d_", full) == "https:// <i>d</i>"
+
+
+def test_link_href_is_attribute_escaped() -> None:
+    assert markdown_html("[a&b](https://x.test/?q=1&r=2)", False) == (
+        '<a href="https://x.test/?q=1&amp;r=2">a&amp;b</a>'
+    )
+
+
+def test_nested_markers() -> None:
+    assert markdown_html("**bold _it_ ~~gone~~**", False) == "<b>bold <i>it</i> <s>gone</s></b>"
+    assert markdown_html("**a `**` b**", False) == "<b>a `</b>` b**"  # first closer wins, still linear
+
+
+def test_input_is_capped() -> None:
+    with pytest.raises(ValueError, match="too long"):
+        markdown_html("x" * (compose.MAX_TEXT + 1), False)
+    with pytest.raises(ValueError, match="too long"):
+        compose_html("x" * (compose.MAX_TEXT + 1), [], {})
+
+
+def _best_ms(fn: Callable[[], object]) -> float:
+    gc.disable()
+    try:
+        runs = []
+        for _ in range(3):
+            start = time.perf_counter()
+            fn()
+            runs.append(time.perf_counter() - start)
+    finally:
+        gc.enable()
+    return min(runs) * 1000
+
+
+HOSTILE = [*"*_~`[", "**a", "[x](", ":a", "@A ", "a*", "[(", "x https://h.t/"]
+
+
+@pytest.mark.parametrize("unit", HOSTILE)
+def test_hostile_runs_stay_linear(unit: str) -> None:
+    """Doubling a hostile input must not quadruple the time (quadratic would ratio ~4)."""
+
+    def ratio(fn: Callable[[str], object]) -> float:
+        small, big = (unit * (n // len(unit)) for n in (10_000, 20_000))
+        return _best_ms(lambda: fn(big)) / max(_best_ms(lambda: fn(small)), 0.05)
+
+    assert ratio(lambda t: markdown_html(t, True)) < 3
+    assert ratio(lambda t: compose_html(t, [{"name": "A", "mri": "m"}], {"a": "x"})) < 3
+
+
+def test_labels_sharing_one_bad_url_stay_linear() -> None:
+    def text(n: int) -> str:
+        return "[" * n + "](https://" + "a" * n + " )"
+
+    assert (
+        _best_ms(lambda: markdown_html(text(10_000), False))
+        / _best_ms(lambda: markdown_html(text(5_000), False))
+        < 3
+    )

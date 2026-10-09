@@ -1,0 +1,232 @@
+"""Composer text → Teams message HTML: a markdown subset, `:shortcode:` emojis, `@Name` mentions.
+
+Pure, stdlib only (spec 012). No backtracking regex: closers are found with `str.find`.
+"""
+
+import html
+import json
+import re
+from collections.abc import Callable
+from typing import Any
+
+from .emoji_table import SHORTCODES
+
+MAX_TEXT = 28_000  # Teams refuses messages past ~28 KB anyway
+# Tenant region host, as on every CustomEmoji in the archive; other regions pass `asyncgw_host`.
+ASYNCGW_HOST = "fr-prod.asyncgw.teams.microsoft.com"
+
+_MENTION = "http://schema.skype.com/Mention"
+_CUSTOM_EMOJI = "http://schema.skype.com/CustomEmoji"
+_SPECIAL_RE = re.compile(r"[`\[*_~]|https?://")
+_RUN_RE = re.compile(r"\*+|_+|~+")
+_URL_RE = re.compile(r"https?://[^\s<>\"'`]+")
+_ORDERED_RE = re.compile(r"\d{1,9}\. ")
+# The trailing `:` is a lookahead so an unknown name gives it back: `10:30:fire:` still finds `:fire:`.
+_EMOJI = r":(?P<emoji>[A-Za-z0-9_+-]{1,64})(?=:)"
+_SPANS = (("**", "b"), ("~~", "s"), ("*", "i"), ("_", "i"))
+MAX_MENTIONS = 50
+MAX_NAME = 200
+
+type OnText = Callable[[str], str]
+
+
+def _word(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
+
+
+def _inline(line: str, on_text: OnText) -> str:
+    """One line of inline markup; `on_text` renders the plain runs between spans.
+
+    Recursion stays shallow: a span's content cannot hold its own marker (the nearest one closes it).
+    """
+    # ponytail: an unclosed `[`/`(` run re-scans to the line end (memchr); 7 ms at MAX_TEXT, cache if raised.
+    find = line.find
+
+    def closer(i: int, marker: str) -> int:
+        # Intra-word or space-padded markers stay literal: `2*3*4`, `snake_case_name`, `a * b`.
+        start = i + len(marker)
+        if (i and _word(line[i - 1])) or start >= len(line) or line[start].isspace():
+            return -1
+        end = find(marker, start)
+        after = end + len(marker)
+        if end <= start or line[end - 1].isspace() or (after < len(line) and _word(line[after])):
+            return -1
+        return end
+
+    out: list[str] = []
+    bad_link = -1  # every `[` before the same `](…)` shares its verdict: check the URL once
+    i = flushed = 0
+    while (m := _SPECIAL_RE.search(line, i)) is not None:
+        i = m.start()
+        hit: tuple[str, int] | None = None
+        ch = line[i]
+        if ch == "h":  # a bare URL stays plain text, markers and all: Teams links it whole
+            i = url_m.end() if (url_m := _URL_RE.match(line, i)) else i + 1
+            continue
+        if ch == "`":
+            end = find("`", i + 1)
+            if end > i + 1:
+                hit = f"<code>{html.escape(line[i + 1 : end])}</code>", end + 1
+        elif ch == "[":
+            close = find("]", i + 1)
+            if close > i + 1 and close != bad_link and line.startswith("(", close + 1):
+                end = find(")", close + 2)
+                url = line[close + 2 : end]
+                if end > 0 and url.count("(") == 1:  # one balanced pair: wiki-style `Foo_(bar)`
+                    end = find(")", end + 1)
+                    url = line[close + 2 : end]
+                if end > 0 and url.count("(") == url.count(")") <= 1 and _URL_RE.fullmatch(url):
+                    label = html.escape(line[i + 1 : close])
+                    hit = f'<a href="{html.escape(url)}">{label}</a>', end + 1
+                else:
+                    bad_link = close
+        else:
+            for marker, tag in _SPANS:
+                if line.startswith(marker, i) and (end := closer(i, marker)) >= 0:
+                    inner = _inline(line[i + len(marker) : end], on_text)
+                    hit = f"<{tag}>{inner}</{tag}>", end + len(marker)
+                    break
+            else:
+                # A rejected run stays literal whole, or `2**3**4` would open on its second `*`.
+                run = _RUN_RE.match(line, i)
+                i = run.end() - 1 if run else i
+        if hit is None:
+            i += 1
+            continue
+        out += (on_text(line[flushed:i]), hit[0])
+        i = flushed = hit[1]
+    out.append(on_text(line[flushed:]))
+    return "".join(out)
+
+
+def _blocks(text: str, on_text: OnText) -> str:
+    """Full mode: fenced code, `> ` quotes, `- `/`* `/`1. ` lists; other lines inline, joined by <br>."""
+    lines = text.split("\n")
+    fences = [n for n, line in enumerate(lines) if line.startswith("```")]
+    fence_end = dict(zip(fences, fences[1:], strict=False))
+    kinds: list[tuple[str, Callable[[str], int]]] = [
+        ("blockquote", lambda s: 2 if s.startswith("> ") else 1 if s == ">" else 0),
+        ("ul", lambda s: 2 if s.startswith(("- ", "* ")) else 0),
+        ("ol", lambda s: m.end() if (m := _ORDERED_RE.match(s)) else 0),
+    ]
+    out: list[str] = []
+    after_text = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if (close := fence_end.get(i)) is not None:
+            code = html.escape("\n".join(lines[i + 1 : close]))
+            out.append(f"<pre><code>{code}</code></pre>")
+            i, after_text = close + 1, False
+            continue
+        for tag, marker in kinds:
+            if marker(line):
+                items: list[str] = []
+                while i < len(lines) and (cut := marker(lines[i])):
+                    items.append(_inline(lines[i][cut:], on_text))
+                    i += 1
+                if tag == "blockquote":
+                    out.append(f"<blockquote>{'<br>'.join(items)}</blockquote>")
+                else:
+                    out.append(f"<{tag}>{''.join(f'<li>{it}</li>' for it in items)}</{tag}>")
+                after_text = False
+                break
+        else:
+            out.append(("<br>" if after_text else "") + _inline(line, on_text))
+            after_text = True
+            i += 1
+    return "".join(out)
+
+
+def _render(text: str, full: bool, on_text: OnText) -> str:
+    if len(text) > MAX_TEXT:
+        raise ValueError(f"message too long ({len(text)} > {MAX_TEXT} characters)")
+    if full:
+        return _blocks(text, on_text)
+    return "<br>".join(_inline(line, on_text) for line in text.split("\n"))
+
+
+def markdown_html(text: str, full: bool) -> str:
+    """Markdown subset → Teams HTML; with no markup it equals `send.message_html(text, False)`."""
+    return _render(text, full, html.escape)
+
+
+def compose_html(
+    text: str,
+    mentions: list[dict[str, Any]],
+    emojis: dict[str, str],
+    *,
+    full: bool = False,
+    asyncgw_host: str = ASYNCGW_HOST,
+) -> tuple[str, dict[str, Any] | None]:
+    """Composer text → (content HTML, message `properties` or None).
+
+    `mentions`: picked `{name, mri, everyone?}`; `emojis`: custom name → AMS object id. `@Name`
+    matches when `@` starts a word and the name is followed by the end or a non-word character;
+    names are tried longest first, case-sensitive, so `@Ann Lee` wins over `@Ann`. Code, link
+    labels and URLs are never expanded.
+
+    Trusts every `mri` as given: the caller checks each against the thread roster (the thread id
+    for everyone). More than MAX_MENTIONS entries or a name past MAX_NAME raises ValueError.
+    """
+    if len(mentions) > MAX_MENTIONS:
+        raise ValueError(f"too many mentions ({len(mentions)} > {MAX_MENTIONS})")
+    by_name: dict[str, dict[str, Any]] = {}
+    for mention in mentions:
+        if name := str(mention.get("name") or ""):
+            if len(name) > MAX_NAME:
+                raise ValueError(f"mention name too long ({len(name)} > {MAX_NAME} characters)")
+            by_name.setdefault(name, mention)
+    alternatives = "|".join(re.escape(n) for n in sorted(by_name, key=len, reverse=True))
+    mention_re = rf"(?<!\w)@(?P<name>{alternatives})(?!\w)|" if alternatives else ""
+    # Bare URLs go first so Teams still links them whole: no emoji or mention inside a URL.
+    token_re = re.compile(rf"(?P<url>{_URL_RE.pattern})|" + mention_re + _EMOJI)
+    entries: list[dict[str, Any]] = []
+
+    def token(m: re.Match[str]) -> str | None:
+        if m.group("url") is not None:
+            return html.escape(m.group())
+        if (name := m.group("name") if alternatives else None) is not None:
+            picked = by_name[name]
+            everyone = bool(picked.get("everyone"))
+            label = "Everyone" if everyone else name
+            entries.append(
+                {
+                    "@type": _MENTION,
+                    "itemid": len(entries),
+                    "mri": str(picked.get("mri") or ""),
+                    "mentionType": "everyone" if everyone else "person",
+                    "displayName": label,
+                }
+            )
+            return (
+                f'<span itemtype="{_MENTION}" itemscope="" itemid="{len(entries) - 1}">'
+                f"{html.escape(label)}</span>"
+            )
+        emoji = m.group("emoji")
+        if emoji in SHORTCODES:
+            return SHORTCODES[emoji]
+        if emoji in emojis:
+            name, oid = html.escape(emoji), html.escape(emojis[emoji])
+            # alt is the bare name, as in every CustomEmoji Teams wrote to the archive.
+            return (
+                f'<img alt="{name}" itemid="{name};{oid}" itemtype="{_CUSTOM_EMOJI}" '
+                f'src="https://{asyncgw_host}/v1/objects/{oid}/views/imgt2_anim" '
+                'style="width:20px; height:20px">'
+            )
+        return None
+
+    def on_text(seg: str) -> str:
+        out: list[str] = []
+        pos = scan = 0
+        while (m := token_re.search(seg, scan)) is not None:
+            if (rendered := token(m)) is None:
+                scan = m.end()
+                continue
+            out += (html.escape(seg[pos : m.start()]), rendered)
+            pos = scan = m.end() + (m.group("emoji") is not None)  # consume the emoji's closing `:`
+        out.append(html.escape(seg[pos:]))
+        return "".join(out)
+
+    content = _render(text, full, on_text)
+    return content, ({"mentions": json.dumps(entries, ensure_ascii=False)} if entries else None)

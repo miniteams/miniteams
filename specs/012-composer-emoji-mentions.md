@@ -40,8 +40,9 @@ the person (or everyone) is notified and the name shows highlighted in Teams, as
   still finds in the text). Server-side `compose_html(text, mentions, emojis)`:
   - escape, newlines → `<br>` (as today);
   - each `:name:` with a known name → the unicode character, or for a custom emoji
-    `<img alt=":name:" itemid="<name>;<id>" itemtype="http://schema.skype.com/CustomEmoji"
-    src="https://<asyncgw host>/v1/objects/<id>/views/imgt2_anim">` (the shape Teams sends);
+    `<img alt="<name>" itemid="<name>;<id>" itemtype="http://schema.skype.com/CustomEmoji"
+    src="https://<asyncgw host>/v1/objects/<id>/views/imgt2_anim" style="width:20px; height:20px">` (the
+    shape Teams sends, checked on the archive: bare name in `alt`, 20px);
   - each `@Name` whose `name` is in `mentions` → `<span itemtype="http://schema.skype.com/Mention"
     itemscope itemid="N">Name</span>` (`Everyone` for the everyone entry), `N` counting from 0 in
     text order, every occurrence replaced; `properties.mentions` becomes the JSON string
