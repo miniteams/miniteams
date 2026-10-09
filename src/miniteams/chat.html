@@ -7,7 +7,7 @@
 <style>
   :root {
     color-scheme: light;
-    --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f0f2f5; --text: #1b1f24; --dim: #6b7380; --faint: #9aa1ab;
+    --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f0f2f5; --text: #1b1f24; --dim: #5f6775; --faint: #9aa1ab;
     --line: #e3e6ea; --accent: #4f5bd5; --accent-soft: #4f5bd51a; --hot: #e5484d; --ok: #2f9e6e; --typing: #b7791f;
     --mention: #0284c7; --mention-soft: #0ea5e91a; --on-mention: #fff;
     --shadow: 0 1px 2px #0000000d, 0 4px 14px #0000000a;
@@ -32,13 +32,15 @@
   html, body { height: 100%; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
     display: flex; }
-  #main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  #main { flex: 1; min-width: 0; display: flex; flex-direction: column; container-type: inline-size; }
   button { font: inherit; color: inherit; }
   .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 
-  header { background: color-mix(in srgb, var(--bg) 85%, transparent); padding: 10px 16px; display: flex; align-items: center;
+  /* The split list's filter row shares this height: the two bottom borders read as one line. */
+  :root { --bar-h: 47px; }
+  header { background: color-mix(in srgb, var(--bg) 85%, transparent); height: var(--bar-h); padding: 0 16px; display: flex; align-items: center;
     gap: 12px; border-bottom: 1px solid var(--line); flex: none; position: relative; z-index: 2; }
-  #find, #day { font: inherit; font-size: 12.5px; color: inherit; background: var(--panel); border: 1px solid var(--line);
+  #find { font: inherit; font-size: 12.5px; color: inherit; background: var(--panel); border: 1px solid var(--line);
     border-radius: 8px; padding: 2px 8px; }
   #find { width: 12em; }
   #hits { position: absolute; top: 100%; right: 16px; width: min(440px, 92vw); max-height: 60vh; overflow-y: auto;
@@ -52,36 +54,85 @@
   #hits .none.err { color: var(--hot); }
   #back { color: var(--dim); text-decoration: none; font-size: 15px; border-radius: 8px; padding: 2px 6px; }
   #back:hover { background: var(--panel-2); color: var(--text); }
-  #menu { display: none; }
+  #menu, #teams .icon { display: none; }
+  /* Narrow chat column: the header keeps one line, the label keeps room to be read. Breakpoints measured:
+     the full header needs ~596px with a long label, the compact one ~387px (~350 tightened). */
+  @container (max-width: 639px) {
+    #teams .full, #members { display: none; }
+    #teams .icon { display: inline; }
+    #find { width: 8em; }
+  }
+  @container (max-width: 399px) {
+    header { gap: 6px; padding: 0 12px; }
+  }
 
   /* chatnav=split: the board's list beside the chat (rows as in widget.html, scoped: messages hold li too). */
-  #side { flex: none; width: 300px; display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line); background: var(--bg); }
-  #side[hidden] { display: none; }
-  #side .bar { flex: none; display: grid; gap: 6px; padding: 10px 8px 6px; border-bottom: 1px solid var(--line); }
-  .seg { display: flex; background: var(--panel-2); border-radius: 10px; padding: 3px; gap: 2px; overflow-x: auto; scrollbar-width: none; }
-  .seg button { flex: 1; border: 0; background: transparent; padding: 3px 6px; white-space: nowrap; border-radius: 8px; cursor: pointer; color: var(--dim); font-size: 12px; }
+  #side { flex: none; width: var(--side-w, 300px); display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line);
+    background: var(--bg); container-type: inline-size; }
+  #side[hidden], #grip[hidden] { display: none; }
+  /* 8px to grab over the 1px border, drawn as a 2px accent line only while it is in use. */
+  #grip { flex: none; width: 8px; margin: 0 -4px; cursor: col-resize; position: relative; z-index: 3; touch-action: none; outline: none; }
+  #grip::after { content: ""; position: absolute; inset: 0 3px; border-radius: 1px; }
+  #grip:hover::after, #grip:focus-visible::after, body.resizing #grip::after { background: var(--accent); }
+  body.resizing { user-select: none; cursor: col-resize; }
+  @media (width > 700px) { body.side-off #side, body.side-off #grip { display: none; } }
+  #side .bar { flex: none; height: var(--bar-h); display: flex; align-items: center; padding: 0 8px; border-bottom: 1px solid var(--line); position: relative; }
+  #side .tabs { flex: none; padding: 6px 8px 4px; position: relative; }
+  .seg { display: flex; background: var(--panel-2); border-radius: 10px; padding: 3px; gap: 2px; }
+  .seg button { flex: 1 1 auto; border: 0; background: transparent; padding: 3px 4px; white-space: nowrap; border-radius: 8px; cursor: pointer; color: var(--dim); font-size: 12px; }
+  /* Seen and Muted live behind ⋯ until a 360px list (359 inside its 1px border) has room for all five. */
+  .seg .x { display: none; }
+  @container (min-width: 359px) { .seg .x { display: block; } .seg .more, #more { display: none; } }
+  #more { position: absolute; right: 8px; top: 100%; z-index: 4; display: grid; min-width: 120px; padding: 4px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); }
+  #more[hidden] { display: none; }
+  #more button { border: 0; background: transparent; text-align: left; padding: 3px 8px; border-radius: 6px; cursor: pointer; font-size: 12.5px; }
+  #more button:hover, #more button.on { background: var(--accent-soft); color: var(--accent); }
   .seg button.on { background: var(--panel); color: var(--text); box-shadow: var(--shadow); font-weight: 550; }
-  .seg b { font-weight: 600; margin-left: 3px; font-size: 10.5px; padding: 0 5px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); }
+  /* ⚙ as in widget.html. */
+  .cog { position: relative; flex: none; }
+  .cog > button { border: 0; background: transparent; color: var(--dim); font-size: 16px; width: 28px; height: 28px; border-radius: 8px; cursor: pointer; }
+  .cog > button:hover, .cog.open > button { background: var(--panel-2); color: var(--text); }
+  .cog > button:focus-visible, .menu .seg button:focus-visible, .switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .menu { position: absolute; right: 0; top: 34px; width: 220px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    box-shadow: var(--shadow); padding: 10px; display: grid; gap: 10px; z-index: 6; }
+  .menu h3 { margin: 0 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); font-weight: 600; }
+  .menu .seg button { flex: 1; }
+  .menu label { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; cursor: pointer; }
+  .switch { appearance: none; width: 32px; height: 18px; border-radius: 99px; background: var(--line); position: relative; cursor: pointer; transition: background .15s; margin: 0; }
+  .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: left .15s; box-shadow: 0 1px 2px #0003; }
+  .switch:checked { background: var(--accent); }
+  .switch:checked::after { left: 16px; }
+  .seg b { font-weight: 600; margin-left: 3px; font-size: 10.5px; padding: 0 4px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); }
   .seg button.mention b { background: var(--mention-soft); color: var(--mention); }
-  #filter { font: inherit; font-size: 12.5px; color: inherit; background: var(--panel-2); border: 0; border-radius: 10px; padding: 4px 8px; }
-  #filter:focus { outline: 2px solid var(--accent-soft); }
+  #filter { flex: 1; min-width: 0; font: inherit; font-size: 12.5px; color: inherit; background: var(--panel-2); border: 0; border-radius: 10px;
+    padding: 5px 26px 5px 9px; outline: none; }
+  #filter::-webkit-search-cancel-button { display: none; }
+  #clear { position: absolute; right: 12px; border: 0; background: transparent; color: var(--dim); border-radius: 6px; width: 20px; height: 20px;
+    padding: 0; line-height: 20px; cursor: pointer; }
+  #clear[hidden] { display: none; }
+  #clear:hover { color: var(--text); background: var(--line); }
+  #filter:focus-visible, .seg button:focus-visible, #more button:focus-visible, #grip:focus-visible, #clear:focus-visible,
+  #rows .name:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   #rows { flex: 1; overflow-y: auto; list-style: none; margin: 0; padding: 4px 6px; display: grid; align-content: start; gap: 2px; }
   #rows > li { display: grid; grid-template-columns: 34px minmax(0,1fr) auto; gap: 0 8px; padding: 7px 8px; border-radius: 10px; align-items: center; position: relative; }
   #rows > li:hover { background: var(--panel); box-shadow: var(--shadow); }
   #rows > li.unread { box-shadow: inset 3px 0 0 var(--stripe); }
   #rows > li.mention { background: var(--mention-soft); box-shadow: inset 3px 0 0 var(--mention); }
-  #rows > li.seen { opacity: .5; }
-  #rows > li.cur { outline: 2px solid var(--accent); outline-offset: -2px; opacity: 1; }
+  #rows > li.sel { outline: 2px solid var(--accent); outline-offset: -2px; }
+  #rows > li.cur { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); opacity: 1; }
   #rows .rav { grid-row: 1 / span 2; width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; font-weight: 650; font-size: 12.5px; color: #fff; }
   #rows .rav.round { border-radius: 50%; }
   #rows .name { font-weight: 500; color: inherit; text-decoration: none; }
   #rows .name mark { background: var(--accent-soft); color: var(--accent); border-radius: 4px; padding: 0 2px; }
   #rows > li.unread .name, #rows > li.mention .name { font-weight: 700; }
+  /* Colour, not opacity: a faded row takes its time and preview under 4.5:1. */
+  #rows > li.seen .name { color: var(--dim); font-weight: 400; }
   #rows .meta { grid-column: 3; grid-row: 1; justify-self: end; display: flex; align-items: center; gap: 4px; }
-  #rows .ago { font-size: 11.5px; color: var(--faint); white-space: nowrap; }
+  #rows .ago { font-size: 11.5px; color: var(--dim); white-space: nowrap; }
   #rows > li.unread .ago { color: var(--accent); font-weight: 600; }
-  #rows .meta button { opacity: 0; border: 1px solid var(--line); background: var(--panel); border-radius: 6px; height: 20px; padding: 0 5px; font-size: 11.5px; line-height: 18px; cursor: pointer; color: var(--dim); }
-  #rows > li:hover .meta button, #rows > li:focus-within .meta button { opacity: 1; }
+  #rows .meta button { display: none; border: 1px solid var(--line); background: var(--panel); border-radius: 6px; height: 20px; padding: 0 5px; font-size: 11.5px; line-height: 18px; cursor: pointer; color: var(--dim); }
+  #rows > li:hover .meta button, #rows > li:focus-within .meta button, #rows > li.hold .meta button { display: inline-block; }
   #rows .prev { grid-column: 2; grid-row: 2; color: var(--dim); font-size: 12.5px; }
   #rows .prev b { color: var(--text); font-weight: 550; }
   #rows .prev .at { color: var(--mention); font-weight: 650; }
@@ -93,15 +144,20 @@
   body.compact #rows > li { grid-template-columns: minmax(0,1fr) auto; padding: 5px 8px; }
   body.compact #rows .name, body.compact #rows .prev { grid-column: 1; }
   body.compact #rows .meta, body.compact #rows .ind { grid-column: 2; }
-  #nochat { padding: 1.5em; text-align: center; color: var(--dim); }
-  /* Narrow window: the list folds behind ☰ and opens over the chat. */
+  #nochat { flex: none; padding: 10px 16px; text-align: center; color: var(--dim); }
+  #nochat[hidden] { display: none; }
+  body.split #menu { display: inline-block; }
+  /* Narrow window: the list folds behind ☰ and opens over the chat, which a backdrop dims. */
   @media (max-width: 700px) {
-    body.split #menu { display: inline-block; }
-    body.split #side { position: fixed; inset: var(--hdr, 0) auto 0 0; width: min(320px, 88vw); z-index: 5; box-shadow: var(--shadow); display: none; }
+    body.split #grip { display: none; }
+    body.split #side { position: fixed; inset: var(--hdr, 0) auto 0 0; width: min(var(--side-w, 300px), 88vw); z-index: 5; box-shadow: var(--shadow); display: none; }
     body.split.nav-open #side { display: flex; }
+    body.split.nav-open #main::after { content: ""; position: fixed; inset: var(--hdr, 0) 0 0 0; z-index: 4;
+      background: color-mix(in srgb, var(--bg) 60%, transparent); }
   }
   h1 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -.01em; }
-  #members { color: var(--faint); font-size: 12.5px; white-space: nowrap; margin-right: auto; }
+  #label { flex: 1 1 auto; min-width: 6em; }
+  #members { color: var(--faint); font-size: 12.5px; white-space: nowrap; }
   #status { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); flex: none; }
   #status.off { background: var(--hot); box-shadow: 0 0 0 3px color-mix(in srgb, var(--hot) 25%, transparent); }
   .btn { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 3px 10px; cursor: pointer; color: var(--dim); font-size: 12.5px; white-space: nowrap; }
@@ -242,22 +298,27 @@
 <body>
 <aside id="side" hidden>
   <div class="bar">
-    <div class="seg" id="tabs"></div>
-    <input id="filter" type="search" placeholder="filter" autocomplete="off" spellcheck="false" aria-label="filter chats by name">
+    <input id="filter" type="search" placeholder="filter · Ctrl+K" autocomplete="off" spellcheck="false" aria-label="filter chats by name">
+    <button id="clear" title="clear the filter" aria-label="clear the filter" hidden>×</button>
   </div>
+  <div class="tabs">
+    <div class="seg" id="tabs"></div>
+    <div id="more" role="menu" aria-label="more filters" hidden></div>
+  </div>
+  <div id="nochat" hidden></div>
   <ul id="rows"></ul>
-  <div id="nochat" hidden>nothing yet</div>
 </aside>
+<div id="grip" role="separator" aria-orientation="vertical" aria-controls="side" aria-label="resize chat list" tabindex="0" hidden></div>
 <div id="main">
 <header>
-  <button id="menu" class="btn" title="chats" aria-label="chats">☰</button>
+  <button id="menu" class="btn" title="chats" aria-label="chats" aria-controls="side">☰</button>
   <a id="back" href="/?nav=chat" title="back to the chat list">◀</a>
   <h1 id="label" class="truncate">…</h1>
   <span id="members"></span>
   <span id="status" class="off" title="connecting…"></span>
   <input id="find" type="search" placeholder="search · Enter" aria-label="search this chat">
-  <input id="day" type="date" title="jump to a day" aria-label="jump to a day">
-  <button id="teams" class="btn" title="open this chat in Teams" disabled>Open in Teams</button>
+  <button id="teams" class="btn" title="open this chat in Teams" aria-label="Open in Teams" disabled><span class="full">Open in Teams</span><span class="icon" aria-hidden="true">↗</span></button>
+  <div class="cog" id="cog"><button id="gear" title="settings" aria-label="settings" aria-controls="settings" aria-expanded="false">⚙</button></div>
   <div id="hits" hidden></div>
 </header>
 <div id="pane">
@@ -293,8 +354,9 @@
         $status = document.getElementById("status"), $teams = document.getElementById("teams"),
         $typing = document.getElementById("typing"), $reply = document.getElementById("reply"), $err = document.getElementById("err"),
         $quotes = document.getElementById("quotes"), $latest = document.getElementById("latest"),
-        $find = document.getElementById("find"), $day = document.getElementById("day"), $hits = document.getElementById("hits");
+        $find = document.getElementById("find"), $hits = document.getElementById("hits");
   const store = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+  const keep = (k, v) => { try { if (v == null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch (e) {} };
   const q = new URLSearchParams(location.search), pref = (k) => q.get(k) ?? store(k);
   const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
   // Same colour and initials rules as the widget's rows.
@@ -327,7 +389,7 @@
     if (theme === "auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = theme;
     document.body.classList.toggle("compact", pref("avatars") === "0");
   };
-  addEventListener("storage", applyPrefs);  // the widget tab changed theme or avatars
+  addEventListener("storage", () => { applyPrefs(); renderRows(); });  // the widget tab changed theme or avatars
 
   const send = (obj) => { if (!(ws && ws.readyState === 1)) return false; ws.send(JSON.stringify(obj)); return true; };
   // Same shape as web.deep_link's https form.
@@ -384,7 +446,7 @@
     $list.scrollTop += n.getBoundingClientRect().top - $list.getBoundingClientRect().top - a.offset;
     return true;
   };
-  // A jump's message: the hit itself, else the first message at or after the picked time.
+  // A jump's message: the hit itself, else the first message from its time on.
   const land = (t) => {
     let n = (t.id && byId(t.id)) || [...$msgs.children].find((x) => x.dataset.at >= t.at) || $msgs.lastElementChild;
     if (!n) return;
@@ -733,21 +795,6 @@
     if (!send({ search: thread, q })) { $hits.replaceChildren(el("div", "none err", "offline")); $hits.hidden = false; }
   };
   document.addEventListener("click", (e) => { if (!$hits.contains(e.target) && e.target !== $find) closeHits(); });
-  // Chrome fires `change` for each typed digit of the year (0002, 0020, 0202…): jump once the field settles.
-  let dayTimer = 0, dayAsked = "";
-  const pickDay = () => {
-    clearTimeout(dayTimer);
-    const [y, mo, d] = $day.value.split("-").map(Number);
-    if (!(y >= 1970) || $day.value === dayAsked) return;
-    dayAsked = $day.value;
-    const start = new Date(0);
-    start.setFullYear(y, mo - 1, d); start.setHours(0, 0, 0, 0);  // the start of the day where the reader is
-    jump(start.toISOString());
-  };
-  $day.onchange = () => { clearTimeout(dayTimer); dayTimer = setTimeout(pickDay, 800); };
-  $day.onkeydown = (e) => { if (e.key === "Enter") pickDay(); };
-  $day.onblur = pickDay;
-  $day.onfocus = () => { dayAsked = ""; };  // the same day again, later, is a new jump
 
   const renderTyping = () => { $typing.textContent = typing.size ? "✍ " + [...typing].join(", ") + (typing.size > 1 ? " are" : " is") + " typing…" : ""; };
 
@@ -1034,9 +1081,15 @@
 
   // --- chatnav=split: the board's list beside the chat (row rules as in widget.html) ---
   const $side = document.getElementById("side"), $rows = document.getElementById("rows"), $tabs = document.getElementById("tabs"),
-        $filter = document.getElementById("filter"), $nochat = document.getElementById("nochat"), $menu = document.getElementById("menu");
+        $filter = document.getElementById("filter"), $nochat = document.getElementById("nochat"), $menu = document.getElementById("menu"),
+        $more = document.getElementById("more"), $clear = document.getElementById("clear"), $grip = document.getElementById("grip");
   let rows = [], browser = false, meName = "", query = "";
+  let sel = "";  // the row the arrow keys highlight; its name holds the list's one Tab stop
+  let moreOpen = false;
+  let reveal = true;  // centre the current row at the next render: first load, Back/Forward, never a broadcast
   const TABS = { all: "Inbox", mention: "@", unread: "Unread", seen: "Seen", muted: "Muted" };
+  const EXTRA = ["seen", "muted"];  // behind ⋯ in a column under 360px
+  const EMPTY = { all: "Inbox zero", mention: "No mentions", unread: "No unread chats", seen: "Nothing seen yet", muted: "Nothing muted" };
   // Read once, never written: the widget owns the stored tab.
   let tab = Object.hasOwn(TABS, pref("tab") || "") ? pref("tab") : "all";
   const isSeen = (r) => !!r.seen_at && Date.parse(r.seen_at) >= Date.parse(r.last_activity);
@@ -1101,7 +1154,8 @@
   const chatPath = (id) => "/chat/" + encodeURIComponent(id);
   const rowOf = (r) => {
     const m = mentioned(r), dm = r.id.includes("@unq.gbl");
-    const li = el("li", (r.unread ? "unread " : "") + ((isSeen(r) || r.muted) && !m ? "seen " : "") + (r.id === thread ? "cur " : "") + (m ? "mention " + r.mention.kind : ""));
+    const li = el("li", (r.unread ? "unread " : "") + ((isSeen(r) || r.muted) && !m ? "seen " : "") + (r.id === thread ? "cur " : "")
+      + (r.id === sel ? "sel " : "") + (m ? "mention " + r.mention.kind : ""));
     li.dataset.id = r.id;
     if (r.id === thread) li.setAttribute("aria-current", "page");
     li.style.setProperty("--stripe", `hsl(${hue(r.id)} 62% 55%)`);
@@ -1112,6 +1166,7 @@
     }
     const name = Object.assign(marked(el("a", "name truncate"), rowTitle(r)), { href: r.link || "#", target: "_blank", rel: "noopener", title: r.label });
     name.dataset.k = "name";
+    name.tabIndex = -1;  // renderRows gives one row the Tab stop
     // Plain click switches in place; Ctrl click opens Teams as on the board; middle click is onauxclick's.
     name.onclick = (ev) => {
       if (ev.button === 1) { ev.preventDefault(); return; }
@@ -1122,8 +1177,9 @@
     name.onauxclick = (ev) => {
       if (ev.button !== 1) return;
       ev.preventDefault();
-      if (browser) send({ open: r.id, chat: true });
-      else window.open(chatPath(r.id), "_blank", "noopener");
+      // The new tab opens in split too: --browser has none of this page's stored settings.
+      if (browser) send({ open: r.id, chat: true, chatnav: "split" });
+      else window.open(chatPath(r.id) + "?chatnav=split", "_blank", "noopener");
     };
     const meta = el("span", "meta"), undo = isSeen(r) && !m;
     const seenBtn = el("button", null, undo ? "↺" : "✓");
@@ -1150,19 +1206,104 @@
     const fk = f?.dataset.k, fid = f?.closest("#rows > li")?.dataset.id;
     rows.sort((a, b) => (a.last_activity < b.last_activity) - (a.last_activity > b.last_activity));
     const counts = Object.fromEntries(Object.entries(filters).map(([k, f]) => [k, rows.filter((r) => f(r) && named(r)).length]));
-    $tabs.replaceChildren(...Object.entries(TABS).map(([k, lbl]) => {
-      const b = el("button", (tab === k ? "on " : "") + (k === "mention" ? "mention" : ""), lbl);
+    const tabs = Object.entries(TABS).map(([k, lbl]) => {
+      const b = el("button", (tab === k ? "on " : "") + (k === "mention" ? "mention " : "") + (EXTRA.includes(k) ? "x" : ""), lbl);
       b.append(el("b", null, counts[k]));
       b.dataset.k = "tab:" + k;
       b.setAttribute("aria-pressed", String(tab === k));
       b.onclick = () => { tab = k; renderRows(); };
       return b;
+    });
+    // The 4th button of a narrow column: ⋯, or the Seen / Muted tab when that one is shown.
+    const away = EXTRA.includes(tab), more = el("button", "more" + (away ? " on" : ""), away ? TABS[tab] : "⋯");
+    if (away) more.append(el("b", null, counts[tab]));
+    else more.setAttribute("aria-label", "more filters");
+    more.dataset.k = "tab:more";
+    more.setAttribute("aria-haspopup", "menu");
+    more.setAttribute("aria-expanded", String(moreOpen));
+    more.onclick = (e) => { e.stopPropagation(); moreOpen = !moreOpen; renderRows(); if (moreOpen) $more.querySelector("button").focus(); };
+    $tabs.replaceChildren(...tabs, more);
+    $more.replaceChildren(...EXTRA.map((k) => {
+      const b = el("button", tab === k ? "on" : null, `${TABS[k]} ${counts[k]}`);
+      b.dataset.k = "menu:" + k;
+      b.setAttribute("role", "menuitemradio");
+      b.tabIndex = -1;  // a menu is one Tab stop: its items move with the arrow keys
+      b.setAttribute("aria-checked", String(tab === k));
+      b.onclick = (e) => { e.stopPropagation(); tab = k; closeMore(); };
+      return b;
     }));
+    $more.hidden = !moreOpen;
     const shown = rows.filter((r) => filters[tab](r) && named(r));
     $rows.replaceChildren(...shown.map(rowOf));
-    $nochat.textContent = query ? "no chat matches" : "nothing yet";
+    const stop = $rows.querySelector("li.sel") || $rows.querySelector("li.cur") || $rows.firstElementChild;
+    if (stop) stop.querySelector(".name").tabIndex = 0;
+    $nochat.textContent = query ? `no chat matches «${$filter.value.trim()}»` : EMPTY[tab];
     $nochat.hidden = shown.length > 0;
-    if (fk) (fid ? $rows.querySelector(`li[data-id="${CSS.escape(fid)}"] [data-k="${fk}"]`) : $tabs.querySelector(`[data-k="${fk}"]`))?.focus();
+    $clear.hidden = !$filter.value;
+    const fli = fid && $rows.querySelector(`li[data-id="${CSS.escape(fid)}"]`);
+    // A new row's ✓ / 🔕 are display:none until focus is inside it: shown for the focus() call only.
+    if (fli) { fli.classList.add("hold"); fli.querySelector(`[data-k="${fk}"]`)?.focus(); fli.classList.remove("hold"); }
+    else if (fk && !fid) $side.querySelector(`[data-k="${fk}"]`)?.focus();
+    // A hidden list (folded, drawer closed) keeps the reveal for when it shows.
+    if (reveal && rows.length && $rows.offsetParent) { reveal = false; $rows.querySelector("li.cur")?.scrollIntoView({ block: "center" }); }
+  };
+  const closeMore = (focus = true) => {
+    moreOpen = false;
+    renderRows();
+    if (focus) $tabs.querySelector(".more").focus();
+  };
+  // Arrow keys: from the filter they highlight a row and the focus stays in the box; in the list they
+  // move the focus and the Tab stop with it.
+  const highlight = (li, focus) => {
+    if (!li) return;
+    for (const o of $rows.querySelectorAll("li.sel")) o.classList.remove("sel");
+    for (const a of $rows.querySelectorAll('.name[tabindex="0"]')) a.tabIndex = -1;
+    li.classList.add("sel");
+    sel = li.dataset.id;
+    const name = li.querySelector(".name");
+    name.tabIndex = 0;
+    if (focus) name.focus(); else li.scrollIntoView({ block: "nearest" });
+  };
+  const clearFilter = () => { $filter.value = ""; query = ""; sel = ""; renderRows(); };
+  // The list's width: what the reader set, shown clamped to what the window leaves the chat.
+  const W_MIN = 280, W_DEF = 300;
+  const wMax = () => Math.max(W_MIN, Math.min(560, innerWidth - 420));
+  let wanted = parseInt(store("chatnav_w"), 10), width = W_DEF;
+  const setW = (w, save) => {
+    if (w !== undefined) wanted = w;
+    width = Math.round(Math.min(wMax(), Math.max(W_MIN, Number.isFinite(wanted) ? wanted : W_DEF)));
+    document.body.style.setProperty("--side-w", width + "px");
+    $grip.setAttribute("aria-valuenow", width); $grip.setAttribute("aria-valuemin", W_MIN); $grip.setAttribute("aria-valuemax", wMax());
+    if (save) { wanted = width; keep("chatnav_w", String(width)); }
+  };
+  const resetW = () => { setW(NaN); keep("chatnav_w", null); };
+  // ☰ folds the docked list in a wide window and opens it as a drawer in a narrow one.
+  const narrow = matchMedia("(max-width: 700px)");
+  const syncMenu = () => $menu.setAttribute("aria-expanded",
+    String(narrow.matches ? document.body.classList.contains("nav-open") : !document.body.classList.contains("side-off")));
+  // The drawer is modal: Tab cycles through it and the header, never into the chat under the backdrop.
+  const drawer = (open) => {
+    document.body.classList.toggle("nav-open", open);
+    for (const n of document.querySelectorAll("#pane, #typing, footer")) n.inert = open;
+    syncMenu();
+  };
+  const closeSide = () => drawer(false);
+  const showCur = () => {
+    if (!$rows.offsetParent) return;
+    reveal = false;
+    $rows.querySelector("li.cur")?.scrollIntoView({ block: "nearest" });
+  };
+  const openList = () => {
+    if (narrow.matches) {
+      document.body.style.setProperty("--hdr", document.querySelector("header").offsetHeight + "px");  // the list opens under ☰
+      drawer(true);
+    } else if (document.body.classList.contains("side-off")) {
+      document.body.classList.remove("side-off");
+      keep("chatnav_fold", null);
+      syncMenu();
+    }
+    showCur();
+    $filter.focus();
   };
   const onBoard = (m) => {
     rows = m.rows; browser = !!m.browser; meName = m.me || "";
@@ -1174,13 +1315,14 @@
     source = "archive"; target = restore = null; aroundAt = ""; loaded = false; followFailed = false;
     stick = true; filled = ""; unfolded.clear(); typing.clear(); renderTyping();
     $msgs.replaceChildren(); $note.hidden = false; $note.className = ""; $note.textContent = "loading…";
-    closeHits(); $find.value = ""; $day.value = ""; dayAsked = ""; clearTimeout(dayTimer);
+    closeHits(); $find.value = "";
     $teams.disabled = true; $members.textContent = "";
     showLatest();
   };
   const switchTo = (id, push) => {
-    document.body.classList.remove("nav-open");
+    closeSide();
     if (id === thread) return;
+    sel = "";
     stash();
     if (push) history.pushState(null, "", chatPath(id) + location.search);
     thread = id;
@@ -1199,21 +1341,95 @@
     document.body.classList.add("split");
     $side.hidden = false;
     document.getElementById("back").hidden = true;
-    const $header = document.querySelector("header");
+    $grip.hidden = false;
+    setW();
+    addEventListener("resize", () => setW());  // the window's room changes, not the reader's choice
+    document.body.classList.toggle("side-off", store("chatnav_fold") === "1");
+    narrow.addEventListener("change", closeSide);
+    syncMenu();
     $menu.onclick = (e) => {
       e.stopPropagation();
-      document.body.style.setProperty("--hdr", $header.offsetHeight + "px");  // the list opens under ☰
-      document.body.classList.toggle("nav-open");
+      if (!narrow.matches) {
+        const off = document.body.classList.toggle("side-off");
+        keep("chatnav_fold", off ? "1" : null);
+        syncMenu();
+        if (!off) showCur();
+      } else if (document.body.classList.contains("nav-open")) closeSide();
+      else openList();
     };
-    const closeSide = () => document.body.classList.remove("nav-open");
-    addEventListener("keydown", (e) => { if (e.key === "Escape") closeSide(); });
+    $grip.onpointerdown = (e) => {
+      if (e.button) return;
+      e.preventDefault();
+      $grip.setPointerCapture(e.pointerId);
+      const x0 = e.clientX, w0 = width;
+      let moved = false;  // a plain click (or the first of a double click) stores nothing
+      document.body.classList.add("resizing");
+      $grip.onpointermove = (ev) => { moved ||= ev.clientX !== x0; setW(w0 + ev.clientX - x0); };
+      $grip.onpointerup = $grip.onpointercancel = () => {
+        $grip.onpointermove = $grip.onpointerup = $grip.onpointercancel = null;
+        document.body.classList.remove("resizing");
+        if (moved) setW(undefined, true);
+      };
+    };
+    $grip.ondblclick = resetW;
+    $grip.onkeydown = (e) => {
+      const d = e.shiftKey ? 64 : 16, to = { ArrowLeft: width - d, ArrowRight: width + d, Home: W_MIN, End: wMax() }[e.key];
+      if (e.key === "Enter") resetW();
+      else if (to === undefined) return;
+      else setW(to, true);
+      e.preventDefault();
+    };
+    addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        if (moreOpen) closeMore();
+        else if (document.body.classList.contains("nav-open")) { closeSide(); $menu.focus(); }
+      } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        openList();
+        $filter.select();
+      }
+    });
     // The path, not contains(): a tab click re-renders the list, detaching its own target first.
-    addEventListener("click", (e) => { if (!e.composedPath().includes($side)) closeSide(); });
-    $filter.oninput = () => { query = foldText($filter.value.trim())[0]; renderRows(); };
+    addEventListener("click", (e) => {
+      if (moreOpen && !e.composedPath().includes($more)) closeMore(false);
+      if (!e.composedPath().includes($side)) closeSide();
+    });
+    $filter.oninput = () => { query = foldText($filter.value.trim())[0]; sel = ""; renderRows(); };
+    $filter.onkeydown = (e) => {
+      const cur = $rows.querySelector("li.sel");
+      if (e.key === "ArrowDown") highlight(cur ? cur.nextElementSibling || cur : $rows.firstElementChild, false);
+      else if (e.key === "ArrowUp") highlight(cur ? cur.previousElementSibling || cur : $rows.lastElementChild, false);
+      else if (e.key === "Enter") { const li = cur || $rows.firstElementChild; if (li) switchTo(li.dataset.id, true); }
+      else if (e.key === "Escape" && ($filter.value || sel)) { e.stopPropagation(); clearFilter(); }
+      else return;
+      e.preventDefault();
+    };
+    $clear.onclick = () => { clearFilter(); $filter.focus(); };
+    $rows.onkeydown = (e) => {
+      const li = e.target.closest?.(".name") && e.target.closest("li");
+      if (!li) return;
+      const to = { ArrowDown: li.nextElementSibling, ArrowUp: li.previousElementSibling, Home: $rows.firstElementChild, End: $rows.lastElementChild }[e.key];
+      if (to === undefined) return;
+      e.preventDefault();
+      highlight(to, true);
+    };
+    $more.onkeydown = (e) => {
+      const items = [...$more.children], i = items.indexOf(document.activeElement), n = items.length;
+      const to = { ArrowDown: (i + 1) % n, ArrowUp: (i + n - 1) % n, Home: 0, End: n - 1 }[e.key];
+      if (to === undefined) return;
+      e.preventDefault();
+      items[to].focus();
+    };
+    // After the move, not during it: closing re-renders the tabs the focus may be heading to.
+    $more.addEventListener("focusout", () => setTimeout(() => {
+      if (moreOpen && !$more.contains(document.activeElement)) closeMore(false);
+    }));
     addEventListener("popstate", () => {
       let id = null;
       try { id = decodeURIComponent(location.pathname.slice("/chat/".length)); } catch (e) {}
-      if (id) switchTo(id, false);
+      if (!id) return;
+      reveal = id !== thread;
+      switchTo(id, false);
     });
     setInterval(renderRows, 30000);  // keep the relative times honest
   };
@@ -1265,6 +1481,59 @@
       setTimeout(connect, retry); retry = Math.min(retry * 2, 30000);
     };
   };
+  // ⚙: the settings this page reads, on the widget's keys: a tab opened in another browser through
+  // --browser has a storage of its own, set here. A URL parameter would outrank the stored choice: it goes.
+  const $cog = document.getElementById("cog"), $gear = document.getElementById("gear");
+  let cogOpen = false;
+  const here = () => location.pathname + (q.size ? "?" + q : "");
+  const choose = (k, v) => { keep(k, v); q.delete(k); history.replaceState(history.state, "", here()); };
+  const segOf = (title, items, cur, pick) => {
+    const box = el("div"), seg = el("div", "seg");
+    for (const [k, label] of items) {
+      const b = el("button", cur === k ? "on" : null, label);
+      b.setAttribute("aria-pressed", String(cur === k));
+      b.onclick = () => {
+        for (const o of seg.children) { o.classList.toggle("on", o === b); o.setAttribute("aria-pressed", String(o === b)); }
+        pick(k);
+      };
+      seg.append(b);
+    }
+    box.append(el("h3", null, title), seg);
+    return box;
+  };
+  const renderCog = () => {
+    $cog.classList.toggle("open", cogOpen);
+    $gear.setAttribute("aria-expanded", String(cogOpen));
+    $cog.querySelector(".menu")?.remove();
+    if (!cogOpen) return;
+    const menu = el("div", "menu");
+    menu.id = "settings";
+    menu.setAttribute("role", "group"); menu.setAttribute("aria-label", "settings");
+    menu.onclick = (e) => e.stopPropagation();
+    const theme = ["light", "dark"].includes(pref("theme")) ? pref("theme") : "auto";
+    const themes = segOf("Theme", [["auto", "◐ Auto"], ["light", "☀ Light"], ["dark", "☾ Dark"]], theme,
+      (k) => { choose("theme", k); applyPrefs(); });
+    const dbox = el("div"), lab = el("label", null, "Show avatars"), sw = el("input", "switch");
+    sw.type = "checkbox"; sw.checked = pref("avatars") !== "0";
+    sw.onchange = () => { choose("avatars", sw.checked ? "1" : "0"); applyPrefs(); renderRows(); };
+    lab.append(sw); dbox.append(el("h3", null, "Display"), lab);
+    const nav = segOf("Chat navigation", [["list", "List"], ["split", "Split"]], split ? "split" : "list", (k) => {
+      keep("chatnav", k); q.delete("chatnav");
+      saveDraft();
+      location.replace(here());
+    });
+    menu.append(themes, dbox, nav);
+    $cog.append(menu);
+  };
+  const closeCog = (focus) => { cogOpen = false; renderCog(); if (focus) $gear.focus(); };
+  $gear.onclick = (e) => {
+    e.stopPropagation();
+    cogOpen = !cogOpen;
+    renderCog();
+    if (cogOpen) $cog.querySelector(".menu .on").focus();
+  };
+  $cog.onkeydown = (e) => { if (e.key === "Escape" && cogOpen) { e.stopPropagation(); closeCog(true); } };
+  $cog.addEventListener("focusout", () => setTimeout(() => { if (cogOpen && !$cog.contains(document.activeElement)) closeCog(false); }));
   applyPrefs();
   if (!thread) {
     $note.className = "err"; $note.textContent = "malformed chat address";

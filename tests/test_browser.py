@@ -916,19 +916,6 @@ async def test_latest_button_after_a_jump_reloads_the_latest_page(board: W.Board
     await page.wait_for_function("document.querySelector('#msgs').lastElementChild.dataset.id === '901'")
 
 
-async def test_date_picker_lands_on_the_first_message_of_the_day(chat: Pages) -> None:
-    """011-AC18: the picked day starts at local midnight: in Paris, 22:30 UTC the day before is its first."""
-    page = await chat.open(_chat(D), timezone_id="Europe/Paris", **_VIEW)
-    await _handled(page, "history")
-    await page.evaluate(_SPY)
-    since = await _frames(page)
-    await page.fill("#day", "2026-09-11")
-    await _handled(page, "history", since)
-    assert (await _history_sent(page))[-1] == {"history": D, "around": "2026-09-10T22:00:00.000Z"}
-    assert await page.locator("#msgs .msg.hit").evaluate_all("ns => ns.map(n => n.dataset.id)") == ["e"]
-    assert await _in_view(page, "e")
-
-
 async def test_jump_without_archive_says_so(
     board: W.Board, chat: Pages, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -938,7 +925,10 @@ async def test_jump_without_archive_says_so(
     monkeypatch.setattr(W, "fetch_history", lambda *a: [_m("1", _at(1))])
     page = await chat.open(_chat(b))
     await _handled(page, "history")
-    await page.fill("#day", "2026-09-11")
+    await _search(page, "x")  # answered "no archive": a hit offered anyway still cannot jump
+    hit = {"id": "1", "at": _at(1), "name": "Ann Lee", "text": "x"}
+    await _inject(page, [{"search": b, "q": "x", "hits": [hit]}])
+    await page.locator("#hits button").click()
     await page.wait_for_function("document.getElementById('err').textContent !== ''")
     assert await page.locator("#err").inner_text() == "jump: not available without archive"
     assert await _ids(page) == ["1"]
@@ -1004,30 +994,6 @@ async def test_two_quick_jumps_land_on_the_second(chat: Pages, monkeypatch: pyte
     assert await _in_view(page, "245")
     await asyncio.sleep(0.5)
     assert [v for v in await _history_sent(page) if "after" in v or "before" in v] == []
-
-
-async def test_typing_a_date_jumps_once(chat: Pages) -> None:
-    """011-AC18: Chrome fires `change` per typed year digit and per edit: one jump once the field settles."""
-    page = await chat.open(_chat(D), locale="en-US", timezone_id="Europe/Paris", **_VIEW)
-    await _handled(page, "history")
-    await page.evaluate(_SPY)
-    await page.locator("#day").press_sequentially("09102026")
-    await page.keyboard.press("ArrowUp")  # 2027 then back: two more complete dates within the delay
-    await page.keyboard.press("ArrowDown")
-    await page.wait_for_function("window.__sent.some(v => 'around' in v)")
-    await asyncio.sleep(1.2)
-    assert await _history_sent(page) == [{"history": D, "around": "2026-09-09T22:00:00.000Z"}]
-
-
-async def test_a_year_before_1970_is_not_a_jump(chat: Pages) -> None:
-    """011-AC18: a half-typed year (0020) never asks for history."""
-    page = await chat.open(_chat(D), locale="en-US", **_VIEW)
-    await _handled(page, "history")
-    await page.evaluate(_SPY)
-    await page.locator("#day").press_sequentially("09100020")
-    await page.keyboard.press("Enter")
-    await asyncio.sleep(1.2)
-    assert await _history_sent(page) == []
 
 
 async def test_a_short_page_asks_for_older_without_a_scroll(
@@ -1561,7 +1527,7 @@ async def test_split_shows_the_list_and_switches_in_place(board: W.Board, split:
         await page.locator("#rows li").first.locator(".prev").inner_text() == "Ann Lee: snippet Fictional L"
     )
     assert not await page.locator("#back").is_visible()
-    assert not await page.locator("#menu").is_visible()
+    assert await page.locator("#menu").is_visible()  # folds the docked list (011-AC29)
     await page.evaluate("window.__same = 1")
     await _switch(page, L)
     assert page.url.endswith(_chat(L) + "?chatnav=split")
@@ -1728,10 +1694,11 @@ async def test_split_list_updates_live_and_its_actions_work(board: W.Board, spli
     await page.locator(f'#rows li[data-id="{T}"] .mute').click()
     await page.wait_for_function(f"!document.querySelector('#rows li[data-id={json.dumps(T)}]')")
     assert board.rows[T]["muted"] is True
-    await page.get_by_role("button", name="Muted").click()
+    await page.locator("#tabs .more").click()  # Muted sits behind ⋯ in a 300px list (011-AC28)
+    await page.get_by_role("menuitemradio", name="Muted").click()
     assert await _row_ids(page) == [T]
     await page.locator("#filter").fill("zzz")
-    assert await page.locator("#nochat").inner_text() == "no chat matches"
+    assert await page.locator("#nochat").inner_text() == "no chat matches «zzz»"
 
 
 async def test_split_narrow_window_folds_the_list(split: Pages) -> None:
@@ -1764,9 +1731,9 @@ async def test_split_narrow_window_folds_the_list(split: Pages) -> None:
 async def test_split_middle_click_opens_a_new_tab(
     board: W.Board, split: Pages, monkeypatch: pytest.MonkeyPatch, browser: bool
 ) -> None:
-    """011-AC21: middle click on a row opens that chat in a new tab, through --browser when set; the
-    shown chat does not change."""
-    opened: list[tuple[str, bool]] = []
+    """011-AC21: middle click on a row opens that chat in a new tab, in split too, through --browser when
+    set; the shown chat does not change."""
+    opened: list[Verb] = []
 
     async def spy(
         thread_id: str,
@@ -1776,7 +1743,7 @@ async def test_split_middle_click_opens_a_new_tab(
         chat: bool = False,
         split: bool = False,
     ) -> bool:
-        opened.append((thread_id, chat))
+        opened.append((thread_id, "split" if split else chat))
         return True
 
     monkeypatch.setattr(board, "open_row", spy)
@@ -1786,12 +1753,12 @@ async def test_split_middle_click_opens_a_new_tab(
     if browser:
         await name.click(button="middle")
         await _until(opened, 1)
-        assert opened == [(L, True)]
+        assert opened == [(L, "split")]
     else:
         async with page.context.expect_page() as tab:
             await name.click(button="middle")
         new = await tab.value
-        await new.wait_for_url(f"http://{split.host}{_chat(L)}")
+        await new.wait_for_url(f"http://{split.host}{_chat(L)}?chatnav=split")
         await new.close()
     assert page.url.endswith(_chat(T) + "?chatnav=split")
 

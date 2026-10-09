@@ -76,8 +76,8 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
   the MCP archive search on that one thread (`mcp.Archive.search_messages`, case and accents
   ignored, whole history), answers up to 50 hits newest first `{id, at, name, text}`. A thread
   without archive answers `{"search": id, "error": "no archive for this chat"}`. Clicking a hit
-  asks `history` `around` its time and highlights the message. A date picker in the header does
-  the same `around` the start of the picked day.
+  asks `history` `around` its time and highlights the message. (A date picker was dropped: see
+  Decisions.)
 - **Composer.** Same textarea rules as spec 006 (Enter sends, Shift+Enter newline, in-flight lock,
   error under the field, draft kept on failure), reusing the `send` verb. The server accepts
   `send` for a followed thread even when it is not on the board (archived-only chats), as long as it
@@ -202,9 +202,9 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 - [ ] **AC17** `history` with `around` returns messages on both sides of the anchor with `older`
       and `newer` set; `after` pages forward without overlap or gap.
 - [ ] **AC18** `search` returns the thread's matching messages, case and accents ignored, at most
-      50, newest first; clicking a hit shows that message highlighted with its neighbours; the
-      date picker shows the first message of the picked day; a thread without archive answers the
-      `error` above.
+      50, newest first; clicking a hit shows that message highlighted with its neighbours; a thread
+      without archive answers the `error` above. ~~The date picker shows the first message of the
+      picked day.~~
 - [ ] **AC19** The header's Open in Teams sends `open` for the thread and the server runs the
       opener on its deep link, also for a thread followed but not on the board; with
       `--opener none` it opens the https deep link in a new tab. A message's Open in Teams opens
@@ -244,10 +244,15 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
       presses from the filter; ☰ toggles the docked list above 700 px (saved) and opens a drawer
       with a backdrop below it, with `aria-expanded`, focus into the filter, Escape back to ☰.
 - [ ] **AC30** Split polish: the chat header never overflows (label at least 80 px at 720 px wide;
-      Open in Teams as an icon below 560 px); the current row is marked by a fill and a 3 px bar and
+      Open in Teams as an icon below 640 px of chat width; breakpoints measured on the real header); the current row is marked by a fill and a 3 px bar and
       scrolled into view on load and Back/Forward, not on live updates; empty tabs and empty filters
       say so right under the bar; focus rings use the accent colour; row times and seen rows reach
       4.5:1 contrast in both themes. Switching chats keeps the list's scroll position.
+- [ ] **AC31** The chat page has its own ⚙ menu (list and split modes) with the settings it reads:
+      theme, avatars, chat navigation. They share the widget's keys in the browser's storage, so a
+      page opened in another browser through `--browser` can be set there. Choosing a chat
+      navigation value stores it, drops any `chatnav` URL parameter and reloads the page in that
+      mode; theme and avatars apply at once.
 
 ## Phases
 
@@ -315,7 +320,7 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 - Work: from the UX audit of split mode (screenshots at 4 widths, both themes): resizable column,
   filter row and tabs, row width and roving focus, narrow header, current row, empty states,
   contrast; tests.
-- **Covers**: AC27, AC28, AC29, AC30
+- **Covers**: AC27, AC28, AC29, AC30, AC31
 - **Data model impact**: none
 - **DoD**: browser tests for each AC; screenshots at 1920, 1300, 1024 and 700 px in both themes show
   no clipped tab, no overflowing header and aligned pane borders.
@@ -345,6 +350,8 @@ None.
   proxy for any URL and the archive already fetches media.
 - Upload stays out; the Open in Teams button covers it, and anything else the page lacks
   (babs, 2026-10-09). Multi-quote kept, as Teams does it.
+- The chat page gets its own ⚙ (babs, 2026-10-09): settings are per browser and the page may
+  open in another one, so it must be able to set them; it now writes `chatnav` too.
 - Split mode UX pass (babs, 2026-10-09): resizable list, reorganised filters, then a full audit.
   Seen and Muted move into a "⋯" menu below 360 px rather than a native select, to keep the
   widget's segmented look. Not this pass: drag-to-collapse, Alt+↑/↓ between chats, cross-tab filter
@@ -355,6 +362,8 @@ None.
   Cards, so one renderer covers them.
 - Navigation between chats from the chat page, both as a list page and side by side, chosen by a
   setting (babs, 2026-10-09). Default `list`: smaller change, overturnable.
+- Jump to a date dropped (babs, 2026-10-09): the header field looked out of place and added little
+  next to the search. `history` keeps `around`, which search hits use.
 - Search in the chat, jump to date, infinite scroll and "↓ latest" in scope (babs, 2026-10-09).
   Search reads the archive only: the API has no per-chat search the project uses.
 - Quote, reactions, edit and delete in scope (babs, 2026-10-09): the view must work like a normal

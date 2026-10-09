@@ -122,7 +122,11 @@ page's own view of the chat (history, live updates, reply box, Open in Teams), t
 set, else in a new tab. On `/?nav=chat` the board is a chat picker, and the chat page's ◀ goes there: a click on a row opens that chat page in the same
 tab, a middle click in a new one, and Ctrl click opens Teams as before. With ⚙ **Chat navigation** at
 `Split` (default `List`), the chat page shows that list on its left instead of ◀: a click switches chats in
-place (Back returns), each chat keeps its draft and quotes, and below 700px the list folds behind ☰. The chat
+place (Back returns) and each chat keeps its draft and quotes. Drag the list's edge to resize it (or focus it:
+←/→, Home/End, Enter or a double click resets); ☰ folds the list away, or opens it over the chat below 700px.
+Ctrl+K jumps to the list's filter, where ↑/↓ pick a row and Enter opens it; Seen and Muted sit behind ⋯ in a
+narrow list. Width and fold are kept per browser. The chat page has its own ⚙ for theme, avatars and chat
+navigation, on the widget's keys: a page opened through `--browser` can be set in that browser. The chat
 page's message box completes `:emoji` and `@member` (picked members are notified), takes markdown-like formatting
 (bold, italic, strike, code, lists, quotes) through a toolbar or Ctrl+B / Ctrl+I, and its preview button shows the
 message as it will be posted. The
