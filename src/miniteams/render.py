@@ -31,7 +31,11 @@ _NOT_ARCHIVED = "[image not archived]"
 def _web_url(value: str) -> str | None:
     """`value` when it is an http(s) URL; entities are already decoded by the parser."""
     url = value.strip()
-    return url if urlsplit(url).scheme.lower() in ("http", "https") else None
+    try:
+        scheme = urlsplit(url).scheme
+    except ValueError:  # "https://[x": a bad bracket host must not sink the whole message
+        return None
+    return url if scheme.lower() in ("http", "https") else None
 
 
 def media_url(thread_id: str, media_dir: Path | None, src: str) -> str | None:
@@ -175,7 +179,9 @@ _MSG_MD = 50_000
 _CODESNIPPET = "application/vnd.microsoft.card.codesnippet"
 # Bounded inner spans keep every pattern linear on hostile text (no nested quantifiers).
 _MD_INLINE = re.compile(
-    r"\[([^\[\]\n]{1,500})\]\(([^()\[\]\s]{1,2000})\)"
+    # Labels may hold one bracket pair, as GitLab's "[repo [!123]](url)"; each branch consumes a
+    # character or a whole pair, so the scan stays linear.
+    r"\[((?:[^\[\]\n]|\[[^\[\]\n]{0,100}\]){1,500})\]\(([^()\[\]\s]{1,2000})\)"
     r"|\*\*([^*\n]{1,500})\*\*"
     r"|(?<![\w_])_([^_\n]{1,500})_(?![\w_])"
 )
@@ -301,6 +307,11 @@ class _CardRenderer:
 
     def element(self, el: dict[str, Any], depth: int) -> str:
         kind = el.get("type")
+        if _is_toggle(el) and kind in (
+            "TextBlock",
+            "RichTextBlock",
+        ):  # "Show details…": nothing to toggle here
+            return ""
         if kind == "TextBlock":
             text = _str(el.get("text"))
             if not text:
@@ -343,7 +354,7 @@ class _CardRenderer:
 
     def run(self, run: dict[str, Any], depth: int) -> str:
         text = html.escape(_str(run.get("text"))).replace("\n", "<br>")
-        if not text:
+        if not text or _is_toggle(run):
             return ""
         if _str(run.get("weight")).lower() == "bolder":
             text = f"<b>{text}</b>"
@@ -367,7 +378,7 @@ class _CardRenderer:
         if kind == "Action.ShowCard" and isinstance(act.get("card"), dict):
             inner = self.card(act["card"], depth)
             return f"<details><summary>{title}</summary>{inner}</details>" if title or inner else ""
-        if not title:
+        if not title or kind == "Action.ToggleVisibility":  # a read-only view shows all; no toggle
             return ""
         url = act.get("url") if kind == "Action.OpenUrl" else None
         return _link(url, title, "act") if _web_url(_str(url)) else f'<span class="act">{title}</span>'
@@ -375,6 +386,11 @@ class _CardRenderer:
 
 def _str(value: object) -> str:
     return value if isinstance(value, str) else ""
+
+
+def _is_toggle(el: dict[str, Any]) -> bool:
+    action = el.get("selectAction")
+    return isinstance(action, dict) and action.get("type") == "Action.ToggleVisibility"
 
 
 def _open_url(action: object) -> object:

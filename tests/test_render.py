@@ -773,3 +773,63 @@ def test_spent_budget_leaves_no_empty_blocks_and_keeps_the_fallback() -> None:
     assert "late" not in out
     msg["properties"]["cards"][-1]["content"]["fallbackText"] = "late summary"
     assert "late summary" in cards_html(msg)
+
+
+def test_link_label_with_a_bracket_pair_and_toggle_actions() -> None:
+    """011-AC24: a label such as "[repo [!12]](url)" is still a link, as GitLab cards write it; a
+    ToggleVisibility action has no place on a read-only card."""
+    html = markdown_html(
+        "[repo [!12]](https://x.org/mr/12) and [[a]](https://x.org/a) [[[b]]](https://x.org/b)"
+    )
+    assert '<a href="https://x.org/mr/12" rel="noopener" target="_blank">repo [!12]</a>' in html
+    assert ">[a]</a>" in html
+    assert "[[[b]]]" in html  # two levels stay literal
+    card = {
+        "type": "AdaptiveCard",
+        "body": [
+            {
+                "type": "ActionSet",
+                "actions": [
+                    {"type": "Action.ToggleVisibility", "title": "Show details..."},
+                    {"type": "Action.ToggleVisibility", "title": "Hide details..."},
+                    {"type": "Action.OpenUrl", "title": "Diff", "url": "https://x.org/d"},
+                ],
+            }
+        ],
+    }
+    out = card_html(card)
+    assert "details..." not in out
+    assert ">Diff</a>" in out
+    toggle = {"type": "Action.ToggleVisibility", "targetElements": ["x"]}
+    card = {
+        "type": "AdaptiveCard",
+        "body": [
+            {
+                "type": "RichTextBlock",
+                "isVisible": False,
+                "inlines": [
+                    {"type": "TextRun", "text": "Hide details...", "selectAction": toggle},
+                    {"type": "TextRun", "text": "kept", "weight": "bolder"},
+                ],
+            },
+            {"type": "TextBlock", "text": "Show details...", "selectAction": toggle},
+            {"type": "Container", "isVisible": False, "items": [{"type": "TextBlock", "text": "inside"}]},
+        ],
+    }
+    out = card_html(card)
+    assert (
+        "details..." not in out and "<b>kept</b>" in out and "inside" in out
+    )  # hidden content shows, toggles do not
+
+
+def test_a_malformed_url_is_dropped_not_raised() -> None:
+    """011-AC24: `urlsplit` raises on "https://[x"; a bot card or a body link carrying it must only
+    lose the link, never the message."""
+    card = {
+        "type": "AdaptiveCard",
+        "body": [{"type": "TextBlock", "text": "t"}],
+        "actions": [{"type": "Action.OpenUrl", "title": "Go", "url": "https://[x"}],
+    }
+    out = card_html(card)
+    assert "<a " not in out and ">Go</span>" in out
+    assert "<a " not in sanitize('<a href="https://[x">y</a>', "19:t@thread.v2", None)
