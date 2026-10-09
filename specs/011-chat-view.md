@@ -106,6 +106,18 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
     message itself updates from the Trouter echo (AC7), no optimistic change.
   - "Own message" is decided on the server from its copy of the message (`from` equals my MRI);
     edit and delete on another's message are refused without an API call.
+- **Navigation between chats.** A second ⚙ setting in the widget, "Chat navigation", stored per
+  browser under `chatnav`, values `list` (default) and `split`; the chat page reads the same key.
+  - `list`: the chat page's ◀ goes to `/?nav=chat`, the board in navigation mode: a plain click on a
+    row opens `/chat/<id>` in the same tab, a middle click opens it in a new tab (through
+    `--browser` when set, as the middle-click setting does), Ctrl click opens Teams as today. The
+    widget opened on `/` without `nav` is unchanged.
+  - `split`: `/chat/<id>` shows the conversation list on the left (same rows, tabs, seen and mute
+    state as the board, kept live) and the chat on the right. A click on a row switches the chat in
+    place: the page follows the new thread, loads its history and puts the new id in the URL
+    (`history.pushState`; Back returns to the previous chat). Each chat keeps its composer draft
+    and quotes while the page stays open. Below ~700px wide the list collapses behind a ☰ button.
+    No ◀ in this mode.
 - **Theme.** Follows the widget's `theme` and `avatars` settings (same `localStorage`).
 - **Docs.** README `web` paragraph: the setting and the route. `docs/agent-archive.md` untouched.
 
@@ -156,8 +168,8 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
       the page.
 - [ ] **AC11** Reply with quote: `send` with `quote: [a, b]` posts a body starting with the
       Reply blockquotes of `a` then `b`, author MRI, name and preview from the server's copy; any
-      `quote` id that is not a message of that thread, or more than 10 ids, is refused without an
-      API call; the page renders the sent reply with its quotes.
+      `quote` id that is not a message of that thread, or more than 10 ids, is refused without
+      posting anything (an id the archive lacks may cost one history read); the page renders the sent reply with its quotes.
 - [ ] **AC12** `react` calls `send.react()` once with the key, `remove: true` when I already
       reacted with it; a key outside the 8 defaults is refused without an API call.
 - [ ] **AC13** `edit` on my own message calls `edit_message()` once with the new text; on another
@@ -179,6 +191,17 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
       opener on its deep link, also for a thread followed but not on the board; with
       `--opener none` it opens the https deep link in a new tab. A message's Open in Teams opens
       the deep link on that message id.
+- [ ] **AC20** With `chatnav` at `list`, the chat page's ◀ opens `/?nav=chat`; there a plain click
+      on a row opens that chat in the same tab, a middle click opens it in a new tab (through
+      `--browser` when set), Ctrl click is unchanged; `/` without `nav` behaves as before.
+- [ ] **AC21** With `chatnav` at `split`, `/chat/<id>` shows the live conversation list beside the
+      chat; clicking another row follows that thread, shows its history and changes the URL
+      without a page load; browser Back returns to the previous chat.
+- [ ] **AC22** In `split`, switching chats keeps each chat's unsent draft and quotes, and live
+      events of the previous chat no longer reach the page (one followed thread at a time).
+- [ ] **AC23** In `split`, the list's rows update live like the board (new message moves the row
+      up, unread and mention marks), and the socket still never receives data of chats that are not
+      on the board beyond their rows.
 
 ## Phases
 
@@ -225,6 +248,15 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
   page, a chat with 1000+ messages scrolls back to its start, a search hit and a date jump land on
   the right message, "↓ latest" returns to the bottom.
 
+### Phase 6 — navigation between chats
+- Work: `chatnav` setting in the widget ⚙; `nav=chat` mode of the board; split layout in
+  `chat.html` (list pane reusing the board's row rendering, in-place switch with re-follow and
+  `pushState`, per-chat drafts, narrow-width collapse); tests.
+- **Covers**: AC20, AC21, AC22, AC23
+- **Data model impact**: none
+- **DoD**: `pytest` green incl. browser tests for each AC; on the live test window, both settings
+  move between three chats without opening Teams, and Back works in `split`.
+
 ## Data model impact (summary)
 
 None. Archive read-only, no new file under `~/.config/miniteams`.
@@ -250,6 +282,8 @@ None.
   proxy for any URL and the archive already fetches media.
 - Upload stays out; the Open in Teams button covers it, and anything else the page lacks
   (babs, 2026-10-09). Multi-quote kept, as Teams does it.
+- Navigation between chats from the chat page, both as a list page and side by side, chosen by a
+  setting (babs, 2026-10-09). Default `list`: smaller change, overturnable.
 - Search in the chat, jump to date, infinite scroll and "↓ latest" in scope (babs, 2026-10-09).
   Search reads the archive only: the API has no per-chat search the project uses.
 - Quote, reactions, edit and delete in scope (babs, 2026-10-09): the view must work like a normal

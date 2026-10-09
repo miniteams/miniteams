@@ -21,7 +21,7 @@ import random
 import re
 import sqlite3
 import time
-from collections.abc import Awaitable, Coroutine, Iterable
+from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from datetime import UTC, datetime
 from http import HTTPStatus
 from importlib.resources import files
@@ -36,14 +36,14 @@ from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 from websockets.typing import Origin
 
-from .archive_store import find_chat_dir, read_chats, read_page
+from .archive_store import find_chat_dir, read_chats, read_messages, read_page
 from .chats import fetch_conversations, is_meeting, is_private, last_activity
 from .config import Settings
 from .directory import Directory
 from .dump import _ISO_RE, _epoch_seconds, fetch_history
 from .messages import _TAG_RE, EMOJI, thread_of
 from .render import sanitize
-from .send import mark_read, message_html, send_message
+from .send import delete_message, edit_message, mark_read, message_html, react, send_message
 from .stream import run_forever
 
 log = structlog.get_logger()
@@ -74,6 +74,10 @@ _CHAT_PAGE = 100  # history messages per page of the chat view
 _CHAT_PAGE_MAX = 200  # the archive query is cheap, the page's DOM is not
 _MEDIA_MAX = 50 * 1024 * 1024  # ponytail: whole-body responses; stream if videos ever get linked
 _MSG_ID_RE = re.compile(r"[0-9]{1,20}")  # Teams message ids are ms-epoch digits
+_QUOTE_MAX = 10  # quotes in one reply
+_PREVIEW_LEN = 100  # characters of the quoted message a Reply block carries
+_ACTIONS = ("react", "edit", "delete")  # page verbs on one message
+_TEXT_TYPES = ("RichText/Html", "Text")  # what a person wrote: quotable, editable
 _SCRIPT_RE = re.compile(r"<script>(.*?)</script>", re.DOTALL)
 # Thread activity that changes the label (topic, member count): drop the cached thread info.
 # Someone reading a chat is not activity: bumping the row on it would defeat "seen".
@@ -268,7 +272,7 @@ def chat_record(
     content = str(message.get("content") or "")
     kind = _record_type(msgtype)
     mri = str(message.get("from") or "").rsplit("/", 1)[-1]
-    deleted = bool(props.get("deletetime") or props.get("hardDeleteTime"))
+    deleted = _deleted(props)
     body = ""
     if not deleted:
         if msgtype == "RichText/Html":
@@ -312,6 +316,21 @@ def chat_record(
         "reactions": reactions,
         "mentions": mention_kind(message, me),
     }
+
+
+def reply_quote(message: dict[str, Any], name: str) -> str:
+    """Teams' Reply block quoting `message`, in the shape the archive holds (spec 011)."""
+    msg_id = html.escape(str(message.get("id") or ""))
+    mri = html.escape(str(message.get("from") or "").rsplit("/", 1)[-1])
+    props = message.get("properties")
+    msgtype, content = str(message.get("messagetype") or ""), str(message.get("content") or "")
+    preview = snippet(msgtype, content, props if isinstance(props, dict) else None)[:_PREVIEW_LEN]
+    return (
+        f'<blockquote itemscope itemtype="http://schema.skype.com/Reply" itemid="{msg_id}">'
+        f'<strong itemprop="mri" itemid="{mri}">{html.escape(name)}</strong>'
+        f'<span itemprop="time" itemid="{msg_id}"></span>'
+        f'<p itemprop="preview">{html.escape(preview)}</p></blockquote>'
+    )
 
 
 _APP_MRI = "28:"  # bots and app installs sit in the roster like people do
@@ -687,6 +706,7 @@ class Board:
         self._typing_timers: dict[tuple[str, str], asyncio.TimerHandle] = {}
         self._follows: dict[ServerConnection, tuple[str, Path | None]] = {}  # socket → (thread, media dir)
         self._history_busy: set[ServerConnection] = set()  # sockets with a history answer pending
+        self._action_busy: set[ServerConnection] = set()  # sockets with a message action pending
         self._seen: dict[str, str] = _load_seen(seen_path)
         self._muted: dict[str, str] = _load_seen(muted_path)  # thread → when muted (same shape)
         for row in rows.values():
@@ -791,21 +811,42 @@ class Board:
             return False
         return True
 
-    async def send(self, thread_id: str, text: Any, ws: ServerConnection | None = None) -> str | None:
-        """Page verb `send`: post `text` to the row's chat (or the chat `ws` follows) as me.
-        Returns the refusal/failure reason, None once Teams accepted it.
+    async def send(
+        self, thread_id: str, text: Any, ws: ServerConnection | None = None, quote: Any = None
+    ) -> str | None:
+        """Page verb `send`: post `text` to the row's chat (or the chat `ws` follows) as me, after
+        one Reply block per `quote` id. Returns the refusal/failure reason, None once Teams accepted it.
 
         The row is left alone: the Trouter echo of the sent message updates it like any other."""
-        # Off the board, only a followed chat of the widget's scope: never a channel.
-        if thread_id not in self.rows and not (in_scope(thread_id) and self._following(ws, thread_id)):
+        if not self._may_post(ws, thread_id):
             return "unknown chat"
-        if not isinstance(text, str) or not text.strip():
-            return "empty message"
-        if len(message_html(text, False).encode()) > _SEND_MAX_BYTES:
-            return "message too long"
+        if error := _text_error(text):
+            return error
+        quote = [] if quote is None else quote
+        if not isinstance(quote, list):
+            return "invalid quote"
+        if len(quote) > _QUOTE_MAX:
+            return "too many quotes"
+        ids_ok = all(isinstance(q, str) and _MSG_ID_RE.fullmatch(q) for q in quote)
+        if not ids_ok or len(set(quote)) < len(quote):
+            return "invalid quote"
         if self.directory is None:
             return "not connected"
         try:
+            extra = {}
+            if quote:
+                copies = await asyncio.to_thread(self._server_copies, thread_id, quote)
+                if any(q not in copies for q in quote):
+                    return "unknown quoted message"
+                if any(
+                    not copies[q].get("from") or copies[q].get("messagetype") not in _TEXT_TYPES
+                    for q in quote
+                ):
+                    return "cannot quote this message"
+                text = "".join(self._reply_quote(copies[q]) for q in quote) + message_html(text, False)
+                if len(text.encode()) > _SEND_MAX_BYTES:
+                    return "message too long"
+                extra["is_html"] = True
             await asyncio.to_thread(
                 send_message,
                 self.directory.settings,
@@ -813,6 +854,7 @@ class Board:
                 thread_id,
                 text,
                 self.me_name,
+                **extra,
             )
         except Exception as exc:  # noqa: BLE001 — a failed send must not drop the socket
             reason = _failure(exc)
@@ -821,6 +863,91 @@ class Board:
         return None
 
     # --- chat view (spec 011) ---
+
+    async def act(self, ws: ServerConnection | None, verb: str, request: dict[str, Any]) -> dict[str, Any]:
+        """Page verbs `react`, `edit`, `delete` on one message of a chat `send` may post to."""
+        thread_id, msg_id = request[verb], request.get("msg")
+        error = await self._act(ws, verb, request, thread_id, msg_id)
+        head = {verb: thread_id, "msg": msg_id if isinstance(msg_id, str) else None}
+        return {**head, **({"error": error} if error else {"ok": True})}
+
+    async def _act(
+        self, ws: ServerConnection | None, verb: str, request: dict[str, Any], thread_id: str, msg_id: Any
+    ) -> str | None:
+        if not isinstance(msg_id, str) or not _MSG_ID_RE.fullmatch(msg_id):
+            return "invalid message"
+        if not self._may_post(ws, thread_id):
+            return "unknown chat"
+        key, remove, text = request.get("key"), request.get("remove", False), request.get("text")
+        if verb == "react" and not (isinstance(key, str) and key in EMOJI and isinstance(remove, bool)):
+            return "invalid reaction"
+        if verb == "edit" and (error := _text_error(text)):
+            return error
+        if self.directory is None:
+            return "not connected"
+        settings, token = self.directory.settings, self.directory.skype_token
+        try:
+            copy = (await asyncio.to_thread(self._server_copies, thread_id, [msg_id])).get(msg_id)
+            if copy is None:
+                return "unknown message"
+            # The server's copy decides: the page could name anyone's message.
+            if verb != "react" and not _is_me(str(copy.get("from") or ""), self.me):
+                return "not your message"
+            props = copy.get("properties")
+            if verb != "react" and _deleted(props if isinstance(props, dict) else {}):
+                return "message deleted"
+            if verb == "edit" and copy.get("messagetype") not in _TEXT_TYPES:
+                return "cannot edit this message"
+            if verb == "react":
+                await asyncio.to_thread(react, settings, token, thread_id, msg_id, str(key), remove=remove)
+            elif verb == "edit":
+                await asyncio.to_thread(edit_message, settings, token, thread_id, msg_id, str(text))
+            else:
+                await asyncio.to_thread(delete_message, settings, token, thread_id, msg_id)
+        except Exception as exc:  # noqa: BLE001 — a failed action must not drop the socket
+            reason = _failure(exc)
+            log.warning(
+                "message_action_failed",
+                verb=verb,
+                thread=thread_id,
+                message_id=msg_id,
+                error=reason,
+                error_type=type(exc).__name__,
+            )
+            return reason
+        return None
+
+    def _may_post(self, ws: ServerConnection | None, thread_id: str) -> bool:
+        # Off the board, only a followed chat of the widget's scope: never a channel.
+        return thread_id in self.rows or (in_scope(thread_id) and self._following(ws, thread_id))
+
+    def _server_copies(self, thread_id: str, ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Messages `ids` of the thread as the server holds them, by id: the archive, then the latest
+        API page for those it lacks (sent after the archiver's last write). Blocking: worker thread."""
+        found: dict[str, dict[str, Any]] = {}
+        chat_dir = self._archive_dir(thread_id)
+        if chat_dir is not None:
+            try:
+                found = read_messages(chat_dir, ids)
+            except (OSError, sqlite3.Error) as exc:
+                if not isinstance(exc, FileNotFoundError):
+                    log.warning("archive_message_lookup_failed", thread=thread_id, error=str(exc))
+        if len(found) < len(ids) and self.directory is not None:
+            page = fetch_history(
+                self.directory.settings, self.directory.skype_token, thread_id, _CHAT_PAGE_MAX, 1
+            )
+            for message in page:
+                msg_id = str(message.get("id") or "")
+                if msg_id in ids:
+                    found.setdefault(msg_id, message)
+        return found
+
+    def _reply_quote(self, message: dict[str, Any]) -> str:
+        mri = str(message.get("from") or "").rsplit("/", 1)[-1]
+        name = str(message.get("imdisplayname") or "") or (
+            self.directory.name_for(mri) if self.directory else mri
+        )
+        return reply_quote(message, name)
 
     def _following(self, ws: ServerConnection | None, thread_id: str) -> bool:
         return ws is not None and self._follows.get(ws, ("", None))[0] == thread_id
@@ -1001,13 +1128,22 @@ class Board:
         with contextlib.suppress(ConnectionClosed):
             await ws.send(json.dumps(answer, ensure_ascii=False))
 
-    async def _reply(self, ws: ServerConnection, thread_id: str, text: Any) -> None:
-        error = await self.send(thread_id, text, ws)
-        ack = {"sent": thread_id, **({"error": error} if error else {"ok": True})}
+    async def _sent(self, ws: ServerConnection, thread_id: str, text: Any, quote: Any) -> dict[str, Any]:
         # Only the sending page learns the outcome; every page sees the echoed message.
-        # A page closed during the send is not a handler failure.
-        with contextlib.suppress(ConnectionClosed):
-            await ws.send(json.dumps(ack))
+        error = await self.send(thread_id, text, ws, quote)
+        return {"sent": thread_id, **({"error": error} if error else {"ok": True})}
+
+    async def _one_at_a_time(
+        self, ws: ServerConnection, head: dict[str, Any], work: Callable[[], Awaitable[dict[str, Any]]]
+    ) -> dict[str, Any]:
+        """One message action (or quoted send) per socket: another while it runs answers `busy`."""
+        if ws in self._action_busy:
+            return {**head, "error": "busy"}
+        self._action_busy.add(ws)
+        try:
+            return await work()
+        finally:
+            self._action_busy.discard(ws)
 
     def mark_unseen(self, thread_id: str) -> bool:
         """Undo `seen`: the row shows again until the next click."""
@@ -1337,7 +1473,13 @@ class Board:
                     self.set_muted(verb["unmute"], False)
                 elif isinstance(verb, dict) and isinstance(verb.get("send"), str):
                     # A send can take the whole HTTP timeout: the page's other verbs must not queue behind it.
-                    self._background(self._reply(ws, verb["send"], verb.get("text")))
+                    sent = functools.partial(
+                        self._sent, ws, verb["send"], verb.get("text"), verb.get("quote")
+                    )
+                    # Quotes cost a lookup: they count as a message action.
+                    quoted = verb.get("quote")
+                    work = self._one_at_a_time(ws, {"sent": verb["send"]}, sent) if quoted else sent()
+                    self._background(self._answer(ws, work))
                 elif isinstance(verb, dict) and isinstance(verb.get("history"), str):
                     if ws in self._history_busy:  # one page in flight per socket
                         busy = {**_history_head(verb["history"], verb.get("before")), "error": "busy"}
@@ -1356,15 +1498,37 @@ class Board:
                     await self.open_row(
                         verb["open"], web=verb.get("web") is True, ws=ws, msg_id=msg, chat=chat
                     )
+                elif isinstance(verb, dict) and (
+                    action := next((k for k in _ACTIONS if isinstance(verb.get(k), str)), "")
+                ):
+                    # An HTTP round trip, like send: the page's other verbs must not queue behind it.
+                    msg = verb.get("msg")
+                    head = {action: verb[action], "msg": msg if isinstance(msg, str) else None}
+                    acted = functools.partial(self.act, ws, action, verb)
+                    self._background(self._answer(ws, self._one_at_a_time(ws, head, acted)))
                 else:
                     log.debug("ws_client_message_ignored", data=str(raw)[:100])
         finally:
             self.clients.discard(ws)
             self._follows.pop(ws, None)
+            self._action_busy.discard(ws)
 
 
 def _history_head(thread_id: str, before: Any) -> dict[str, Any]:
     return {"history": thread_id, "before": before if isinstance(before, str) and before else None}
+
+
+def _deleted(props: dict[str, Any]) -> bool:
+    return bool(props.get("deletetime") or props.get("hardDeleteTime"))
+
+
+def _text_error(text: Any) -> str | None:
+    """Why `text` cannot be posted as a message, None when it can."""
+    if not isinstance(text, str) or not text.strip():
+        return "empty message"
+    if len(message_html(text, False).encode()) > _SEND_MAX_BYTES:
+        return "message too long"
+    return None
 
 
 def _failure(exc: Exception) -> str:

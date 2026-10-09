@@ -8,6 +8,7 @@ A sent/edited message echoes back over the live stream (same `clientmessageid`),
 `teams_conv_send_typing_to_channel`. `edit_message` is reconstructed from
 the inbound `MessageUpdate` + `skypeeditedid` wire format (purple-teams only *consumes* edits) and
 the SkPy client: PUT the message id with `skypeeditedid` set to it — confirmed against live Teams.
+`delete_message` was captured from the Teams web client.
 """
 
 import html
@@ -144,6 +145,18 @@ def edit_message(
     }
     result = _check(_CLIENT.put(url, headers=_headers(skype_token, settings), json=body), "edit")
     log.info("message_edited", thread=thread_id, message_id=message_id, status=result["status"])
+    return result
+
+
+def delete_message(settings: Settings, skype_token: str, thread_id: str, message_id: str) -> dict[str, Any]:
+    """Delete your message: `DELETE …/messages/<id>`, no query, no body (captured from Teams web,
+    answers 200). The message stays, with `properties.deletetime` set and an empty content."""
+    url = (
+        f"https://{settings.contacts_host}/v1/users/ME/conversations"
+        f"/{quote(thread_id, safe='')}/messages/{quote(message_id, safe='')}"
+    )
+    result = _check(_CLIENT.delete(url, headers=_headers(skype_token, settings)), "delete")
+    log.info("message_deleted", thread=thread_id, message_id=message_id, status=result["status"])
     return result
 
 

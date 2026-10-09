@@ -100,6 +100,24 @@ def test_edit_message_puts_with_skypeeditedid(settings: Settings, monkeypatch) -
     assert captured["json"]["content"] == "new <b>text</b>"
 
 
+def test_delete_message_sends_a_bare_delete(settings: Settings, monkeypatch) -> None:
+    """011-AC14: DELETE on the message URL, no query, no body (the wire captured from Teams web)."""
+    captured: dict[str, Any] = {}
+
+    def fake_delete(url: str, **kw: Any) -> _Resp:
+        captured["url"] = url
+        captured.update(kw)
+        return _Resp({}, status=200, content=b"")
+
+    monkeypatch.setattr(send._CLIENT, "delete", fake_delete)
+    assert send.delete_message(settings, "sk", "19:a b@thread.v2", "1781920776714") == {"status": 200}
+    assert captured["url"] == (
+        f"https://{settings.contacts_host}/v1/users/ME/conversations/19%3Aa%20b%40thread.v2/messages/1781920776714"
+    )
+    assert set(captured) == {"url", "headers"}  # no json, content or params
+    assert captured["headers"]["X-Skypetoken"] == "sk"
+
+
 def test_send_message_raises_on_error_envelope(settings: Settings, monkeypatch) -> None:
     monkeypatch.setattr(
         send._CLIENT, "post", lambda *a, **k: _Resp({"errorCode": 1, "message": "nope"}, content=b"{...}")

@@ -157,6 +157,28 @@ def read_page(chat_dir: Path, before: str, limit: int) -> tuple[list[dict[str, A
     return messages, older is not None
 
 
+def read_messages(chat_dir: Path, ids: list[str]) -> dict[str, dict[str, Any]]:
+    """The archived messages among `ids`, by id, read-only; same errors as `read_page`."""
+    path = chat_dir / "messages.db"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        marks = ",".join("?" * len(ids))
+        rows = db.execute(f"SELECT id, raw FROM messages WHERE id IN ({marks})", ids).fetchall()
+    finally:
+        db.close()
+    found = {}
+    for msg_id, raw in rows:
+        try:
+            message = json.loads(raw)
+        except ValueError:
+            message = None
+        if isinstance(message, dict):
+            found[str(msg_id)] = message
+    return found
+
+
 class Index:
     """`data/index.db` — one row per known chat; enumeration metadata + backfill flag."""
 

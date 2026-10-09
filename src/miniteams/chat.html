@@ -85,9 +85,29 @@
   .msg.system .html { display: inline; }
   .actions { display: none; position: absolute; right: 8px; top: -10px; background: var(--panel); border: 1px solid var(--line);
     border-radius: 8px; box-shadow: var(--shadow); padding: 2px; }
-  .msg:hover .actions { display: flex; }
+  /* A click focuses the message itself (not focus-visible): no bar pinned. Not `:has(:focus-visible)`:
+     Chrome drops the focus when Tab leaves the message for its first button. */
+  .msg:hover .actions, .msg:focus-visible .actions, .msg:focus-within:not(:focus) .actions { display: flex; }
+  .msg:has(.editor) .actions { display: none !important; }  /* outranks the focus-within rule: the editor holds focus */
   .actions button { border: 0; background: transparent; border-radius: 6px; padding: 0 6px; cursor: pointer; color: var(--dim); font-size: 12.5px; }
   .actions button:hover { background: var(--panel-2); color: var(--accent); }
+  .actions .picker { display: flex; border-left: 1px solid var(--line); margin-left: 2px; padding-left: 2px; }
+  .actions .picker[hidden] { display: none; }
+  .actions .picker button.mine { background: var(--accent-soft); }
+  body.readonly .actions [data-act]:not([data-act="teams"]) { display: none; }
+  /* innerText skips what is not displayed: an edit starts from the message without its quotes. */
+  .plain blockquote.reply { display: none; }
+  .editor { display: block; width: 100%; resize: vertical; font: inherit; color: inherit; background: var(--panel);
+    border: 1px solid var(--accent); border-radius: 8px; padding: 6px 8px; }
+  .edit-err { display: block; color: var(--hot); font-size: 12px; }
+  #quotes { display: flex; flex-direction: column; gap: 3px; margin-bottom: 4px; }
+  #quotes[hidden] { display: none; }
+  .quote { display: flex; align-items: center; gap: 6px; border-left: 3px solid var(--accent); background: var(--panel-2);
+    border-radius: 0 6px 6px 0; padding: 2px 4px 2px 8px; font-size: 12.5px; color: var(--dim); }
+  .quote b { color: var(--text); font-weight: 600; white-space: nowrap; }
+  .quote span { flex: 1; }
+  .quote button { border: 0; background: transparent; cursor: pointer; color: var(--dim); border-radius: 4px; }
+  .quote button:hover { color: var(--hot); }
   /* Avatars off: no avatar column, the same rhythm as the widget's compact mode. */
   body.compact .msg { grid-template-columns: minmax(0, 1fr); }
   body.compact .av { display: none; }
@@ -114,6 +134,7 @@
 <div id="list"><div id="note">loading…</div><div id="msgs"></div></div>
 <div id="typing" aria-live="polite"></div>
 <footer>
+  <div id="quotes" hidden></div>
   <textarea id="reply" rows="1" placeholder="message · Enter sends, Shift+Enter new line" aria-label="message"></textarea>
   <small id="err"></small>
 </footer>
@@ -124,7 +145,8 @@
   const $list = document.getElementById("list"), $msgs = document.getElementById("msgs"), $note = document.getElementById("note"),
         $label = document.getElementById("label"), $members = document.getElementById("members"),
         $status = document.getElementById("status"), $teams = document.getElementById("teams"),
-        $typing = document.getElementById("typing"), $reply = document.getElementById("reply"), $err = document.getElementById("err");
+        $typing = document.getElementById("typing"), $reply = document.getElementById("reply"), $err = document.getElementById("err"),
+        $quotes = document.getElementById("quotes");
   const store = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
   const q = new URLSearchParams(location.search), pref = (k) => q.get(k) ?? store(k);
   const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
@@ -138,6 +160,10 @@
   const pending = new Set();  // history cursors asked and not answered ("" = latest page)
   let live = [], liveEdits = [];  // frames relayed while the latest page was being fetched
   const typing = new Set();
+  // Teams' 8 default reactions, the keys `react` accepts (messages.EMOJI).
+  const EMOJI = { like: "👍", heart: "❤️", laugh: "😆", surprised: "😮", sad: "😢", angry: "😡", yes: "✅", no: "❌" };
+  const QUOTE_MAX = 10;
+  let quotes = [];  // [{id, name, line}] quoted by the next send, in the order picked
 
   const applyPrefs = () => {
     const theme = ["light", "dark"].includes(pref("theme")) ? pref("theme") : "auto";
@@ -183,6 +209,7 @@
     if (r.deleted) body.append(el("div", "html", "message deleted"));
     else { const h = el("div", "html"); h.innerHTML = r.html || ""; body.append(h); }
     if (sys) { node.append(body); node.title = r.at; return node; }
+    node.tabIndex = 0;  // keyboard users reach the actions through focus-visible
     const name = r.name || (r.me ? "You" : "?");
     const av = el("div", "av", initials(name));
     av.style.background = `linear-gradient(135deg, hsl(${hue(r.from || name)} 62% 58%), hsl(${(hue(r.from || name) + 40) % 360} 62% 48%))`;
@@ -195,11 +222,98 @@
       for (const x of r.reactions) line.append(Object.assign(el("span", x.mine ? "mine" : null, `${x.emoji} ${x.count}`), { title: x.key }));
       body.append(line);
     }
-    const actions = el("div", "actions"), open = el("button", null, "↗ Teams");
-    open.title = "open this message in Teams"; open.onclick = () => openTeams(r.id);
-    actions.append(open);
+    const actions = el("div", "actions");
+    actions.onmousedown = (e) => e.preventDefault();  // a mouse click must not leave focus on the button and pin the bar
+    const button = (act, text, title, onclick) => { const b = el("button", null, text); b.dataset.act = act; b.title = title; b.setAttribute("aria-label", title); b.onclick = onclick; actions.append(b); return b; };
+    if (!r.deleted) {
+      button("reply", "↩", "reply with quote", () => addQuote(r, node));
+      const picker = el("span", "picker");
+      picker.hidden = true;
+      for (const [key, emoji] of Object.entries(EMOJI)) {
+        const mine = (r.reactions || []).some((x) => x.key === key && x.mine);
+        const b = el("button", mine ? "mine" : null, emoji);
+        b.dataset.key = key; b.title = mine ? `remove ${key}` : key; b.setAttribute("aria-label", b.title);
+        b.onclick = () => { picker.hidden = true; send({ react: thread, msg: r.id, key, remove: mine }) || ($err.textContent = "offline, not sent"); };
+        picker.append(b);
+      }
+      button("react", "☺", "react", () => { picker.hidden = !picker.hidden; });
+      actions.append(picker);
+      node.addEventListener("mouseleave", () => { picker.hidden = true; });
+      node.addEventListener("keydown", (e) => { if (e.key === "Escape") picker.hidden = true; });
+      if (r.me && r.type === "text") button("edit", "✎", "edit", () => startEdit(node, r));
+      if (r.me) {
+        button("delete", "🗑", "delete", () => { if (confirm("Delete this message?")) send({ delete: thread, msg: r.id }) || ($err.textContent = "offline, not deleted"); });
+      }
+    }
+    button("teams", "↗ Teams", "open this message in Teams", () => openTeams(r.id));
     node.append(av, body, actions);
     return node;
+  };
+
+  // The rendered body as plain text, its reply quotes left out (they are lost on edit).
+  const plainOf = (node) => {
+    const h = node.querySelector(".html");
+    if (!h) return "";
+    h.classList.add("plain");
+    const text = h.innerText;
+    h.classList.remove("plain");
+    return text.trim();
+  };
+
+  const renderQuotes = () => {
+    $quotes.replaceChildren(...quotes.map((q, i) => {
+      const chip = el("div", "quote"), drop = el("button", null, "✕");
+      chip.dataset.quote = q.id;
+      drop.title = "drop this quote"; drop.setAttribute("aria-label", drop.title);
+      drop.onclick = () => { quotes.splice(i, 1); renderQuotes(); };
+      chip.append(el("b", null, q.name), el("span", "truncate", q.line), drop);
+      return chip;
+    }));
+    $quotes.hidden = !quotes.length;
+  };
+  const addQuote = (r, node) => {
+    if (quotes.some((q) => q.id === r.id)) return;
+    if (quotes.length >= QUOTE_MAX) { $err.textContent = `${QUOTE_MAX} quotes at most`; return; }
+    quotes.push({ id: r.id, name: r.name || (r.me ? "You" : "?"), line: plainOf(node).split("\n")[0] });
+    renderQuotes();
+    $reply.focus();
+  };
+
+  // Edit in place: the body becomes a textarea; only the ack, a delete echo or Escape puts a message back.
+  const rerender = (id) => {
+    const node = $msgs.querySelector(`[data-id="${CSS.escape(id)}"]`), r = records.get(id);
+    if (node && r) { node.replaceWith(renderMessage(r)); regroup(); }
+  };
+  const startEdit = (node, r, text = null, focus = true, note = "") => {
+    const h = node.querySelector(".html");
+    if (!h || node.querySelector(".editor")) return;
+    const box = el("textarea", "editor"), err = el("small", "edit-err");
+    box.value = text ?? plainOf(node);
+    err.textContent = note;
+    box.rows = Math.min(8, box.value.split("\n").length);
+    box.onkeydown = (e) => {
+      if (e.key === "Escape") { e.preventDefault(); rerender(r.id); return; }
+      if (e.key !== "Enter" || e.shiftKey || e.isComposing || e.keyCode === 229) return;
+      e.preventDefault();
+      if (box.dataset.saving) return;  // a flag, not `disabled`: Escape must still reach the field
+      if (!send({ edit: thread, msg: r.id, text: box.value })) { err.textContent = "offline, not saved"; return; }
+      err.textContent = ""; box.dataset.saving = "1";
+    };
+    h.replaceWith(box, err);
+    if (focus) box.focus();
+  };
+  const onAction = (m) => {
+    if (m.edit !== undefined) {
+      const node = $msgs.querySelector(`[data-id="${CSS.escape(m.msg || "")}"]`), box = node?.querySelector(".editor");
+      // No editor waiting for it (cancelled, malformed id): only a failure is worth saying.
+      if (!box?.dataset.saving) { if (m.error) $err.textContent = "edit: " + m.error; return; }
+      delete box.dataset.saving;
+      if (m.ok) { rerender(m.msg); return; }
+      box.focus();
+      node.querySelector(".edit-err").textContent = m.error || "not saved";
+      return;
+    }
+    if (m.error) $err.textContent = ("react" in m ? "reaction: " : "delete: ") + m.error;
   };
 
   // Consecutive messages from one sender within 5 minutes share one avatar and name.
@@ -215,6 +329,9 @@
 
   const showPage = (messages) => {
     const keep = loaded && !stick, top = $list.scrollTop;  // a reconnect keeps the reader's place
+    // Restored editors start idle: a save in flight lost its answer with the old socket (see onclose).
+    const editing = [...$msgs.querySelectorAll(".editor")].map((box) => ({ id: box.closest(".msg").dataset.id, text: box.value,
+      focused: box === document.activeElement, note: box.nextElementSibling?.textContent || "" }));
     records.clear();
     for (const r of messages) records.set(r.id, r);
     for (const r of live) if (!records.has(r.id)) records.set(r.id, r);  // landed while the page was read
@@ -223,6 +340,11 @@
     const edits = liveEdits;
     live = []; liveEdits = [];
     for (const r of edits) replace(r);
+    for (const e of editing) {
+      const node = $msgs.querySelector(`[data-id="${CSS.escape(e.id)}"]`), r = records.get(e.id);
+      if (node && r && !r.deleted) startEdit(node, r, e.text, e.focused, e.note);
+      else $err.textContent = "edit lost: the message is no longer shown";
+    }
     $note.hidden = records.size > 0;
     $note.className = ""; $note.textContent = "no message yet";
     loaded = true;
@@ -246,6 +368,7 @@
     if (!old || !node) return;  // not on screen: the next page read carries it
     const merged = "html" in r ? r : { ...old, ...r, html: old.html };  // a partial update keeps the body
     records.set(r.id, merged);
+    if (node.querySelector(".editor") && !merged.deleted) return;  // an edit in progress: shown once it ends
     node.replaceWith(renderMessage(merged));
     regroup();
   };
@@ -277,7 +400,7 @@
     // A newer chat.html on the server (restart, edit): this page is stale, reload it.
     if (m.page) { if (pageVersion && m.page !== pageVersion) { saveDraft(); location.reload(); return; } pageVersion = m.page; }
     followFailed = false;
-    if (m.read_only) { readOnly = true; $reply.disabled = true; $reply.placeholder = "read-only: team channel"; }
+    if (m.read_only) { readOnly = true; $reply.disabled = true; $reply.placeholder = "read-only: team channel"; document.body.classList.add("readonly"); }
     opener = !!m.opener;
     $teams.disabled = false;
     const label = m.label || thread, n = label.match(/ · (\d+)p$/);
@@ -291,14 +414,22 @@
   const grow = () => { $reply.style.height = "auto"; $reply.style.height = $reply.scrollHeight + 2 + "px"; };
   let readOnly = false;
   const setSending = (on) => { sending = on; $reply.disabled = on || readOnly; if (!on) $reply.focus(); };
-  // The draft survives the reload a newer chat.html triggers.
+  // The draft (text and quotes) survives the reload a newer chat.html triggers.
   const draftKey = "draft:" + thread;
-  const saveDraft = () => { try { sessionStorage.setItem(draftKey, $reply.value); } catch (e) {} };
-  const takeDraft = () => { try { const d = sessionStorage.getItem(draftKey); sessionStorage.removeItem(draftKey); return d; } catch (e) { return null; } };
+  const saveDraft = () => { try { sessionStorage.setItem(draftKey, JSON.stringify({ text: $reply.value, quotes })); } catch (e) {} };
+  const takeDraft = () => {
+    let d = null;
+    try { d = sessionStorage.getItem(draftKey); sessionStorage.removeItem(draftKey); } catch (e) { return null; }
+    if (d == null) return null;
+    // A page from before the quotes saved the bare text.
+    try { const o = JSON.parse(d); if (o && typeof o.text === "string") return o; } catch (e) {}
+    return { text: d, quotes: [] };
+  };
   const submit = () => {
     const text = $reply.value;
     if (!text.trim() || sending) return;
-    if (!send({ send: thread, text })) { $err.textContent = "offline, not sent"; return; }
+    const verb = quotes.length ? { send: thread, text, quote: quotes.map((q) => q.id) } : { send: thread, text };
+    if (!send(verb)) { $err.textContent = "offline, not sent"; return; }
     $err.textContent = "";
     setSending(true);
   };
@@ -310,7 +441,7 @@
   };
   const onSent = (m) => {
     if (m.sent !== thread || !sending) return;
-    if (m.ok) { $reply.value = ""; grow(); $err.textContent = ""; }
+    if (m.ok) { $reply.value = ""; grow(); $err.textContent = ""; quotes = []; renderQuotes(); }
     else $err.textContent = m.error || "not sent";
     setSending(false);
   };
@@ -327,6 +458,8 @@
       const m = JSON.parse(e.data);
       if ("follow" in m) onFollow(m);
       else if ("history" in m) onHistory(m);
+      // Acks name the thread; a relayed `edit` frame carries a record.
+      else if (typeof m.edit === "string" || "react" in m || "delete" in m) onAction(m);
       else if (m.msg) {
         append(m.msg);
         if (typing.delete(m.msg.name)) renderTyping();
@@ -340,6 +473,10 @@
       typing.clear(); renderTyping();
       // No ack will come: the message may or may not have gone out.
       if (sending) { $err.textContent = "connection lost: check the chat before resending"; setSending(false); }
+      for (const box of $msgs.querySelectorAll(".editor[data-saving]")) {
+        delete box.dataset.saving;
+        box.nextElementSibling.textContent = "connection lost: check the message before saving again";
+      }
       setTimeout(connect, retry); retry = Math.min(retry * 2, 30000);
     };
   };
@@ -350,7 +487,14 @@
     return;
   }
   const draft = takeDraft();
-  if (draft) { $reply.value = draft; grow(); }
+  if (draft) {
+    $reply.value = draft.text; grow();
+    if (Array.isArray(draft.quotes)) {
+      quotes = draft.quotes.filter((q) => q && typeof q.id === "string").slice(0, QUOTE_MAX)
+        .map((q) => ({ id: q.id, name: String(q.name ?? ""), line: String(q.line ?? "") }));
+      renderQuotes();
+    }
+  }
   connect();
   $reply.focus();
 })();

@@ -1074,3 +1074,383 @@ async def test_open_chat_runs_the_browser_on_our_own_chat_page(
             await ws.send(json.dumps({"follow": B}))
             await _frame(ws)
     assert launched == [("firefox", "--new-tab", f"http://{host}/chat/19%3Abbbb%40thread.v2")]
+
+
+# --- message actions: quote, react, edit, delete (011 phase 4) ---
+
+BO = "8:orgid:00000000-0000-0000-0000-00000000000c"
+_LONG = "<p>R&amp;D <b>plan</b> " + "x" * 120 + "</p>"
+_LONG_PREVIEW = ("R&D plan " + "x" * 120)[:100].replace("&", "&amp;")  # first 100 plain chars, escaped
+
+
+@pytest.fixture
+def act_board(tmp_path: Path, quiet_directory: Directory) -> W.Board:
+    """T archived with Ann's message 1, my message 2 and Bo's message 3 (a name to escape); my deleted
+    message 4, my file post 5, a sender-less system event 6."""
+    mine = {"from": f"https://h/v1/users/ME/contacts/{ME}", "imdisplayname": "Me Self"}
+    bo = {"from": f"https://h/v1/users/ME/contacts/{BO}", "imdisplayname": "Bo <B> & Co"}
+    data = _archive(
+        tmp_path / "acts",
+        T,
+        [
+            _m("1", _at(1), _LONG),
+            _m("2", _at(2), "<p>mine</p>", **mine),
+            _m("3", _at(3), '<p>a"b</p>', **bo),
+            _m("4", _at(4), "", **{**mine, "properties": {"deletetime": "1789466600000"}}),
+            _m("5", _at(5), "<p>f</p>", **{**mine, "messagetype": "RichText/Media_GenericFile"}),
+            _m("6", _at(6), "<addmember/>", **{"messagetype": "ThreadActivity/AddMember", "from": ""}),
+        ],
+    )
+    _archive(data, C, [_m("1", _at(1), **mine)])
+    rows = {
+        B: {"id": B, "label": "B", "last_activity": _at(1), "last_id": "1", "seen_at": None, "typing": []}
+    }
+    return W.Board(rows, quiet_directory, me=ME, data_dir=data)
+
+
+@pytest.fixture
+def calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
+    """Every Teams call the actions make (writes and the API history read), API mocked."""
+    made: list[tuple[Any, ...]] = []
+
+    def fake_send(s: Any, token: str, thread_id: str, text: str, name: str, **kw: Any) -> dict[str, Any]:
+        made.append(("send", thread_id, text, kw))
+        return {"status": 201}
+
+    def fake_react(s: Any, token: str, thread_id: str, msg: str, key: str, *, remove: bool) -> dict[str, Any]:
+        made.append(("react", thread_id, msg, key, remove))
+        return {"status": 200}
+
+    def fake_edit(s: Any, token: str, thread_id: str, msg: str, text: str) -> dict[str, Any]:
+        made.append(("edit", thread_id, msg, text))
+        return {"status": 200}
+
+    def fake_delete(s: Any, token: str, thread_id: str, msg: str) -> dict[str, Any]:
+        made.append(("delete", thread_id, msg))
+        return {"status": 200}
+
+    def fake_history(s: Any, token: str, thread_id: str, size: int, pages: int) -> list[dict[str, Any]]:
+        made.append(("history", thread_id))
+        return []
+
+    for name, fake in (
+        ("send_message", fake_send),
+        ("react", fake_react),
+        ("edit_message", fake_edit),
+        ("delete_message", fake_delete),
+        ("fetch_history", fake_history),
+    ):
+        monkeypatch.setattr(W, name, fake)
+    return made
+
+
+def _writes(made: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
+    return [c for c in made if c[0] != "history"]
+
+
+async def _following(board: W.Board, thread_id: str) -> Any:
+    ws = object()
+    assert (await board.follow(ws, thread_id))["ok"]  # type: ignore[arg-type]
+    return ws
+
+
+def _block(msg_id: str, mri: str, name: str, preview: str) -> str:
+    return (
+        f'<blockquote itemscope itemtype="http://schema.skype.com/Reply" itemid="{msg_id}">'
+        f'<strong itemprop="mri" itemid="{mri}">{name}</strong>'
+        f'<span itemprop="time" itemid="{msg_id}"></span>'
+        f'<p itemprop="preview">{preview}</p></blockquote>'
+    )
+
+
+async def test_quote_prepends_reply_blocks_in_order_from_the_servers_copy(
+    act_board: W.Board, calls: list[tuple[Any, ...]]
+) -> None:
+    """011-AC11: one Reply block per id, in the order given, author and preview from the archive, escaped."""
+    ws = await _following(act_board, T)
+    assert await act_board.send(T, "ok <then>\nbye", ws, ["3", "1"]) is None
+    assert calls == [
+        (
+            "send",
+            T,
+            _block("3", BO, "Bo &lt;B&gt; &amp; Co", "a&quot;b")
+            + _block("1", ANN, "Ann Lee", _LONG_PREVIEW)
+            + "ok &lt;then&gt;<br>bye",
+            {"is_html": True},
+        )
+    ]
+
+
+async def test_quote_refusals_make_no_write(act_board: W.Board, calls: list[tuple[Any, ...]]) -> None:
+    """011-AC11: unknown id, more than 10, duplicates, malformed ids: refused before any write."""
+    ws = await _following(act_board, T)
+    eleven = [str(i) for i in range(1, 12)]
+    for ids, error in (
+        (["1", "99"], "unknown quoted message"),
+        (eleven, "too many quotes"),
+        (["1", "1"], "invalid quote"),
+        (["1x"], "invalid quote"),
+        ([1], "invalid quote"),
+        ("1", "invalid quote"),
+        ([{"id": "1"}], "invalid quote"),
+    ):
+        assert await act_board.send(T, "hi", ws, ids) == error, ids
+    assert _writes(calls) == []
+    # A message the archive lacks is looked for in the latest API page, read only.
+    assert calls == [("history", T)]
+
+
+async def test_quote_found_in_the_api_page_when_the_archive_lacks_it(
+    act_board: W.Board, monkeypatch: pytest.MonkeyPatch, calls: list[tuple[Any, ...]]
+) -> None:
+    """011-AC11: a chat without archive (and a message newer than it) quotes from one API page."""
+    fresh = _m("7", _at(7), "<p>fresh</p>")
+    monkeypatch.setattr(W, "fetch_history", lambda *a: [fresh])
+    assert await act_board.send(B, "re", None, ["7"]) is None
+    ws = await _following(act_board, T)
+    assert await act_board.send(T, "re", ws, ["1", "7"]) is None
+    fresh_block = _block("7", ANN, "Ann Lee", "fresh")
+    assert [c[2] for c in calls] == [
+        fresh_block + "re",
+        _block("1", ANN, "Ann Lee", _LONG_PREVIEW) + fresh_block + "re",
+    ]
+
+
+async def test_quote_counts_toward_the_size_cap(act_board: W.Board, calls: list[tuple[Any, ...]]) -> None:
+    """011-AC11 + 011-AC13: the 28 KB cap applies to the body with its quotes."""
+    ws = await _following(act_board, T)
+    text = "y" * (W._SEND_MAX_BYTES - 100)
+    assert await act_board.send(T, text, ws) is None
+    assert await act_board.send(T, text, ws, ["1"]) == "message too long"
+    assert [c[0] for c in calls] == ["send"]
+
+
+async def test_react_adds_and_removes_one_of_the_eight_keys(
+    act_board: W.Board, calls: list[tuple[Any, ...]]
+) -> None:
+    """011-AC12: one react() per verb with the key and `remove`; other keys and bad flags refused."""
+    ws = await _following(act_board, T)
+    assert await act_board.act(ws, "react", {"react": T, "msg": "1", "key": "like", "remove": False}) == {
+        "react": T,
+        "msg": "1",
+        "ok": True,
+    }
+    assert (await act_board.act(ws, "react", {"react": T, "msg": "2", "key": "heart", "remove": True}))["ok"]
+    for request, error in (
+        ({"key": "1f525_fire"}, "invalid reaction"),
+        ({"key": "Like"}, "invalid reaction"),
+        ({"key": ["like"]}, "invalid reaction"),
+        ({"key": "like", "remove": "yes"}, "invalid reaction"),
+        ({"key": "like", "msg": "99"}, "unknown message"),
+        ({"key": "like", "msg": "../1"}, "invalid message"),
+        ({"key": "like", "msg": None}, "invalid message"),
+    ):
+        answer = await act_board.act(ws, "react", {"react": T, "msg": "1", **request})
+        assert answer.get("error") == error, request
+    assert _writes(calls) == [("react", T, "1", "like", False), ("react", T, "2", "heart", True)]
+
+
+async def test_edit_only_my_own_message_with_valid_text(
+    act_board: W.Board, calls: list[tuple[Any, ...]]
+) -> None:
+    """011-AC13: edit() once on my message; another's, empty or over 28 KB: refused, no API write."""
+    ws = await _following(act_board, T)
+    assert await act_board.act(ws, "edit", {"edit": T, "msg": "2", "text": "fixed <b>"}) == {
+        "edit": T,
+        "msg": "2",
+        "ok": True,
+    }
+    for msg, text, error in (
+        ("1", "hijack", "not your message"),
+        ("3", "hijack", "not your message"),
+        ("2", "  ", "empty message"),
+        ("2", None, "empty message"),
+        ("2", "<" * (W._SEND_MAX_BYTES // 4 + 1), "message too long"),
+    ):
+        answer = await act_board.act(ws, "edit", {"edit": T, "msg": msg, "text": text})
+        assert answer.get("error") == error, (msg, error)
+    assert _writes(calls) == [("edit", T, "2", "fixed <b>")]
+
+
+async def test_delete_only_my_own_message(act_board: W.Board, calls: list[tuple[Any, ...]]) -> None:
+    """011-AC14: delete() once on my message; on another's it is refused without an API write."""
+    ws = await _following(act_board, T)
+    assert await act_board.act(ws, "delete", {"delete": T, "msg": "1"}) == {
+        "delete": T,
+        "msg": "1",
+        "error": "not your message",
+    }
+    assert await act_board.act(ws, "delete", {"delete": T, "msg": "2"}) == {
+        "delete": T,
+        "msg": "2",
+        "ok": True,
+    }
+    assert _writes(calls) == [("delete", T, "2")]
+
+
+async def test_own_message_is_decided_without_a_known_me(
+    act_board: W.Board, calls: list[tuple[Any, ...]]
+) -> None:
+    """011-AC13 + 011-AC14: with my MRI unknown, no message is mine: edit and delete refused."""
+    act_board.me = ""
+    ws = await _following(act_board, T)
+    for verb, extra in (("edit", {"text": "x"}), ("delete", {})):
+        answer = await act_board.act(ws, verb, {verb: T, "msg": "2", **extra})
+        assert answer["error"] == "not your message"
+    assert _writes(calls) == []
+
+
+async def test_actions_refused_on_channels_and_chats_not_followed(
+    act_board: W.Board, calls: list[tuple[Any, ...]]
+) -> None:
+    """011-AC9 + 011-AC12..14: a followed channel, or a chat this socket does not follow: refused, no call."""
+    channel = await _following(act_board, C)
+    stranger = object()
+    for ws, thread_id in ((channel, C), (stranger, T), (channel, NOPE)):
+        for verb, extra in (("react", {"key": "like"}), ("edit", {"text": "x"}), ("delete", {})):
+            answer = await act_board.act(ws, verb, {verb: thread_id, "msg": "1", **extra})
+            assert answer["error"] == "unknown chat", (thread_id, verb)
+        assert await act_board.send(thread_id, "x", ws, ["1"]) == "unknown chat"
+    assert calls == []
+
+
+async def test_action_failure_answers_the_reason(
+    act_board: W.Board, monkeypatch: pytest.MonkeyPatch, calls: list[tuple[Any, ...]]
+) -> None:
+    """011-AC13: a Teams refusal reaches the page as the reason, the socket survives it."""
+
+    def refused(*args: Any) -> None:
+        request = httpx.Request("PUT", "https://x")
+        raise httpx.HTTPStatusError("no", request=request, response=httpx.Response(403, request=request))
+
+    monkeypatch.setattr(W, "edit_message", refused)
+    ws = await _following(act_board, T)
+    answer = await act_board.act(ws, "edit", {"edit": T, "msg": "2", "text": "x"})
+    assert answer == {"edit": T, "msg": "2", "error": "Teams answered 403"}
+
+
+async def test_action_verbs_over_the_socket(
+    act_board: W.Board, settings: Settings, calls: list[tuple[Any, ...]]
+) -> None:
+    """011-AC11..AC14: each verb answers the asking socket only, in `{verb: thread, msg, ok|error}` shape."""
+    async with _served(act_board, settings) as host, _chat_socket(host) as chat, _chat_socket(host) as other:
+        await other.send(json.dumps({"follow": T}))
+        await other.recv()
+        await chat.send(json.dumps({"follow": T}))
+        await chat.recv()
+        await chat.send(json.dumps({"react": T, "msg": "1", "key": "laugh", "remove": False}))
+        assert json.loads(await asyncio.wait_for(chat.recv(), 2)) == {"react": T, "msg": "1", "ok": True}
+        await chat.send(json.dumps({"edit": T, "msg": "1", "text": "x"}))
+        assert json.loads(await asyncio.wait_for(chat.recv(), 2)) == {
+            "edit": T,
+            "msg": "1",
+            "error": "not your message",
+        }
+        await chat.send(json.dumps({"delete": T, "msg": "2"}))
+        assert json.loads(await asyncio.wait_for(chat.recv(), 2)) == {"delete": T, "msg": "2", "ok": True}
+        await chat.send(json.dumps({"send": T, "text": "re", "quote": ["2"]}))
+        assert json.loads(await asyncio.wait_for(chat.recv(), 2)) == {"sent": T, "ok": True}
+        await _silent(other)
+    assert [c[0] for c in calls] == ["react", "delete", "send"]
+    assert calls[-1][2] == _block("2", ME, "Me Self", "mine") + "re"
+
+
+async def test_server_copy_survives_a_broken_archive(
+    act_board: W.Board, monkeypatch: pytest.MonkeyPatch, calls: list[tuple[Any, ...]]
+) -> None:
+    """011-AC11: a corrupt row or a corrupt messages.db counts as "not archived": the API page decides."""
+    chat_dir = find_chat_dir(act_board.data_dir, T)  # type: ignore[arg-type]
+    assert chat_dir is not None
+    db = sqlite3.connect(chat_dir / "messages.db")
+    with db:
+        db.execute("INSERT INTO messages (id, composetime, raw) VALUES ('8', ?, '{bad')", (_at(8),))
+    db.close()
+    ws = await _following(act_board, T)
+    assert await act_board.send(T, "x", ws, ["8"]) == "unknown quoted message"
+    (chat_dir / "messages.db").write_bytes(b"not a database" * 100)
+    for leftover in chat_dir.glob("messages.db-*"):
+        leftover.unlink()
+    monkeypatch.setattr(W, "fetch_history", lambda *a: [_m("2", _at(2))])
+    assert await act_board.send(T, "x", ws, ["2"]) is None
+    assert [c[0] for c in calls] == ["history", "send"]
+
+
+async def test_actions_without_a_connection(act_board: W.Board, calls: list[tuple[Any, ...]]) -> None:
+    """011-AC12..AC14: no Teams session: refused, nothing called."""
+    act_board.directory = None
+    ws = await _following(act_board, T)
+    assert (await act_board.act(ws, "delete", {"delete": T, "msg": "2"}))["error"] == "not connected"
+    assert await act_board.send(T, "x", ws, ["2"]) == "not connected"
+    assert calls == []
+
+
+async def test_edit_and_delete_refuse_my_deleted_or_non_text_messages(
+    act_board: W.Board, calls: list[tuple[Any, ...]]
+) -> None:
+    """011-AC13 + 011-AC14: the server's copy must be a live text message of mine to edit, live to delete."""
+    ws = await _following(act_board, T)
+    for verb, msg, error in (
+        ("edit", "4", "message deleted"),
+        ("delete", "4", "message deleted"),
+        ("edit", "5", "cannot edit this message"),
+    ):
+        answer = await act_board.act(ws, verb, {verb: T, "msg": msg, "text": "x"})
+        assert answer.get("error") == error, (verb, msg)
+    assert (await act_board.act(ws, "delete", {"delete": T, "msg": "5"}))["ok"]  # a file post of mine goes
+    assert _writes(calls) == [("delete", T, "5")]
+
+
+async def test_quote_refuses_non_text_or_sender_less_messages(
+    act_board: W.Board, calls: list[tuple[Any, ...]]
+) -> None:
+    """011-AC11: a file post or a system event cannot be quoted; nothing is posted."""
+    ws = await _following(act_board, T)
+    for ids in (["5"], ["6"], ["1", "6"]):
+        assert await act_board.send(T, "x", ws, ids) == "cannot quote this message", ids
+    assert calls == []
+
+
+async def test_one_message_action_in_flight_per_socket(
+    act_board: W.Board, settings: Settings, monkeypatch: pytest.MonkeyPatch, calls: list[tuple[Any, ...]]
+) -> None:
+    """011-AC12..AC14: while one action runs, another action or a quoted send on that socket answers
+    `busy`; a plain send and another socket are not held."""
+    entered, release = threading.Event(), threading.Event()
+    real = W.react
+
+    def held(*args: Any, **kw: Any) -> Any:
+        entered.set()
+        release.wait(5)
+        return real(*args, **kw)
+
+    monkeypatch.setattr(W, "react", held)
+    async with _served(act_board, settings) as host, _chat_socket(host) as chat, _chat_socket(host) as other:
+        for ws in (chat, other):
+            await ws.send(json.dumps({"follow": T}))
+            await ws.recv()
+        await chat.send(json.dumps({"react": T, "msg": "1", "key": "like", "remove": False}))
+        assert await asyncio.to_thread(entered.wait, 5)
+        await chat.send(json.dumps({"delete": T, "msg": "2"}))
+        assert json.loads(await asyncio.wait_for(chat.recv(), 2)) == {
+            "delete": T,
+            "msg": "2",
+            "error": "busy",
+        }
+        await chat.send(json.dumps({"edit": T, "msg": "2", "text": "x"}))
+        assert json.loads(await asyncio.wait_for(chat.recv(), 2)) == {"edit": T, "msg": "2", "error": "busy"}
+        await chat.send(json.dumps({"send": T, "text": "q", "quote": ["1"]}))
+        assert json.loads(await asyncio.wait_for(chat.recv(), 2)) == {"sent": T, "error": "busy"}
+        await chat.send(json.dumps({"send": T, "text": "plain"}))
+        assert json.loads(await asyncio.wait_for(chat.recv(), 2)) == {"sent": T, "ok": True}
+        await other.send(json.dumps({"delete": T, "msg": "2"}))
+        assert json.loads(await asyncio.wait_for(other.recv(), 2)) == {"delete": T, "msg": "2", "ok": True}
+        release.set()
+        assert json.loads(await asyncio.wait_for(chat.recv(), 2)) == {"react": T, "msg": "1", "ok": True}
+        await chat.send(json.dumps({"delete": T, "msg": "2"}))  # released: the next one runs
+        assert json.loads(await asyncio.wait_for(chat.recv(), 2)) == {"delete": T, "msg": "2", "ok": True}
+    assert _writes(calls) == [
+        ("send", T, "plain", {}),
+        ("delete", T, "2"),
+        ("react", T, "1", "like", False),
+        ("delete", T, "2"),
+    ]

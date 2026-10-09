@@ -36,8 +36,9 @@ from playwright.async_api import Browser, BrowserContext, Page, Route, async_pla
 
 pytestmark = pytest.mark.browser
 # test_web_chat's fixtures; `board` builds on this module's `data_dir`.
-board, launched, quiet_directory, sent = (
+board, calls, launched, quiet_directory, sent = (
     test_web_chat.board,
+    test_web_chat.calls,
     test_web_chat.launched,
     test_web_chat.quiet_directory,
     test_web_chat.sent,
@@ -253,7 +254,7 @@ async def test_open_in_teams_with_opener_runs_it(
     await _until(launched, 1)
     first = page.locator(".msg").first
     await first.hover()
-    await first.locator(".actions button").click()
+    await first.locator(".actions [data-act=teams]").click()
     await _until(launched, 2)
     scheme = board.open_scheme
     assert launched == [("xdg-open", W.deep_link(T, "3", scheme)), ("xdg-open", W.deep_link(T, "1", scheme))]
@@ -322,9 +323,10 @@ async def test_edit_during_the_history_read_is_applied_after_it(
 async def test_newer_page_reloads_the_tab_and_keeps_the_draft(
     board: W.Board, chat: Pages, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A newer chat.html reloads the open tab; the composer draft survives it (no AC)."""
+    """A newer chat.html reloads the open tab; the composer draft, quotes included, survives it (no AC)."""
     page = await chat.open(_chat(T))
-    await _handled(page, "follow")
+    await _handled(page, "history")
+    await page.locator('[data-id="1"] [data-act=reply]').dispatch_event("click")
     await page.locator("#reply").fill("half-written\nreply")
     await page.evaluate("window.__same = 1")
     monkeypatch.setattr(W, "page_version", lambda name="widget.html": "newer")
@@ -332,6 +334,7 @@ async def test_newer_page_reloads_the_tab_and_keeps_the_draft(
         await _drop(board)
     assert await page.evaluate("window.__same") is None
     assert await page.locator("#reply").input_value() == "half-written\nreply"
+    assert await page.locator("#quotes .quote").evaluate_all("qs => qs.map(q => q.dataset.quote)") == ["1"]
     assert await page.evaluate("sessionStorage.length") == 0
 
 
@@ -378,6 +381,313 @@ async def test_follow_error_is_not_overwritten_by_the_history_error(
     await _handled(page, "history")
     assert await page.locator("#note").inner_text() == "unknown chat"
     assert await page.locator("#teams").is_disabled()
+
+
+# --- message actions (011 phase 4) ---
+
+
+def _act(page: Page, msg_id: str, act: str) -> Any:
+    return page.locator(f'[data-id="{msg_id}"] [data-act={act}]')
+
+
+async def _quote_ids(page: Page) -> list[str]:
+    return list(await page.locator("#quotes .quote").evaluate_all("qs => qs.map(q => q.dataset.quote)"))
+
+
+async def test_reply_builds_the_quote_list_and_sends_it(
+    board: W.Board, chat: Pages, calls: list[tuple[Any, ...]]
+) -> None:
+    """011-AC11: Reply adds author + first line above the composer, once per message, ✕ drops one;
+    Enter sends the ids in the order picked and clears the list on success; the echo shows the quotes."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    for msg_id in ("3", "1", "3"):  # quoting one already there does nothing
+        await page.locator(f'[data-id="{msg_id}"]').hover()
+        await _act(page, msg_id, "reply").click()
+    assert await _quote_ids(page) == ["3", "1"]
+    first = page.locator("#quotes .quote").nth(1)
+    assert await first.locator("b").inner_text() == "Ann Lee"
+    assert await first.locator("span").inner_text() == "hello there"
+    await page.locator("#quotes .quote").first.locator("button").click()
+    assert await _quote_ids(page) == ["1"]
+    await page.locator('[data-id="2"]').hover()
+    await _act(page, "2", "reply").click()
+    await page.locator("#reply").fill("answer")
+    await page.locator("#reply").press("Enter")
+    await page.wait_for_function("document.getElementById('quotes').hidden")
+    assert [c[:2] for c in calls] == [("send", T)]
+    assert calls[0][2].count("<blockquote") == 2
+    assert calls[0][2].index('itemid="1"') < calls[0][2].index('itemid="2"')
+    mine = {"from": f"https://h/v1/users/ME/contacts/{ME}", "imdisplayname": "Me Self"}
+    await board.on_event(_event("NewMessage", T, **_m("9", _at(9), calls[0][2], **mine)))
+    quoted = page.locator('[data-id="9"] .html blockquote.reply')
+    await quoted.first.wait_for()
+    assert await quoted.locator("strong").all_inner_texts() == ["Ann Lee", "Ann Lee"]
+
+
+async def test_quote_list_stops_at_ten(chat: Pages) -> None:
+    """011-AC11: an eleventh quote is not added and says why."""
+    page = await chat.open(_chat(L))
+    await _handled(page, "history")
+    for i in range(10, 21):
+        await _act(page, str(i), "reply").dispatch_event("click")
+    assert await _quote_ids(page) == [str(i) for i in range(10, 20)]
+    assert await page.locator("#err").inner_text() == "10 quotes at most"
+
+
+async def test_react_toggles_my_reaction(board: W.Board, chat: Pages, calls: list[tuple[Any, ...]]) -> None:
+    """011-AC12: the picker offers the 8 keys; one I already gave is sent with `remove: true`."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    await page.locator('[data-id="1"]').hover()
+    await _act(page, "1", "react").click()
+    picker = page.locator('[data-id="1"] .picker')
+    assert await picker.locator("button").evaluate_all("bs => bs.map(b => b.dataset.key)") == list(W.EMOJI)
+    await picker.locator("[data-key=like]").click()
+    await _until(calls, 1)
+    mine = {"emotions": [{"key": "like", "users": [{"mri": ME}]}]}
+    partial = {k: v for k, v in _m("1", _at(1)).items() if k != "content"}
+    await board.on_event(_event("MessageUpdate", T, **{**partial, "properties": mine}))
+    await page.wait_for_selector('[data-id="1"] .reacts span.mine')
+    await page.locator('[data-id="1"]').hover()
+    await _act(page, "1", "react").click()
+    await page.locator('[data-id="1"] .picker [data-key=like]').click()
+    await _until(calls, 2)
+    assert calls == [("react", T, "1", "like", False), ("react", T, "1", "like", True)]
+
+
+async def test_edit_and_delete_only_on_my_messages(chat: Pages) -> None:
+    """011-AC13 + 011-AC14: Edit and Delete show on my message only; Reply and React on every one."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    for act, owners in (
+        ("edit", ["3"]),
+        ("delete", ["3"]),
+        ("reply", ["1", "2", "3"]),
+        ("react", ["1", "2", "3"]),
+    ):
+        found = await page.locator(f".msg:has([data-act={act}])").evaluate_all(
+            "ns => ns.map(n => n.dataset.id)"
+        )
+        assert found == owners, act
+
+
+async def test_edit_escape_cancels_enter_saves_errors_stay_inline(
+    chat: Pages, calls: list[tuple[Any, ...]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC13: the body turns into its plain text; Escape restores it, Enter saves once, a refusal
+    shows under the field with the text kept."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    await page.locator('[data-id="3"]').hover()
+    await _act(page, "3", "edit").click()
+    box = page.locator('[data-id="3"] .editor')
+    assert await box.input_value() == "mine"
+    await page.locator("#reply").hover()
+    assert await page.locator('[data-id="3"] .actions').is_hidden()  # no bar over an open editor
+    await box.press("Escape")
+    assert await page.locator('[data-id="3"] .editor').count() == 0
+    assert await page.locator('[data-id="3"] .html').inner_text() == "mine"
+    await page.locator('[data-id="3"]').hover()
+    await _act(page, "3", "edit").click()
+    await box.fill("mine v2")
+    await box.press("Shift+Enter")
+    await box.press_sequentially("more")
+    await box.press("Enter")
+    await page.wait_for_selector('[data-id="3"] .html')  # the ack closes the editor
+    assert calls == [("edit", T, "3", "mine v2\nmore")]
+
+    monkeypatch.setattr(W, "edit_message", _refused)
+    await page.locator('[data-id="3"]').hover()
+    await _act(page, "3", "edit").click()
+    await box.fill("kept")
+    await box.press("Enter")
+    await page.wait_for_function("document.querySelector('[data-id=\"3\"] .edit-err')?.textContent")
+    assert await page.locator('[data-id="3"] .edit-err').inner_text() == "Teams answered 403"
+    assert await box.input_value() == "kept"
+    assert not await box.is_disabled()
+
+
+async def test_delete_asks_first(chat: Pages, calls: list[tuple[Any, ...]]) -> None:
+    """011-AC14: a dismissed confirm sends nothing; an accepted one sends `delete` once."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    for accept in (False, True):
+        page.once("dialog", lambda d, accept=accept: d.accept() if accept else d.dismiss())
+        since = await _frames(page)
+        await page.locator('[data-id="3"]').hover()
+        await _act(page, "3", "delete").click()
+        if accept:
+            await _handled(page, "delete", since)
+    assert calls == [("delete", T, "3")]
+
+
+_MINE = {"from": f"https://h/v1/users/ME/contacts/{ME}", "imdisplayname": "Me Self"}
+
+
+def _refused(*args: Any) -> None:
+    request = httpx.Request("PUT", "https://x")
+    raise httpx.HTTPStatusError("no", request=request, response=httpx.Response(403, request=request))
+
+
+async def _edit(page: Page, msg_id: str) -> Any:
+    await page.locator(f'[data-id="{msg_id}"]').hover()
+    await _act(page, msg_id, "edit").click()
+    return page.locator(f'[data-id="{msg_id}"] .editor')
+
+
+async def test_edit_starts_from_the_text_without_its_reply_quote(board: W.Board, chat: Pages) -> None:
+    """011-AC13: quotes are lost on edit: the field holds only what I wrote."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    body = W.reply_quote(_m("1", _at(1), "<p>hello there</p>"), "Ann Lee") + "<p>my answer</p><p>second</p>"
+    await board.on_event(_event("NewMessage", T, **_m("9", _at(9), body, **_MINE)))
+    await page.wait_for_selector('[data-id="9"] blockquote.reply')
+    assert await (await _edit(page, "9")).input_value() == "my answer\n\nsecond"
+
+
+async def test_live_frames_during_an_edit(board: W.Board, chat: Pages) -> None:
+    """011-AC7 + 011-AC13: an edit frame neither closes the editor nor reads as its ack, Escape then shows
+    the new body; a delete echo closes the editor on the deleted message."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    box = await _edit(page, "3")
+    await box.fill("draft")
+    since = await _frames(page)
+    edited = {"edittime": "1789466500000"}
+    await board.on_event(
+        _event("MessageUpdate", T, **_m("3", _at(3), "<p>mine v3</p>", properties=edited, **_MINE))
+    )
+    await _handled(page, "edit", since)
+    assert await box.input_value() == "draft"
+    assert (await page.locator("#err").inner_text(), await page.locator(".edit-err").inner_text()) == ("", "")
+    await box.press("Escape")
+    assert await page.locator('[data-id="3"] .html').inner_text() == "mine v3"
+    assert await page.locator('[data-id="3"] .edited').count() == 1
+    box = await _edit(page, "3")
+    gone = {"deletetime": "1789466600000"}
+    await board.on_event(
+        _event("MessageUpdate", T, **{**_m("3", _at(3), "x", **_MINE), "content": "", "properties": gone})
+    )
+    await page.wait_for_selector('[data-id="3"].deleted')
+    assert await page.locator(".editor").count() == 0
+    assert await _act(page, "3", "edit").count() == 0
+
+
+async def test_an_open_editor_survives_a_reload_of_the_page_of_messages(
+    board: W.Board, chat: Pages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC13: after a reconnect the editor comes back with its text, or says it is lost."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    await (await _edit(page, "3")).fill("kept across")
+    since = await _frames(page)
+    await _drop(board)
+    await _handled(page, "history", since)
+    assert await page.locator('[data-id="3"] .editor').input_value() == "kept across"
+    real_read = W.read_page
+    monkeypatch.setattr(W, "read_page", lambda *a: ([m for m in real_read(*a)[0] if m["id"] != "3"], False))
+    since = await _frames(page)
+    await _drop(board)
+    await _handled(page, "history", since)
+    assert await page.locator(".editor").count() == 0
+    assert await page.locator("#err").inner_text() == "edit lost: the message is no longer shown"
+
+
+async def test_a_save_cut_by_a_reconnect_can_be_retried_and_the_composer_keeps_focus(
+    board: W.Board, chat: Pages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC13: a save whose answer died with the socket says so and can be sent again; restoring the
+    editor does not take the focus from the composer."""
+    entered, release = threading.Event(), threading.Event()
+    saved: list[str] = []
+
+    def first_held(*args: Any) -> dict[str, Any]:
+        saved.append(args[-1])
+        if len(saved) == 1:
+            entered.set()
+            release.wait(5)
+        return {"status": 200}
+
+    monkeypatch.setattr(W, "edit_message", first_held)
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    box = await _edit(page, "3")
+    await box.fill("first try")
+    await box.press("Enter")
+    assert await asyncio.to_thread(entered.wait, 5)
+    await page.locator("#reply").focus()
+    since = await _frames(page)
+    await _drop(board)
+    await _handled(page, "history", since)
+    release.set()
+    assert await page.evaluate("document.activeElement.id") == "reply"
+    assert await box.input_value() == "first try"
+    assert await page.locator('[data-id="3"] .edit-err').inner_text() == (
+        "connection lost: check the message before saving again"
+    )
+    await box.fill("second try")
+    await box.press("Enter")
+    await page.wait_for_selector('[data-id="3"] .html')
+    assert saved == ["first try", "second try"]
+
+
+async def test_escape_during_a_save_then_its_failure_lands_on_the_composer_line(
+    chat: Pages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC13: the field stays usable while saving; a failure with no editor left still shows."""
+    entered, release = threading.Event(), threading.Event()
+
+    def held(*args: Any) -> None:
+        entered.set()
+        release.wait(5)
+        _refused()
+
+    monkeypatch.setattr(W, "edit_message", held)
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    box = await _edit(page, "3")
+    await box.fill("try")
+    await box.press("Enter")
+    assert await asyncio.to_thread(entered.wait, 5)
+    assert not await box.is_disabled()
+    await box.press("Escape")
+    assert await page.locator(".editor").count() == 0
+    release.set()
+    await page.wait_for_function("document.getElementById('err').textContent !== ''")
+    assert await page.locator("#err").inner_text() == "edit: Teams answered 403"
+
+
+async def test_actions_reachable_from_the_keyboard_and_picker_closes(chat: Pages) -> None:
+    """011-AC12: a message reached by Tab shows its actions, Tab reaches labelled buttons, a click does
+    not pin the bar; the picker closes when the pointer leaves the message and on Escape."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    for _ in range(5):  # Tab, not focus(): the bar follows keyboard focus (focus-visible) only
+        await page.keyboard.press("Tab")
+        if await page.evaluate("document.activeElement.dataset.id") == "1":
+            break
+    assert await page.locator('[data-id="1"] .actions').is_visible()
+    await page.keyboard.press("Tab")
+    focused = await page.evaluate("[document.activeElement.dataset.act, document.activeElement.ariaLabel]")
+    assert focused == ["reply", "reply with quote"]
+    await page.keyboard.press("Tab")
+    await page.keyboard.press("Enter")
+    picker = page.locator('[data-id="1"] .picker')
+    assert await picker.is_visible()
+    assert await picker.locator("[data-key=like]").get_attribute("aria-label") == "like"
+    await page.keyboard.press("Escape")
+    assert await picker.is_hidden()
+    await page.locator("#reply").click()  # keyboard focus left the bar; the mouse path starts clean
+    await page.locator('[data-id="1"]').hover()
+    await _act(page, "1", "react").click()
+    assert await picker.is_visible()
+    await page.locator("#reply").hover()
+    assert await picker.is_hidden()
+    assert await page.locator('[data-id="1"] .actions').is_hidden()  # a clicked button does not pin it
+    await page.locator('[data-id="2"] .html').click()  # a click focuses the message, not its bar
+    await page.locator("#reply").hover()
+    assert await page.locator('[data-id="2"] .actions').is_hidden()
 
 
 # --- widget middle click (011 phase 3) ---
@@ -499,10 +809,17 @@ async def test_middle_click_chat_setting_opens_the_chat_page(widget: Widget, bro
         assert await widget.act(lambda: page.locator("a.name").click(button="middle")) == ([(T, "chat")], [])
     else:
         assert await widget.opens_tab(widget.base + _chat(T), button="middle") == []
-    # A browser that also fires `click` for button 1 must not add a verb or a second tab.
+    # A browser that also fires `click` for button 1 must not add a verb or a second tab. dispatchEvent
+    # returns false only when the default (the link's own tab) was prevented: no tab can come later.
     script = "new MouseEvent('click', {button: 1, bubbles: true, cancelable: true})"
     dispatch = f"document.querySelector('a.name').dispatchEvent({script})"
-    assert await widget.act(lambda: page.evaluate(dispatch)) == ([], [])
+    dispatched: list[bool] = []
+
+    async def click() -> None:
+        dispatched.append(await page.evaluate(dispatch))
+
+    assert await widget.act(click) == ([], [])
+    assert dispatched == [False]
 
 
 @pytest.mark.parametrize("setting", ["teams", "chat"])
