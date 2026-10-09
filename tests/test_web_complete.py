@@ -18,7 +18,7 @@ from miniteams.directory import Directory
 
 ELO = "8:orgid:00000000-0000-0000-0000-00000000000d"
 BOT = "28:00000000-0000-0000-0000-0000000000ee"
-TRIO = "19:trio0000@thread.v2"  # me, Ann and a bot: two humans
+TRIO = "19:trio0000@thread.v2"  # group of me, Ann and a bot: two humans
 DUO = "19:00000000-0000-0000-0000-00000000000a_00000000-0000-0000-0000-00000000000b@unq.gbl.spaces"
 OID = "0-weu-d1-feedc0ffee"
 MENTION = "http://schema.skype.com/Mention"
@@ -574,12 +574,17 @@ async def test_a_closed_page_does_not_cancel_the_shared_fetch(
     assert (await second)["items"] == [{"name": "Ann Lee", "mri": ANN}]
 
 
-async def test_everyone_counts_humans_only(board: W.Board, sent: list[Any]) -> None:
-    """Me, Ann and a bot: three members, two people, so no everyone."""
-    assert (await _complete(board, "member", "", TRIO))["items"] == [{"name": "Ann Lee", "mri": ANN}]
+async def test_everyone_on_any_group_whatever_its_size(board: W.Board, sent: list[Any]) -> None:
+    """As the Teams client: a group of two people (me, Ann, a bot) offers and accepts everyone."""
+    assert (await _complete(board, "member", "", TRIO))["items"] == [
+        {"name": "everyone", "mri": TRIO, "everyone": True},
+        {"name": "Ann Lee", "mri": ANN},
+    ]
     everyone = [{"name": "everyone", "mri": TRIO, "everyone": True}]
-    assert await board.send(TRIO, "@everyone hi", None, None, everyone) == "unknown mention"
-    assert sent == []
+    assert await board.send(TRIO, "@everyone hi", None, None, everyone) is None
+    [(thread, body, kw)] = sent
+    assert thread == TRIO and body.endswith('itemid="0">Everyone</span> hi')
+    assert json.loads(kw["properties"]["mentions"])[0]["mentionType"] == "everyone"
 
 
 async def test_mention_names_come_from_the_roster(board: W.Board, sent: list[Any]) -> None:

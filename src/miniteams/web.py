@@ -959,7 +959,7 @@ class Board:
     async def _resolved(self, thread_id: str, mentions: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
         """The mentions with the roster's name as `label`; None when one is not a human of the thread
         (or everyone of a group), or its typed name is not that member's."""
-        from .mcp import _fold
+        from .mcp import _fold, chat_kind
 
         members = await self._members(thread_id)
         if members is None:
@@ -969,7 +969,7 @@ class Board:
         for m in mentions:
             if m.get("everyone"):
                 name = m["name"]
-                ok = m["mri"] == thread_id and len(humans) > 2 and _fold(name) == "everyone"
+                ok = m["mri"] == thread_id and chat_kind(thread_id) != "private" and _fold(name) == "everyone"
             else:
                 name = humans.get(m["mri"], "")
                 ok = bool(name) and _fold(name) == _fold(m["name"])
@@ -1835,11 +1835,12 @@ def _humans(members: list[dict[str, Any]]) -> dict[str, str]:
 def _member_items(humans: dict[str, str], thread_id: str, me: str, q: str) -> list[dict[str, Any]]:
     """Humans but me whose full, first or last name starts with `q` (accents folded); everyone first
     on groups."""
-    from .mcp import _fold
+    from .mcp import _fold, chat_kind
 
     prefix = _fold(q)
     items: list[dict[str, Any]] = []
-    if len(humans) > 2 and "everyone".startswith(prefix):
+    # As the Teams client: every chat but a 1:1 has everyone, whatever its member count.
+    if chat_kind(thread_id) != "private" and "everyone".startswith(prefix):
         items.append({"name": "everyone", "mri": thread_id, "everyone": True})
     for mri, name in humans.items():
         folded = _fold(name)

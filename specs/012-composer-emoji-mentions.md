@@ -29,7 +29,7 @@ the person (or everyone) is notified and the name shows highlighted in Teams, as
   custom image (`emojis.py` download cache, `~/.cache/miniteams/emojis/`, fetched on first use,
   404 when unknown). Member items: `{name, mri}` from the thread roster (`Directory` roster,
   members only, bots left out, me left out), plus `{name: "everyone", mri: "<thread>",
-  everyone: true}` first when the thread has more than two members; prefix match on first name,
+  everyone: true}` first on group chats (any size, as the Teams client offers it; never on a 1:1); prefix match on first name,
   last name and full name, accents ignored.
 - **Page.** A popup under the caret opens on `:` followed by 2+ `[a-z0-9_+-]` characters, or on
   `@` followed by 0+ characters; ↑/↓ move, Enter/Tab insert, Escape closes, any other key filters.
@@ -153,7 +153,8 @@ None.
 - Formatting split by composer (babs, 2026-10-09; WYSIWYG may come later): light inline markdown in the
   widget, full subset + toolbar + preview in the chat view. Converted on the server so both
   composers and the preview share one function.
-- `@everyone` included in the completion (babs, 2026-10-09), listed first on groups only: a 1:1
+- `@everyone` offered on every group chat whatever its size, as the Teams client does (babs,
+  2026-10-09; first rule was "more than two members"). Listed first on groups only: a 1:1
   has no everyone in Teams.
 - Mentions resolved server-side from a `{name, mri}` list the page sends, not from caret offsets:
   offsets drift with every edit, names do not; the roster check stops a page from mentioning an
