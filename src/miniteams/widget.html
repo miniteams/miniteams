@@ -121,6 +121,11 @@
   #reply:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
   #reply:disabled { opacity: .6; }
   .composer small { display: block; color: var(--hot); font-size: 12px; margin-top: 2px; }
+  #pop { position: absolute; z-index: 4; min-width: 180px; max-width: 280px; max-height: 240px; overflow-y: auto; padding: 4px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); }
+  #pop [role=option] { display: flex; align-items: center; gap: 8px; padding: 3px 8px; border-radius: 6px; cursor: pointer; }
+  #pop [aria-selected=true] { background: var(--accent-soft); color: var(--accent); }
+  #pop img, #pop .ch { width: 20px; height: 20px; flex: none; text-align: center; }
   #empty { padding: 2em; text-align: center; color: var(--dim); }
   /* Still filling in from the live listing: the rows on screen come from the local archive. */
   .spin { position: fixed; right: 14px; bottom: 14px; width: 16px; height: 16px; border-radius: 50%;
@@ -359,21 +364,122 @@
     $empty.hidden = shown.length > 0;
   };
 
-  const $composer = el("li", "composer"), $reply = el("textarea"), $err = el("small");
+  const $composer = el("li", "composer"), $reply = el("textarea"), $err = el("small"), $pop = el("div");
   $reply.id = "reply"; $reply.rows = 1; $reply.placeholder = "reply · Enter sends, Shift+Enter new line";
   $reply.setAttribute("aria-label", "reply");
-  $composer.append($reply, $err);
+  $pop.id = "pop"; $pop.hidden = true; $pop.setAttribute("role", "listbox");
+  $pop.onmousedown = (e) => e.preventDefault();  // its scrollbar too: a press there must not blur the textarea
+  for (const [k, v] of [["role", "combobox"], ["aria-autocomplete", "list"], ["aria-controls", "pop"], ["aria-expanded", "false"]]) $reply.setAttribute(k, v);
+  $composer.append($reply, $pop, $err);
   const grow = () => { $reply.style.height = "auto"; $reply.style.height = $reply.scrollHeight + 2 + "px"; };
+
+  // `:` / `@` completion (spec 012): the server answers {complete, q, items}; only the answer to the
+  // latest question counts, an older one arriving late would list the wrong names.
+  let comp = null, want = null, timer = 0, dismissed = -1;
+  const picked = new Map();  // chat id → Map(name → {name, mri, everyone?}): the mentions picked in its draft
+  const token = () => {
+    const at = $reply.selectionStart;
+    if (at !== $reply.selectionEnd) return null;
+    // Word start only: `10:30` and `me@host` must not ask anything. One inner space reaches a last name
+    // (`@ann l`); an inserted `@Ann Lee ` ends in a second one, so it never asks again.
+    // Emoji first: the member pattern's inner space would let `@ann :fi` read as one name.
+    const before = $reply.value.slice(0, at), e = /(?:^|\s):([a-z0-9_+-]{2,})$/i.exec(before);
+    const m = e || /(?:^|\s)@([^\s@]*(?: [^\s@]*)?)$/.exec(before);
+    return m && { kind: e ? "emoji" : "member", q: m[1], start: at - m[1].length - 1 };
+  };
+  // A textarea exposes no caret coordinates: lay the text before the caret out in a hidden copy.
+  const caret = () => {
+    const cs = getComputedStyle($reply), copy = el("div", null, $reply.value.slice(0, $reply.selectionStart)), mark = el("span", null, "\u200b");
+    for (const k of ["font", "padding", "border", "boxSizing", "lineHeight", "letterSpacing", "tabSize", "width"]) copy.style[k] = cs[k];
+    Object.assign(copy.style, { position: "absolute", visibility: "hidden", whiteSpace: "pre-wrap", overflowWrap: "break-word", top: 0, left: 0 });
+    copy.append(mark); document.body.append(copy);
+    const xy = [mark.offsetLeft, mark.offsetTop + mark.offsetHeight];
+    copy.remove();
+    return xy;
+  };
+  const renderPop = () => {
+    $pop.hidden = !comp;
+    $reply.setAttribute("aria-expanded", String(!!comp));
+    if (!comp) { $pop.replaceChildren(); $reply.removeAttribute("aria-activedescendant"); return; }
+    $pop.setAttribute("aria-label", comp.kind === "emoji" ? "emoji" : "members");
+    $pop.replaceChildren(...comp.items.map((it, i) => {
+      const o = el("div");
+      o.id = "pop-" + i; o.setAttribute("role", "option"); o.setAttribute("aria-selected", String(i === comp.active));
+      if (comp.kind === "emoji") {
+        // Images only from our own /emoji/ route: the item comes over the socket, the page trusts no URL.
+        const own = it.custom && /^\/emoji\/[\w-]+$/.test(it.src || "");
+        o.append(own ? Object.assign(el("img"), { src: it.src, alt: "" }) : el("span", "ch", it.custom ? "" : it.char));
+      }
+      o.append(el("span", "truncate", comp.kind === "emoji" ? `:${it.name}:` : it.name));
+      o.onclick = () => { const t = live(); if (t && t.q === comp.q) { comp.active = i; insert(t); } };
+      return o;
+    }));
+    $reply.setAttribute("aria-activedescendant", "pop-" + comp.active);
+    const [x, y] = caret();
+    $pop.style.top = $reply.offsetTop + y - $reply.scrollTop + "px";
+    $pop.style.left = $reply.offsetLeft + Math.max(0, Math.min(x, $reply.offsetWidth - $pop.offsetWidth)) + "px";
+    document.getElementById("pop-" + comp.active).scrollIntoView({ block: "nearest" });
+  };
+  const closePop = () => { clearTimeout(timer); want = null; comp = null; renderPop(); };
+  const lookup = () => {
+    clearTimeout(timer); want = null;
+    const t = token();
+    if (!t || t.start === dismissed) { if (!t) dismissed = -1; comp = null; renderPop(); return; }
+    timer = setTimeout(() => {
+      // No socket or no answer: drop the list, or Enter would wait forever on a prefix nobody answers.
+      if (!(ws && ws.readyState === 1)) { closePop(); return; }
+      want = t; send({ complete: t.kind, q: t.q, thread: replyTo });
+      timer = setTimeout(closePop, 2000);
+    }, 120);
+  };
+  const answered = (msg) => {
+    if (!want || msg.complete !== want.kind || msg.q !== want.q) return;
+    clearTimeout(timer);
+    // A malformed item would throw mid-render and leave the list stuck open.
+    const items = Array.isArray(msg.items) && !msg.error ? msg.items.filter((it) => it && typeof it.name === "string").slice(0, 12) : [];
+    comp = items.length ? { ...want, items, active: 0 } : null;
+    renderPop();
+  };
+  // The word the open list answers, or null once the caret left it.
+  const live = () => { const t = token(); return t && t.start === comp.start && t.kind === comp.kind ? t : null; };
+  const insert = (t) => {
+    const it = comp.items[comp.active], kind = comp.kind;
+    $reply.setRangeText(kind === "member" ? `@${it.name} ` : it.custom ? `:${it.name}:` : it.char, t.start, $reply.selectionStart, "end");
+    if (kind === "member") {
+      if (!picked.has(replyTo)) picked.set(replyTo, new Map());
+      picked.get(replyTo).set(it.name, { name: it.name, mri: it.mri, ...(it.everyone ? { everyone: true } : {}) });
+    }
+    closePop();
+    if (kind === "member") dismissed = t.start;  // `@everyone ` + the next word must not ask `everyone t`…
+    drafts.set(replyTo, $reply.value);
+    grow();
+  };
+  // Enter with the list open picks, never sends; true when the key was the list's. While a longer
+  // prefix is still being asked, the list on screen answers a shorter one: Enter/Tab wait for it.
+  const popKey = (e) => {
+    const n = comp.items.length;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") { comp.active = (comp.active + (e.key === "ArrowDown" ? 1 : n - 1)) % n; renderPop(); }
+    else if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
+      const t = live();
+      if (!t) { closePop(); return false; }  // caret left the word: the key is the textarea's again
+      if (t.q === comp.q) insert(t);
+    }
+    else if (e.key === "Escape") { dismissed = comp.start; closePop(); }
+    else return false;
+    return true;
+  };
+
   const openReply = (id) => {
     replyTo = sel = id;
     $reply.value = drafts.get(id) || "";
+    dismissed = -1; closePop();
     render();
     if (!$composer.isConnected) return;
     grow();
     $reply.focus();
     $reply.setSelectionRange($reply.value.length, $reply.value.length);
   };
-  const closeReply = () => { replyTo = ""; render(); $q.focus(); };
+  const closeReply = () => { replyTo = ""; closePop(); render(); $q.focus(); };
   // A failed send re-enables the field: give it the focus back unless the user moved on.
   const refocus = (id) => { if (replyTo === id && $composer.isConnected && document.activeElement === document.body) $reply.focus(); };
   const submit = () => {
@@ -381,12 +487,17 @@
     if (!text.trim() || sending.has(id)) return;
     if (!(ws && ws.readyState === 1)) { errors.set(id, "offline, not sent"); render(); return; }
     sending.add(id); errors.delete(id);
-    ws.send(JSON.stringify({ send: id, text }));
+    // Names, not offsets: a picked mention counts only while its `@Name` is still in the text.
+    const mentions = [...(picked.get(id)?.values() || [])].filter((m) => text.includes("@" + m.name));
+    ws.send(JSON.stringify({ send: id, text, mentions, format: "inline" }));
     render();
   };
-  $reply.oninput = () => { drafts.set(replyTo, $reply.value); grow(); };
+  $reply.oninput = (e) => { drafts.set(replyTo, $reply.value); grow(); if (!e.isComposing) lookup(); };
+  $reply.addEventListener("compositionend", lookup);
+  $reply.onblur = closePop;
   // Teams' keys: Enter sends, Shift+Enter breaks the line (Ctrl+Enter sends too).
   $reply.onkeydown = (e) => {
+    if (comp && !e.isComposing && e.keyCode !== 229 && popKey(e)) { e.preventDefault(); return; }
     if (e.key === "Escape") { e.preventDefault(); closeReply(); return; }
     if (e.key !== "Enter" || e.shiftKey || e.isComposing || e.keyCode === 229) return;
     e.preventDefault();
@@ -435,10 +546,11 @@
       if ("me" in msg) meName = msg.me || "";
       if ("busy" in msg) $spin.hidden = !msg.busy;
       if (msg.rows) { rows = msg.rows; render(); }
+      if (msg.complete) answered(msg);
       if (msg.sent) {
         sending.delete(msg.sent);
         if (msg.ok) {
-          drafts.delete(msg.sent); errors.delete(msg.sent);
+          drafts.delete(msg.sent); errors.delete(msg.sent); picked.delete(msg.sent);
           if (replyTo === msg.sent) { $reply.value = ""; closeReply(); } else render();
         } else { errors.set(msg.sent, msg.error || "not sent"); render(); refocus(msg.sent); }
       }
