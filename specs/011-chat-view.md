@@ -78,7 +78,8 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
   the same `around` the start of the picked day.
 - **Composer.** Same textarea rules as spec 006 (Enter sends, Shift+Enter newline, in-flight lock,
   error under the field, draft kept on failure), reusing the `send` verb. The server accepts
-  `send` for a followed thread even when it is not on the board (archived-only chats).
+  `send` for a followed thread even when it is not on the board (archived-only chats), as long as it
+  is a private, group or meeting chat: a team channel is refused (a post there reaches the whole team).
 - **Message actions**, on hover of a message, like Teams:
   - **Reply with quote** (any message): puts the quoted message above the composer (author +
     first line, ✕ to drop it). Quoting another message adds it, up to 10, in the order picked;

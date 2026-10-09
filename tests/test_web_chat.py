@@ -1,7 +1,9 @@
 """Chat view server side (spec 011 phase 1): `history`, `follow`, message records, live relay."""
 
 import asyncio
+import base64
 import contextlib
+import hashlib
 import json
 import socket
 import sqlite3
@@ -10,13 +12,14 @@ import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import pytest
 import websockets
 
 from miniteams import web as W
-from miniteams.archive_store import ChatStore, Index
+from miniteams.archive_store import ChatStore, Index, find_chat_dir
 from miniteams.config import Settings
 from miniteams.directory import Directory
 
@@ -430,7 +433,7 @@ async def test_follow_relays_messages_edits_deletes_reactions_and_typing(
     async with _served(board, settings) as host, _connect(host) as ws:
         await ws.recv()
         await ws.send(json.dumps({"follow": T}))
-        assert await _frame(ws) == {"follow": T, "ok": True}
+        assert (await _frame(ws)).items() >= {"follow": T, "ok": True}.items()
 
         new = {"id": "9", "composetime": _at(9), "messagetype": "RichText/Html", "content": "<p>new</p>"}
         await board.on_event(_event("NewMessage", T, **new))
@@ -464,7 +467,7 @@ async def test_follow_relays_only_its_thread_and_skips_noise(board: W.Board, set
     async with _served(board, settings) as host, _connect(host) as ws:
         await ws.recv()
         await ws.send(json.dumps({"follow": C}))  # an archived channel, outside the board's scope
-        assert await _frame(ws) == {"follow": C, "ok": True}
+        assert (await _frame(ws)).items() >= {"follow": C, "ok": True}.items()
         mine = f"https://h/v1/users/ME/contacts/{ME}"
         await board.on_event(
             _event("NewMessage", T, id="1", composetime=_at(1), messagetype="Text", content="x")
@@ -536,7 +539,7 @@ async def test_relay_skips_a_socket_that_does_not_follow(board: W.Board, setting
         await ws.recv()
         await idle.recv()
         await ws.send(json.dumps({"follow": T}))
-        assert await _frame(ws) == {"follow": T, "ok": True}
+        assert (await _frame(ws)).items() >= {"follow": T, "ok": True}.items()
         await board.on_event(_event("NewMessage", T, messagetype="Control/Typing"))
         await board.on_event(
             _event("NewMessage", T, id="9", composetime=_at(9), messagetype="Text", content="x")
@@ -728,4 +731,276 @@ async def test_typing_expiry_off_the_board_does_not_rebroadcast(
     board._typing_arm(C, "Ann Lee")
     await asyncio.sleep(0.15)
     assert (C, "Ann Lee") not in board._typing_timers
+    assert sent == []
+
+
+# --- phase 2: routes, chat socket, send/open on a followed chat ---
+
+
+def _media(data_dir: Path) -> Path:
+    found = find_chat_dir(data_dir, T)
+    assert found is not None
+    media = found / "media"
+    (media / f"{OBJ}.png").write_bytes(b"\x89PNG-fake")
+    return media
+
+
+def _chat_url(host: str, thread_id: str) -> str:
+    return f"http://{host}/chat/{quote(thread_id, safe='')}"
+
+
+async def test_chat_route_serves_the_page_for_board_and_archived_chats(
+    board: W.Board, settings: Settings
+) -> None:
+    """011-AC3: `/chat/<id>` is the chat page for a thread on the board or in the archive, 404 else."""
+    async with _served(board, settings) as host, httpx.AsyncClient() as client:
+        for thread_id in (T, B, C):
+            page = await client.get(_chat_url(host, thread_id))
+            assert page.status_code == 200, thread_id
+            assert page.headers["content-type"].startswith("text/html")
+            csp = page.headers["content-security-policy"]
+            script = page.text.split("<script>", 1)[1].split("</script>", 1)[0]
+            digest = base64.b64encode(hashlib.sha256(script.encode()).digest()).decode()
+            assert f"script-src 'sha256-{digest}';" in csp and "img-src 'self'" in csp
+            assert "unsafe-inline" not in csp.split("script-src", 1)[1].split(";", 1)[0]
+            assert "/ws?chat" in page.text
+        for path in (_chat_url(host, NOPE), f"http://{host}/chat/", f"http://{host}/chat/{T}/x"):
+            assert (await client.get(path)).status_code == 404, path
+
+
+async def test_media_route_serves_an_archived_file(
+    board: W.Board, settings: Settings, data_dir: Path
+) -> None:
+    """011-AC3: an archived asset is served with its type, sandboxed; a missing one is a 404."""
+    _media(data_dir)
+    async with _served(board, settings) as host, httpx.AsyncClient() as client:
+        base = f"http://{host}/media/{quote(T, safe='')}"
+        got = await client.get(f"{base}/{OBJ}.png")
+        assert got.status_code == 200 and got.content == b"\x89PNG-fake"
+        assert got.headers["content-type"] == "image/png"
+        assert got.headers["x-content-type-options"] == "nosniff"
+        assert got.headers["content-security-policy"] == "sandbox"
+        assert got.headers["cross-origin-resource-policy"] == "same-origin"
+        for path in (f"{base}/missing.png", f"{base}/%2e%2e%2Findex.db", f"http://{host}/media/{T}"):
+            assert (await client.get(path)).status_code == 404, path
+
+
+def test_media_file_stays_inside_the_media_folder(board: W.Board, data_dir: Path, tmp_path: Path) -> None:
+    """011-AC3: traversal in every shape, symlinks out, partial downloads and unknown chats are refused."""
+    media = _media(data_dir)
+    secret = tmp_path / "secret.png"
+    secret.write_bytes(b"secret")
+    (media / "out.png").symlink_to(secret)
+    (media / "half.png.part").write_bytes(b"half")
+    (media / "to-part.png").symlink_to(media / "half.png.part")
+    (media / "sub").mkdir()
+    thread = quote(T, safe="")
+    assert board.media_file(f"/media/{thread}/{OBJ}.png") == (b"\x89PNG-fake", "image/png")
+    refused = [
+        "..",
+        "%2e%2e",
+        "%2E%2E%2Findex.db",
+        "..%2F..%2Fsecret.png",
+        "%2Fetc%2Fpasswd",
+        "..%5Cindex.db",
+        "out.png",  # symlink leaving the folder
+        "to-part.png",  # symlink onto a partial download
+        "half.png.part",
+        "sub",
+        "missing.png",
+        "",
+        f"{OBJ}.png%00.txt",
+    ]
+    for name in refused:
+        assert board.media_file(f"/media/{thread}/{name}") is None, name
+    assert board.media_file(f"/media/{thread}//etc/passwd") is None  # absolute: extra segment
+    assert board.media_file(f"/media/{thread}/sub/x.png") is None
+    assert board.media_file(f"/media/{quote(NOPE, safe='')}/{OBJ}.png") is None
+    assert board.media_file(f"/media/{quote(B, safe='')}/{OBJ}.png") is None  # on the board, no archive
+
+
+def test_media_file_refuses_oversized_files(
+    board: W.Board, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC3: the whole-body response is capped."""
+    _media(data_dir)
+    monkeypatch.setattr(W, "_MEDIA_MAX", 4)
+    assert board.media_file(f"/media/{quote(T, safe='')}/{OBJ}.png") is None
+
+
+def _chat_socket(host: str) -> Any:
+    return websockets.connect(f"ws://{host}/ws?chat", origin=websockets.Origin(f"http://{host}"))
+
+
+async def test_chat_socket_never_receives_the_board(board: W.Board, settings: Settings) -> None:
+    """011-AC10: a chat page's socket gets its chat's frames, never the board's rows; the widget does."""
+    async with _served(board, settings) as host, _chat_socket(host) as chat, _connect(host) as widget:
+        assert "rows" in json.loads(await widget.recv())
+        await chat.send(json.dumps({"follow": T}))
+        assert json.loads(await asyncio.wait_for(chat.recv(), 2)) == {
+            "follow": T,
+            "ok": True,
+            "label": T,  # archived, not seeded: no better name known
+            "opener": False,
+            "page": W.page_version("chat.html"),
+            "read_only": False,
+        }
+        assert len(board.clients) == 1
+        board.broadcast()
+        assert "rows" in json.loads(await widget.recv())
+        await board.on_event(
+            _event("NewMessage", T, id="9", composetime=_at(9), messagetype="Text", content="x")
+        )
+        assert json.loads(await asyncio.wait_for(chat.recv(), 2))["msg"]["id"] == "9"
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(chat.recv(), 0.3)
+
+
+async def test_follow_names_a_board_chat_and_tells_the_opener(
+    quiet_directory: Directory, data_dir: Path
+) -> None:
+    """011-AC19: the follow answer carries the row's label and whether the server has an opener."""
+    rows = {B: {"id": B, "label": "Team · 4p", "last_activity": _at(1), "last_id": "1", "typing": []}}
+    board = W.Board(rows, quiet_directory, me=ME, data_dir=data_dir, opener=["xdg-open"])
+    answer = await board.follow(object(), B)  # type: ignore[arg-type]
+    assert (answer["label"], answer["opener"]) == ("Team · 4p", True)
+
+
+@pytest.fixture
+def sent(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    calls: list[tuple[str, str]] = []
+
+    def fake_send(settings: Any, token: str, thread_id: str, text: str, me_name: str) -> dict[str, Any]:
+        calls.append((thread_id, text))
+        return {"status": 201}
+
+    monkeypatch.setattr(W, "send_message", fake_send)
+    return calls
+
+
+async def test_send_reaches_a_followed_chat_off_the_board(
+    board: W.Board, settings: Settings, sent: list[tuple[str, str]]
+) -> None:
+    """011-AC8: the composer's send posts once to a followed archived chat; anything else is refused."""
+    async with _served(board, settings) as host, _chat_socket(host) as chat, _chat_socket(host) as other:
+        await other.send(json.dumps({"send": T, "text": "not following"}))
+        assert json.loads(await asyncio.wait_for(other.recv(), 2)) == {"sent": T, "error": "unknown chat"}
+        await chat.send(json.dumps({"follow": T}))
+        await chat.recv()
+        await chat.send(json.dumps({"send": T, "text": "hello\nthere"}))
+        assert json.loads(await asyncio.wait_for(chat.recv(), 2)) == {"sent": T, "ok": True}
+        await chat.send(json.dumps({"send": NOPE, "text": "elsewhere"}))
+        assert json.loads(await asyncio.wait_for(chat.recv(), 2)) == {"sent": NOPE, "error": "unknown chat"}
+        await chat.send(json.dumps({"send": T, "text": "  "}))
+        assert json.loads(await asyncio.wait_for(chat.recv(), 2)) == {"sent": T, "error": "empty message"}
+    assert sent == [(T, "hello\nthere")]
+
+
+async def test_send_failure_keeps_the_reason(
+    board: W.Board, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC8: a failed send answers the reason the page shows under the field."""
+
+    def failing(*args: Any) -> None:
+        raise httpx.ConnectError("boom", request=httpx.Request("POST", "https://x"))
+
+    monkeypatch.setattr(W, "send_message", failing)
+    async with _served(board, settings) as host, _chat_socket(host) as chat:
+        await chat.send(json.dumps({"follow": T}))
+        await chat.recv()
+        await chat.send(json.dumps({"send": T, "text": "hi"}))
+        assert json.loads(await asyncio.wait_for(chat.recv(), 2)) == {"sent": T, "error": "network error"}
+
+
+@pytest.fixture
+def launched(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
+    calls: list[tuple[str, ...]] = []
+
+    class _Proc:
+        async def wait(self) -> int:
+            return 0
+
+    async def fake_exec(*argv: str, **kw: Any) -> _Proc:
+        calls.append(argv)
+        return _Proc()
+
+    monkeypatch.setattr(W.asyncio, "create_subprocess_exec", fake_exec)
+    return calls
+
+
+async def _until(calls: list[Any], n: int) -> None:
+    for _ in range(100):
+        if len(calls) >= n:
+            return
+        await asyncio.sleep(0.01)
+
+
+async def test_open_reaches_a_followed_chat_and_lands_on_a_message(
+    quiet_directory: Directory, data_dir: Path, settings: Settings, launched: list[tuple[str, ...]]
+) -> None:
+    """011-AC19: `open` runs the opener for a followed off-board chat, on a message id when it is digits."""
+    rows = {B: {"id": B, "label": "B", "last_activity": _at(1), "last_id": "1", "typing": []}}
+    board = W.Board(rows, quiet_directory, me=ME, data_dir=data_dir, opener=["xdg-open"])
+    async with _served(board, settings) as host, _chat_socket(host) as chat:
+        await chat.send(json.dumps({"open": T}))  # not followed yet: refused
+        await chat.send(json.dumps({"follow": T}))
+        await chat.recv()
+        await chat.send(json.dumps({"open": T, "msg": "1789466500000"}))
+        await chat.send(json.dumps({"open": T, "msg": "12a/../x"}))  # not an id: the chat link
+        await chat.send(json.dumps({"open": T}))
+        await chat.send(json.dumps({"open": NOPE, "msg": "1"}))
+        await chat.send(json.dumps({"open": B, "msg": "²"}))  # unicode digit: ignored, row's last id
+        await _until(launched, 4)
+        await asyncio.sleep(0.1)
+    assert launched == [
+        ("xdg-open", W.deep_link(T, "1789466500000", "msteams")),
+        ("xdg-open", W.deep_link(T, "", "msteams")),
+        ("xdg-open", W.deep_link(T, "", "msteams")),
+        ("xdg-open", W.deep_link(B, "1", "msteams")),
+    ]
+
+
+async def test_open_without_opener_is_left_to_the_page(
+    board: W.Board, launched: list[tuple[str, ...]]
+) -> None:
+    """011-AC19: with `--opener none` the server opens nothing (the page opens the https link)."""
+    assert await board.open_row(B, msg_id="1") is False
+    assert launched == []
+
+
+async def test_chat_and_media_refuse_a_foreign_host(
+    board: W.Board, settings: Settings, data_dir: Path
+) -> None:
+    """011-AC10: DNS rebinding: a name other than the bound address reads neither a chat nor its files."""
+    _media(data_dir)
+    async with _served(board, settings) as host, httpx.AsyncClient() as client:
+        thread = quote(T, safe="")
+        for path in (f"/chat/{thread}", f"/media/{thread}/{OBJ}.png"):
+            assert (await client.get(f"http://{host}{path}")).status_code == 200, path
+            for foreign in ("evil.example", f"evil.example:{host.rsplit(':', 1)[1]}", "localhost"):
+                got = await client.get(f"http://{host}{path}", headers={"Host": foreign})
+                assert got.status_code == 404, (path, foreign)
+
+
+async def test_chat_socket_checks_the_origin(board: W.Board, settings: Settings) -> None:
+    """011-AC10: `/ws?chat` has the board's Origin rule: a foreign or missing Origin gets 403."""
+    async with _served(board, settings) as host:
+        for origin in ("http://evil.example", "null", None):
+            with pytest.raises(websockets.InvalidStatus) as exc:
+                await websockets.connect(
+                    f"ws://{host}/ws?chat", origin=websockets.Origin(origin) if origin else None
+                )
+            assert exc.value.response.status_code == 403, origin
+
+
+async def test_send_never_reaches_a_followed_channel(
+    board: W.Board, settings: Settings, sent: list[tuple[str, str]]
+) -> None:
+    """011-AC8 + 011-AC9: a followed archived channel is read-only: send is refused, no API call."""
+    async with _served(board, settings) as host, _chat_socket(host) as chat:
+        await chat.send(json.dumps({"follow": C}))
+        answer = json.loads(await asyncio.wait_for(chat.recv(), 2))
+        assert (answer["ok"], answer["read_only"]) == (True, True)
+        await chat.send(json.dumps({"send": C, "text": "hi"}))
+        assert json.loads(await asyncio.wait_for(chat.recv(), 2)) == {"sent": C, "error": "unknown chat"}
     assert sent == []

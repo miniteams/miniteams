@@ -11,9 +11,12 @@ survives restarts; the whole 127/8 is loopback on Linux, no interface setup need
 import asyncio
 import base64
 import contextlib
+import functools
+import hashlib
 import html
 import ipaddress
 import json
+import mimetypes
 import random
 import re
 import sqlite3
@@ -24,7 +27,7 @@ from http import HTTPStatus
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 import structlog
@@ -69,6 +72,9 @@ _SEND_MAX_BYTES = 28 * 1024  # Teams' per-message limit
 _TYPING_TTL = 10.0  # seconds; Teams does not always send ClearTyping
 _CHAT_PAGE = 100  # history messages per page of the chat view
 _CHAT_PAGE_MAX = 200  # the archive query is cheap, the page's DOM is not
+_MEDIA_MAX = 50 * 1024 * 1024  # ponytail: whole-body responses; stream if videos ever get linked
+_MSG_ID_RE = re.compile(r"[0-9]{1,20}")  # Teams message ids are ms-epoch digits
+_SCRIPT_RE = re.compile(r"<script>(.*?)</script>", re.DOTALL)
 # Thread activity that changes the label (topic, member count): drop the cached thread info.
 # Someone reading a chat is not activity: bumping the row on it would defeat "seen".
 _SILENT_TYPES = {"ThreadActivity/MemberConsumptionHorizonUpdate"}
@@ -784,12 +790,13 @@ class Board:
             return False
         return True
 
-    async def send(self, thread_id: str, text: Any) -> str | None:
-        """Page verb `send`: post `text` to the row's chat as me. Returns the refusal/failure
-        reason, None once Teams accepted it.
+    async def send(self, thread_id: str, text: Any, ws: ServerConnection | None = None) -> str | None:
+        """Page verb `send`: post `text` to the row's chat (or the chat `ws` follows) as me.
+        Returns the refusal/failure reason, None once Teams accepted it.
 
         The row is left alone: the Trouter echo of the sent message updates it like any other."""
-        if thread_id not in self.rows:
+        # Off the board, only a followed chat of the widget's scope: never a channel.
+        if thread_id not in self.rows and not (in_scope(thread_id) and self._following(ws, thread_id)):
             return "unknown chat"
         if not isinstance(text, str) or not text.strip():
             return "empty message"
@@ -813,6 +820,34 @@ class Board:
         return None
 
     # --- chat view (spec 011) ---
+
+    def _following(self, ws: ServerConnection | None, thread_id: str) -> bool:
+        return ws is not None and self._follows.get(ws, ("", None))[0] == thread_id
+
+    def media_file(self, path: str) -> tuple[bytes, str] | None:
+        """`/media/<thread>/<file>`: (body, content type) of an archived asset, None for anything
+        else. Blocking (index lookup, NFS read): run it in a worker thread."""
+        parts = path.removeprefix("/media/").split("/")
+        if len(parts) != 2:
+            return None
+        thread_id, name = (unquote(part) for part in parts)
+        chat_dir = self._archive_dir(thread_id)
+        if chat_dir is None:
+            return None
+        try:
+            media = (chat_dir / "media").resolve(strict=True)
+            target = (media / name).resolve(strict=True)
+            # Resolved: `..`, encoded slashes and symlinks out of the folder or onto a partial download
+            # all fail this one check.
+            if target.parent != media or target.name.endswith(".part") or not target.is_file():
+                return None
+            if target.stat().st_size > _MEDIA_MAX:
+                log.info("media_too_large", thread=thread_id, file=name)
+                return None
+            body = target.read_bytes()
+        except OSError, ValueError:  # ValueError: an encoded NUL in the name
+            return None
+        return body, mimetypes.guess_type(name)[0] or "application/octet-stream"
 
     def _archive_dir(self, thread_id: str) -> Path | None:
         """The chat's archive folder; None when the archive does not hold it or cannot be read."""
@@ -908,7 +943,17 @@ class Board:
         if chat_dir is None and thread_id not in self.rows:
             return {"follow": thread_id, "error": "unknown chat"}
         self._follows[ws] = (thread_id, chat_dir / "media" if chat_dir else None)
-        return {"follow": thread_id, "ok": True}
+        row = self.rows.get(thread_id)
+        label = str(row.get("label") or "") if row else await self.archived_label(thread_id)
+        # `opener` tells the page whether Open in Teams goes through the server or its own new tab.
+        return {
+            "follow": thread_id,
+            "ok": True,
+            "label": label or thread_id,
+            "opener": self.opener is not None,
+            "page": page_version("chat.html"),  # an open tab reloads when chat.html changed
+            "read_only": not in_scope(thread_id),  # `send` refuses channels: no composer for them
+        }
 
     async def _forward(
         self, thread_id: str, resource_type: Any, resource: dict[str, Any], msgtype: str
@@ -956,7 +1001,7 @@ class Board:
             await ws.send(json.dumps(answer, ensure_ascii=False))
 
     async def _reply(self, ws: ServerConnection, thread_id: str, text: Any) -> None:
-        error = await self.send(thread_id, text)
+        error = await self.send(thread_id, text, ws)
         ack = {"sent": thread_id, **({"error": error} if error else {"ok": True})}
         # Only the sending page learns the outcome; every page sees the echoed message.
         # A page closed during the send is not a handler failure.
@@ -1208,15 +1253,19 @@ class Board:
             ensure_ascii=False,
         )
 
-    async def open_row(self, thread_id: str, web: bool = False) -> bool:
-        """Page verb `open`: run the opener (or, for `web`, the browser) on the row's deep link.
+    async def open_row(
+        self, thread_id: str, web: bool = False, ws: ServerConnection | None = None, msg_id: str = ""
+    ) -> bool:
+        """Page verb `open`: run the opener (or, for `web`, the browser) on the deep link of the row
+        (or of the chat `ws` follows), at `msg_id` when given, else at the row's last message.
 
         Opening is not reading: the row keeps its seen/unread state until the user says so."""
         row = self.rows.get(thread_id)
         argv = self.browser if web else self.opener
-        if row is None or argv is None:
+        if (row is None and not self._following(ws, thread_id)) or argv is None:
             return False
-        url = deep_link(thread_id, row.get("last_id", ""), "https" if web else self.open_scheme)
+        target = msg_id or str((row or {}).get("last_id") or "")
+        url = deep_link(thread_id, target, "https" if web else self.open_scheme)
         try:
             # argv exec, no shell: the only variable part is a URL built from ids we already hold.
             proc = await asyncio.create_subprocess_exec(
@@ -1250,9 +1299,13 @@ class Board:
         broadcast(self.clients, self.payload())
 
     async def handle(self, ws: ServerConnection) -> None:
-        self.clients.add(ws)
+        # A chat page (`/ws?chat`) only needs its own chat: the board's rows never reach it.
+        board_page = ws.request is None or urlsplit(ws.request.path).query != "chat"
+        if board_page:
+            self.clients.add(ws)
         try:
-            await ws.send(self.payload())
+            if board_page:
+                await ws.send(self.payload())
             async for raw in ws:
                 try:
                     verb = json.loads(raw)
@@ -1285,7 +1338,9 @@ class Board:
                 elif isinstance(verb, dict) and isinstance(verb.get("follow"), str):
                     await self._answer(ws, self.follow(ws, verb["follow"]))
                 elif isinstance(verb, dict) and isinstance(verb.get("open"), str):
-                    await self.open_row(verb["open"], web=verb.get("web") is True)
+                    msg = verb.get("msg")
+                    msg = msg if isinstance(msg, str) and _MSG_ID_RE.fullmatch(msg) else ""
+                    await self.open_row(verb["open"], web=verb.get("web") is True, ws=ws, msg_id=msg)
                 else:
                     log.debug("ws_client_message_ignored", data=str(raw)[:100])
         finally:
@@ -1322,30 +1377,75 @@ def _load_seen(path: Path | None) -> dict[str, str]:
     return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
 
 
-def _page_path() -> Path:
-    return Path(str(files("miniteams").joinpath("widget.html")))
+def _page_path(name: str = "widget.html") -> Path:
+    return Path(str(files("miniteams").joinpath(name)))
 
 
-def page_version() -> str:
+def page_version(name: str = "widget.html") -> str:
     try:
-        return str(_page_path().stat().st_mtime_ns)
+        return str(_page_path(name).stat().st_mtime_ns)
     except OSError:
         return ""
 
 
-def _page() -> str:
-    return _page_path().read_text(encoding="utf-8")
+def _page(name: str = "widget.html") -> str:
+    return _page_path(name).read_text(encoding="utf-8")
 
 
-def _process_request(ws: ServerConnection, request: Request) -> Response | None:
+@functools.lru_cache(maxsize=4)
+def _chat_csp(page: str) -> str:
+    """CSP for chat.html: only its own script (by hash) runs, so an inline handler in a message cannot.
+
+    Server HTML reaches that page's DOM: no foreign script, image or socket even if the sanitiser slips.
+    """
+    found = _SCRIPT_RE.search(page)
+    digest = hashlib.sha256(found.group(1).encode() if found else b"").digest()
+    return (
+        f"default-src 'none'; script-src 'sha256-{base64.b64encode(digest).decode()}'; "
+        "style-src 'unsafe-inline'; img-src 'self'; connect-src 'self'; base-uri 'none'; "
+        "form-action 'none'; frame-ancestors 'none'"
+    )
+
+
+def _respond(ws: ServerConnection, body: bytes, headers: dict[str, str]) -> Response:
+    resp = ws.respond(HTTPStatus.OK, "")
+    resp.body = body
+    for name, value in {**headers, "Content-Length": str(len(body))}.items():
+        if name in resp.headers:  # respond() stamps text/plain; Headers is a multidict
+            del resp.headers[name]
+        resp.headers[name] = value
+    return resp
+
+
+async def _process_request(
+    board: Board, bound: str, ws: ServerConnection, request: Request
+) -> Response | None:
     path = request.path.split("?", 1)[0]  # the page's view params (?theme=…) ride the query string
     if path == "/ws":
         return None  # proceed with the websocket upgrade
     if path == "/":
-        resp = ws.respond(HTTPStatus.OK, _page())
-        del resp.headers["Content-Type"]  # respond() stamps text/plain; Headers is a multidict
-        resp.headers["Content-Type"] = "text/html; charset=utf-8"
-        return resp
+        return _respond(ws, _page().encode(), {"Content-Type": "text/html; charset=utf-8"})
+    # DNS rebinding: a foreign name resolving to our address must not read a chat or its files.
+    own_host = request.headers.get("Host") == bound
+    if own_host and path.startswith("/chat/"):
+        thread_id = unquote(path.removeprefix("/chat/"))
+        if thread_id in board.rows or await asyncio.to_thread(board._archive_dir, thread_id) is not None:
+            page = _page("chat.html")
+            headers = {"Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": _chat_csp(page)}
+            return _respond(ws, page.encode(), headers)
+    if own_host and path.startswith("/media/"):
+        found = await asyncio.to_thread(board.media_file, path)
+        if found is not None:
+            body, ctype = found
+            # An archived HTML or SVG opened directly must not run as this origin (it could open /ws).
+            safe = {
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "sandbox",
+                "Cross-Origin-Resource-Policy": "same-origin",
+            }
+            return _respond(
+                ws, body, {"Content-Type": ctype, "Cache-Control": "private, max-age=3600"} | safe
+            )
     return ws.respond(HTTPStatus.NOT_FOUND, "not found\n")
 
 
@@ -1356,7 +1456,8 @@ async def serve_board(board: Board, settings: Settings, bind: str | None) -> Non
             # Only the page we serve may open the socket — any other site's Origin gets 403,
             # else every open tab could read the chat list (cross-site websocket hijacking).
             origins = [Origin(f"http://{host}:{port}")]
-            async with serve(board.handle, host, port, origins=origins, process_request=_process_request):
+            routes = functools.partial(_process_request, board, f"{host}:{port}")
+            async with serve(board.handle, host, port, origins=origins, process_request=routes):
                 log.info("web_listening", url=f"http://{host}:{port}/")
                 await board.watch_page()  # until cancelled
         except OSError as exc:

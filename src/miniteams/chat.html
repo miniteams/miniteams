@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>miniteams chat</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f0f2f5; --text: #1b1f24; --dim: #6b7380; --faint: #9aa1ab;
+    --line: #e3e6ea; --accent: #4f5bd5; --accent-soft: #4f5bd51a; --hot: #e5484d; --ok: #2f9e6e; --typing: #b7791f;
+    --mention: #0284c7; --mention-soft: #0ea5e91a; --on-mention: #fff;
+    --shadow: 0 1px 2px #0000000d, 0 4px 14px #0000000a;
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0f1115; --panel: #171a21; --panel-2: #1e222b; --text: #e6e8ec; --dim: #8b93a1; --faint: #5d6472;
+    --line: #262b35; --accent: #8b96ff; --accent-soft: #8b96ff22; --hot: #ff6b6f; --ok: #4cc38a; --typing: #f0b45a;
+    --mention: #7dd3fc; --mention-soft: #7dd3fc1f; --on-mention: #062a3d;
+    --shadow: 0 1px 2px #00000066, 0 6px 20px #00000055;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #0f1115; --panel: #171a21; --panel-2: #1e222b; --text: #e6e8ec; --dim: #8b93a1; --faint: #5d6472;
+      --line: #262b35; --accent: #8b96ff; --accent-soft: #8b96ff22; --hot: #ff6b6f; --ok: #4cc38a; --typing: #f0b45a;
+      --mention: #7dd3fc; --mention-soft: #7dd3fc1f; --on-mention: #062a3d;
+      --shadow: 0 1px 2px #00000066, 0 6px 20px #00000055;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; }
+  button { font: inherit; color: inherit; }
+  .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+
+  header { background: color-mix(in srgb, var(--bg) 85%, transparent); padding: 10px 16px; display: flex; align-items: center;
+    gap: 12px; border-bottom: 1px solid var(--line); flex: none; }
+  #back { color: var(--dim); text-decoration: none; font-size: 15px; border-radius: 8px; padding: 2px 6px; }
+  #back:hover { background: var(--panel-2); color: var(--text); }
+  h1 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -.01em; }
+  #members { color: var(--faint); font-size: 12.5px; white-space: nowrap; margin-right: auto; }
+  #status { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); flex: none; }
+  #status.off { background: var(--hot); box-shadow: 0 0 0 3px color-mix(in srgb, var(--hot) 25%, transparent); }
+  .btn { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 3px 10px; cursor: pointer; color: var(--dim); font-size: 12.5px; white-space: nowrap; }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+
+  #list { flex: 1; overflow-y: auto; padding: 8px 12px; }
+  #note { text-align: center; color: var(--dim); padding: 1em; }
+  #note.err { color: var(--hot); }
+  .msg { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 0 10px; padding: 4px 8px; border-radius: 10px; position: relative; }
+  .msg:not(.cont) { margin-top: 10px; }
+  .msg:hover { background: var(--panel); }
+  .av { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; font-weight: 650; font-size: 13px; color: #fff; }
+  .msg.cont .av, .msg.cont .head { display: none; }
+  .body { grid-column: 2; min-width: 0; }
+  .head { display: flex; align-items: baseline; gap: 8px; }
+  .head b { font-weight: 600; }
+  .msg.me .head b { color: var(--accent); }
+  .when, .edited { font-size: 11.5px; color: var(--faint); white-space: nowrap; }
+  .html { overflow-wrap: anywhere; }
+  .html p { margin: 0; }
+  .html p + p, .html ul, .html ol, .html pre, .html table { margin: 4px 0; }
+  .html pre, .html code { font: 12.5px/1.4 ui-monospace, monospace; background: var(--panel-2); border-radius: 4px; }
+  .html pre { padding: 6px 8px; overflow-x: auto; }
+  .html code { padding: 0 3px; }
+  .html pre code { padding: 0; background: none; }
+  .html blockquote { margin: 4px 0; padding: 2px 10px; border-left: 3px solid var(--line); color: var(--dim); }
+  .html blockquote.reply { border-left-color: var(--accent); background: var(--panel-2); border-radius: 0 6px 6px 0; }
+  .html blockquote.reply strong { display: block; color: var(--text); font-size: 12.5px; }
+  .html img { max-width: min(100%, 420px); max-height: 360px; height: auto; border-radius: 6px; display: block; margin: 4px 0; }
+  .html img.emoji { display: inline; height: 1.4em; width: auto; margin: 0; vertical-align: -.3em; border-radius: 0; }
+  .html a { color: var(--accent); }
+  .html table { border-collapse: collapse; }
+  .html td, .html th { border: 1px solid var(--line); padding: 2px 6px; }
+  .mention { color: var(--mention); font-weight: 600; }
+  .mention-me { background: var(--mention-soft); border-radius: 4px; padding: 0 3px; }
+  .msg.deleted .html { color: var(--faint); font-style: italic; }
+  .reacts { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
+  .reacts span { font-size: 12px; border: 1px solid var(--line); background: var(--panel); border-radius: 99px; padding: 0 7px; }
+  .reacts span.mine { border-color: var(--accent); background: var(--accent-soft); }
+  .msg.system { display: block; text-align: center; color: var(--faint); font-size: 12.5px; padding: 2px 8px; }
+  .msg.system .html { display: inline; }
+  .actions { display: none; position: absolute; right: 8px; top: -10px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; box-shadow: var(--shadow); padding: 2px; }
+  .msg:hover .actions { display: flex; }
+  .actions button { border: 0; background: transparent; border-radius: 6px; padding: 0 6px; cursor: pointer; color: var(--dim); font-size: 12.5px; }
+  .actions button:hover { background: var(--panel-2); color: var(--accent); }
+  /* Avatars off: no avatar column, the same rhythm as the widget's compact mode. */
+  body.compact .msg { grid-template-columns: minmax(0, 1fr); }
+  body.compact .av { display: none; }
+  body.compact .body { grid-column: 1; }
+  body.compact .msg:not(.cont) { margin-top: 6px; }
+
+  #typing { flex: none; min-height: 1.45em; padding: 0 20px; color: var(--typing); font-style: italic; font-size: 12.5px; }
+  footer { flex: none; padding: 0 12px 10px; }
+  #reply { display: block; width: 100%; resize: none; max-height: calc(8lh + 14px); overflow-y: auto; font: inherit; color: inherit;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
+  #reply:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+  #reply:disabled { opacity: .6; }
+  #err { display: block; color: var(--hot); font-size: 12px; margin-top: 2px; min-height: 0; }
+</style>
+</head>
+<body>
+<header>
+  <a id="back" href="/" title="back to the board">◀</a>
+  <h1 id="label" class="truncate">…</h1>
+  <span id="members"></span>
+  <span id="status" class="off" title="connecting…"></span>
+  <button id="teams" class="btn" title="open this chat in Teams" disabled>Open in Teams</button>
+</header>
+<div id="list"><div id="note">loading…</div><div id="msgs"></div></div>
+<div id="typing" aria-live="polite"></div>
+<footer>
+  <textarea id="reply" rows="1" placeholder="message · Enter sends, Shift+Enter new line" aria-label="message"></textarea>
+  <small id="err"></small>
+</footer>
+<script>
+(() => {
+  let thread = null;
+  try { thread = decodeURIComponent(location.pathname.slice("/chat/".length)); } catch (e) {}
+  const $list = document.getElementById("list"), $msgs = document.getElementById("msgs"), $note = document.getElementById("note"),
+        $label = document.getElementById("label"), $members = document.getElementById("members"),
+        $status = document.getElementById("status"), $teams = document.getElementById("teams"),
+        $typing = document.getElementById("typing"), $reply = document.getElementById("reply"), $err = document.getElementById("err");
+  const store = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+  const q = new URLSearchParams(location.search), pref = (k) => q.get(k) ?? store(k);
+  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+  // Same colour and initials rules as the widget's rows.
+  const hue = (s) => [...s].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7);
+  const initials = (name) => { const w = name.split(/[ ,]+/).filter((x) => /\p{L}/u.test(x));
+    return ((w[0] || "?")[0] + ((w[1] || "")[0] || "")).toUpperCase(); };
+
+  let ws = null, opener = false, sending = false, retry = 1000, loaded = false, followFailed = false, pageVersion = null;
+  const records = new Map();  // id → record, for the messages on screen
+  const pending = new Set();  // history cursors asked and not answered ("" = latest page)
+  let live = [], liveEdits = [];  // frames relayed while the latest page was being fetched
+  const typing = new Set();
+
+  const applyPrefs = () => {
+    const theme = ["light", "dark"].includes(pref("theme")) ? pref("theme") : "auto";
+    if (theme === "auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = theme;
+    document.body.classList.toggle("compact", pref("avatars") === "0");
+  };
+  addEventListener("storage", applyPrefs);  // the widget tab changed theme or avatars
+
+  const send = (obj) => { if (!(ws && ws.readyState === 1)) return false; ws.send(JSON.stringify(obj)); return true; };
+  // Same shape as web.deep_link's https form.
+  const CTX = encodeURIComponent('{"contextType":"chat"}');
+  const teamsLink = (msgId) => msgId
+    ? `https://teams.microsoft.com/l/message/${encodeURIComponent(thread)}/${msgId}?context=${CTX}`
+    : `https://teams.microsoft.com/l/chat/${encodeURIComponent(thread)}/conversations?context=${CTX}`;
+  // Through the server's opener (desktop client) when it has one, else the https link in a new tab.
+  const openTeams = (msgId) => {
+    if (opener && send({ open: thread, msg: msgId || "" })) return;
+    window.open(teamsLink(msgId), "_blank", "noopener");
+  };
+  const lastId = () => $msgs.lastElementChild?.dataset.id || "";
+  $teams.onclick = () => openTeams(lastId());
+
+  const near = () => $list.scrollHeight - $list.scrollTop - $list.clientHeight < 40;
+  let stick = true;
+  $list.addEventListener("scroll", () => { stick = near(); });
+  const toBottom = () => { $list.scrollTop = $list.scrollHeight; stick = true; };
+  // Images grow the list after it was laid out: keep the bottom in view when it was.
+  $list.addEventListener("load", () => { if (stick) toBottom(); }, true);
+
+  const fmtTime = (iso) => {
+    const d = new Date(iso);
+    if (isNaN(d)) return "";
+    const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return d.toDateString() === new Date().toDateString() ? hm : d.toLocaleDateString([], { day: "numeric", month: "short", year: d.getFullYear() === new Date().getFullYear() ? undefined : "numeric" }) + " " + hm;
+  };
+
+  // The one place a record becomes DOM. `html` is the server's sanitised body: the only markup the page inserts.
+  const renderMessage = (r) => {
+    const sys = r.type === "system" || r.type === "call";
+    const node = el("div", "msg" + (r.me ? " me" : "") + (r.deleted ? " deleted" : "") + (sys ? " system" : ""));
+    node.dataset.id = r.id; node.dataset.from = r.from || ""; node.dataset.at = r.at || "";
+    const body = el("div", "body");
+    if (r.deleted) body.append(el("div", "html", "message deleted"));
+    else { const h = el("div", "html"); h.innerHTML = r.html || ""; body.append(h); }
+    if (sys) { node.append(body); node.title = r.at; return node; }
+    const name = r.name || (r.me ? "You" : "?");
+    const av = el("div", "av", initials(name));
+    av.style.background = `linear-gradient(135deg, hsl(${hue(r.from || name)} 62% 58%), hsl(${(hue(r.from || name) + 40) % 360} 62% 48%))`;
+    const head = el("div", "head");
+    head.append(el("b", null, name), Object.assign(el("span", "when", fmtTime(r.at)), { title: r.at }));
+    if (r.edited && !r.deleted) head.append(el("span", "edited", "edited"));
+    body.prepend(head);
+    if (!r.deleted && r.reactions && r.reactions.length) {
+      const line = el("div", "reacts");
+      for (const x of r.reactions) line.append(Object.assign(el("span", x.mine ? "mine" : null, `${x.emoji} ${x.count}`), { title: x.key }));
+      body.append(line);
+    }
+    const actions = el("div", "actions"), open = el("button", null, "↗ Teams");
+    open.title = "open this message in Teams"; open.onclick = () => openTeams(r.id);
+    actions.append(open);
+    node.append(av, body, actions);
+    return node;
+  };
+
+  // Consecutive messages from one sender within 5 minutes share one avatar and name.
+  const regroup = () => {
+    let prev = null;
+    for (const n of $msgs.children) {
+      const cont = !!prev && !n.classList.contains("system") && !prev.classList.contains("system")
+        && prev.dataset.from === n.dataset.from && Date.parse(n.dataset.at) - Date.parse(prev.dataset.at) < 300000;
+      n.classList.toggle("cont", cont);
+      prev = n;
+    }
+  };
+
+  const showPage = (messages) => {
+    const keep = loaded && !stick, top = $list.scrollTop;  // a reconnect keeps the reader's place
+    records.clear();
+    for (const r of messages) records.set(r.id, r);
+    for (const r of live) if (!records.has(r.id)) records.set(r.id, r);  // landed while the page was read
+    $msgs.replaceChildren(...[...records.values()].map(renderMessage));
+    regroup();
+    const edits = liveEdits;
+    live = []; liveEdits = [];
+    for (const r of edits) replace(r);
+    $note.hidden = records.size > 0;
+    $note.className = ""; $note.textContent = "no message yet";
+    loaded = true;
+    if (keep) $list.scrollTop = top; else toBottom();
+  };
+
+  const append = (r) => {
+    if (pending.has("")) live.push(r);
+    if (records.has(r.id)) return;
+    const was = stick;
+    records.set(r.id, r);
+    $msgs.append(renderMessage(r));
+    regroup();
+    $note.hidden = true;
+    if (was) toBottom();
+  };
+
+  const replace = (r) => {
+    if (pending.has("")) liveEdits.push(r);
+    const old = records.get(r.id), node = $msgs.querySelector(`[data-id="${CSS.escape(r.id)}"]`);
+    if (!old || !node) return;  // not on screen: the next page read carries it
+    const merged = "html" in r ? r : { ...old, ...r, html: old.html };  // a partial update keeps the body
+    records.set(r.id, merged);
+    node.replaceWith(renderMessage(merged));
+    regroup();
+  };
+
+  // History is keyed on its `before` cursor ("" = the latest page): one request per cursor in flight.
+  const requestHistory = (before = "") => {
+    if (pending.has(before)) return;
+    if (!send({ history: thread, before: before || null })) return;
+    pending.add(before);
+    if (!before) { live = []; liveEdits = []; }
+  };
+  const onHistory = (m) => {
+    const key = m.before || "";
+    pending.delete(key);
+    if (m.error) {
+      if (followFailed) return;  // its error says more than this one
+      $note.hidden = false; $note.className = "err";
+      $note.textContent = "history: " + m.error;
+      if (m.error === "busy") setTimeout(() => requestHistory(key), 500);
+      return;
+    }
+    if (!key) showPage(m.messages || []);
+  };
+
+  const renderTyping = () => { $typing.textContent = typing.size ? "✍ " + [...typing].join(", ") + (typing.size > 1 ? " are" : " is") + " typing…" : ""; };
+
+  const onFollow = (m) => {
+    if (m.error) { followFailed = true; $note.hidden = false; $note.className = "err"; $note.textContent = m.error; return; }
+    // A newer chat.html on the server (restart, edit): this page is stale, reload it.
+    if (m.page) { if (pageVersion && m.page !== pageVersion) { saveDraft(); location.reload(); return; } pageVersion = m.page; }
+    followFailed = false;
+    if (m.read_only) { readOnly = true; $reply.disabled = true; $reply.placeholder = "read-only: team channel"; }
+    opener = !!m.opener;
+    $teams.disabled = false;
+    const label = m.label || thread, n = label.match(/ · (\d+)p$/);
+    $label.textContent = n ? label.slice(0, n.index) : label;
+    $label.title = thread;
+    $members.textContent = n ? n[1] + " members" : "";
+    document.title = $label.textContent + " · miniteams";
+  };
+
+  // Teams' keys (spec 006): Enter sends, Shift+Enter breaks the line, Ctrl+Enter sends too.
+  const grow = () => { $reply.style.height = "auto"; $reply.style.height = $reply.scrollHeight + 2 + "px"; };
+  let readOnly = false;
+  const setSending = (on) => { sending = on; $reply.disabled = on || readOnly; if (!on) $reply.focus(); };
+  // The draft survives the reload a newer chat.html triggers.
+  const draftKey = "draft:" + thread;
+  const saveDraft = () => { try { sessionStorage.setItem(draftKey, $reply.value); } catch (e) {} };
+  const takeDraft = () => { try { const d = sessionStorage.getItem(draftKey); sessionStorage.removeItem(draftKey); return d; } catch (e) { return null; } };
+  const submit = () => {
+    const text = $reply.value;
+    if (!text.trim() || sending) return;
+    if (!send({ send: thread, text })) { $err.textContent = "offline, not sent"; return; }
+    $err.textContent = "";
+    setSending(true);
+  };
+  $reply.oninput = grow;
+  $reply.onkeydown = (e) => {
+    if (e.key !== "Enter" || e.shiftKey || e.isComposing || e.keyCode === 229) return;
+    e.preventDefault();
+    submit();
+  };
+  const onSent = (m) => {
+    if (m.sent !== thread || !sending) return;
+    if (m.ok) { $reply.value = ""; grow(); $err.textContent = ""; }
+    else $err.textContent = m.error || "not sent";
+    setSending(false);
+  };
+
+  const connect = () => {
+    ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws?chat");
+    ws.onopen = () => {
+      retry = 1000; $status.title = "live"; $status.classList.remove("off");
+      pending.clear();
+      send({ follow: thread });
+      requestHistory();  // after a drop too: whatever landed meanwhile is in the latest page
+    };
+    ws.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      if ("follow" in m) onFollow(m);
+      else if ("history" in m) onHistory(m);
+      else if (m.msg) {
+        append(m.msg);
+        if (typing.delete(m.msg.name)) renderTyping();
+      }
+      else if (m.edit) replace(m.edit);
+      else if ("typing" in m) { if (m.on) typing.add(m.typing); else typing.delete(m.typing); renderTyping(); }
+      else if ("sent" in m) onSent(m);
+    };
+    ws.onclose = () => {
+      $status.title = "disconnected"; $status.classList.add("off");
+      typing.clear(); renderTyping();
+      // No ack will come: the message may or may not have gone out.
+      if (sending) { $err.textContent = "connection lost: check the chat before resending"; setSending(false); }
+      setTimeout(connect, retry); retry = Math.min(retry * 2, 30000);
+    };
+  };
+  applyPrefs();
+  if (!thread) {
+    $note.className = "err"; $note.textContent = "malformed chat address";
+    $reply.disabled = true;
+    return;
+  }
+  const draft = takeDraft();
+  if (draft) { $reply.value = draft; grow(); }
+  connect();
+  $reply.focus();
+})();
+</script>
+</body>
+</html>
