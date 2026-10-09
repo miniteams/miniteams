@@ -248,7 +248,8 @@ def markdown_html(text: str) -> str:
 class _CardRenderer:
     def __init__(self, media: MediaUrl | None) -> None:
         self.media = media
-        self.nodes = 0  # per card
+        self.nodes = 0
+        self.header_row = False  # per card
         self.md_left = _MSG_MD  # per message
 
     def md(self, text: str) -> str:
@@ -301,6 +302,16 @@ class _CardRenderer:
         rows = self.many(sec.get("facts"), depth + 1, self.fact)
         return out + (f'<table class="facts">{rows}</table>' if rows else "")
 
+    def table_row(self, row: dict[str, Any], depth: int) -> str:
+        tag = "th" if self.header_row else "td"
+        self.header_row = False  # only the first row of a table heads it
+        cells = "".join(
+            f"<{tag}>{self.many(cell.get('items'), depth + 1, self.element)}</{tag}>"
+            for cell in (row.get("cells") or [])
+            if isinstance(cell, dict)
+        )
+        return f"<tr>{cells}</tr>" if cells else ""
+
     def fact(self, fact: dict[str, Any], depth: int) -> str:
         title = html.escape(_str(fact.get("title")) or _str(fact.get("name")))
         return f"<tr><th>{title}</th><td>{self.md(_str(fact.get('value')))}</td></tr>"
@@ -340,6 +351,10 @@ class _CardRenderer:
             return box if "<a " in inner else _link(_open_url(el.get("selectAction")), box)
         if kind == "FactSet":
             rows = self.many(el.get("facts"), depth + 1, self.fact)
+            return f'<table class="facts">{rows}</table>' if rows else ""
+        if kind == "Table":  # Adaptive Cards 1.5 table: bots put their facts here nowadays
+            self.header_row = el.get("firstRowAsHeaders") is True
+            rows = self.many(el.get("rows"), depth + 1, self.table_row)
             return f'<table class="facts">{rows}</table>' if rows else ""
         if kind == "Image":
             img = self.image(el)

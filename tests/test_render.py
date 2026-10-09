@@ -833,3 +833,29 @@ def test_a_malformed_url_is_dropped_not_raised() -> None:
     out = card_html(card)
     assert "<a " not in out and ">Go</span>" in out
     assert "<a " not in sanitize('<a href="https://[x">y</a>', "19:t@thread.v2", None)
+
+
+def test_table_rows_render_as_a_facts_table() -> None:
+    """011-AC24: an Adaptive Cards 1.5 Table (rows of cells holding elements) renders like a FactSet,
+    first row as headers when the card says so; hostile cells stay escaped."""
+    cell = lambda text: {"type": "TableCell", "items": [{"type": "TextBlock", "text": text}]}  # noqa: E731
+    card = {
+        "type": "AdaptiveCard",
+        "body": [
+            {
+                "type": "Table",
+                "firstRowAsHeaders": True,
+                "rows": [
+                    {"type": "TableRow", "cells": [cell("Status"), cell("Value")]},
+                    {"type": "TableRow", "cells": [cell("branch"), cell("<main>")]},
+                    "junk",
+                ],
+            }
+        ],
+    }
+    out = card_html(card)
+    assert out.count("<tr>") == 2 and "<th>" in out and "&lt;main&gt;" in out
+    assert out.index("<th>") < out.index("<td>")
+    plain = dict(card["body"][0])
+    plain.pop("firstRowAsHeaders")
+    assert "<th>" not in card_html({"type": "AdaptiveCard", "body": [plain]})
