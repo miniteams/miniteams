@@ -230,6 +230,24 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 - [ ] **AC26** Clicking a reaction chip under a message sends `react` with that key: `remove:
       true` when the chip is mine, else `remove: false`; the chip shows a "mine" state from the
       record; chips are reachable by keyboard.
+- [ ] **AC27** Split list column resizes: a focusable separator (`role="separator"`, aria values)
+      between the list and the chat; dragging +100 px gives a 400 px list saved as
+      `localStorage.chatnav_w` and kept after a reload; ←/→ step 16 px (Shift 64), Home = 280 min,
+      End = `min(560, window − 420)`; double-click or Enter resets to 300 and clears the key; a
+      stored out-of-range value is clamped; no separator at 700 px and below or in list mode.
+- [ ] **AC28** Split filters: the filter row is as tall as the chat header (bottom borders aligned
+      within 1 px); tabs Inbox, @, Unread and a "⋯" menu holding Seen and Muted fit a 280 px column
+      without scrolling, the active tab always visible; from 360 px the five tabs show inline; the
+      filter has a × clear, ↑/↓/Enter/Escape like the widget's, and Ctrl+K focuses it from anywhere.
+- [ ] **AC29** Split rows and focus: seen/mute buttons take no width until hover or focus; rows use a
+      roving tabindex (↑/↓/Home/End move, Enter switches), so the chat header is at most 10 Tab
+      presses from the filter; ☰ toggles the docked list above 700 px (saved) and opens a drawer
+      with a backdrop below it, with `aria-expanded`, focus into the filter, Escape back to ☰.
+- [ ] **AC30** Split polish: the chat header never overflows (label at least 80 px at 720 px wide;
+      Open in Teams as an icon below 560 px); the current row is marked by a fill and a 3 px bar and
+      scrolled into view on load and Back/Forward, not on live updates; empty tabs and empty filters
+      say so right under the bar; focus rings use the accent colour; row times and seen rows reach
+      4.5:1 contrast in both themes. Switching chats keeps the list's scroll position.
 
 ## Phases
 
@@ -293,6 +311,15 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 - **DoD**: `pytest tests/test_render.py` green for each element kind and the fallbacks; on the live
   page, a bot card from the archive reads like its Teams rendering (title, facts, action links).
 
+### Phase 8 — split mode UX pass
+- Work: from the UX audit of split mode (screenshots at 4 widths, both themes): resizable column,
+  filter row and tabs, row width and roving focus, narrow header, current row, empty states,
+  contrast; tests.
+- **Covers**: AC27, AC28, AC29, AC30
+- **Data model impact**: none
+- **DoD**: browser tests for each AC; screenshots at 1920, 1300, 1024 and 700 px in both themes show
+  no clipped tab, no overflowing header and aligned pane borders.
+
 ## Data model impact (summary)
 
 None. Archive read-only, no new file under `~/.config/miniteams`.
@@ -318,6 +345,10 @@ None.
   proxy for any URL and the archive already fetches media.
 - Upload stays out; the Open in Teams button covers it, and anything else the page lacks
   (babs, 2026-10-09). Multi-quote kept, as Teams does it.
+- Split mode UX pass (babs, 2026-10-09): resizable list, reorganised filters, then a full audit.
+  Seen and Muted move into a "⋯" menu below 360 px rather than a native select, to keep the
+  widget's segmented look. Not this pass: drag-to-collapse, Alt+↑/↓ between chats, cross-tab filter
+  hints, absolute old dates, an unread-only Inbox count (would change the widget's meaning too).
 - Runs of deleted messages collapse (babs, 2026-10-09): the data is right (the API confirms bots
   delete their old notifications), the page just must not drown in them.
 - Cards rendered, not just their text fallback (babs, 2026-10-09): both carriers are Adaptive
