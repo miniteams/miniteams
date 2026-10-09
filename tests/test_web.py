@@ -187,7 +187,8 @@ async def test_row_without_last_message_is_empty_but_valid(quiet_directory: Dire
     assert row["last_activity"] == "2025-09-15T10:00:00Z"  # falls back to version
 
 
-async def test_bootstrap_filters_scope_and_caps(quiet_directory: Directory) -> None:
+async def test_bootstrap_filters_scope_and_caps(quiet_directory: Directory, monkeypatch) -> None:
+    monkeypatch.setattr(W, "fetch_history", lambda *a: [])  # no recent page: rows stay as listed
     pages = [
         [
             _conv("19:chan@thread.tacv2", "2026-09-15T12:00:00Z"),  # channel: out

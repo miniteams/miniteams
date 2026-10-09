@@ -88,7 +88,12 @@ async def test_resource_to_record_surfaces_fields(directory: Directory) -> None:
     assert rec["raw"] is res
 
 
-async def test_event_to_record_includes_delivery_envelope(directory: Directory) -> None:
+async def test_event_to_record_includes_delivery_envelope(directory: Directory, monkeypatch) -> None:
+    async def offline(self: Directory, key: str) -> str:
+        return key
+
+    monkeypatch.setattr(Directory, "display", offline)
+    monkeypatch.setattr(Directory, "label", offline)
     obj = {"type": "EventMessage", "resourceType": "NewMessage", "resource": {"from": "8:o:u"}}
     req = {"id": 42, "method": "POST", "url": "https://h/x/messaging", "headers": {"a": "b"}}
     rec = await event_to_record(obj, req, directory)

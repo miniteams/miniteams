@@ -218,6 +218,7 @@ def test_assets_only_no_longer_forces_denied_assets(monkeypatch) -> None:
 
     monkeypatch.setattr(archive, "run_archive", fake_run_archive)
     monkeypatch.setattr(auth.TokenSource, "acquire", lambda self: {"access_token": "x"})
+    monkeypatch.setattr(auth, "_app", lambda *a: None)  # msal discovers its authority online
 
     assert cli.main(["archive", "--assets-only"]) == 0
     assert seen["assets_only"] is True
@@ -247,6 +248,7 @@ def _archive_retry_case(monkeypatch, outcomes: list[Any], argv: list[str]) -> tu
 
     monkeypatch.setattr(archive, "run_archive", fake_run_archive)
     monkeypatch.setattr(auth.TokenSource, "acquire", lambda self: {"access_token": "x"})
+    monkeypatch.setattr(auth, "_app", lambda *a: None)  # msal discovers its authority online
     monkeypatch.setattr(time, "sleep", slept.append)
     return cli.main(argv), slept
 
@@ -390,6 +392,7 @@ def test_archive_live_exits_1_when_the_refresh_token_dies(monkeypatch) -> None:
 
     monkeypatch.setattr(archive_live, "run_live", fake_run_live)
     monkeypatch.setattr(auth.TokenSource, "acquire", lambda self: {"access_token": "x"})
+    monkeypatch.setattr(auth, "_app", lambda *a: None)  # msal discovers its authority online
     assert cli.main(["archive", "--live", "--no-media"]) == 1
     assert calls and calls[0]["download_media"] is False
     assert calls[0]["reconcile"] == 1800
@@ -422,5 +425,6 @@ def test_recheck_since_reaches_the_run_as_a_utc_floor(monkeypatch) -> None:
 
     monkeypatch.setattr(archive, "run_archive", fake_run_archive)
     monkeypatch.setattr(auth.TokenSource, "acquire", lambda self: {"access_token": "x"})
+    monkeypatch.setattr(auth, "_app", lambda *a: None)  # msal discovers its authority online
     assert cli.main(["archive", "--recheck-since", "2026-09-22T02:00:00+02:00"]) == 0
     assert seen["recheck_since"] == "2026-09-22T00:00:00"
