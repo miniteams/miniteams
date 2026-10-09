@@ -22,7 +22,7 @@ import test_web_chat
 from test_web_chat import ANN, ME, OBJ, C, T, _archive, _at, _event, _m, _served, _until
 
 from miniteams import web as W
-from miniteams.archive_store import find_chat_dir
+from miniteams.archive_store import ChatStore, find_chat_dir
 from miniteams.config import Settings
 
 CHROME = Path("/usr/bin/google-chrome")
@@ -48,6 +48,9 @@ L = "19:llll@thread.v2"  # archived, long enough for the list to scroll
 X = "19:xxxx@thread.v2"  # archived, several pages long
 LONG = 250
 D = "19:dddd@thread.v2"  # archived, messages on several days
+K = "19:kkkk@thread.v2"  # archived, a bot card
+R = "19:rrrr@thread.v2"  # archived, deleted runs and reaction chips
+GONE = {"deletetime": "1789466600000"}
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
     "1f15c4890000000d49444154789c63000100000500010d0a2db40000000049454e44ae426082"  # pragma: allowlist secret
@@ -158,7 +161,6 @@ def data_dir(tmp_path: Path) -> Path:
     assert chat_dir is not None
     (chat_dir / "media" / f"{OBJ}.png").write_bytes(PNG)
     _archive(path, L, [_m(str(i), _at(i)) for i in range(10, 40)])
-    _archive(path, C, [])
     far = {5, 245}  # two search hits more than a page apart
     long = [_m(str(i), _at(i), f"<p>x{i:03d}{' far' if i in far else ''}</p>") for i in range(LONG)]
     long[160] = _m(
@@ -171,6 +173,28 @@ def data_dir(tmp_path: Path) -> Path:
         ("b", "2026-09-11T08:00:00.000Z"),
     ]
     _archive(path, D, [_m(i, t) for i, t in days])
+    card = {"contentType": "application/vnd.microsoft.card.adaptive", "content": test_web_chat._BUILD_CARD}
+    my_card = {
+        **test_web_chat._swift_message({"attachments": [card]}),
+        "id": "2",
+        "composetime": _at(2),
+        **mine,
+    }
+    text_card = {"cards": [{"content": test_web_chat._card({"type": "TextBlock", "text": "CARDTEXT"})}]}
+    mine_html = _m("3", _at(3), "<p>hello</p>", properties=text_card, **mine)
+    _archive(path, K, [test_web_chat._swift_message({"attachments": [card]}), my_card, mine_html])
+    reacts = {
+        "emotions": [
+            {"key": "like", "users": [{"mri": ME}]},
+            {"key": "heart", "users": [{"mri": ANN}]},
+            {"key": "party", "users": [{"mri": ANN}]},
+            {"key": "toString", "users": [{"mri": ANN}]},
+        ]
+    }
+    _archive(path, C, [_m("1", _at(1), properties=reacts)])
+    deleted = [_m(i, _at(int(i)), properties=GONE, **(mine if i == "3" else {})) for i in "234"]
+    others = [_m(str(i), _at(i), properties=GONE if i == 7 else {}) for i in range(5, 21)]
+    _archive(path, R, [_m("1", _at(1), properties=reacts), *deleted, *others])
     return path
 
 
@@ -191,7 +215,8 @@ async def test_page_renders_the_archived_history(chat: Pages) -> None:
     assert await page.locator(".msg").first.locator(".html b").inner_text() == "there"
     await page.wait_for_function("document.querySelector('.html img')?.naturalWidth > 0")
     assert await page.locator(".msg.cont").count() == 1
-    assert await page.locator(".msg.me .reacts span").inner_text() == "👍 1"
+    assert await page.locator(".msg.me .reacts button").inner_text() == "👍 1"
+    assert await page.locator("#back").get_attribute("href") == "/?nav=chat"  # 011-AC20, list mode
 
 
 async def test_live_append_edit_delete_reaction_and_typing(board: W.Board, chat: Pages) -> None:
@@ -204,7 +229,7 @@ async def test_live_append_edit_delete_reaction_and_typing(board: W.Board, chat:
     reaction = {"emotions": [{"key": "heart", "users": [{"mri": ME}]}]}
     partial = {k: v for k, v in _m("4", _at(4)).items() if k != "content"}
     await board.on_event(_event("MessageUpdate", T, **{**partial, "properties": reaction}))
-    await page.wait_for_selector('[data-id="4"] .reacts span.mine')
+    await page.wait_for_selector('[data-id="4"] .reacts button.mine')
     assert "live one" in await page.locator('[data-id="4"] .html').inner_text()  # a partial edit keeps it
     edit = {"edittime": "1789466500000"}
     await board.on_event(_event("MessageUpdate", T, **_m("4", _at(4), "<p>live two</p>", properties=edit)))
@@ -359,6 +384,9 @@ async def test_channel_page_has_no_composer(chat: Pages) -> None:
     await _handled(page, "follow")
     assert await page.locator("#reply").is_disabled()
     assert await page.locator("#reply").get_attribute("placeholder") == "read-only: team channel"
+    await page.wait_for_selector('[data-id="1"] .reacts')
+    assert await page.locator(".reacts button").count() == 0  # 011-AC26: no react on a channel
+    assert await page.locator(".reacts span").count() == 4
 
 
 async def test_malformed_chat_address_is_guarded(chat: Pages) -> None:
@@ -463,7 +491,7 @@ async def test_react_toggles_my_reaction(board: W.Board, chat: Pages, calls: lis
     mine = {"emotions": [{"key": "like", "users": [{"mri": ME}]}]}
     partial = {k: v for k, v in _m("1", _at(1)).items() if k != "content"}
     await board.on_event(_event("MessageUpdate", T, **{**partial, "properties": mine}))
-    await page.wait_for_selector('[data-id="1"] .reacts span.mine')
+    await page.wait_for_selector('[data-id="1"] .reacts button.mine')
     await page.locator('[data-id="1"]').hover()
     await _act(page, "1", "react").click()
     await page.locator('[data-id="1"] .picker [data-key=like]').click()
@@ -1022,6 +1050,33 @@ async def test_a_short_page_asks_for_older_without_a_scroll(
     assert len(asked) == 2  # that page was empty: older false, no more
 
 
+async def test_a_failed_older_page_is_asked_again_after_a_reconnect(
+    board: W.Board, chat: Pages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC15: on a page too short to scroll, one failed `before` does not stop older history for
+    good: the next latest page (a reconnect) asks it again and the older message shows."""
+    b = test_web_chat.B
+    board.rows[b] = {"id": b, "label": "B", "last_activity": _at(5), "typing": []}
+    befores: list[int] = []
+
+    def flaky(settings: Any, token: str, thread: str, size: int, pages: int, end: int | None = None) -> Any:
+        if end is None:
+            return [_m(str(i), _at(i)) for i in (2, 3)]
+        befores.append(end)
+        if len(befores) == 1:
+            raise RuntimeError("odd")
+        return [_m("1", _at(1))]
+
+    monkeypatch.setattr(W, "fetch_history", flaky)
+    page = await chat.open(_chat(b))
+    await page.wait_for_function("window.__frames.some(f => f.error === 'odd')")
+    since = await _frames(page)
+    await _drop(board)
+    await _handled(page, "follow", since)
+    await page.wait_for_selector('[data-id="1"]', timeout=3000)
+    assert befores[1] == befores[0]  # the failed edge, asked again
+
+
 async def test_an_empty_page_that_says_older_is_asked_once(
     chat: Pages, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1302,3 +1357,143 @@ async def test_midclick_url_param_overrides_the_stored_choice(widget: Widget) ->
     page = await widget.load(True, "/?midclick=teams", midclick="chat")
     assert await widget.act(lambda: page.locator("a.name").click(button="middle")) == ([(T, True)], [])
     assert await page.evaluate("localStorage.getItem('midclick')") == "chat"
+
+
+# --- cards, deleted runs, reaction chips (011 phase 7) ---
+
+
+async def test_a_card_renders_its_title_facts_and_links(chat: Pages) -> None:
+    """011-AC24: a bot card shows its title, its facts as a table and its OpenUrl action as a link;
+    its images that are not archived show their alt text, nothing is fetched (chat fixture)."""
+    page = await chat.open(_chat(K))
+    await _handled(page, "history")
+    card = page.locator('[data-id="1"] .html .card')
+    assert await card.locator(".tb.w-bolder").inner_text() == "Build failed"
+    assert await card.locator("table.facts th").all_inner_texts() == ["Branch"]
+    assert await card.locator("table.facts td").all_inner_texts() == ["main"]
+    link = card.locator("a.act")
+    assert await link.inner_text() == "Open"
+    assert await link.get_attribute("href") == "https://ci.example.org/1"
+    assert await card.locator("img").count() == 0
+    assert "logo" in await card.inner_text()
+    assert await card.evaluate("c => getComputedStyle(c).borderTopStyle") == "solid"
+    assert await _act(page, "2", "delete").count() == 1
+    assert await _act(page, "2", "edit").count() == 0  # my own card: the server refuses its edit
+
+
+async def test_deleted_runs_fold_into_one_line_that_expands(chat: Pages) -> None:
+    """011-AC25: three consecutive deleted messages (two senders) are one toggle line; a lone
+    deleted message stays as itself."""
+    page = await chat.open(_chat(R))
+    await _handled(page, "history")
+    toggle = page.locator("#msgs .run")
+    assert await toggle.count() == 1
+    assert (await toggle.inner_text(), await toggle.get_attribute("aria-expanded")) == (
+        "3 messages deleted",
+        "false",
+    )
+    for i in "234":
+        assert await page.locator(f'[data-id="{i}"] .html').is_hidden()
+    assert await page.locator('[data-id="7"] .html').inner_text() == "message deleted"
+    # Same sender within 5 minutes as the run's last message, yet it shows its own name.
+    assert "cont" not in (await page.locator('[data-id="5"]').get_attribute("class") or "").split()
+    await toggle.click()
+    assert await toggle.get_attribute("aria-expanded") == "true"
+    assert await page.evaluate("document.activeElement.classList.contains('run')")
+    for i in "234":
+        assert await page.locator(f'[data-id="{i}"] .html').inner_text() == "message deleted"
+    await page.keyboard.press("Enter")
+    assert await toggle.get_attribute("aria-expanded") == "false"
+    assert await page.locator('[data-id="3"]').is_hidden()
+
+
+async def test_a_live_delete_after_a_run_grows_it(board: W.Board, chat: Pages) -> None:
+    """011-AC25: deleting the message right after a run joins it; the composer's quotes stay."""
+    page = await chat.open(_chat(R))
+    await _handled(page, "history")
+    await _act(page, "5", "reply").dispatch_event("click")
+    await board.on_event(_event("MessageUpdate", R, **{**_m("5", _at(5)), "content": "", "properties": GONE}))
+    await page.wait_for_function("document.querySelector('#msgs .run')?.textContent === '4 messages deleted'")
+    assert await page.locator("#msgs .run").count() == 1
+    assert await page.locator('[data-id="5"]').is_hidden()
+    assert await _quote_ids(page) == ["5"]
+
+
+async def test_reaction_chips_add_or_remove_mine(chat: Pages, calls: list[tuple[Any, ...]]) -> None:
+    """011-AC26: a chip I gave removes my reaction, another adds it; chips are labelled, marked when
+    mine, reachable by Tab; a key `react` refuses is not a button."""
+    page = await chat.open(_chat(R))
+    await _handled(page, "history")
+    chips = page.locator('[data-id="1"] .reacts button')
+    labels = await chips.evaluate_all("bs => bs.map(b => [b.ariaLabel, b.classList.contains('mine')])")
+    assert labels == [["👍 1, remove", True], ["❤️ 1, add", False]]
+    spans = page.locator('[data-id="1"] .reacts span')
+    assert await spans.all_inner_texts() == [":party: 1", ":toString: 1"]
+    await chips.first.click()
+    await _until(calls, 1)
+    await chips.nth(1).click()
+    await _until(calls, 2)
+    await page.locator('[data-id="1"]').focus()
+    await page.keyboard.press("Tab")
+    assert await page.evaluate("document.activeElement.ariaLabel") == "👍 1, remove"
+    await page.keyboard.press("Tab")
+    await page.keyboard.press("Enter")
+    await _until(calls, 3)
+    heart = ("react", R, "1", "heart", False)
+    assert calls == [("react", R, "1", "like", True), heart, heart]
+
+
+async def test_an_open_run_stays_open_as_it_grows_at_either_end(board: W.Board, chat: Pages) -> None:
+    """011-AC25: an expanded run keeps expanded when a live delete joins it above or below."""
+    page = await chat.open(_chat(R))
+    await _handled(page, "history")
+    toggle = page.locator("#msgs .run")
+    await toggle.click()
+    for msg_id, count in (("1", 4), ("5", 5)):
+        update = {**_m(msg_id, _at(int(msg_id))), "content": "", "properties": GONE}
+        await board.on_event(_event("MessageUpdate", R, **update))
+        await page.wait_for_function(
+            f"document.querySelector('#msgs .run')?.textContent === '{count} messages deleted'"
+        )
+        assert await toggle.get_attribute("aria-expanded") == "true"
+        assert await page.locator('[data-id="3"] .html').is_visible()
+    await toggle.click()
+    assert await page.locator('[data-id="3"]').is_hidden()
+
+
+async def test_a_search_hit_inside_a_folded_run_lands_on_its_line(chat: Pages) -> None:
+    """011-AC25: a jump to a folded message highlights the run's visible line."""
+    page = await chat.open(_chat(R), **_VIEW)
+    await _handled(page, "history")
+    await _search(page, "m3")
+    await page.locator('#hits button[data-id="3"]').click()
+    await page.wait_for_selector('#msgs [data-id="2"].hit')
+    assert await page.locator('[data-id="2"] .run').is_visible()
+
+
+async def test_reconnect_on_a_message_folded_meanwhile_keeps_the_place(
+    board: W.Board, chat: Pages, data_dir: Path
+) -> None:
+    """011-AC25: the reader's message folded into a run during a drop: its run's line takes its place."""
+    page = await chat.open(_chat(R), viewport={"width": 700, "height": 300})
+    await _handled(page, "history")
+    await page.locator('#msgs [data-id="7"]').evaluate("n => n.scrollIntoView({ block: 'start' })")
+    await _scroll(page, "l.scrollTop")
+    before = await page.evaluate(_OFFSET, "7")
+    store = ChatStore(data_dir, R)
+    store.apply_message({**_m("6", _at(6)), "version": "9", "properties": GONE}, _at(30))
+    store.close()
+    since = await _frames(page)
+    await _drop(board)
+    await _handled(page, "history", since)
+    assert await page.locator('[data-id="7"]').is_hidden()
+    assert abs(await page.evaluate(_OFFSET, "6") - before) < 2
+
+
+async def test_editing_my_message_leaves_its_card_out(chat: Pages) -> None:
+    """011-AC13: the editor starts from my text only, not from the card the message carries."""
+    page = await chat.open(_chat(K))
+    await _handled(page, "history")
+    assert "CARDTEXT" in await page.locator('[data-id="3"] .html .card').inner_text()
+    box = await _edit(page, "3")
+    assert await box.input_value() == "hello"

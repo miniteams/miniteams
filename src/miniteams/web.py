@@ -42,7 +42,7 @@ from .config import Settings
 from .directory import Directory
 from .dump import _epoch_seconds, fetch_history
 from .messages import _TAG_RE, EMOJI, thread_of
-from .render import sanitize
+from .render import cards_html, media_url, sanitize
 from .send import delete_message, edit_message, mark_read, message_html, react, send_message
 from .stream import run_forever
 
@@ -288,6 +288,11 @@ def chat_record(
             body = sanitize(content, thread_id, media_dir, me, mentions)
         elif msgtype == "Text":
             body = html.escape(content)
+        if msgtype == "RichText/Media_Card" or props.get("cards"):
+            # Appended after sanitize(), never through it: the card markup is its own allowlist.
+            cards = cards_html(message, media_url=lambda u: media_url(thread_id, media_dir, u))
+            body += cards
+            kind = "text" if cards and kind == "other" else kind
         body = body or html.escape(snippet(msgtype, content, props))  # file/card posts, markers
     reactions = []
     for emotion in _json_list(props.get("emotions")):
@@ -314,6 +319,7 @@ def chat_record(
         "name": str(message.get("imdisplayname") or ""),
         "me": _is_me(mri, me),
         "type": kind,
+        "editable": msgtype in _TEXT_TYPES,
         "html": body,
         "edited": bool(message.get("skypeeditedid") or props.get("edittime")),
         "deleted": deleted,

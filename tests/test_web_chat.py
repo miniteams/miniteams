@@ -319,6 +319,7 @@ def test_record_fields() -> None:
         "name": "Ann Lee",
         "me": False,
         "type": "text",
+        "editable": True,
         "html": "<p>hi <b>you</b></p>",
         "edited": True,
         "deleted": False,
@@ -385,6 +386,77 @@ def test_record_types_and_markers(
         {"id": "1", "composetime": _at(1), "messagetype": msgtype, "content": content, "properties": props}, T
     )
     assert (record["type"], record["html"]) == (kind, body)
+
+
+def _card(*body: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    return {"type": "AdaptiveCard", "body": list(body), **extra}
+
+
+_BUILD_CARD = _card(
+    {"type": "TextBlock", "text": "Build failed", "weight": "Bolder", "size": "Large"},
+    {"type": "FactSet", "facts": [{"title": "Branch", "value": "main"}]},
+    {"type": "Image", "url": f"https://eu-api.asm.skype.com/v1/objects/{OBJ}/views/imgo", "altText": "shot"},
+    {"type": "Image", "url": "https://cdn.example.org/logo.png", "altText": "logo"},
+    actions=[{"type": "Action.OpenUrl", "title": "Open", "url": "https://ci.example.org/1"}],
+)
+
+
+def _swift_message(payload: dict[str, Any]) -> dict[str, Any]:
+    b64 = base64.b64encode(json.dumps(payload).encode()).decode()
+    content = f'<URIObject type="SWIFT.1"><Swift b64="{b64}"></Swift></URIObject>'
+    return {"id": "1", "composetime": _at(1), "messagetype": "RichText/Media_Card", "content": content}
+
+
+def test_record_renders_a_media_card(tmp_path: Path) -> None:
+    """011-AC24: a Swift card renders as card HTML, typed text; images only from the archive."""
+    (tmp_path / f"{OBJ}.png").write_bytes(b"png")
+    attachment = {"contentType": "application/vnd.microsoft.card.adaptive", "content": _BUILD_CARD}
+    record = W.chat_record(_swift_message({"attachments": [attachment]}), T, ME, tmp_path)
+    assert record["type"] == "text"
+    out = record["html"]
+    assert (
+        out.startswith('<div class="card">') and '<div class="tb w-bolder s-large">Build failed</div>' in out
+    )
+    assert '<table class="facts"><tr><th>Branch</th><td>main</td></tr></table>' in out
+    assert f'<img src="/media/19%3Aaaaa%40thread.v2/{OBJ}.png" alt="shot">' in out
+    assert "<p>logo</p>" in out and "cdn.example.org" not in out
+    assert 'href="https://ci.example.org/1"' in out
+
+
+def test_record_appends_properties_cards_after_the_sanitised_body() -> None:
+    """011-AC24: `properties.cards` (a JSON string) follows the body, its classes intact."""
+    cards = [{"appName": "CI", "content": _BUILD_CARD}]
+    message = _m("7", _at(7), '<p onclick="x()">see below</p>', properties={"cards": json.dumps(cards)})
+    record = W.chat_record(message, T, ME)
+    assert record["type"] == "text"
+    assert record["html"].startswith('<p>see below</p><div class="card"><div class="card-app">CI</div>')
+    assert '<table class="facts">' in record["html"] and "onclick" not in record["html"]
+
+
+def test_record_card_type_only_upgrades_other() -> None:
+    """011-AC24: a card makes `other` a text record, never editable; a system message stays system."""
+    cards = {"cards": [{"content": _BUILD_CARD}]}
+    mine = {"from": f"https://h/v1/users/ME/contacts/{ME}"}
+    attachment = {"contentType": "application/vnd.microsoft.card.adaptive", "content": _BUILD_CARD}
+    record = W.chat_record({**_swift_message({"attachments": [attachment]}), **mine}, T, ME)
+    assert (record["type"], record["editable"], record["me"]) == ("text", False, True)
+    added = {**_m("8", _at(8)), "messagetype": "ThreadActivity/AddMember", "properties": cards}
+    record = W.chat_record(added, T, ME)
+    assert (record["type"], record["editable"]) == ("system", False)
+    assert '<div class="card">' in record["html"]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        _swift_message({"attachments": [{"content": _card({"type": "Unknown"})}]}),
+        {**_m("7", _at(7)), "content": "", "properties": {"cards": [{"content": _card()}]}},
+    ],
+)
+def test_record_with_nothing_to_render_keeps_the_marker(message: dict[str, Any]) -> None:
+    """011-AC24: an empty body and cards that render nothing fall back to the card marker."""
+    record = W.chat_record(message, T, ME)
+    assert record["html"] == "🃏 card"
 
 
 # --- socket: follow + relay (011-AC7), answers to the asker only ---
