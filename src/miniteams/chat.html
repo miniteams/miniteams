@@ -36,7 +36,19 @@
   .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 
   header { background: color-mix(in srgb, var(--bg) 85%, transparent); padding: 10px 16px; display: flex; align-items: center;
-    gap: 12px; border-bottom: 1px solid var(--line); flex: none; }
+    gap: 12px; border-bottom: 1px solid var(--line); flex: none; position: relative; z-index: 2; }
+  #find, #day { font: inherit; font-size: 12.5px; color: inherit; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 2px 8px; }
+  #find { width: 12em; }
+  #hits { position: absolute; top: 100%; right: 16px; width: min(440px, 92vw); max-height: 60vh; overflow-y: auto;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); padding: 4px; }
+  #hits[hidden] { display: none; }
+  #hits button { display: block; width: 100%; text-align: left; border: 0; background: transparent; border-radius: 6px;
+    padding: 4px 8px; cursor: pointer; }
+  #hits button:hover, #hits button:focus-visible { background: var(--panel-2); }
+  #hits b { font-weight: 600; margin-right: 6px; }
+  #hits .none { color: var(--dim); padding: 4px 8px; }
+  #hits .none.err { color: var(--hot); }
   #back { color: var(--dim); text-decoration: none; font-size: 15px; border-radius: 8px; padding: 2px 6px; }
   #back:hover { background: var(--panel-2); color: var(--text); }
   h1 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -.01em; }
@@ -47,12 +59,16 @@
   .btn:disabled { opacity: .5; cursor: default; }
   .btn:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
 
+  #pane { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
   #list { flex: 1; overflow-y: auto; padding: 8px 12px; }
+  #latest { position: absolute; right: 20px; bottom: 10px; box-shadow: var(--shadow); color: var(--accent); }
+  #latest[hidden] { display: none; }
   #note { text-align: center; color: var(--dim); padding: 1em; }
   #note.err { color: var(--hot); }
   .msg { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 0 10px; padding: 4px 8px; border-radius: 10px; position: relative; }
   .msg:not(.cont) { margin-top: 10px; }
   .msg:hover { background: var(--panel); }
+  .msg.hit { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
   .av { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; font-weight: 650; font-size: 13px; color: #fff; }
   .msg.cont .av, .msg.cont .head { display: none; }
   .body { grid-column: 2; min-width: 0; }
@@ -129,9 +145,15 @@
   <h1 id="label" class="truncate">…</h1>
   <span id="members"></span>
   <span id="status" class="off" title="connecting…"></span>
+  <input id="find" type="search" placeholder="search · Enter" aria-label="search this chat">
+  <input id="day" type="date" title="jump to a day" aria-label="jump to a day">
   <button id="teams" class="btn" title="open this chat in Teams" disabled>Open in Teams</button>
+  <div id="hits" hidden></div>
 </header>
-<div id="list"><div id="note">loading…</div><div id="msgs"></div></div>
+<div id="pane">
+  <div id="list"><div id="note">loading…</div><div id="msgs"></div></div>
+  <button id="latest" class="btn" hidden>↓ latest</button>
+</div>
 <div id="typing" aria-live="polite"></div>
 <footer>
   <div id="quotes" hidden></div>
@@ -146,7 +168,8 @@
         $label = document.getElementById("label"), $members = document.getElementById("members"),
         $status = document.getElementById("status"), $teams = document.getElementById("teams"),
         $typing = document.getElementById("typing"), $reply = document.getElementById("reply"), $err = document.getElementById("err"),
-        $quotes = document.getElementById("quotes");
+        $quotes = document.getElementById("quotes"), $latest = document.getElementById("latest"),
+        $find = document.getElementById("find"), $day = document.getElementById("day"), $hits = document.getElementById("hits");
   const store = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
   const q = new URLSearchParams(location.search), pref = (k) => q.get(k) ?? store(k);
   const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
@@ -157,8 +180,16 @@
 
   let ws = null, opener = false, sending = false, retry = 1000, loaded = false, followFailed = false, pageVersion = null;
   const records = new Map();  // id → record, for the messages on screen
-  const pending = new Set();  // history cursors asked and not answered ("" = latest page)
-  let live = [], liveEdits = [];  // frames relayed while the latest page was being fetched
+  const pending = new Set();  // history requests asked and not answered: "<kind>:<cursor>", "" = latest page
+  // Relayed frames the screen cannot take yet: while a page that replaces it is read, or while
+  // detached (`newer`), where they wait for the page to reach the latest message.
+  let live = [], liveEdits = [];
+  let older = false, newer = false;  // more history above / below what is shown; `newer` = detached by a jump
+  let unseen = 0;  // live messages received while the latest one was out of view
+  let source = "archive", target = null, restore = null;  // target: a jump's {at, id}; restore: a reconnect's anchor
+  let aroundAt = "";  // the one `around` page still wanted: an answer for another is stale
+  const LIVE_MAX = 600;  // messages kept on screen at the bottom (and buffered while detached)
+  const EDGE = 150;  // px from the top or bottom that loads the next page
   const typing = new Set();
   // Teams' 8 default reactions, the keys `react` accepts (messages.EMOJI).
   const EMOJI = { like: "👍", heart: "❤️", laugh: "😆", surprised: "😮", sad: "😢", angry: "😡", yes: "✅", no: "❌" };
@@ -186,10 +217,52 @@
   const lastId = () => $msgs.lastElementChild?.dataset.id || "";
   $teams.onclick = () => openTeams(lastId());
 
-  const near = () => $list.scrollHeight - $list.scrollTop - $list.clientHeight < 40;
+  const near = (px = 40) => $list.scrollHeight - $list.scrollTop - $list.clientHeight < px;
   let stick = true;
-  $list.addEventListener("scroll", () => { stick = near(); });
-  const toBottom = () => { $list.scrollTop = $list.scrollHeight; stick = true; };
+  const showLatest = () => {
+    $latest.hidden = !newer && near();
+    $latest.textContent = unseen ? `↓ latest (${unseen})` : "↓ latest";
+  };
+  const firstAt = () => $msgs.firstElementChild?.dataset.at || "", lastAt = () => $msgs.lastElementChild?.dataset.at || "";
+  $list.addEventListener("scroll", () => {
+    stick = !newer && near();
+    if (stick) unseen = 0;
+    showLatest();
+    if (!loaded || pending.size) return;  // one page at a time: the server answers `busy` to a second
+    if (older && $list.scrollTop < EDGE) requestHistory("before", firstAt());
+    else if (newer && near(EDGE)) requestHistory("after", lastAt());
+  });
+  // A page shorter than the list never scrolls: ask the next one without waiting for a scroll.
+  let filled = "";  // the edge `fill` last asked: asked again, it would bring nothing again
+  const fill = () => {
+    if (pending.size || $list.scrollHeight > $list.clientHeight) return;
+    const [kind, at] = older ? ["before", firstAt()] : newer ? ["after", lastAt()] : ["", ""];
+    if (!at || kind + at === filled) return;
+    filled = kind + at;
+    requestHistory(kind, at);
+  };
+  const toBottom = () => { $list.scrollTop = $list.scrollHeight; stick = !newer; if (stick) unseen = 0; showLatest(); };
+  const byId = (id) => $msgs.querySelector(`[data-id="${CSS.escape(id)}"]`);
+  // The reader's place as a message and its offset, not pixels: pages above it change the pixels.
+  const anchor = () => {
+    const top = $list.getBoundingClientRect().top;
+    const n = [...$msgs.children].find((x) => x.getBoundingClientRect().bottom > top);
+    return n ? { id: n.dataset.id, offset: n.getBoundingClientRect().top - top } : null;
+  };
+  const toAnchor = (a) => {
+    const n = a && byId(a.id);
+    if (!n) return false;
+    $list.scrollTop += n.getBoundingClientRect().top - $list.getBoundingClientRect().top - a.offset;
+    return true;
+  };
+  // A jump's message: the hit itself, else the first message at or after the picked time.
+  const land = (t) => {
+    const n = (t.id && byId(t.id)) || [...$msgs.children].find((x) => x.dataset.at >= t.at) || $msgs.lastElementChild;
+    if (!n) return;
+    for (const old of $msgs.querySelectorAll(".hit")) old.classList.remove("hit");
+    n.classList.add("hit");
+    n.scrollIntoView({ block: t.id ? "center" : "start" });
+  };
   // Images grow the list after it was laid out: keep the bottom in view when it was.
   $list.addEventListener("load", () => { if (stick) toBottom(); }, true);
 
@@ -327,18 +400,22 @@
     }
   };
 
-  const showPage = (messages) => {
-    const keep = loaded && !stick, top = $list.scrollTop;  // a reconnect keeps the reader's place
+  // A page that replaces the screen: the latest one, a jump, a reconnect.
+  const showPage = (messages, more, jumped = false) => {
     // Restored editors start idle: a save in flight lost its answer with the old socket (see onclose).
     const editing = [...$msgs.querySelectorAll(".editor")].map((box) => ({ id: box.closest(".msg").dataset.id, text: box.value,
       focused: box === document.activeElement, note: box.nextElementSibling?.textContent || "" }));
+    older = !!more.older; newer = !!more.newer;
     records.clear();
     for (const r of messages) records.set(r.id, r);
-    for (const r of live) if (!records.has(r.id)) records.set(r.id, r);  // landed while the page was read
+    if (!newer) {  // landed while the page was read, or while detached
+      for (const r of live) if (!records.has(r.id)) records.set(r.id, r);
+      live = [];
+    }
     $msgs.replaceChildren(...[...records.values()].map(renderMessage));
     regroup();
     const edits = liveEdits;
-    live = []; liveEdits = [];
+    liveEdits = [];
     for (const r of edits) replace(r);
     for (const e of editing) {
       const node = $msgs.querySelector(`[data-id="${CSS.escape(e.id)}"]`), r = records.get(e.id);
@@ -348,22 +425,62 @@
     $note.hidden = records.size > 0;
     $note.className = ""; $note.textContent = "no message yet";
     loaded = true;
-    if (keep) $list.scrollTop = top; else toBottom();
+    const t = jumped ? target : null, back = restore;
+    if (jumped) target = null;
+    restore = null;
+    if (t) land(t);
+    else if (!toAnchor(back)) toBottom();
+    stick = !newer && near();
+    showLatest();
+    fill();
+  };
+  // A page next to the screen: older above with the visible message kept in place, newer below.
+  const addPage = (messages, above) => {
+    const a = above && anchor();
+    const nodes = messages.filter((r) => !records.has(r.id)).map((r) => { records.set(r.id, r); return renderMessage(r); });
+    if (above) $msgs.prepend(...nodes); else $msgs.append(...nodes);
+    if (!above && !newer) {  // reached the latest message: what arrived while detached follows it
+      for (const r of live) if (!records.has(r.id)) { records.set(r.id, r); $msgs.append(renderMessage(r)); }
+      live = [];
+    }
+    regroup();
+    if (a) toAnchor(a);
+    $note.hidden = records.size > 0;
+    showLatest();
+    if (nodes.length) fill();
+  };
+  const replacing = () => [...pending].some((k) => !k || k.startsWith("around:"));
+
+  // A long-open busy chat: the reader at the bottom keeps the newest LIVE_MAX, scrolling up reloads the rest.
+  const trim = () => {
+    const cut = [...$msgs.children].slice(0, Math.max(0, $msgs.children.length - LIVE_MAX));
+    const editor = cut.findIndex((n) => n.querySelector(".editor"));
+    if (editor >= 0) cut.length = editor;  // an unsaved edit outlives the trim
+    if (!cut.length) return;
+    for (const n of cut) { records.delete(n.dataset.id); n.remove(); }
+    older = true;
+    regroup();
   };
 
   const append = (r) => {
-    if (pending.has("")) live.push(r);
+    if (newer || replacing()) {
+      if (!live.some((x) => x.id === r.id)) live.push(r);
+      if (live.length > LIVE_MAX) live.shift();
+    }
+    if (newer) { unseen++; showLatest(); return; }  // not after what is shown: it waits for the latest page
     if (records.has(r.id)) return;
     const was = stick;
     records.set(r.id, r);
     $msgs.append(renderMessage(r));
     regroup();
     $note.hidden = true;
-    if (was) toBottom();
+    if (was) { trim(); toBottom(); } else { unseen++; showLatest(); }
   };
 
   const replace = (r) => {
-    if (pending.has("")) liveEdits.push(r);
+    if (replacing()) liveEdits.push(r);
+    const held = live.findIndex((x) => x.id === r.id);  // detached: it is shown once the latest page is
+    if (held >= 0) live[held] = "html" in r ? r : { ...live[held], ...r, html: live[held].html };
     const old = records.get(r.id), node = $msgs.querySelector(`[data-id="${CSS.escape(r.id)}"]`);
     if (!old || !node) return;  // not on screen: the next page read carries it
     const merged = "html" in r ? r : { ...old, ...r, html: old.html };  // a partial update keeps the body
@@ -373,25 +490,84 @@
     regroup();
   };
 
-  // History is keyed on its `before` cursor ("" = the latest page): one request per cursor in flight.
-  const requestHistory = (before = "") => {
-    if (pending.has(before)) return;
-    if (!send({ history: thread, before: before || null })) return;
-    pending.add(before);
-    if (!before) { live = []; liveEdits = []; }
+  // History is keyed on its cursor, which the answer echoes: one request per cursor in flight.
+  const requestHistory = (kind = "before", at = "") => {
+    const key = at ? kind + ":" + at : "";
+    if (pending.has(key)) return;
+    if (!send({ history: thread, [kind]: at || null })) return;
+    pending.add(key);
+    if (!at && !newer) { live = []; liveEdits = []; }  // attached: what came before is on screen
   };
+  const jump = (at, id = "") => { target = { at, id }; aroundAt = at; requestHistory("around", at); };
   const onHistory = (m) => {
-    const key = m.before || "";
-    pending.delete(key);
+    const kind = ["after", "around"].find((k) => k in m) || "before", at = m[kind] || "";
+    pending.delete(at ? kind + ":" + at : "");
+    if (kind === "around" && at !== aroundAt) return;  // a later jump (or the latest page) replaced it
+    if (m.error === "busy") { setTimeout(() => requestHistory(kind, at), 500); return; }
+    if (kind === "around") aroundAt = "";
     if (m.error) {
+      if (kind === "around" && restore) { restore = null; requestHistory(); return; }  // a reconnect: the latest page then
+      if (kind !== "before" && at) { $err.textContent = (kind === "around" ? "jump: " : "history: ") + m.error; target = null; return; }
       if (followFailed) return;  // its error says more than this one
       $note.hidden = false; $note.className = "err";
       $note.textContent = "history: " + m.error;
-      if (m.error === "busy") setTimeout(() => requestHistory(key), 500);
       return;
     }
-    if (!key) showPage(m.messages || []);
+    source = m.source;
+    const messages = m.messages || [];
+    if (!at || kind === "around") showPage(messages, m, kind === "around");
+    // A page asked for an edge that has moved since (a jump, a trim) is stale: the next scroll asks again.
+    else if (kind === "before" && at === firstAt()) { older = !!m.older; addPage(messages, true); }
+    else if (kind === "after" && at === lastAt()) { newer = !!m.newer; addPage(messages, false); }
   };
+  $latest.onclick = () => {
+    if (!newer) { toBottom(); return; }
+    target = restore = null; aroundAt = "";
+    requestHistory();  // showPage ends at the bottom
+  };
+
+  const onSearch = (m) => {
+    if (m.q !== $find.dataset.q) return;  // an answer to a search since replaced
+    if (m.error === "busy") { setTimeout(() => send({ search: thread, q: m.q }), 500); return; }
+    $hits.replaceChildren();
+    if (m.error) $hits.append(el("div", "none err", m.error));
+    else if (!(m.hits || []).length) $hits.append(el("div", "none", "no match"));
+    for (const h of m.hits || []) {
+      const b = el("button");
+      b.dataset.id = h.id;
+      b.append(el("b", null, h.name || "?"), el("span", "when", fmtTime(h.at)), el("div", "truncate", h.text));
+      b.onclick = () => { $hits.hidden = true; jump(h.at, h.id); };
+      $hits.append(b);
+    }
+    $hits.hidden = false;
+  };
+  // Closing the results drops the search: its answer, or a busy retry, must not reopen them.
+  const closeHits = () => { $hits.hidden = true; delete $find.dataset.q; };
+  $find.onkeydown = (e) => {
+    if (e.key === "Escape") { closeHits(); return; }
+    if (e.key !== "Enter" || e.isComposing) return;
+    e.preventDefault();
+    const q = $find.value.trim();
+    if (!q) return;
+    $find.dataset.q = q;
+    if (!send({ search: thread, q })) { $hits.replaceChildren(el("div", "none err", "offline")); $hits.hidden = false; }
+  };
+  document.addEventListener("click", (e) => { if (!$hits.contains(e.target) && e.target !== $find) closeHits(); });
+  // Chrome fires `change` for each typed digit of the year (0002, 0020, 0202…): jump once the field settles.
+  let dayTimer = 0, dayAsked = "";
+  const pickDay = () => {
+    clearTimeout(dayTimer);
+    const [y, mo, d] = $day.value.split("-").map(Number);
+    if (!(y >= 1970) || $day.value === dayAsked) return;
+    dayAsked = $day.value;
+    const start = new Date(0);
+    start.setFullYear(y, mo - 1, d); start.setHours(0, 0, 0, 0);  // the start of the day where the reader is
+    jump(start.toISOString());
+  };
+  $day.onchange = () => { clearTimeout(dayTimer); dayTimer = setTimeout(pickDay, 800); };
+  $day.onkeydown = (e) => { if (e.key === "Enter") pickDay(); };
+  $day.onblur = pickDay;
+  $day.onfocus = () => { dayAsked = ""; };  // the same day again, later, is a new jump
 
   const renderTyping = () => { $typing.textContent = typing.size ? "✍ " + [...typing].join(", ") + (typing.size > 1 ? " are" : " is") + " typing…" : ""; };
 
@@ -452,12 +628,17 @@
       retry = 1000; $status.title = "live"; $status.classList.remove("off");
       pending.clear();
       send({ follow: thread });
-      requestHistory();  // after a drop too: whatever landed meanwhile is in the latest page
+      // After a drop: the reader scrolled up gets the page around their message back, else the latest
+      // page, which holds whatever landed meanwhile.
+      const back = loaded && !stick ? anchor() : null, at = back && byId(back.id).dataset.at;
+      restore = back; target = null; aroundAt = "";  // a jump asked on the dead socket is lost with it
+      if (at && source === "archive") { aroundAt = at; requestHistory("around", at); } else requestHistory();
     };
     ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
       if ("follow" in m) onFollow(m);
       else if ("history" in m) onHistory(m);
+      else if ("search" in m) onSearch(m);
       // Acks name the thread; a relayed `edit` frame carries a record.
       else if (typeof m.edit === "string" || "react" in m || "delete" in m) onAction(m);
       else if (m.msg) {

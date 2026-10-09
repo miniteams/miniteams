@@ -45,6 +45,9 @@ board, calls, launched, quiet_directory, sent = (
 )
 
 L = "19:llll@thread.v2"  # archived, long enough for the list to scroll
+X = "19:xxxx@thread.v2"  # archived, several pages long
+LONG = 250
+D = "19:dddd@thread.v2"  # archived, messages on several days
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
     "1f15c4890000000d49444154789c63000100000500010d0a2db40000000049454e44ae426082"  # pragma: allowlist secret
@@ -156,6 +159,18 @@ def data_dir(tmp_path: Path) -> Path:
     (chat_dir / "media" / f"{OBJ}.png").write_bytes(PNG)
     _archive(path, L, [_m(str(i), _at(i)) for i in range(10, 40)])
     _archive(path, C, [])
+    far = {5, 245}  # two search hits more than a page apart
+    long = [_m(str(i), _at(i), f"<p>x{i:03d}{' far' if i in far else ''}</p>") for i in range(LONG)]
+    long[160] = _m(
+        "160", _at(160), "<p>x160</p>", **mine
+    )  # an editable message near the top of the latest page
+    _archive(path, X, long)
+    days = [
+        ("a", "2026-09-10T12:00:00.000Z"),
+        ("e", "2026-09-10T22:30:00.000Z"),
+        ("b", "2026-09-11T08:00:00.000Z"),
+    ]
+    _archive(path, D, [_m(i, t) for i, t in days])
     return path
 
 
@@ -302,10 +317,10 @@ async def test_edit_during_the_history_read_is_applied_after_it(
     reading, release = threading.Event(), threading.Event()
     real_read = W.read_page
 
-    def held_read(*args: Any) -> Any:
+    def held_read(*args: Any, **kwargs: Any) -> Any:
         reading.set()
         release.wait(5)
-        return real_read(*args)
+        return real_read(*args, **kwargs)
 
     monkeypatch.setattr(W, "read_page", held_read)
     since = await _frames(page)
@@ -586,7 +601,9 @@ async def test_an_open_editor_survives_a_reload_of_the_page_of_messages(
     await _handled(page, "history", since)
     assert await page.locator('[data-id="3"] .editor').input_value() == "kept across"
     real_read = W.read_page
-    monkeypatch.setattr(W, "read_page", lambda *a: ([m for m in real_read(*a)[0] if m["id"] != "3"], False))
+    monkeypatch.setattr(
+        W, "read_page", lambda *a, **k: ([m for m in real_read(*a, **k)[0] if m["id"] != "3"], False, False)
+    )
     since = await _frames(page)
     await _drop(board)
     await _handled(page, "history", since)
@@ -663,7 +680,7 @@ async def test_actions_reachable_from_the_keyboard_and_picker_closes(chat: Pages
     not pin the bar; the picker closes when the pointer leaves the message and on Escape."""
     page = await chat.open(_chat(T))
     await _handled(page, "history")
-    for _ in range(5):  # Tab, not focus(): the bar follows keyboard focus (focus-visible) only
+    for _ in range(12):  # Tab, not focus(): the bar follows keyboard focus (focus-visible) only
         await page.keyboard.press("Tab")
         if await page.evaluate("document.activeElement.dataset.id") == "1":
             break
@@ -688,6 +705,451 @@ async def test_actions_reachable_from_the_keyboard_and_picker_closes(chat: Pages
     await page.locator('[data-id="2"] .html').click()  # a click focuses the message, not its bar
     await page.locator("#reply").hover()
     assert await page.locator('[data-id="2"] .actions').is_hidden()
+
+
+# --- scroll, latest button, search, jump (011 phase 5) ---
+
+# The page's outgoing verbs land in window.__sent (its current socket only).
+_SPY = """(() => { const ws = window.__ws, real = ws.send.bind(ws); window.__sent = [];
+  ws.send = (d) => { window.__sent.push(JSON.parse(d)); real(d); }; })()"""
+_OFFSET = """id => { const l = document.getElementById('list'),
+  n = document.querySelector(`#msgs [data-id="${id}"]`);
+  return n ? n.getBoundingClientRect().top - l.getBoundingClientRect().top : null; }"""
+_VIEW = {"viewport": {"width": 700, "height": 400}}
+
+
+async def _scroll(page: Page, to: str) -> None:
+    """Scroll the list; the event is dispatched so the page reads its position in the handler."""
+    await page.evaluate(f"(l => {{ l.scrollTop = {to}; l.dispatchEvent(new Event('scroll')); }})({_LIST})")
+
+
+async def _history_sent(page: Page) -> list[dict[str, Any]]:
+    return list(await page.evaluate("window.__sent.filter(v => 'history' in v)"))
+
+
+async def _ids(page: Page) -> list[str]:
+    return list(await page.locator("#msgs .msg").evaluate_all("ns => ns.map(n => n.dataset.id)"))
+
+
+def _slow_pages(monkeypatch: pytest.MonkeyPatch, wait: float = 0.3) -> None:
+    real = W.read_page
+
+    def slow(*args: Any, **kwargs: Any) -> Any:
+        threading.Event().wait(wait)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(W, "read_page", slow)
+
+
+async def _open_long(chat: Pages) -> Page:
+    page = await chat.open(_chat(X), **_VIEW)
+    await _handled(page, "history")
+    await page.evaluate(_SPY)
+    return page
+
+
+async def test_scroll_to_top_loads_older_once_and_keeps_the_place(
+    chat: Pages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC15: the top of the list asks the previous page once while it is read, the message in view
+    stays where it was, and the page stops asking at `older: false`."""
+    page = await _open_long(chat)
+    assert await _ids(page) == [str(i) for i in range(150, LONG)]
+    _slow_pages(monkeypatch)
+    await _scroll(page, "0")
+    before = await page.evaluate(_OFFSET, "150")
+    for _ in range(3):  # still at the top while the page is read: no second request
+        await _scroll(page, "0")
+    since = await _frames(page)
+    await _handled(page, "history", since)
+    assert await _history_sent(page) == [{"history": X, "before": _at(150)}]
+    assert len(await _ids(page)) == 200
+    assert abs(await page.evaluate(_OFFSET, "150") - before) < 2
+    await _scroll(page, "0")
+    await page.wait_for_function("document.querySelectorAll('#msgs .msg').length === 250")
+    assert (await _ids(page))[0] == "0"
+    await _scroll(page, "0")
+    await asyncio.sleep(0.5)
+    assert len(await _history_sent(page)) == 2  # older: false, nothing more to ask
+
+
+async def test_latest_button_counts_live_messages_and_returns_to_the_bottom(
+    board: W.Board, chat: Pages
+) -> None:
+    """011-AC16: scrolled up, "↓ latest" shows with the count of live messages; a click lands on the
+    newest."""
+    page = await _open_long(chat)
+    assert await page.locator("#latest").is_hidden()
+    await _scroll(page, "l.scrollHeight / 2")
+    await page.wait_for_selector("#latest:visible")
+    assert await page.locator("#latest").inner_text() == "↓ latest"
+    for i in (900, 901):
+        await board.on_event(_event("NewMessage", X, **_m(str(i), _at(i))))
+    await page.wait_for_function("document.getElementById('latest').textContent === '↓ latest (2)'")
+    assert (await _ids(page))[-1] == "901"  # attached: they are on the page, below the reader
+    await page.click("#latest")
+    await page.wait_for_function(_AT_BOTTOM)
+    assert await page.locator("#latest").is_hidden()
+    assert await _history_sent(page) == []  # attached: no reload needed
+
+
+async def _search(page: Page, q: str) -> None:
+    await page.fill("#find", q)
+    await page.press("#find", "Enter")
+    await page.wait_for_selector("#hits:visible")
+
+
+async def _in_view(page: Page, msg_id: str) -> bool:
+    return bool(
+        await page.evaluate(
+            """id => { const l = document.getElementById('list').getBoundingClientRect(),
+              n = document.querySelector(`#msgs [data-id="${id}"]`).getBoundingClientRect();
+              return n.top >= l.top - 1 && n.bottom <= l.bottom + 1; }""",
+            msg_id,
+        )
+    )
+
+
+async def test_search_hit_shows_the_message_highlighted_with_its_neighbours(chat: Pages) -> None:
+    """011-AC18: a hit, clicked, loads the page around it and shows it highlighted, in view."""
+    page = await _open_long(chat)
+    await _search(page, "X02")  # case folded: x020..x029
+    hits = page.locator("#hits button")
+    assert await hits.evaluate_all("bs => bs.map(b => b.dataset.id)") == [str(i) for i in range(29, 19, -1)]
+    since = await _frames(page)
+    await page.locator('#hits button[data-id="20"]').click()
+    await _handled(page, "history", since)
+    assert await page.locator("#hits").is_hidden()
+    assert (await _history_sent(page))[-1] == {"history": X, "around": _at(20)}
+    assert await page.locator("#msgs .msg.hit").evaluate_all("ns => ns.map(n => n.dataset.id)") == ["20"]
+    assert await _in_view(page, "20")
+    ids = await _ids(page)
+    assert (ids[0], ids[-1]) == ("0", "99")  # 20 before (all there is), the rest of the page from the hit on
+    assert await page.locator("#latest").is_visible()  # detached: the latest message is not loaded
+
+
+async def test_search_errors_show_in_the_results(
+    board: W.Board, chat: Pages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC18: a chat without archive says so where the results would be."""
+    b = test_web_chat.B
+    board.rows[b] = {"id": b, "label": "B", "last_activity": _at(1), "typing": []}
+    monkeypatch.setattr(W, "fetch_history", lambda *a: [])
+    page = await chat.open(_chat(b))
+    await _handled(page, "history")
+    await _search(page, "x")
+    assert await page.locator("#hits .err").inner_text() == "no archive for this chat"
+
+
+async def _jump_to(page: Page, msg_id: str) -> None:
+    await _search(page, f"x{int(msg_id):03d}")
+    since = await _frames(page)
+    await page.locator(f'#hits button[data-id="{msg_id}"]').click()
+    await _handled(page, "history", since)
+
+
+async def test_after_a_jump_scrolling_down_loads_newer(board: W.Board, chat: Pages) -> None:
+    """011-AC16 + 011-AC17: detached by a jump, the bottom asks `after` until `newer` is false; a live
+    message meanwhile only bumps the count, then follows the latest message once it is reached."""
+    page = await _open_long(chat)
+    await _jump_to(page, "20")
+    await board.on_event(_event("NewMessage", X, **_m("900", _at(900))))
+    await page.wait_for_function("document.getElementById('latest').textContent === '↓ latest (1)'")
+    assert "900" not in await _ids(page)
+    for last in ("199", "900"):  # the last page reaches the latest message: the live one follows it
+        await _scroll(page, "l.scrollHeight")
+        await page.wait_for_function(
+            f"document.querySelector('#msgs').lastElementChild.dataset.id === {json.dumps(last)}"
+        )
+    afters = [v["after"] for v in await _history_sent(page) if "after" in v]
+    assert afters == [_at(99), _at(199)]
+    ids = await _ids(page)
+    assert ids == [*(str(i) for i in range(LONG)), "900"]  # no overlap, no gap
+    await _scroll(page, "l.scrollHeight")
+    await page.wait_for_selector("#latest", state="hidden")
+
+
+async def test_latest_button_after_a_jump_reloads_the_latest_page(board: W.Board, chat: Pages) -> None:
+    """011-AC16: after a jump, "↓ latest" loads the latest page and shows the newest message at the bottom,
+    live ones received meanwhile included."""
+    page = await _open_long(chat)
+    await _jump_to(page, "20")
+    await board.on_event(_event("NewMessage", X, **_m("900", _at(900))))
+    await page.wait_for_function("document.getElementById('latest').textContent === '↓ latest (1)'")
+    since = await _frames(page)
+    await page.click("#latest")
+    await _handled(page, "history", since)
+    await page.wait_for_function(_AT_BOTTOM)
+    assert (await _history_sent(page))[-1] == {"history": X, "before": None}
+    ids = await _ids(page)
+    assert (ids[0], ids[-2], ids[-1]) == ("150", "249", "900")
+    assert await page.locator("#latest").is_hidden()
+    await board.on_event(_event("NewMessage", X, **_m("901", _at(901))))
+    await page.wait_for_function("document.querySelector('#msgs').lastElementChild.dataset.id === '901'")
+
+
+async def test_date_picker_lands_on_the_first_message_of_the_day(chat: Pages) -> None:
+    """011-AC18: the picked day starts at local midnight: in Paris, 22:30 UTC the day before is its first."""
+    page = await chat.open(_chat(D), timezone_id="Europe/Paris", **_VIEW)
+    await _handled(page, "history")
+    await page.evaluate(_SPY)
+    since = await _frames(page)
+    await page.fill("#day", "2026-09-11")
+    await _handled(page, "history", since)
+    assert (await _history_sent(page))[-1] == {"history": D, "around": "2026-09-10T22:00:00.000Z"}
+    assert await page.locator("#msgs .msg.hit").evaluate_all("ns => ns.map(n => n.dataset.id)") == ["e"]
+    assert await _in_view(page, "e")
+
+
+async def test_jump_without_archive_says_so(
+    board: W.Board, chat: Pages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC17: a chat read from the API cannot jump; the page says why and keeps its messages."""
+    b = test_web_chat.B
+    board.rows[b] = {"id": b, "label": "B", "last_activity": _at(1), "typing": []}
+    monkeypatch.setattr(W, "fetch_history", lambda *a: [_m("1", _at(1))])
+    page = await chat.open(_chat(b))
+    await _handled(page, "history")
+    await page.fill("#day", "2026-09-11")
+    await page.wait_for_function("document.getElementById('err').textContent !== ''")
+    assert await page.locator("#err").inner_text() == "jump: not available without archive"
+    assert await _ids(page) == ["1"]
+
+
+async def test_a_long_open_busy_chat_keeps_the_page_bounded(chat: Pages) -> None:
+    """Deferred to phase 5: at the bottom, past 600 messages the oldest leave the page; scrolling up
+    reloads them."""
+    page = await _open_long(chat)
+    # Straight into the page's handler: 520 relays through the server would only slow the test down.
+    await _inject(page, [{"msg": _live(i)} for i in range(520)])
+    ids = await _ids(page)
+    assert (len(ids), ids[0], ids[-1]) == (600, "170", "n519")
+    assert await page.evaluate(_AT_BOTTOM)
+    since = await _frames(page)
+    await _scroll(page, "0")
+    await _handled(page, "history", since)
+    assert (await _history_sent(page))[-1] == {"history": X, "before": _at(170)}
+    assert (await _ids(page))[:2] == ["70", "71"]
+
+
+async def test_reconnect_anchors_on_the_message_in_view(board: W.Board, chat: Pages) -> None:
+    """Deferred to phase 5: after a drop the message at the top of the view stays there, even when it
+    came from an older page the latest one does not hold."""
+    page = await _open_long(chat)
+    await _scroll(page, "0")
+    await page.wait_for_function("document.querySelectorAll('#msgs .msg').length === 200")
+    await page.locator('#msgs [data-id="60"]').evaluate("n => n.scrollIntoView({ block: 'start' })")
+    await page.evaluate(f"{_LIST}.scrollTop -= 7")
+    await _scroll(page, "l.scrollTop")
+    before = await page.evaluate(_OFFSET, "60")
+    since = await _frames(page)
+    await _drop(board)
+    await _handled(page, "history", since)
+    assert abs(await page.evaluate(_OFFSET, "60") - before) < 2
+    # The page around the first message in view (59, 7px above 60), not the latest one.
+    assert (await _ids(page))[0] == "9"
+
+
+async def _inject(page: Page, frames: list[dict[str, Any]]) -> None:
+    """Frames straight into the page's socket handler, as if the server had sent them."""
+    await page.evaluate(
+        "fs => { for (const f of fs)"
+        " window.__ws.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(f) })); }",
+        frames,
+    )
+
+
+async def test_two_quick_jumps_land_on_the_second(chat: Pages, monkeypatch: pytest.MonkeyPatch) -> None:
+    """011-AC18: the answer to a superseded jump is dropped; the last hit clicked lands highlighted."""
+    page = await _open_long(chat)
+    await _search(page, "far")
+    _slow_pages(monkeypatch)
+    since = await _frames(page)
+    await page.evaluate(
+        "for (const id of ['5', '245']) document.querySelector(`#hits button[data-id=\"${id}\"]`).click()"
+    )
+    await page.wait_for_function(
+        f"window.__frames.slice({since}).some(f => f.around === {json.dumps(_at(245))} && f.messages)"
+    )
+    await page.wait_for_selector("#msgs .msg.hit")
+    assert await page.locator("#msgs .msg.hit").evaluate_all("ns => ns.map(n => n.dataset.id)") == ["245"]
+    assert await _in_view(page, "245")
+    await asyncio.sleep(0.5)
+    assert [v for v in await _history_sent(page) if "after" in v or "before" in v] == []
+
+
+async def test_typing_a_date_jumps_once(chat: Pages) -> None:
+    """011-AC18: Chrome fires `change` per typed year digit and per edit: one jump once the field settles."""
+    page = await chat.open(_chat(D), locale="en-US", timezone_id="Europe/Paris", **_VIEW)
+    await _handled(page, "history")
+    await page.evaluate(_SPY)
+    await page.locator("#day").press_sequentially("09102026")
+    await page.keyboard.press("ArrowUp")  # 2027 then back: two more complete dates within the delay
+    await page.keyboard.press("ArrowDown")
+    await page.wait_for_function("window.__sent.some(v => 'around' in v)")
+    await asyncio.sleep(1.2)
+    assert await _history_sent(page) == [{"history": D, "around": "2026-09-09T22:00:00.000Z"}]
+
+
+async def test_a_year_before_1970_is_not_a_jump(chat: Pages) -> None:
+    """011-AC18: a half-typed year (0020) never asks for history."""
+    page = await chat.open(_chat(D), locale="en-US", **_VIEW)
+    await _handled(page, "history")
+    await page.evaluate(_SPY)
+    await page.locator("#day").press_sequentially("09100020")
+    await page.keyboard.press("Enter")
+    await asyncio.sleep(1.2)
+    assert await _history_sent(page) == []
+
+
+async def test_a_short_page_asks_for_older_without_a_scroll(
+    board: W.Board, chat: Pages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC15: an API page too short to scroll still loads what is before it, until `older` is false."""
+    b = test_web_chat.B
+    board.rows[b] = {"id": b, "label": "B", "last_activity": _at(5), "typing": []}
+    asked: list[int | None] = []
+
+    def three(settings: Any, token: str, thread: str, size: int, pages: int, end: int | None = None) -> Any:
+        asked.append(end)
+        return [_m(str(i), _at(i)) for i in (3, 4, 5)]
+
+    monkeypatch.setattr(W, "fetch_history", three)
+    page = await chat.open(_chat(b))
+    await page.wait_for_function("window.__frames.filter(f => 'history' in f).length === 2")
+    assert len(asked) == 2 and asked[1] is not None  # the latest page, then `before` its first message
+    await asyncio.sleep(0.3)
+    assert len(asked) == 2  # that page was empty: older false, no more
+
+
+async def test_an_empty_page_that_says_older_is_asked_once(
+    chat: Pages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC15: a short page whose older page comes back empty (yet `older`) does not ask it again."""
+    real = W.read_page
+    befores: list[str] = []
+
+    def lying(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("before"):
+            befores.append(kwargs["before"])
+            return [], True, False
+        messages, _, newer = real(*args, **kwargs)
+        return messages, True, newer
+
+    monkeypatch.setattr(W, "read_page", lying)
+    page = await chat.open(_chat(T))
+    await page.wait_for_function("window.__frames.filter(f => 'history' in f).length === 2")
+    await asyncio.sleep(0.5)
+    assert befores == [_at(1)]
+
+
+async def test_a_failed_reconnect_page_falls_back_to_the_latest(
+    board: W.Board, chat: Pages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deferred to phase 5: when the page around the reader's message fails, the latest page loads."""
+    page = await _open_long(chat)
+    await _scroll(page, "l.scrollHeight / 2")
+    real = W.read_page
+
+    def no_around(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("around"):
+            raise ValueError("boom")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(W, "read_page", no_around)
+    since = await _frames(page)
+    await _drop(board)
+    await page.wait_for_function(
+        f"window.__frames.slice({since}).some(f => 'history' in f && f.before === null && f.messages)"
+    )
+    await page.wait_for_function(_AT_BOTTOM)
+    assert (await _ids(page))[-1] == "249"
+
+
+async def test_an_edit_while_detached_reaches_the_held_message(board: W.Board, chat: Pages) -> None:
+    """011-AC7 + 011-AC16: a live message held while detached shows its edit once the latest page loads."""
+    page = await _open_long(chat)
+    await _jump_to(page, "20")
+    await board.on_event(_event("NewMessage", X, **_m("900", _at(900), "<p>first</p>")))
+    edit = {"edittime": "1789466500000"}
+    await board.on_event(_event("MessageUpdate", X, **_m("900", _at(900), "<p>second</p>", properties=edit)))
+    await page.wait_for_function("document.getElementById('latest').textContent === '↓ latest (1)'")
+    await page.click("#latest")
+    await page.wait_for_selector('[data-id="900"] .edited')
+    assert await page.locator('[data-id="900"] .html').inner_text() == "second"
+
+
+async def test_a_search_answer_after_escape_stays_closed(
+    chat: Pages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC18: closing the results before the answer drops that search."""
+    from miniteams import mcp
+
+    real = mcp.Archive.search_messages
+
+    def slow(self: mcp.Archive, *args: Any) -> Any:
+        threading.Event().wait(1.0)  # Escape must land first, even on a loaded host
+        return real(self, *args)
+
+    monkeypatch.setattr(mcp.Archive, "search_messages", slow)
+    page = await _open_long(chat)
+    since = await _frames(page)
+    await page.fill("#find", "x02")
+    await page.press("#find", "Enter")
+    await page.press("#find", "Escape")
+    await _handled(page, "search", since)
+    await asyncio.sleep(0.1)
+    assert await page.locator("#hits").is_hidden()
+
+
+async def test_trim_keeps_an_open_editor(chat: Pages) -> None:
+    """Deferred to phase 5: the trim stops at a message being edited, its text intact."""
+    page = await _open_long(chat)
+    await (await _edit(page, "160")).fill("half-way")
+    await _scroll(page, "l.scrollHeight")
+    await _inject(page, [{"msg": _live(i)} for i in range(520)])
+    ids = await _ids(page)
+    assert (ids[0], len(ids)) == ("160", 610)
+    assert await page.locator('[data-id="160"] .editor').input_value() == "half-way"
+
+
+def _live(i: int) -> dict[str, Any]:
+    return {
+        "id": f"n{i}",
+        "at": f"2026-09-15T11:{i // 60:02d}:{i % 60:02d}.000Z",
+        "from": ANN,
+        "name": "Ann Lee",
+        "type": "text",
+        "html": f"<p>n{i}</p>",
+        "reactions": [],
+    }
+
+
+async def test_a_stale_after_answer_is_ignored(chat: Pages) -> None:
+    """011-AC17: an `after` page for an edge the screen no longer has does not join it."""
+    page = await _open_long(chat)
+    await _jump_to(page, "20")
+    before = await _ids(page)
+    stale = {"history": X, "after": _at(10), "messages": [_live(1)], "older": True, "newer": False}
+    await _inject(page, [stale])
+    assert await _ids(page) == before
+
+
+async def test_reconnect_while_detached_keeps_the_place_and_stays_detached(
+    board: W.Board, chat: Pages
+) -> None:
+    """Deferred to phase 5: after a jump and a drop, the page around the reader's message comes back."""
+    page = await _open_long(chat)
+    await _jump_to(page, "20")
+    await page.locator('#msgs [data-id="30"]').evaluate("n => n.scrollIntoView({ block: 'start' })")
+    await _scroll(page, "l.scrollTop")
+    before = await page.evaluate(_OFFSET, "30")
+    since = await _frames(page)
+    await _drop(board)
+    await _handled(page, "history", since)
+    assert abs(await page.evaluate(_OFFSET, "30") - before) < 2
+    assert "249" not in await _ids(page)
+    assert await page.locator("#latest").is_visible()
 
 
 # --- widget middle click (011 phase 3) ---

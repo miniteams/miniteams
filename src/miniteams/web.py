@@ -40,7 +40,7 @@ from .archive_store import find_chat_dir, read_chats, read_messages, read_page
 from .chats import fetch_conversations, is_meeting, is_private, last_activity
 from .config import Settings
 from .directory import Directory
-from .dump import _ISO_RE, _epoch_seconds, fetch_history
+from .dump import _epoch_seconds, fetch_history
 from .messages import _TAG_RE, EMOJI, thread_of
 from .render import sanitize
 from .send import delete_message, edit_message, mark_read, message_html, react, send_message
@@ -71,8 +71,12 @@ _PAGE_POLL = 2.0  # seconds between widget.html mtime checks (dev reload)
 _SEND_MAX_BYTES = 28 * 1024  # Teams' per-message limit
 _TYPING_TTL = 10.0  # seconds; Teams does not always send ClearTyping
 _CHAT_PAGE = 100  # history messages per page of the chat view
+_SEARCH_HITS = 50  # search hits per answer
 _CHAT_PAGE_MAX = 200  # the archive query is cheap, the page's DOM is not
 _MEDIA_MAX = 50 * 1024 * 1024  # ponytail: whole-body responses; stream if videos ever get linked
+_CURSOR_RE = re.compile(
+    r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z?", re.ASCII
+)  # a composetime, nothing after it
 _MSG_ID_RE = re.compile(r"[0-9]{1,20}")  # Teams message ids are ms-epoch digits
 _QUOTE_MAX = 10  # quotes in one reply
 _PREVIEW_LEN = 100  # characters of the quoted message a Reply block carries
@@ -707,6 +711,7 @@ class Board:
         self._follows: dict[ServerConnection, tuple[str, Path | None]] = {}  # socket → (thread, media dir)
         self._history_busy: set[ServerConnection] = set()  # sockets with a history answer pending
         self._action_busy: set[ServerConnection] = set()  # sockets with a message action pending
+        self._search_busy: set[ServerConnection] = set()  # sockets with a search pending
         self._seen: dict[str, str] = _load_seen(seen_path)
         self._muted: dict[str, str] = _load_seen(muted_path)  # thread → when muted (same shape)
         for row in rows.values():
@@ -1000,10 +1005,10 @@ class Board:
         return records
 
     def _archive_records(
-        self, chat_dir: Path, thread_id: str, before: str, size: int
-    ) -> tuple[list[dict[str, Any]], bool]:
-        messages, older = read_page(chat_dir, before, size)
-        return self._records(messages, thread_id, chat_dir / "media"), older
+        self, chat_dir: Path, thread_id: str, cursor: tuple[str, str], size: int
+    ) -> tuple[list[dict[str, Any]], bool, bool]:
+        messages, older, newer = read_page(chat_dir, size, **dict([cursor]))
+        return self._records(messages, thread_id, chat_dir / "media"), older, newer
 
     def _api_records(
         self, thread_id: str, before: str, size: int, media: Path | None
@@ -1016,20 +1021,29 @@ class Board:
         # A short page is not the end (the API under-fills windows): only an empty one is.
         return self._records(kept[-size:], thread_id, media), bool(kept)
 
-    async def history(self, thread_id: str, before: Any = None, limit: Any = None) -> dict[str, Any]:
+    async def history(
+        self, thread_id: str, before: Any = None, limit: Any = None, *, after: Any = None, around: Any = None
+    ) -> dict[str, Any]:
         """Page verb `history`: a page of messages, archive first, else one API page.
 
-        The answer echoes `before` so the page can match it to its request."""
-        reply = _history_head(thread_id, before)
+        The answer echoes its cursor (`before`, `after` or `around`) so the page can match it to its
+        request."""
+        cursors = {"before": before, "after": after, "around": around}
+        reply = _history_head(thread_id, cursors)
         try:
-            return {**reply, **await self._history(thread_id, before, limit)}
+            return {**reply, **await self._history(thread_id, cursors, limit)}
         except Exception as exc:  # noqa: BLE001 — the page waits for an answer whatever happens
             log.warning("history_failed", thread=thread_id, error_type=type(exc).__name__)
             return {**reply, "error": "history unavailable"}
 
-    async def _history(self, thread_id: str, before: Any, limit: Any) -> dict[str, Any]:
-        if before and not (isinstance(before, str) and _ISO_RE.match(before)):  # "" = latest, like null
-            return {"error": "invalid before"}
+    async def _history(self, thread_id: str, cursors: dict[str, Any], limit: Any) -> dict[str, Any]:
+        given = {k: v for k, v in cursors.items() if v not in (None, "")}  # "" = latest, like null
+        for key, value in given.items():
+            if not (isinstance(value, str) and _CURSOR_RE.fullmatch(value)):
+                return {"error": f"invalid {key}"}
+        if len(given) > 1:
+            return {"error": "one cursor at most"}
+        key, at = next(iter(given.items()), ("before", ""))
         valid = isinstance(limit, int) and not isinstance(limit, bool) and limit > 0
         size = min(limit if valid else _CHAT_PAGE, _CHAT_PAGE_MAX)
         chat_dir = await asyncio.to_thread(self._archive_dir, thread_id)
@@ -1038,32 +1052,69 @@ class Board:
         try:
             if chat_dir is None:
                 raise FileNotFoundError(thread_id)
-            records, older = await asyncio.to_thread(
-                self._archive_records, chat_dir, thread_id, before or "", size
+            records, older, newer = await asyncio.to_thread(
+                self._archive_records, chat_dir, thread_id, (key, at), size
             )
             source = "archive"
         except (OSError, sqlite3.Error) as exc:
             if not isinstance(exc, FileNotFoundError):
                 log.warning("archive_history_failed", thread=thread_id, error=str(exc))
+            if key != "before":
+                return {"error": "not available without archive"}
             if self.directory is None:
                 return {"error": "not connected"}
             media = chat_dir / "media" if chat_dir else None
             try:
-                records, older = await asyncio.to_thread(
-                    self._api_records, thread_id, before or "", size, media
-                )
+                records, older = await asyncio.to_thread(self._api_records, thread_id, at, size, media)
             except Exception as api_exc:  # noqa: BLE001 — a failed page must not drop the socket
                 reason = _failure(api_exc)
                 log.warning("history_api_failed", thread=thread_id, error=reason)
                 return {"error": reason}
-            source = "api"
-        return {"messages": records, "older": older, "newer": False, "source": source}
+            source, newer = "api", False
+        return {"messages": records, "older": older, "newer": newer, "source": source}
 
     async def _history_reply(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
         try:
-            await self._answer(ws, self.history(verb["history"], verb.get("before"), verb.get("limit")))
+            await self._answer(
+                ws,
+                self.history(
+                    verb["history"],
+                    verb.get("before"),
+                    verb.get("limit"),
+                    after=verb.get("after"),
+                    around=verb.get("around"),
+                ),
+            )
         finally:
             self._history_busy.discard(ws)
+
+    async def search(self, thread_id: str, query: Any) -> dict[str, Any]:
+        """Page verb `search`: the thread's archived messages matching `query`, newest first."""
+        head = {"search": thread_id, "q": query if isinstance(query, str) else None}
+        if not isinstance(query, str) or not query.strip():
+            return {**head, "error": "empty query"}
+        chat_dir = await asyncio.to_thread(self._archive_dir, thread_id)
+        if (
+            self.data_dir is None
+            or chat_dir is None
+            or not await asyncio.to_thread((chat_dir / "messages.db").is_file)
+        ):
+            return {**head, "error": "no archive for this chat"}
+        # Imported here: mcp imports this module.
+        from .mcp import Archive
+
+        try:
+            found = await asyncio.to_thread(
+                Archive(self.data_dir).search_messages, query.strip(), "", "", thread_id, _SEARCH_HITS
+            )
+        except Exception as exc:  # noqa: BLE001 — the page waits for an answer whatever happens
+            log.warning("search_failed", thread=thread_id, error_type=type(exc).__name__)
+            return {**head, "error": "search unavailable"}
+        hits = [
+            {"id": h["id"], "at": h["time"], "name": h["sender"], "text": h["text"]}
+            for h in found["messages"]
+        ]
+        return {**head, "hits": hits}
 
     async def follow(self, ws: ServerConnection, thread_id: str) -> dict[str, Any]:
         """Page verb `follow`: this socket receives the thread's live messages from now on."""
@@ -1134,16 +1185,22 @@ class Board:
         return {"sent": thread_id, **({"error": error} if error else {"ok": True})}
 
     async def _one_at_a_time(
-        self, ws: ServerConnection, head: dict[str, Any], work: Callable[[], Awaitable[dict[str, Any]]]
+        self,
+        ws: ServerConnection,
+        head: dict[str, Any],
+        work: Callable[[], Awaitable[dict[str, Any]]],
+        slots: set[ServerConnection] | None = None,
     ) -> dict[str, Any]:
-        """One message action (or quoted send) per socket: another while it runs answers `busy`."""
-        if ws in self._action_busy:
+        """One message action (or quoted send, or search) per socket: another while it runs answers
+        `busy`."""
+        slots = self._action_busy if slots is None else slots
+        if ws in slots:
             return {**head, "error": "busy"}
-        self._action_busy.add(ws)
+        slots.add(ws)
         try:
             return await work()
         finally:
-            self._action_busy.discard(ws)
+            slots.discard(ws)
 
     def mark_unseen(self, thread_id: str) -> bool:
         """Undo `seen`: the row shows again until the next click."""
@@ -1482,13 +1539,20 @@ class Board:
                     self._background(self._answer(ws, work))
                 elif isinstance(verb, dict) and isinstance(verb.get("history"), str):
                     if ws in self._history_busy:  # one page in flight per socket
-                        busy = {**_history_head(verb["history"], verb.get("before")), "error": "busy"}
+                        busy = {**_history_head(verb["history"], verb), "error": "busy"}
                         with contextlib.suppress(ConnectionClosed):
                             await ws.send(json.dumps(busy, ensure_ascii=False))
                     else:
                         # The API fallback is a network round trip: the page's other verbs must not wait.
                         self._history_busy.add(ws)
                         self._background(self._history_reply(ws, verb))
+                elif isinstance(verb, dict) and isinstance(verb.get("search"), str):
+                    # Reads the whole chat in a worker thread: one search per socket.
+                    head = {"search": verb["search"], "q": verb.get("q")}
+                    found = functools.partial(self.search, verb["search"], verb.get("q"))
+                    self._background(
+                        self._answer(ws, self._one_at_a_time(ws, head, found, self._search_busy))
+                    )
                 elif isinstance(verb, dict) and isinstance(verb.get("follow"), str):
                     await self._answer(ws, self.follow(ws, verb["follow"]))
                 elif isinstance(verb, dict) and isinstance(verb.get("open"), str):
@@ -1512,10 +1576,14 @@ class Board:
             self.clients.discard(ws)
             self._follows.pop(ws, None)
             self._action_busy.discard(ws)
+            self._search_busy.discard(ws)
 
 
-def _history_head(thread_id: str, before: Any) -> dict[str, Any]:
-    return {"history": thread_id, "before": before if isinstance(before, str) and before else None}
+def _history_head(thread_id: str, request: dict[str, Any]) -> dict[str, Any]:
+    """The answer's head: the thread and the cursor asked for, `before: null` for the latest page."""
+    key = next((k for k in ("before", "after", "around") if request.get(k) not in (None, "")), "before")
+    value = request.get(key)
+    return {"history": thread_id, key: value if isinstance(value, str) and value else None}
 
 
 def _deleted(props: dict[str, Any]) -> bool:

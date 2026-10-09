@@ -93,7 +93,9 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
     itemprop="preview">first 100 chars</p></blockquote>`, author and preview taken from the
     server's copy of the message, never from the page.
   - **React** (any message): a picker with Teams' 8 default keys (`messages.EMOJI`); clicking a
-    reaction I already gave removes it. Verb `{"react": "<thread>", "msg": id, "key": k,
+    reaction I already gave removes it. The reactions line under a message is clickable too: a
+    chip I gave removes my reaction, any other chip adds mine, as in Teams (chip marked when
+    `mine`). Verb `{"react": "<thread>", "msg": id, "key": k,
     "remove": bool}` → `send.react()`. Keys outside the 8 are refused.
   - **Edit** (own messages only): the message body turns into a textarea holding its plain text;
     Enter saves, Escape cancels. Verb `{"edit": "<thread>", "msg": id, "text": …}` →
@@ -118,6 +120,21 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
     (`history.pushState`; Back returns to the previous chat). Each chat keeps its composer draft
     and quotes while the page stays open. Below ~700px wide the list collapses behind a ☰ button.
     No ◀ in this mode.
+- **Cards.** Bot and app messages carry an Adaptive Card: `RichText/Media_Card` holds it base64
+  in `<Swift b64>` (`attachments[].content`, with `summary`), a `RichText/Html` may hold one in
+  `properties.cards[].content`. The server renders the card body to the same sanitised HTML
+  subset, no script, no external fetch: `TextBlock` and `RichTextBlock` (weight, size, wrap;
+  the Teams markdown subset bold/italic/links/lists), `Container`, `ColumnSet`/`Column` (as a
+  flex row), `FactSet` (a two-column table), `Image` (archived → `/media`, else alt text),
+  `Action.OpenUrl` and `selectAction` (http(s) links, `rel=noopener`), `codesnippet` cards
+  (`<pre>`). Unknown elements render their `text`/`title` when present, else nothing. A card with
+  no renderable body shows its `summary` or `fallbackText`. Rendered inside `div.card` with the
+  app name when known. `type` stays `text` for these messages.
+- **Deleted runs.** Two or more consecutive deleted messages collapse into one line, "N messages
+  deleted", which expands on click to the usual per-message lines (and collapses back). A lone
+  deleted message stays as today. A live delete that extends a run joins it; the composer's
+  quotes are unaffected. Bots delete their old notifications in bulk, which otherwise fills the
+  page.
 - **Theme.** Follows the widget's `theme` and `avatars` settings (same `localStorage`).
 - **Docs.** README `web` paragraph: the setting and the route. `docs/agent-archive.md` untouched.
 
@@ -128,8 +145,9 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 - An edit keeping the original's mentions, emoji or quote (edit is plain text).
 - Marking the chat read in Teams on open or on send.
 - Unread separator, search across chats (the MCP server already does it).
-- Video / recording playback, transcripts, cards (`Swift`, adaptive cards render as their text
-  fallback), call details beyond "call started / ended".
+- Video / recording playback, transcripts, call details beyond "call started / ended".
+- Card inputs and submit actions (`Input.*`, `Action.Submit`, `Action.Execute`): shown as their
+  title, not wired.
 - Fetching images that are not in the archive (would need the skype token on the page).
 - Message history for threads the archive does not hold beyond one API page.
 - Emoji completion and `@` mentions in the composer (spec 012).
@@ -202,6 +220,16 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 - [ ] **AC23** In `split`, the list's rows update live like the board (new message moves the row
       up, unread and mention marks), and the socket still never receives data of chats that are not
       on the board beyond their rows.
+- [ ] **AC24** A `Media_Card` message with a Swift payload and a `RichText/Html` message with
+      `properties.cards` both render their card: text blocks with weight, facts as a table, column
+      sets side by side, OpenUrl actions as links; a card with an unknown-only body shows its
+      summary; nothing of a card is fetched from the network and no `on*` or script survives.
+- [ ] **AC25** Three consecutive deleted messages render as one "3 messages deleted" line that
+      expands on click; a single deleted message renders as itself; a live delete of the message
+      right after a run grows the run's count.
+- [ ] **AC26** Clicking a reaction chip under a message sends `react` with that key: `remove:
+      true` when the chip is mine, else `remove: false`; the chip shows a "mine" state from the
+      record; chips are reachable by keyboard.
 
 ## Phases
 
@@ -257,6 +285,14 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 - **DoD**: `pytest` green incl. browser tests for each AC; on the live test window, both settings
   move between three chats without opening Teams, and Back works in `split`.
 
+### Phase 7 — cards, deleted runs, reaction chips
+- Work: collapsed deleted runs and clickable reaction chips in `chat.html`; `render.card_html()` (pure, from the card JSON), hooked into `chat_record` for both
+  carriers; CSS for `div.card`, facts and columns; tests on fixture cards.
+- **Covers**: AC24, AC25, AC26
+- **Data model impact**: none
+- **DoD**: `pytest tests/test_render.py` green for each element kind and the fallbacks; on the live
+  page, a bot card from the archive reads like its Teams rendering (title, facts, action links).
+
 ## Data model impact (summary)
 
 None. Archive read-only, no new file under `~/.config/miniteams`.
@@ -282,6 +318,10 @@ None.
   proxy for any URL and the archive already fetches media.
 - Upload stays out; the Open in Teams button covers it, and anything else the page lacks
   (babs, 2026-10-09). Multi-quote kept, as Teams does it.
+- Runs of deleted messages collapse (babs, 2026-10-09): the data is right (the API confirms bots
+  delete their old notifications), the page just must not drown in them.
+- Cards rendered, not just their text fallback (babs, 2026-10-09): both carriers are Adaptive
+  Cards, so one renderer covers them.
 - Navigation between chats from the chat page, both as a list page and side by side, chosen by a
   setting (babs, 2026-10-09). Default `list`: smaller change, overturnable.
 - Search in the chat, jump to date, infinite scroll and "↓ latest" in scope (babs, 2026-10-09).

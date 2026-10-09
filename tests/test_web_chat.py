@@ -594,13 +594,13 @@ async def test_unreadable_archive_rows_are_skipped(
 async def test_any_history_failure_still_answers(board: W.Board, monkeypatch: pytest.MonkeyPatch) -> None:
     """011-AC5: an unexpected failure is an error answer, not a dead task."""
 
-    def broken(*args: Any) -> Any:
+    def broken(*args: Any, **kwargs: Any) -> Any:
         raise ValueError("boom")
 
     monkeypatch.setattr(W, "read_page", broken)
     assert await board.history(T) == {"history": T, "before": None, "error": "history unavailable"}
     monkeypatch.setattr(W, "chat_record", broken)
-    monkeypatch.setattr(W, "read_page", lambda *a: ([_m("1", _at(1))], False))
+    monkeypatch.setattr(W, "read_page", lambda *a, **k: ([_m("1", _at(1))], False, False))
     assert (await board.history(T))["messages"] == []  # the bad record is skipped, the page answers
 
 
@@ -710,9 +710,9 @@ async def test_one_history_in_flight_per_socket(
     """011-AC4: a second request while one is pending is refused `busy`; other sockets are not held up."""
     real = W.read_page
 
-    def slow(*args: Any) -> Any:
+    def slow(*args: Any, **kwargs: Any) -> Any:
         time.sleep(0.4)
-        return real(*args)
+        return real(*args, **kwargs)
 
     monkeypatch.setattr(W, "read_page", slow)
     async with _served(board, settings) as host, _connect(host) as one, _connect(host) as two:
@@ -1454,3 +1454,314 @@ async def test_one_message_action_in_flight_per_socket(
         ("react", T, "1", "like", False),
         ("delete", T, "2"),
     ]
+
+
+# --- phase 5: paging forward, around, search (011-AC17, 011-AC18) ---
+
+TIED = [_at(1), _at(2), _at(3), _at(3), _at(3), _at(4), _at(5)]  # 3, 4 and 5 share one time
+
+
+@pytest.fixture
+def tied(tmp_path: Path, quiet_directory: Directory) -> W.Board:
+    data = _archive(tmp_path / "d", T, [_m(str(i), t) for i, t in enumerate(TIED, 1)])
+    return W.Board({}, quiet_directory, me=ME, data_dir=data)
+
+
+async def test_history_after_pages_forward_without_overlap_or_gap(tied: W.Board, no_api: None) -> None:
+    """011-AC17: walking `after` from the start returns every message once, `newer` false at the end;
+    the page boundary falls inside the tied time and the tie joins the page."""
+    pages: list[tuple[list[str], bool, bool]] = []
+    answer = await tied.history(T, after=_at(0), limit=3)
+    while True:
+        pages.append((_ids(answer), answer["older"], answer["newer"]))
+        if not answer["newer"]:
+            break
+        answer = await tied.history(T, after=answer["messages"][-1]["at"], limit=3)
+    assert pages == [(["1", "2", "3", "4", "5"], False, True), (["6", "7"], True, False)]
+    assert answer["after"] == _at(3) and "before" not in answer
+    assert (await tied.history(T, after=_at(5)))["messages"] == []
+
+
+async def test_history_around_returns_both_sides_of_the_anchor(board: W.Board, no_api: None) -> None:
+    """011-AC17: about limit/2 on each side, the anchor time on the newer side, flags at both ends; near
+    an end the short side's share goes to the other, so the page stays full."""
+    cases = [
+        (_at(3), 2, ["2", "3"], True, True),
+        ("2026-09-15T10:00:03.500Z", 2, ["3", "4"], True, True),  # between two messages
+        (_at(1), 4, ["1", "2", "3", "4"], False, True),  # nothing before the first
+        (_at(9), 4, ["2", "3", "4", "5"], True, False),  # nothing after the last
+        (_at(2), 4, ["1", "2", "3", "4"], False, True),  # one before: three from the anchor on
+        (_at(5), 4, ["2", "3", "4", "5"], True, False),  # one from the anchor: three before
+        (_at(3), 100, ["1", "2", "3", "4", "5"], False, False),
+    ]
+    for anchor, limit, ids, older, newer in cases:
+        answer = await board.history(T, around=anchor, limit=limit)
+        assert (_ids(answer), answer["older"], answer["newer"]) == (ids, older, newer), anchor
+        assert (answer["around"], answer["source"]) == (anchor, "archive")
+        assert "before" not in answer
+
+
+async def test_history_around_keeps_a_tied_time_whole(tied: W.Board, no_api: None) -> None:
+    """011-AC17: messages sharing the anchor's time all come back, then paging either way neither
+    repeats nor skips one."""
+    answer = await tied.history(T, around=_at(3), limit=2)
+    assert (_ids(answer), answer["older"], answer["newer"]) == (["2", "3", "4", "5"], True, True)
+    back = await tied.history(T, before=answer["messages"][0]["at"], limit=2)
+    forth = await tied.history(T, after=answer["messages"][-1]["at"], limit=2)
+    assert (_ids(back), back["older"], _ids(forth), forth["newer"]) == (["1"], False, ["6", "7"], False)
+
+
+async def test_history_flags_at_both_ends_of_the_latest_page(board: W.Board, no_api: None) -> None:
+    """011-AC17: the latest page is never `newer`; an old `before` page is."""
+    latest = await board.history(T, limit=2)
+    assert (latest["older"], latest["newer"]) == (True, False)
+    first = await board.history(T, before=_at(2), limit=2)
+    assert (_ids(first), first["older"], first["newer"]) == (["1"], False, True)
+
+
+@pytest.mark.parametrize("key", ["after", "around"])
+@pytest.mark.parametrize("value", ["garbage", "2026-09-15", "x2026-09-15T10:00:00Z", 123, ["x"]])
+async def test_history_refuses_a_malformed_after_or_around(
+    board: W.Board, no_api: None, key: str, value: Any
+) -> None:
+    """011-AC17: `after` and `around` are checked like `before`, before any read or API call."""
+    for thread in (T, B):
+        assert await board.history(thread, **{key: value}) == {
+            "history": thread,
+            key: value if isinstance(value, str) else None,
+            "error": f"invalid {key}",
+        }
+
+
+async def test_history_refuses_two_cursors(board: W.Board, no_api: None) -> None:
+    """011-AC17: one cursor per request; the answer echoes the first one."""
+    assert await board.history(T, before=_at(3), after=_at(1)) == {
+        "history": T,
+        "before": _at(3),
+        "error": "one cursor at most",
+    }
+
+
+@pytest.mark.parametrize("key", ["after", "around"])
+async def test_after_and_around_need_the_archive(board: W.Board, no_api: None, key: str) -> None:
+    """011-AC17: the API source only serves the latest page and `before`: no API call for the others."""
+    assert await board.history(B, **{key: _at(3)}) == {
+        "history": B,
+        key: _at(3),
+        "error": "not available without archive",
+    }
+
+
+async def test_history_cursor_echo_and_busy_over_the_socket(
+    board: W.Board, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC17: answers and `busy` refusals echo the cursor they were asked with."""
+    real = W.read_page
+
+    def slow(*args: Any, **kwargs: Any) -> Any:
+        time.sleep(0.3)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(W, "read_page", slow)
+    async with _served(board, settings) as host, _connect(host) as ws:
+        await ws.recv()
+        await ws.send(json.dumps({"history": T, "around": _at(3), "limit": 2}))
+        await ws.send(json.dumps({"history": T, "after": _at(1)}))
+        assert await _frame(ws) == {"history": T, "after": _at(1), "error": "busy"}
+        answer = await _frame(ws)
+        assert (answer["around"], _ids(answer)) == (_at(3), ["2", "3"])
+
+
+@pytest.fixture
+def searchable(tmp_path: Path, quiet_directory: Directory) -> W.Board:
+    texts = ["Réunion demain", "nothing here", "la REUNION est annulée", "<p>réunion <b>finie</b></p>"]
+    messages = [_m(str(i), _at(i), f"<p>{t}</p>" if "<" not in t else t) for i, t in enumerate(texts, 1)]
+    data = _archive(tmp_path / "d", T, messages)
+    _archive(data, C, None)  # indexed, never backfilled
+    return W.Board({B: {"id": B, "last_activity": _at(1)}}, quiet_directory, me=ME, data_dir=data)
+
+
+async def test_search_folds_case_and_accents_newest_first(searchable: W.Board, no_api: None) -> None:
+    """011-AC18: case and accents ignored, newest first, hits as {id, at, name, text}."""
+    answer = await searchable.search(T, " reunion ")
+    assert answer["search"] == T
+    assert [h["id"] for h in answer["hits"]] == ["4", "3", "1"]
+    assert answer["hits"][0] == {"id": "4", "at": _at(4), "name": "Ann Lee", "text": "réunion finie"}
+    assert [h["id"] for h in (await searchable.search(T, "ANNULÉE"))["hits"]] == ["3"]
+    assert (await searchable.search(T, "absent"))["hits"] == []
+
+
+async def test_search_caps_at_fifty_newest(tmp_path: Path, quiet_directory: Directory, no_api: None) -> None:
+    """011-AC18: at most 50 hits, the newest ones, over the whole history."""
+    data = _archive(tmp_path / "d", T, [_m(str(i), _at(i), f"<p>hit {i}</p>") for i in range(120)])
+    board = W.Board({}, quiet_directory, me=ME, data_dir=data)
+    hits = (await board.search(T, "HIT"))["hits"]
+    assert [h["id"] for h in hits] == [str(i) for i in range(119, 69, -1)]
+
+
+@pytest.mark.parametrize("thread", [B, C, NOPE])
+async def test_search_without_archive_is_an_error(searchable: W.Board, no_api: None, thread: str) -> None:
+    """011-AC18: on the board only, indexed without messages, or unknown: no archive, no API call."""
+    assert await searchable.search(thread, "x") == {
+        "search": thread,
+        "q": "x",
+        "error": "no archive for this chat",
+    }
+
+
+async def test_search_with_no_data_dir(quiet_directory: Directory, no_api: None) -> None:
+    """011-AC18"""
+    board = W.Board({B: {"id": B, "last_activity": _at(1)}}, quiet_directory)
+    assert (await board.search(B, "x"))["error"] == "no archive for this chat"
+
+
+@pytest.mark.parametrize("query", ["", "   ", None, 3])
+async def test_search_refuses_an_empty_query(searchable: W.Board, query: Any) -> None:
+    """011-AC18: nothing to look for is refused before any read."""
+    assert (await searchable.search(T, query))["error"] == "empty query"
+
+
+async def test_search_runs_off_the_event_loop_and_failures_answer(
+    searchable: W.Board, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC18: the whole-history scan never blocks the loop; an unexpected failure is an answer."""
+    from miniteams import mcp
+
+    loop_thread = threading.get_ident()
+    threads: list[int] = []
+    real = mcp.Archive.search_messages
+
+    def spy(self: mcp.Archive, *args: Any) -> dict[str, Any]:
+        threads.append(threading.get_ident())
+        return real(self, *args)
+
+    monkeypatch.setattr(mcp.Archive, "search_messages", spy)
+    assert len((await searchable.search(T, "reunion"))["hits"]) == 3
+    assert threads and loop_thread not in threads
+
+    def broken(self: mcp.Archive, *args: Any) -> Any:
+        raise sqlite3.DatabaseError("disk image is malformed")
+
+    monkeypatch.setattr(mcp.Archive, "search_messages", broken)
+    assert await searchable.search(T, "reunion") == {
+        "search": T,
+        "q": "reunion",
+        "error": "search unavailable",
+    }
+
+
+async def test_search_over_the_socket_one_at_a_time(
+    searchable: W.Board, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC18: the verb answers the asker; a second search while one runs is refused `busy`."""
+    from miniteams import mcp
+
+    real = mcp.Archive.search_messages
+
+    def slow(self: mcp.Archive, *args: Any) -> dict[str, Any]:
+        time.sleep(0.3)
+        return real(self, *args)
+
+    monkeypatch.setattr(mcp.Archive, "search_messages", slow)
+    async with _served(searchable, settings) as host, _connect(host) as ws:
+        await ws.recv()
+        await ws.send(json.dumps({"search": T, "q": "reunion"}))
+        await ws.send(json.dumps({"search": T, "q": "demain"}))
+        assert await _frame(ws) == {"search": T, "q": "demain", "error": "busy"}
+        assert [h["id"] for h in (await _frame(ws))["hits"]] == ["4", "3", "1"]
+
+
+async def test_a_burst_at_one_time_keeps_the_page_bounded(
+    tmp_path: Path, quiet_directory: Directory, no_api: None
+) -> None:
+    """011-AC17: messages tied with the page's edge join it, up to a cap: a burst at one exact time
+    never makes a page of the whole burst."""
+    burst = [_m(f"b{i:03d}", _at(5)) for i in range(300)]
+    data = _archive(tmp_path / "d", T, [_m("1", _at(1)), *burst, _m("9", _at(9))])
+    board = W.Board({}, quiet_directory, me=ME, data_dir=data)
+    for answer in (
+        await board.history(T, limit=10),
+        await board.history(T, after=_at(1), limit=10),
+        await board.history(T, around=_at(5), limit=10),
+    ):
+        assert 10 <= len(answer["messages"]) <= 10 + 200
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        "2026-09-15T10:00:00Zjunk",
+        "2026-09-15T10:00:00.5Z; x",
+        "2026-09-15T10:00:00+02:00",
+        "2026-09-15T10:00",
+    ],
+)
+async def test_history_refuses_trailing_junk_after_a_time(board: W.Board, no_api: None, cursor: str) -> None:
+    """011-AC17: a cursor is a whole composetime, not one that merely starts like it."""
+    for key in ("before", "after", "around"):
+        assert (await board.history(T, **{key: cursor}))["error"] == f"invalid {key}"
+
+
+@pytest.mark.parametrize(
+    "cursor", ["2026-09-15T10:00:03", "2026-09-15T10:00:03Z", "2026-09-15T10:00:03.1234567Z"]
+)
+async def test_history_accepts_every_composetime_shape(board: W.Board, no_api: None, cursor: str) -> None:
+    """011-AC17: with or without fraction and Z, as the archive and the page's dates write them."""
+    for key in ("before", "after", "around"):
+        assert "error" not in await board.history(T, **{key: cursor}), key
+
+
+def _with_bad_rows(data: Path, times: list[str]) -> None:
+    db = sqlite3.connect(data / T / "messages.db")
+    with db:
+        db.executemany(
+            "INSERT INTO messages (id, composetime, raw) VALUES (?, ?, ?)",
+            [(f"bad{i}", t, "{bad") for i, t in enumerate(times)],
+        )
+    db.close()
+
+
+@pytest.mark.parametrize(
+    ("good", "bad", "cursor", "ids", "older", "newer"),
+    [
+        ([1, 2, 3, 4, 5], [6, 7, 8, 9, 10], {}, ["1", "2", "3", "4", "5"], False, False),  # latest window
+        ([1, 2, 8, 9], [3, 4, 5, 6, 7], {"before": _at(8)}, ["1", "2"], False, True),
+        ([1, 7], [2, 3, 4, 5, 6], {"after": _at(1)}, ["7"], True, False),
+    ],
+)
+async def test_a_window_of_unreadable_rows_is_read_past(
+    tmp_path: Path,
+    quiet_directory: Directory,
+    no_api: None,
+    good: list[int],
+    bad: list[int],
+    cursor: dict[str, str],
+    ids: list[str],
+    older: bool,
+    newer: bool,
+) -> None:
+    """011-AC15 + 011-AC17: a page whose whole window is unreadable reads on instead of answering
+    "empty, but more", which would have the page ask the same edge again."""
+    data = _archive(tmp_path / "d", T, [_m(str(i), _at(i)) for i in good])
+    _with_bad_rows(data, [_at(i) for i in bad])
+    board = W.Board({}, quiet_directory, me=ME, data_dir=data)
+    answer = await board.history(T, limit=5, **cursor)
+    assert (_ids(answer), answer["older"], answer["newer"]) == (ids, older, newer)
+
+
+async def test_reading_past_unreadable_rows_is_bounded(
+    tmp_path: Path, quiet_directory: Directory, no_api: None
+) -> None:
+    """011-AC15: five windows at most; past them the page gets an empty answer it does not repeat."""
+    data = _archive(tmp_path / "d", T, [_m(str(i), _at(i)) for i in range(31, 36)])
+    _with_bad_rows(data, [_at(i) for i in range(1, 31)])
+    board = W.Board({}, quiet_directory, me=ME, data_dir=data)
+    answer = await board.history(T, before=_at(31), limit=5)
+    assert (answer["messages"], answer["older"]) == ([], True)  # windows 26-30 down to 6-10
+    assert _ids(await board.history(T, before=_at(6), limit=5)) == []
+
+
+@pytest.mark.parametrize("cursor", ["２０２６-09-15T10:00:00Z", "2026-09-15T10:00:0٣Z"])
+async def test_history_refuses_non_ascii_digits(board: W.Board, no_api: None, cursor: str) -> None:
+    """011-AC17: `\\d` would take any Unicode digit; a cursor is ASCII."""
+    assert (await board.history(T, after=cursor))["error"] == "invalid after"
