@@ -117,8 +117,9 @@ read marker. `🔕` mutes a chat (out of Inbox whatever lands on it, listed unde
 surface; state in `muted.json`). `✎` (or `r` on the row selected with the arrow keys, `Tab` from the filter) opens
 a reply box under the row: Enter sends it to the chat as you, Shift+Enter adds a line, Escape closes it and keeps
 the draft until the page reloads; a failed send keeps the text and shows why. The ⚙ menu picks the theme (system by default), hides avatars for a denser list, and sets
-**Middle click** to `Teams web` (default, as above) or `Chat here`: a new tab on `/chat/<thread>`, this
-page's own view of the chat (history, live updates, reply box, Open in Teams), `--browser` or not. The
+**Middle click** to `Teams web` (default, as above) or `Chat here`: `/chat/<thread>`, this
+page's own view of the chat (history, live updates, reply box, Open in Teams), through `--browser` when
+set, else in a new tab. The
 process exits non-zero when the stream dies (auth expired) — re-run it.
 
 Open it as a standalone window on the persisted bind:

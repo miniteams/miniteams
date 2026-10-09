@@ -66,7 +66,11 @@ def quiet_directory(directory: Directory, monkeypatch: pytest.MonkeyPatch) -> Di
     async def fake_display(self: Directory, mri: str) -> str:
         return f"name:{mri}"
 
+    async def fake_label(self: Directory, thread_id: str) -> str:
+        return f"label:{thread_id}"
+
     monkeypatch.setattr(Directory, "display", fake_display)
+    monkeypatch.setattr(Directory, "label", fake_label)
     directory.me = ME
     return directory
 
@@ -397,7 +401,28 @@ async def _served(board: W.Board, settings: Settings) -> AsyncIterator[str]:
     port = _free_port()
     task = asyncio.create_task(W.serve_board(board, settings, f"127.0.0.1:{port}"))
     try:
-        await asyncio.sleep(0.2)
+        for _ in range(500):
+            if task.done():
+                task.result()  # the bind failed (port taken since _free_port): say why
+            try:
+                reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            except OSError:
+                await asyncio.sleep(0.01)
+                continue
+            # A real request, not a bare connect: the server logs an aborted handshake as an error.
+            writer.write(f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n".encode())
+            status = b""
+            with contextlib.suppress(OSError, TimeoutError):
+                status = await asyncio.wait_for(reader.readline(), 1)
+            writer.close()
+            with contextlib.suppress(OSError):
+                await writer.wait_closed()
+            if task.done():
+                task.result()  # a foreign listener on that port answered while our bind failed
+            if status.startswith(b"HTTP/1.1 200 "):
+                break
+        else:
+            raise TimeoutError(f"board not listening on {port}")
         yield f"127.0.0.1:{port}"
     finally:
         task.cancel()
@@ -924,7 +949,14 @@ def launched(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
         calls.append(argv)
         return _Proc()
 
-    monkeypatch.setattr(W.asyncio, "create_subprocess_exec", fake_exec)
+    # Only miniteams.web sees the fake: patching asyncio itself would also catch playwright's driver.
+    class _Asyncio:
+        create_subprocess_exec = staticmethod(fake_exec)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(asyncio, name)
+
+    monkeypatch.setattr(W, "asyncio", _Asyncio())
     return calls
 
 
@@ -1004,3 +1036,41 @@ async def test_send_never_reaches_a_followed_channel(
         await chat.send(json.dumps({"send": C, "text": "hi"}))
         assert json.loads(await asyncio.wait_for(chat.recv(), 2)) == {"sent": C, "error": "unknown chat"}
     assert sent == []
+
+
+# --- middle click "chat here" through --browser (011-AC1) ---
+
+
+async def test_open_chat_runs_the_browser_on_our_own_chat_page(
+    board: W.Board, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC1: `{"open", "chat": true}` runs --browser on http://<bind>/chat/<encoded id>, `msg` ignored;
+    unknown threads and a board without --browser launch nothing."""
+    launched: list[tuple[str, ...]] = []
+
+    class _Proc:
+        async def wait(self) -> int:
+            return 0
+
+    async def fake_exec(*argv: str, **kw: Any) -> _Proc:
+        launched.append(argv)
+        return _Proc()
+
+    monkeypatch.setattr(W.asyncio, "create_subprocess_exec", fake_exec)
+    board.browser = ["firefox"]
+    assert await board.open_row(B, chat=True) is False  # not bound yet: no URL to point at
+    board.browser = None
+    async with _served(board, settings) as host:
+        async with _connect(host) as ws:
+            await ws.recv()
+            # Verbs run in order: a follow answer means every verb sent before it ran.
+            await ws.send(json.dumps({"open": B, "chat": True}))  # no --browser yet
+            await ws.send(json.dumps({"follow": B}))
+            await _frame(ws)
+            assert launched == []
+            board.browser = ["firefox", "--new-tab"]
+            await ws.send(json.dumps({"open": B, "chat": True, "msg": "1"}))
+            await ws.send(json.dumps({"open": NOPE, "chat": True}))
+            await ws.send(json.dumps({"follow": B}))
+            await _frame(ws)
+    assert launched == [("firefox", "--new-tab", f"http://{host}/chat/19%3Abbbb%40thread.v2")]

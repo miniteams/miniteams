@@ -303,8 +303,12 @@
         if (opener && r.last_id) { ev.preventDefault(); send({ open: r.id, web: false }); }
       };
       name.onauxclick = (ev) => {
-        // Our own page: this browser is the right one, --browser or not.
-        if (chatHere(ev)) { ev.preventDefault(); window.open("/chat/" + encodeURIComponent(r.id), "_blank", "noopener"); return; }
+        if (chatHere(ev)) {
+          ev.preventDefault();
+          if (browser) send({ open: r.id, chat: true });
+          else window.open("/chat/" + encodeURIComponent(r.id), "_blank", "noopener");
+          return;
+        }
         if (ev.button === 1 && browser) { ev.preventDefault(); send({ open: r.id, web: true }); }
       };
       const replyBtn = el("button", "reply", "✎"); replyBtn.title = "reply (r)";

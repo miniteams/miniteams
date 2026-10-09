@@ -22,8 +22,10 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 ## Scope
 
 - **Setting.** ⚙ menu gains "Middle click: Teams web / chat here" (per browser, `localStorage`
-  key `midclick`, default `teams`). With `chat`, `onauxclick` button 1 opens `/chat/<id>` in a new
-  tab (`window.open`, `noopener`) without any WS verb, whether or not `--browser` is set.
+  key `midclick`, default `teams`). With `chat`, `onauxclick` button 1 opens the chat page: when
+  `--browser` is set, through it (verb `{"open": id, "chat": true}`; the server runs `--browser` on
+  its own `http://<bind>/chat/<encoded id>`), else in a new tab of the page's browser
+  (`window.open`, `noopener`).
 - **Route.** `GET /chat/<thread>` serves `chat.html` (new static page next to `widget.html`),
   `GET /media/<thread>/<file>` serves a file from `<data-dir>/<thread>/media/` (read-only, path
   confined to that directory, 404 otherwise). The thread id is taken from the URL path, url-decoded.
@@ -98,8 +100,8 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
     `send.edit_message()`, same validation as `send`. Mentions, emoji and quotes in the original
     are lost on edit (plain text only, like the composer).
   - **Delete** (own messages only), after a confirm: verb `{"delete": "<thread>", "msg": id}` →
-    new `send.delete_message()`. Wire format confirmed against a live delete in phase 4 before
-    the function is written; the Teams client sends a soft delete.
+    new `send.delete_message()`: `DELETE …/v1/users/ME/conversations/<thread>/messages/<id>`, no
+    query, no body (confirmed live: 200, then the message carries `deletetime` and an empty body).
   - Each action answers the asking socket `{"<verb>": id, "ok": true}` or `{…, "error": …}`; the
     message itself updates from the Trouter echo (AC7), no optimistic change.
   - "Own message" is decided on the server from its copy of the message (`from` equals my MRI);
@@ -123,8 +125,9 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 
 ## Acceptance criteria
 
-- [ ] **AC1** Given the ⚙ setting at `chat`, a middle click on a row opens a new tab on
-      `/chat/<thread id>` and sends no `open` verb; with the setting at `teams` (default) the
+- [ ] **AC1** Given the ⚙ setting at `chat`, a middle click on a row sends `{"open": id, "chat":
+      true}` when `--browser` is set and the server runs `--browser` on `http://<bind>/chat/<encoded
+      id>`; without `--browser` it opens a new tab on `/chat/<encoded id>` and sends no verb; with the setting at `teams` (default) the
       behaviour of today is unchanged (`open`+`web` when `--browser` is set, else the plain link).
 - [ ] **AC2** Ctrl click and plain click are unchanged whatever the setting.
 - [ ] **AC3** `GET /chat/<id>` returns the chat page for a thread on the board or in the archive,
@@ -234,8 +237,9 @@ None.
 
 - Setting stored per browser in `localStorage`, like theme and avatars, not a server flag: it
   changes what the page does with a click, nothing server-side. Overturnable.
-- Middle click with the setting at `chat` works without `--browser`: the target is our own page,
-  the browser running the widget is the right one.
+- Middle click with the setting at `chat` goes through `--browser` when set, like the Teams web link
+  does (babs, 2026-10-09: switch browsers, e.g. Firefox, from the command line); without it, the
+  page's own browser.
 - Separate page (`chat.html`) rather than a panel inside the widget: a tab per chat is what
   "middle click" means, and the widget stays a list.
 - Sanitiser in stdlib (`html.parser`), no new dependency; allowlist, never denylist.

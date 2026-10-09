@@ -676,6 +676,7 @@ class Board:
         self.opener = opener  # argv the deep link is appended to; None = the page follows its link
         self.open_scheme = open_scheme
         self.browser = browser  # argv for the https link on Ctrl/middle click; None = page's own browser
+        self.base_url = ""  # http://host:port, set once bound: `chat` opens point back at us
         self.clients: set[ServerConnection] = set()
         self.busy = busy  # the page shows a spinner until the background fill says otherwise
         self.seed = seed or {}
@@ -1254,18 +1255,29 @@ class Board:
         )
 
     async def open_row(
-        self, thread_id: str, web: bool = False, ws: ServerConnection | None = None, msg_id: str = ""
+        self,
+        thread_id: str,
+        web: bool = False,
+        ws: ServerConnection | None = None,
+        msg_id: str = "",
+        chat: bool = False,
     ) -> bool:
         """Page verb `open`: run the opener (or, for `web`, the browser) on the deep link of the row
         (or of the chat `ws` follows), at `msg_id` when given, else at the row's last message.
+        `chat` runs the browser on our own `/chat/<thread>` page instead.
 
         Opening is not reading: the row keeps its seen/unread state until the user says so."""
         row = self.rows.get(thread_id)
-        argv = self.browser if web else self.opener
+        argv = self.browser if web or chat else self.opener
         if (row is None and not self._following(ws, thread_id)) or argv is None:
             return False
-        target = msg_id or str((row or {}).get("last_id") or "")
-        url = deep_link(thread_id, target, "https" if web else self.open_scheme)
+        if chat:
+            if not self.base_url:
+                return False
+            url = f"{self.base_url}/chat/{quote(thread_id, safe='')}"
+        else:
+            target = msg_id or str((row or {}).get("last_id") or "")
+            url = deep_link(thread_id, target, "https" if web else self.open_scheme)
         try:
             # argv exec, no shell: the only variable part is a URL built from ids we already hold.
             proc = await asyncio.create_subprocess_exec(
@@ -1280,7 +1292,7 @@ class Board:
             log.warning("opener_failed", opener=argv[0], error=str(exc))
             return False
         asyncio.get_running_loop().create_task(proc.wait())  # reap; xdg-open returns at once
-        log.info("opened", thread=thread_id, web=web)
+        log.info("opened", thread=thread_id, web=web, chat=chat)
         return True
 
     async def watch_page(self, interval: float = _PAGE_POLL) -> None:
@@ -1338,9 +1350,12 @@ class Board:
                 elif isinstance(verb, dict) and isinstance(verb.get("follow"), str):
                     await self._answer(ws, self.follow(ws, verb["follow"]))
                 elif isinstance(verb, dict) and isinstance(verb.get("open"), str):
+                    chat = verb.get("chat") is True
                     msg = verb.get("msg")
-                    msg = msg if isinstance(msg, str) and _MSG_ID_RE.fullmatch(msg) else ""
-                    await self.open_row(verb["open"], web=verb.get("web") is True, ws=ws, msg_id=msg)
+                    msg = msg if not chat and isinstance(msg, str) and _MSG_ID_RE.fullmatch(msg) else ""
+                    await self.open_row(
+                        verb["open"], web=verb.get("web") is True, ws=ws, msg_id=msg, chat=chat
+                    )
                 else:
                     log.debug("ws_client_message_ignored", data=str(raw)[:100])
         finally:
@@ -1457,6 +1472,7 @@ async def serve_board(board: Board, settings: Settings, bind: str | None) -> Non
             # else every open tab could read the chat list (cross-site websocket hijacking).
             origins = [Origin(f"http://{host}:{port}")]
             routes = functools.partial(_process_request, board, f"{host}:{port}")
+            board.base_url = f"http://{host}:{port}"
             async with serve(board.handle, host, port, origins=origins, process_request=routes):
                 log.info("web_listening", url=f"http://{host}:{port}/")
                 await board.watch_page()  # until cancelled
