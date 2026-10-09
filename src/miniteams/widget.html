@@ -158,6 +158,7 @@
   let tab = TABS[pref("tab")] ? pref("tab") : "all";
   let theme = THEMES.includes(pref("theme")) ? pref("theme") : "auto";
   let avatars = pref("avatars") !== "0";
+  let midclick = pref("midclick") === "chat" ? "chat" : "teams";
   // Quick reply: one composer element; drafts live per chat until the page reloads.
   let replyTo = "";
   const drafts = new Map(), sending = new Set(), errors = new Map();
@@ -264,7 +265,12 @@
     const dbox = el("div"), lab = el("label", null, "Show avatars"), sw = el("input", "switch");
     sw.type = "checkbox"; sw.checked = avatars; sw.onchange = () => { avatars = sw.checked; store("avatars", avatars ? "1" : "0"); render(); };
     lab.append(sw); dbox.append(el("h3", null, "Display"), lab);
-    menu.append(tbox, dbox); $cog.append(menu);
+    const mbox = el("div"), mseg = el("div", "seg");
+    for (const [k, lbl] of [["teams", "Teams web"], ["chat", "Chat here"]]) {
+      const b = el("button", midclick === k ? "on" : "", lbl); b.onclick = () => { midclick = k; store("midclick", k); render(); }; mseg.append(b);
+    }
+    mbox.append(el("h3", null, "Middle click"), mseg);
+    menu.append(tbox, dbox, mbox); $cog.append(menu);
   };
 
   const render = () => {
@@ -288,13 +294,19 @@
       // Plain click → the server opens the chat (desktop client); modified/middle click → the https
       // link, through the server's --browser when set, else in this browser.
       const modified = (ev) => ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.button === 1;
+      const chatHere = (ev) => ev.button === 1 && midclick === "chat";
       // Without a message id the only link form is chat-only, which the desktop client cannot
       // route in page (it reloads, dropping a call): let that one open in the browser instead.
       name.onclick = (ev) => {
+        if (chatHere(ev)) return;  // onauxclick owns it
         if (modified(ev)) { if (browser) { ev.preventDefault(); send({ open: r.id, web: true }); } return; }
         if (opener && r.last_id) { ev.preventDefault(); send({ open: r.id, web: false }); }
       };
-      name.onauxclick = (ev) => { if (ev.button === 1 && browser) { ev.preventDefault(); send({ open: r.id, web: true }); } };
+      name.onauxclick = (ev) => {
+        // Our own page: this browser is the right one, --browser or not.
+        if (chatHere(ev)) { ev.preventDefault(); window.open("/chat/" + encodeURIComponent(r.id), "_blank", "noopener"); return; }
+        if (ev.button === 1 && browser) { ev.preventDefault(); send({ open: r.id, web: true }); }
+      };
       const replyBtn = el("button", "reply", "✎"); replyBtn.title = "reply (r)";
       replyBtn.onclick = () => openReply(r.id);
       const meta = el("span", "meta"), seenBtn = el("button", null, isSeen(r) && !m ? "↺" : "✓");

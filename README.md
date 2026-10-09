@@ -105,7 +105,7 @@ page). Clicking a row opens the chat at its last message through `--opener` (def
 on an `msteams://` deep link, i.e. the desktop client; `--open-scheme https` for Teams web,
 `--opener none` to let the page follow its plain https link); opening does not mark the row
 seen. Ctrl/middle click opens the https link, through `--browser firefox` when set, else in the
-page's own browser. `xdg-open` only works when the `msteams` handler's `.desktop` entry passes the
+page's own browser (middle click can open the chat page instead, see the ⚙ setting below). `xdg-open` only works when the `msteams` handler's `.desktop` entry passes the
 URL along (`Exec=… %u`); otherwise point `--opener` at the client binary, e.g.
 `--opener "/path/to/teams-for-linux --no-sandbox"`. Hovering a preview cut by the row width shows the whole message (up to 1000 characters).
 Hovering a row shows its **seen** button (✓): the row leaves the Inbox until something
@@ -116,7 +116,9 @@ or read the chat in Teams after the mention. The `@` tab lists mentioned rows, *
 read marker. `🔕` mutes a chat (out of Inbox whatever lands on it, listed under **Muted** until `🔔`; mentions still
 surface; state in `muted.json`). `✎` (or `r` on the row selected with the arrow keys, `Tab` from the filter) opens
 a reply box under the row: Enter sends it to the chat as you, Shift+Enter adds a line, Escape closes it and keeps
-the draft until the page reloads; a failed send keeps the text and shows why. The ⚙ menu picks the theme (system by default) and hides avatars for a denser list. The
+the draft until the page reloads; a failed send keeps the text and shows why. The ⚙ menu picks the theme (system by default), hides avatars for a denser list, and sets
+**Middle click** to `Teams web` (default, as above) or `Chat here`: a new tab on `/chat/<thread>`, this
+page's own view of the chat (history, live updates, reply box, Open in Teams), `--browser` or not. The
 process exits non-zero when the stream dies (auth expired) — re-run it.
 
 Open it as a standalone window on the persisted bind:
