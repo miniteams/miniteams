@@ -1,6 +1,6 @@
 # 012 — Composer: emoji completion and `@` mentions
 
-**Status**: approved
+**Status**: implemented
 **Requested by**: babs
 **Date**: 2026-10-09
 
@@ -78,40 +78,42 @@ the person (or everyone) is notified and the name shows highlighted in Teams, as
 
 ## Acceptance criteria
 
-- [ ] **AC1** `complete emoji` with `q: "fi"` returns `fire` (unicode) and any custom emoji whose
+- [x] **AC1** `complete emoji` with `q: "fi"` returns `fire` (unicode) and any custom emoji whose
       name starts with `fi`, at most 12 items, case-insensitive; an unknown prefix returns `[]`.
-- [ ] **AC2** `complete member` returns the thread's human members matching the prefix on first,
+- [x] **AC2** `complete member` returns the thread's human members matching the prefix on first,
       last or full name with accents folded, me excluded, `everyone` first on groups and absent on
       1:1 chats; a thread not on the board or in the archive is refused with an `error`.
-- [ ] **AC3** `compose_html("ok :fire: :nope:", [], table)` yields `ok 🔥 :nope:`; a custom name
+- [x] **AC3** `compose_html("ok :fire: :nope:", [], table)` yields `ok 🔥 :nope:`; a custom name
       yields the `CustomEmoji` `<img>` with the right `itemid` and `src`; escaping of the rest is
       unchanged (`<` → `&lt;`, newline → `<br>`).
-- [ ] **AC4** `compose_html("@Ann Lee and @Ann Lee", [{Ann Lee, mri}], …)` yields two Mention spans
+- [x] **AC4** `compose_html("@Ann Lee and @Ann Lee", [{Ann Lee, mri}], …)` yields two Mention spans
       with `itemid` 0 and 1 and a `mentions` property with two entries in that order; a picked
       mention absent from the text yields no entry.
-- [ ] **AC5** `@everyone` picked on a group yields a span reading `Everyone` and a `mentionType:
+- [x] **AC5** `@everyone` picked on a group yields a span reading `Everyone` and a `mentionType:
       "everyone"` entry whose `mri` is the thread id.
-- [ ] **AC6** `send` with a mention whose `mri` is not in the thread roster answers
+- [x] **AC6** `send` with a mention whose `mri` is not in the thread roster answers
       `error: "unknown mention"` and calls no API.
-- [ ] **AC7** `send_message(..., properties=p)` puts `p` in the request body; without it the body
+- [x] **AC7** `send_message(..., properties=p)` puts `p` in the request body; without it the body
       is byte-identical to today's.
-- [ ] **AC8** In the page: `:fi` opens the popup, Enter inserts `🔥` and does not send; `@` opens
+- [x] **AC8** In the page: `:fi` opens the popup, Enter inserts `🔥` and does not send; `@` opens
       the member list, Enter inserts `@Full Name` and records the pick; Escape closes the popup
       and keeps the text; Enter with the popup closed still sends.
-- [ ] **AC9** `GET /emoji/<id>` serves the cached image for a known custom emoji, 404 for an
+- [x] **AC9** `GET /emoji/<id>` serves the cached image for a known custom emoji, 404 for an
       unknown id or a path escaping the cache directory.
-- [ ] **AC10** Live: a message sent from the widget with a picked member shows in Teams with the
+- [ ] **AC10** (wire shape checked live on a throwaway group, 2026-10-09: two Mention spans,
+      `properties.mentions` person + everyone, CustomEmoji image; Teams-side rendering and the
+      notification await the user's look) Live: a message sent from the widget with a picked member shows in Teams with the
       name highlighted and the person's activity feed shows the mention; a custom emoji renders in
       Teams as the emoji, not as text.
-- [ ] **AC11** `compose_html` with `inline` turns `**a** *b* _c_ ~~d~~ `e` [f](https://x)` into
+- [x] **AC11** `compose_html` with `inline` turns `**a** *b* _c_ ~~d~~ `e` [f](https://x)` into
       `<b>`, `<i>`, `<i>`, `<s>`, `<code>`, `<a href>`; with `inline`, a line `> q` or `- item`
       stays text.
-- [ ] **AC12** With `full`, a fenced block becomes `<pre><code>` with its content escaped and no
+- [x] **AC12** With `full`, a fenced block becomes `<pre><code>` with its content escaped and no
       emoji or mention expanded inside; `> ` lines become a `<blockquote>`; `- ` and `1. ` runs
       become `<ul>` / `<ol>`.
-- [ ] **AC13** Unclosed or intra-word markers (`2*3*4`, `snake_case_name`, a lone `**`) stay as
+- [x] **AC13** Unclosed or intra-word markers (`2*3*4`, `snake_case_name`, a lone `**`) stay as
       typed; `[x](javascript:…)` stays text; `<b>` typed by hand is escaped.
-- [ ] **AC14** In the chat view, the toolbar wraps the selection in the right markers, and the
+- [x] **AC14** In the chat view, the toolbar wraps the selection in the right markers, and the
       preview shows the server's HTML without sending; the widget composer has no toolbar.
 
 ## Phases

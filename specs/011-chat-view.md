@@ -1,6 +1,6 @@
 # 011 — Chat view in the widget (`/chat/<thread>`)
 
-**Status**: in progress
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-10-09
 
@@ -155,100 +155,100 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 
 ## Acceptance criteria
 
-- [ ] **AC1** Given the ⚙ setting at `chat`, a middle click on a row sends `{"open": id, "chat":
+- [x] **AC1** Given the ⚙ setting at `chat`, a middle click on a row sends `{"open": id, "chat":
       true}` when `--browser` is set and the server runs `--browser` on `http://<bind>/chat/<encoded
       id>`; without `--browser` it opens a new tab on `/chat/<encoded id>` and sends no verb; with the setting at `teams` (default) the
       behaviour of today is unchanged (`open`+`web` when `--browser` is set, else the plain link).
-- [ ] **AC2** Ctrl click and plain click are unchanged whatever the setting.
-- [ ] **AC3** `GET /chat/<id>` returns the chat page for a thread on the board or in the archive,
+- [x] **AC2** Ctrl click and plain click are unchanged whatever the setting.
+- [x] **AC3** `GET /chat/<id>` returns the chat page for a thread on the board or in the archive,
       404 otherwise; `GET /media/<id>/<file>` returns the file for an existing archived asset, 404
       for a missing one and for any path escaping the media directory (`..`, absolute, encoded).
-- [ ] **AC4** `history` on an archived thread returns the last `limit` messages oldest-first,
+- [x] **AC4** `history` on an archived thread returns the last `limit` messages oldest-first,
       `older: true` while earlier ones exist; a second call with `before` returns the page before
       it without overlap or gap, `older: false` at the start.
-- [ ] **AC5** `history` on a thread without `messages.db` returns one API page with
+- [x] **AC5** `history` on a thread without `messages.db` returns one API page with
       `source: "api"`; an API failure answers `{"history": id, "error": …}` and leaves the page
       usable.
-- [ ] **AC6** The sanitiser keeps the allowlisted tags, drops `script`, `style`, `iframe`, event
+- [x] **AC6** The sanitiser keeps the allowlisted tags, drops `script`, `style`, `iframe`, event
       attributes and `javascript:` hrefs, renders a unicode Teams emoji as its character, a custom
       emoji as `<img class="emoji">` pointing to the archived file, a mention as
       `span.mention` (`mention-me` for my MRI) and rewrites an archived image to `/media/…`; an
       unarchived image becomes the "[image not archived]" link.
-- [ ] **AC7** With the page open and followed, a new message on that thread appends within one
+- [x] **AC7** With the page open and followed, a new message on that thread appends within one
       event; an edit replaces the message in place with the `edited` marker; a delete shows
       "message deleted"; a reaction updates the reactions line.
-- [ ] **AC8** Enter in the composer calls `send_message` once with the thread id and text; a
+- [x] **AC8** Enter in the composer calls `send_message` once with the thread id and text; a
       failure keeps the text and shows the reason; success clears the field.
-- [ ] **AC9** `follow`, `history` and `send` for a thread that is neither on the board nor in the
+- [x] **AC9** `follow`, `history` and `send` for a thread that is neither on the board nor in the
       archive are refused with an `error` and no API call.
-- [ ] **AC10** The page is reachable only from the bound loopback address (same bind and Origin
+- [x] **AC10** The page is reachable only from the bound loopback address (same bind and Origin
       rules as the board); no token or MRI other than those of the chat's own messages reaches
       the page.
-- [ ] **AC11** Reply with quote: `send` with `quote: [a, b]` posts a body starting with the
+- [x] **AC11** Reply with quote: `send` with `quote: [a, b]` posts a body starting with the
       Reply blockquotes of `a` then `b`, author MRI, name and preview from the server's copy; any
       `quote` id that is not a message of that thread, or more than 10 ids, is refused without
       posting anything (an id the archive lacks may cost one history read); the page renders the sent reply with its quotes.
-- [ ] **AC12** `react` calls `send.react()` once with the key, `remove: true` when I already
+- [x] **AC12** `react` calls `send.react()` once with the key, `remove: true` when I already
       reacted with it; a key outside the 8 defaults is refused without an API call.
-- [ ] **AC13** `edit` on my own message calls `edit_message()` once with the new text; on another
+- [x] **AC13** `edit` on my own message calls `edit_message()` once with the new text; on another
       person's message, an empty text or a body over 28 KB it is refused without an API call.
-- [ ] **AC14** `delete` on my own message calls `delete_message()` once after the confirm; on
+- [x] **AC14** `delete` on my own message calls `delete_message()` once after the confirm; on
       another person's message it is refused without an API call; the page then shows "message
       deleted" from the echo.
-- [ ] **AC15** Reaching the top of the list loads the previous page once (no duplicate request
+- [x] **AC15** Reaching the top of the list loads the previous page once (no duplicate request
       while one is in flight), keeps the visible message in place, and stops at `older: false`.
-- [ ] **AC16** With the latest message out of view, "↓ latest" shows and counts live messages
+- [x] **AC16** With the latest message out of view, "↓ latest" shows and counts live messages
       received meanwhile; clicking it shows the latest message at the bottom, after a jump too.
-- [ ] **AC17** `history` with `around` returns messages on both sides of the anchor with `older`
+- [x] **AC17** `history` with `around` returns messages on both sides of the anchor with `older`
       and `newer` set; `after` pages forward without overlap or gap.
-- [ ] **AC18** `search` returns the thread's matching messages, case and accents ignored, at most
+- [x] **AC18** `search` returns the thread's matching messages, case and accents ignored, at most
       50, newest first; clicking a hit shows that message highlighted with its neighbours; a thread
       without archive answers the `error` above. ~~The date picker shows the first message of the
       picked day.~~
-- [ ] **AC19** The header's Open in Teams sends `open` for the thread and the server runs the
+- [x] **AC19** The header's Open in Teams sends `open` for the thread and the server runs the
       opener on its deep link, also for a thread followed but not on the board; with
       `--opener none` it opens the https deep link in a new tab. A message's Open in Teams opens
       the deep link on that message id.
-- [ ] **AC20** With `chatnav` at `list`, the chat page's ◀ opens `/?nav=chat`; there a plain click
+- [x] **AC20** With `chatnav` at `list`, the chat page's ◀ opens `/?nav=chat`; there a plain click
       on a row opens that chat in the same tab, a middle click opens it in a new tab (through
       `--browser` when set), Ctrl click is unchanged; `/` without `nav` behaves as before.
-- [ ] **AC21** With `chatnav` at `split`, `/chat/<id>` shows the live conversation list beside the
+- [x] **AC21** With `chatnav` at `split`, `/chat/<id>` shows the live conversation list beside the
       chat; clicking another row follows that thread, shows its history and changes the URL
       without a page load; browser Back returns to the previous chat.
-- [ ] **AC22** In `split`, switching chats keeps each chat's unsent draft and quotes, and live
+- [x] **AC22** In `split`, switching chats keeps each chat's unsent draft and quotes, and live
       events of the previous chat no longer reach the page (one followed thread at a time).
-- [ ] **AC23** In `split`, the list's rows update live like the board (new message moves the row
+- [x] **AC23** In `split`, the list's rows update live like the board (new message moves the row
       up, unread and mention marks), and the socket still never receives data of chats that are not
       on the board beyond their rows.
-- [ ] **AC24** A `Media_Card` message with a Swift payload and a `RichText/Html` message with
+- [x] **AC24** A `Media_Card` message with a Swift payload and a `RichText/Html` message with
       `properties.cards` both render their card: text blocks with weight, facts as a table, column
       sets side by side, OpenUrl actions as links; a card with an unknown-only body shows its
       summary; nothing of a card is fetched from the network and no `on*` or script survives.
-- [ ] **AC25** Three consecutive deleted messages render as one "3 messages deleted" line that
+- [x] **AC25** Three consecutive deleted messages render as one "3 messages deleted" line that
       expands on click; a single deleted message renders as itself; a live delete of the message
       right after a run grows the run's count.
-- [ ] **AC26** Clicking a reaction chip under a message sends `react` with that key: `remove:
+- [x] **AC26** Clicking a reaction chip under a message sends `react` with that key: `remove:
       true` when the chip is mine, else `remove: false`; the chip shows a "mine" state from the
       record; chips are reachable by keyboard.
-- [ ] **AC27** Split list column resizes: a focusable separator (`role="separator"`, aria values)
+- [x] **AC27** Split list column resizes: a focusable separator (`role="separator"`, aria values)
       between the list and the chat; dragging +100 px gives a 400 px list saved as
       `localStorage.chatnav_w` and kept after a reload; ←/→ step 16 px (Shift 64), Home = 280 min,
       End = `min(560, window − 420)`; double-click or Enter resets to 300 and clears the key; a
       stored out-of-range value is clamped; no separator at 700 px and below or in list mode.
-- [ ] **AC28** Split filters: the filter row is as tall as the chat header (bottom borders aligned
+- [x] **AC28** Split filters: the filter row is as tall as the chat header (bottom borders aligned
       within 1 px); tabs Inbox, @, Unread and a "⋯" menu holding Seen and Muted fit a 280 px column
       without scrolling, the active tab always visible; from 360 px the five tabs show inline; the
       filter has a × clear, ↑/↓/Enter/Escape like the widget's, and Ctrl+K focuses it from anywhere.
-- [ ] **AC29** Split rows and focus: seen/mute buttons take no width until hover or focus; rows use a
+- [x] **AC29** Split rows and focus: seen/mute buttons take no width until hover or focus; rows use a
       roving tabindex (↑/↓/Home/End move, Enter switches), so the chat header is at most 10 Tab
       presses from the filter; ☰ toggles the docked list above 700 px (saved) and opens a drawer
       with a backdrop below it, with `aria-expanded`, focus into the filter, Escape back to ☰.
-- [ ] **AC30** Split polish: the chat header never overflows (label at least 80 px at 720 px wide;
+- [x] **AC30** Split polish: the chat header never overflows (label at least 80 px at 720 px wide;
       Open in Teams as an icon below 640 px of chat width; breakpoints measured on the real header); the current row is marked by a fill and a 3 px bar and
       scrolled into view on load and Back/Forward, not on live updates; empty tabs and empty filters
       say so right under the bar; focus rings use the accent colour; row times and seen rows reach
       4.5:1 contrast in both themes. Switching chats keeps the list's scroll position.
-- [ ] **AC31** The chat page has its own ⚙ menu (list and split modes) with the settings it reads:
+- [x] **AC31** The chat page has its own ⚙ menu (list and split modes) with the settings it reads:
       theme, avatars, chat navigation. They share the widget's keys in the browser's storage, so a
       page opened in another browser through `--browser` can be set there. Choosing a chat
       navigation value stores it, drops any `chatnav` URL parameter and reloads the page in that
