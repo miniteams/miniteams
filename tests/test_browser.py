@@ -1285,7 +1285,12 @@ async def widget(settings: Settings, pages: Pages, monkeypatch: pytest.MonkeyPat
     verbs: list[Verb] = []
 
     async def spy(
-        thread_id: str, web: bool = False, ws: Any = None, msg_id: str = "", chat: bool = False
+        thread_id: str,
+        web: bool = False,
+        ws: Any = None,
+        msg_id: str = "",
+        chat: bool = False,
+        split: bool = False,
     ) -> bool:
         verbs.append((thread_id, "chat" if chat else web))
         return True
@@ -1764,7 +1769,12 @@ async def test_split_middle_click_opens_a_new_tab(
     opened: list[tuple[str, bool]] = []
 
     async def spy(
-        thread_id: str, web: bool = False, ws: Any = None, msg_id: str = "", chat: bool = False
+        thread_id: str,
+        web: bool = False,
+        ws: Any = None,
+        msg_id: str = "",
+        chat: bool = False,
+        split: bool = False,
     ) -> bool:
         opened.append((thread_id, chat))
         return True

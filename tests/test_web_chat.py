@@ -1227,6 +1227,35 @@ async def test_open_chat_runs_the_browser_on_our_own_chat_page(
     assert launched == [("firefox", "--new-tab", f"http://{host}/chat/19%3Abbbb%40thread.v2")]
 
 
+async def test_open_chat_carries_the_split_setting(
+    board: W.Board, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC21: `chatnav: "split"` adds `?chatnav=split` to the chat page URL; any other value is
+    ignored, and `chatnav` alone does not make a chat open."""
+    launched: list[tuple[str, ...]] = []
+
+    class _Proc:
+        async def wait(self) -> int:
+            return 0
+
+    async def fake_exec(*argv: str, **kw: Any) -> _Proc:
+        launched.append(argv)
+        return _Proc()
+
+    monkeypatch.setattr(W.asyncio, "create_subprocess_exec", fake_exec)
+    board.browser = ["firefox"]
+    async with _served(board, settings) as host:
+        async with _connect(host) as ws:
+            await ws.recv()
+            for chatnav in ("split", "split&x=1", '"><', ["split"], True, "list"):
+                await ws.send(json.dumps({"open": B, "chat": True, "chatnav": chatnav}))
+            await ws.send(json.dumps({"open": B, "chat": "split", "chatnav": "split"}))
+            await ws.send(json.dumps({"follow": B}))
+            await _frame(ws)
+    page = f"http://{host}/chat/19%3Abbbb%40thread.v2"
+    assert launched == [("firefox", page + "?chatnav=split")] + [("firefox", page)] * 5
+
+
 # --- message actions: quote, react, edit, delete (011 phase 4) ---
 
 BO = "8:orgid:00000000-0000-0000-0000-00000000000c"

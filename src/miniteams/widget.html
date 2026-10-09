@@ -165,6 +165,8 @@
   let avatars = pref("avatars") !== "0";
   let midclick = pref("midclick") === "chat" ? "chat" : "teams";
   let chatnav = pref("chatnav") === "split" ? "split" : "list";
+  // The setting travels in the URL: the chat page may open in a browser without our storage (--browser).
+  const chatPage = (id) => "/chat/" + encodeURIComponent(id) + (chatnav === "split" ? "?chatnav=split" : "");
   // The chat page's ◀ lands here: rows open our chat page instead of Teams.
   const nav = q.get("nav") === "chat";
   // Quick reply: one composer element; drafts live per chat until the page reloads.
@@ -313,14 +315,14 @@
       name.onclick = (ev) => {
         if (chatHere(ev)) { ev.preventDefault(); return; }  // onauxclick owns it: no Teams tab from the link too
         if (modified(ev)) { if (browser) { ev.preventDefault(); send({ open: r.id, web: true }); } return; }
-        if (nav) { ev.preventDefault(); location.assign("/chat/" + encodeURIComponent(r.id)); return; }
+        if (nav) { ev.preventDefault(); location.assign(chatPage(r.id)); return; }
         if (opener && r.last_id) { ev.preventDefault(); send({ open: r.id, web: false }); }
       };
       name.onauxclick = (ev) => {
         if (chatHere(ev)) {
           ev.preventDefault();
-          if (browser) send({ open: r.id, chat: true });
-          else window.open("/chat/" + encodeURIComponent(r.id), "_blank", "noopener");
+          if (browser) send({ open: r.id, chat: true, ...(chatnav === "split" && { chatnav }) });
+          else window.open(chatPage(r.id), "_blank", "noopener");
           return;
         }
         if (ev.button === 1 && browser) { ev.preventDefault(); send({ open: r.id, web: true }); }

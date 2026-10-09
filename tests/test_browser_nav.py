@@ -5,6 +5,7 @@ Run: `uv run --with playwright pytest tests/test_browser_nav.py`.
 
 import asyncio
 import re
+from typing import Any
 
 import pytest
 import test_browser
@@ -18,6 +19,8 @@ _DISPATCH = (
     "document.querySelector('a.name').dispatchEvent("
     "new MouseEvent('click', {button: %d, bubbles: true, cancelable: true}))"
 )
+
+_SUFFIX = {"list": "", "split": "?chatnav=split"}
 
 
 async def _stub_chat(route: Route) -> None:
@@ -35,12 +38,12 @@ async def _load(widget: Widget, browser: bool, path: str, **stored: str) -> Page
 @pytest.mark.parametrize("chatnav", ["list", "split"])
 async def test_nav_plain_click_opens_the_chat_page_in_the_same_tab(widget: Widget, chatnav: str) -> None:
     """011-AC20: on `/?nav=chat` a plain click navigates this tab to the encoded chat URL, no verb,
-    no tab from the link's own target."""
+    no tab from the link's own target. 011-AC21: the URL carries `chatnav=split` when set."""
     page = await _load(widget, True, "/?nav=chat", chatnav=chatnav)
     await widget.ctx.route(re.compile(r"/chat/"), _stub_chat)
     widget.verbs.clear()
     await page.locator("a.name").click()
-    await page.wait_for_url(widget.base + _chat(T))
+    await page.wait_for_url(widget.base + _chat(T) + _SUFFIX[chatnav])
     assert "%3A" in page.url and "%40" in page.url
     await asyncio.sleep(0.2)  # a verb sent before the navigation would have reached the spy by now
     assert widget.verbs == []
@@ -79,6 +82,35 @@ async def test_nav_middle_click_opens_the_chat_page_in_a_new_tab(widget: Widget,
     assert await widget.act(click) == ([], [])
     assert dispatched == [False]
     assert page.url == widget.base + "/?nav=chat"
+
+
+@pytest.mark.parametrize("chatnav", ["list", "split"])
+@pytest.mark.parametrize("browser", [True, False], ids=["browser", "no-browser"])
+async def test_middle_click_carries_the_split_setting(
+    widget: Widget, monkeypatch: pytest.MonkeyPatch, browser: bool, chatnav: str
+) -> None:
+    """011-AC21: the chat page a middle click opens gets the widget's `chatnav` when split: in the
+    verb for --browser (which has none of our storage), in the tab URL otherwise."""
+
+    async def spy(
+        thread_id: str,
+        web: bool = False,
+        ws: Any = None,
+        msg_id: str = "",
+        chat: bool = False,
+        split: bool = False,
+    ) -> bool:
+        widget.verbs.append((thread_id, "split" if split else chat or web))
+        return True
+
+    page = await _load(widget, browser, "/?nav=chat", chatnav=chatnav)
+    monkeypatch.setattr(widget.board, "open_row", spy)
+    await widget.ctx.route(re.compile(r"/chat/"), _stub_chat)
+    if browser:
+        sent = await widget.act(lambda: page.locator("a.name").click(button="middle"))
+        assert sent == ([(T, "split" if chatnav == "split" else True)], [])
+    else:
+        assert await widget.opens_tab(widget.base + _chat(T) + _SUFFIX[chatnav], button="middle") == []
 
 
 @pytest.mark.parametrize("browser", [True, False], ids=["browser", "no-browser"])

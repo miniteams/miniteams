@@ -1660,10 +1660,11 @@ class Board:
         ws: ServerConnection | None = None,
         msg_id: str = "",
         chat: bool = False,
+        split: bool = False,
     ) -> bool:
         """Page verb `open`: run the opener (or, for `web`, the browser) on the deep link of the row
         (or of the chat `ws` follows), at `msg_id` when given, else at the row's last message.
-        `chat` runs the browser on our own `/chat/<thread>` page instead.
+        `chat` runs the browser on our own `/chat/<thread>` page instead, in split mode with `split`.
 
         Opening is not reading: the row keeps its seen/unread state until the user says so."""
         row = self.rows.get(thread_id)
@@ -1674,6 +1675,8 @@ class Board:
             if not self.base_url:
                 return False
             url = f"{self.base_url}/chat/{quote(thread_id, safe='')}"
+            if split:  # the --browser has none of the widget's stored settings
+                url += "?chatnav=split"
         else:
             target = msg_id or str((row or {}).get("last_id") or "")
             url = deep_link(thread_id, target, "https" if web else self.open_scheme)
@@ -1776,10 +1779,11 @@ class Board:
                     await self._answer(ws, self.follow(ws, verb["follow"]))
                 elif isinstance(verb, dict) and isinstance(verb.get("open"), str):
                     chat = verb.get("chat") is True
+                    split = chat and verb.get("chatnav") == "split"
                     msg = verb.get("msg")
                     msg = msg if not chat and isinstance(msg, str) and _MSG_ID_RE.fullmatch(msg) else ""
                     await self.open_row(
-                        verb["open"], web=verb.get("web") is True, ws=ws, msg_id=msg, chat=chat
+                        verb["open"], web=verb.get("web") is True, ws=ws, msg_id=msg, chat=chat, split=split
                     )
                 elif isinstance(verb, dict) and (
                     action := next((k for k in _ACTIONS if isinstance(verb.get(k), str)), "")
