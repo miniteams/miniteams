@@ -122,7 +122,10 @@ page's own view of the chat (history, live updates, reply box, Open in Teams), t
 set, else in a new tab. On `/?nav=chat` the board is a chat picker, and the chat page's ◀ goes there: a click on a row opens that chat page in the same
 tab, a middle click in a new one, and Ctrl click opens Teams as before. With ⚙ **Chat navigation** at
 `Split` (default `List`), the chat page shows that list on its left instead of ◀: a click switches chats in
-place (Back returns), each chat keeps its draft and quotes, and below 700px the list folds behind ☰. The
+place (Back returns), each chat keeps its draft and quotes, and below 700px the list folds behind ☰. The chat
+page's message box completes `:emoji` and `@member` (picked members are notified), takes markdown-like formatting
+(bold, italic, strike, code, lists, quotes) through a toolbar or Ctrl+B / Ctrl+I, and its preview button shows the
+message as it will be posted. The
 process exits non-zero when the stream dies (auth expired) — re-run it.
 
 Open it as a standalone window on the persisted bind:
