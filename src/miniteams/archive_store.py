@@ -103,6 +103,60 @@ def read_meta(data_dir: Path) -> dict[str, str]:
         db.close()
 
 
+def find_chat_dir(data_dir: Path, thread_id: str) -> Path | None:
+    """Folder of an indexed chat, read-only; None when the index does not know the thread.
+
+    Same rule as `read_chats`: raises OSError without an index, sqlite3.Error when unreadable.
+    """
+    path = data_dir / "index.db"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        row = db.execute("SELECT dir FROM chats WHERE id = ?", (thread_id,)).fetchone()
+    finally:
+        db.close()
+    return None if row is None else data_dir / (row[0] or chat_dir_name(thread_id))
+
+
+def read_page(chat_dir: Path, before: str, limit: int) -> tuple[list[dict[str, Any]], bool]:
+    """The `limit` newest messages composed before `before` ("" = the latest), oldest first, and
+    whether older ones exist.
+
+    Messages sharing the oldest time all join the page: a `before` cursor at that time would
+    otherwise skip the ones left out.
+    """
+    path = chat_dir / "messages.db"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        rows = db.execute(
+            "SELECT id, composetime, raw FROM messages WHERE composetime < ?"
+            " ORDER BY composetime DESC, id DESC LIMIT ?",
+            (before or "￿", limit),
+        ).fetchall()
+        if not rows:
+            return [], False
+        floor = rows[-1][1]
+        ties = db.execute("SELECT id, composetime, raw FROM messages WHERE composetime = ?", (floor,))
+        page = {r[0]: r for r in [*rows, *ties.fetchall()]}
+        older = db.execute("SELECT 1 FROM messages WHERE composetime < ? LIMIT 1", (floor,)).fetchone()
+    finally:
+        db.close()
+    messages = []
+    for msg_id, _, raw in sorted(page.values(), key=lambda r: (r[1], r[0])):
+        try:
+            message = json.loads(raw)
+        except ValueError:
+            message = None
+        if isinstance(message, dict):
+            messages.append(message)
+        else:
+            log.warning("archive_row_unreadable", chat_dir=str(chat_dir), msg_id=msg_id)
+    return messages, older is not None
+
+
 class Index:
     """`data/index.db` — one row per known chat; enumeration metadata + backfill flag."""
 

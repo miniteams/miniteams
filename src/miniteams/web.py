@@ -18,7 +18,7 @@ import random
 import re
 import sqlite3
 import time
-from collections.abc import Iterable
+from collections.abc import Awaitable, Coroutine, Iterable
 from datetime import UTC, datetime
 from http import HTTPStatus
 from importlib.resources import files
@@ -33,12 +33,13 @@ from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 from websockets.typing import Origin
 
-from .archive_store import read_chats
+from .archive_store import find_chat_dir, read_chats, read_page
 from .chats import fetch_conversations, is_meeting, is_private, last_activity
 from .config import Settings
 from .directory import Directory
-from .dump import fetch_history
+from .dump import _ISO_RE, _epoch_seconds, fetch_history
 from .messages import _TAG_RE, EMOJI, thread_of
+from .render import sanitize
 from .send import mark_read, message_html, send_message
 from .stream import run_forever
 
@@ -66,6 +67,8 @@ _STUB_SNIPPETS = ("🗑 deleted", "📎 attachment")
 _PAGE_POLL = 2.0  # seconds between widget.html mtime checks (dev reload)
 _SEND_MAX_BYTES = 28 * 1024  # Teams' per-message limit
 _TYPING_TTL = 10.0  # seconds; Teams does not always send ClearTyping
+_CHAT_PAGE = 100  # history messages per page of the chat view
+_CHAT_PAGE_MAX = 200  # the archive query is cheap, the page's DOM is not
 # Thread activity that changes the label (topic, member count): drop the cached thread info.
 # Someone reading a chat is not activity: bumping the row on it would defeat "seen".
 _SILENT_TYPES = {"ThreadActivity/MemberConsumptionHorizonUpdate"}
@@ -238,6 +241,71 @@ def snippet(msgtype: str, content: str, props: dict[str, Any] | None = None) -> 
         text = (_TYPE_MARKERS.get(msgtype) or f"[{msgtype.rsplit('/', 1)[-1]}]") if msgtype else ""
     text = " ".join(text.split())
     return text if len(text) <= _SNIPPET_LEN else text[: _SNIPPET_LEN - 1] + "…"
+
+
+def _record_type(msgtype: str) -> str:
+    if msgtype in ("RichText/Html", "Text"):
+        return "text"
+    if msgtype == "Event/Call":
+        return "call"
+    return "system" if _is_system(msgtype) else "other"
+
+
+def chat_record(
+    message: dict[str, Any], thread_id: str, me: str = "", media_dir: Path | None = None
+) -> dict[str, Any]:
+    """One message as the chat page shows it (spec 011): sanitised body, reactions, mention kind."""
+    props = message.get("properties")
+    props = props if isinstance(props, dict) else {}
+    message = {**message, "properties": props}  # mention_kind reads it too
+    msgtype = str(message.get("messagetype") or "")
+    content = str(message.get("content") or "")
+    kind = _record_type(msgtype)
+    mri = str(message.get("from") or "").rsplit("/", 1)[-1]
+    deleted = bool(props.get("deletetime") or props.get("hardDeleteTime"))
+    body = ""
+    if not deleted:
+        if msgtype == "RichText/Html":
+            mentions = {
+                str(m.get("itemid")): str(m.get("mri") or "")
+                for m in _json_list(props.get("mentions"))
+                if isinstance(m, dict)
+            }
+            body = sanitize(content, thread_id, media_dir, me, mentions)
+        elif msgtype == "Text":
+            body = html.escape(content)
+        body = body or html.escape(snippet(msgtype, content, props))  # file/card posts, markers
+    reactions = []
+    for emotion in _json_list(props.get("emotions")):
+        if not isinstance(emotion, dict):
+            continue
+        users = emotion.get("users")
+        users = (
+            [str(u.get("mri") or "") for u in users if isinstance(u, dict)] if isinstance(users, list) else []
+        )
+        if users:
+            key = str(emotion.get("key") or "")
+            reactions.append(
+                {
+                    "key": key,
+                    "emoji": EMOJI.get(key, f":{key}:"),
+                    "count": len(users),
+                    "mine": any(_is_me(u, me) for u in users),
+                }
+            )
+    return {
+        "id": str(message.get("id") or ""),
+        "at": str(message.get("composetime") or message.get("originalarrivaltime") or ""),
+        "from": mri,
+        "name": str(message.get("imdisplayname") or ""),
+        "me": _is_me(mri, me),
+        "type": kind,
+        "html": body,
+        "edited": bool(message.get("skypeeditedid") or props.get("edittime")),
+        "deleted": deleted,
+        "reactions": reactions,
+        "mentions": mention_kind(message, me),
+    }
 
 
 _APP_MRI = "28:"  # bots and app installs sit in the roster like people do
@@ -610,6 +678,8 @@ class Board:
         self._seed_stamp = _index_stamp(data_dir)
         self._replies: set[asyncio.Task[None]] = set()  # the loop keeps only weak refs to tasks
         self._typing_timers: dict[tuple[str, str], asyncio.TimerHandle] = {}
+        self._follows: dict[ServerConnection, tuple[str, Path | None]] = {}  # socket → (thread, media dir)
+        self._history_busy: set[ServerConnection] = set()  # sockets with a history answer pending
         self._seen: dict[str, str] = _load_seen(seen_path)
         self._muted: dict[str, str] = _load_seen(muted_path)  # thread → when muted (same shape)
         for row in rows.values():
@@ -736,16 +806,154 @@ class Board:
                 text,
                 self.me_name,
             )
-        except httpx.HTTPStatusError as exc:
-            log.warning("send_failed", thread=thread_id, status=exc.response.status_code)
-            return f"Teams answered {exc.response.status_code}"
-        except httpx.TransportError as exc:
-            log.warning("send_failed", thread=thread_id, error=type(exc).__name__)
-            return "network error"
         except Exception as exc:  # noqa: BLE001 — a failed send must not drop the socket
-            log.warning("send_failed", thread=thread_id, error=str(exc))
-            return str(exc)[:200]
+            reason = _failure(exc)
+            log.warning("send_failed", thread=thread_id, error=reason, error_type=type(exc).__name__)
+            return reason
         return None
+
+    # --- chat view (spec 011) ---
+
+    def _archive_dir(self, thread_id: str) -> Path | None:
+        """The chat's archive folder; None when the archive does not hold it or cannot be read."""
+        if self.data_dir is None:
+            return None
+        try:
+            return find_chat_dir(self.data_dir, thread_id)
+        except (OSError, sqlite3.Error) as exc:
+            log.info("archive_chat_lookup_failed", thread=thread_id, error=str(exc))
+            return None
+
+    def _records(
+        self, messages: list[dict[str, Any]], thread_id: str, media: Path | None
+    ) -> list[dict[str, Any]]:
+        """Records of a page, in a worker thread: sanitising globs the media folder (NFS)."""
+        records = []
+        for message in messages:
+            try:
+                records.append(chat_record(message, thread_id, self.me, media))
+            except Exception as exc:  # noqa: BLE001 — one malformed message must not lose the page
+                log.warning("chat_record_skipped", thread=thread_id, error_type=type(exc).__name__)
+        return records
+
+    def _archive_records(
+        self, chat_dir: Path, thread_id: str, before: str, size: int
+    ) -> tuple[list[dict[str, Any]], bool]:
+        messages, older = read_page(chat_dir, before, size)
+        return self._records(messages, thread_id, chat_dir / "media"), older
+
+    def _api_records(
+        self, thread_id: str, before: str, size: int, media: Path | None
+    ) -> tuple[list[dict[str, Any]], bool]:
+        assert self.directory is not None
+        # endTime is second-granular: ask up to the next second, then cut at `before` exactly.
+        end = _epoch_seconds(before) + 1 if before else None
+        page = fetch_history(self.directory.settings, self.directory.skype_token, thread_id, size, 1, end)
+        kept = [m for m in page if not before or str(m.get("composetime") or "") < before]
+        # A short page is not the end (the API under-fills windows): only an empty one is.
+        return self._records(kept[-size:], thread_id, media), bool(kept)
+
+    async def history(self, thread_id: str, before: Any = None, limit: Any = None) -> dict[str, Any]:
+        """Page verb `history`: a page of messages, archive first, else one API page.
+
+        The answer echoes `before` so the page can match it to its request."""
+        reply = _history_head(thread_id, before)
+        try:
+            return {**reply, **await self._history(thread_id, before, limit)}
+        except Exception as exc:  # noqa: BLE001 — the page waits for an answer whatever happens
+            log.warning("history_failed", thread=thread_id, error_type=type(exc).__name__)
+            return {**reply, "error": "history unavailable"}
+
+    async def _history(self, thread_id: str, before: Any, limit: Any) -> dict[str, Any]:
+        if before and not (isinstance(before, str) and _ISO_RE.match(before)):  # "" = latest, like null
+            return {"error": "invalid before"}
+        valid = isinstance(limit, int) and not isinstance(limit, bool) and limit > 0
+        size = min(limit if valid else _CHAT_PAGE, _CHAT_PAGE_MAX)
+        chat_dir = await asyncio.to_thread(self._archive_dir, thread_id)
+        if chat_dir is None and thread_id not in self.rows:
+            return {"error": "unknown chat"}
+        try:
+            if chat_dir is None:
+                raise FileNotFoundError(thread_id)
+            records, older = await asyncio.to_thread(
+                self._archive_records, chat_dir, thread_id, before or "", size
+            )
+            source = "archive"
+        except (OSError, sqlite3.Error) as exc:
+            if not isinstance(exc, FileNotFoundError):
+                log.warning("archive_history_failed", thread=thread_id, error=str(exc))
+            if self.directory is None:
+                return {"error": "not connected"}
+            media = chat_dir / "media" if chat_dir else None
+            try:
+                records, older = await asyncio.to_thread(
+                    self._api_records, thread_id, before or "", size, media
+                )
+            except Exception as api_exc:  # noqa: BLE001 — a failed page must not drop the socket
+                reason = _failure(api_exc)
+                log.warning("history_api_failed", thread=thread_id, error=reason)
+                return {"error": reason}
+            source = "api"
+        return {"messages": records, "older": older, "newer": False, "source": source}
+
+    async def _history_reply(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
+        try:
+            await self._answer(ws, self.history(verb["history"], verb.get("before"), verb.get("limit")))
+        finally:
+            self._history_busy.discard(ws)
+
+    async def follow(self, ws: ServerConnection, thread_id: str) -> dict[str, Any]:
+        """Page verb `follow`: this socket receives the thread's live messages from now on."""
+        chat_dir = await asyncio.to_thread(self._archive_dir, thread_id)
+        if chat_dir is None and thread_id not in self.rows:
+            return {"follow": thread_id, "error": "unknown chat"}
+        self._follows[ws] = (thread_id, chat_dir / "media" if chat_dir else None)
+        return {"follow": thread_id, "ok": True}
+
+    async def _forward(
+        self, thread_id: str, resource_type: Any, resource: dict[str, Any], msgtype: str
+    ) -> None:
+        """Relay a followed thread's message, edit or typing to the sockets following it."""
+        medias = [media for tid, media in self._follows.values() if tid == thread_id]
+        if not medias:
+            return
+        media = medias[0]
+        if resource_type == "NewMessage" and msgtype in ("Control/Typing", "Control/ClearTyping"):
+            if _is_me(str(resource.get("from") or "").rsplit("/", 1)[-1], self.me):
+                return
+            name = await sender_of(resource, self.directory)
+            if msgtype == "Control/Typing":
+                self._typing_arm(thread_id, name)
+                self._relay(thread_id, {"typing": name, "on": True})
+            else:
+                self._typing_stop(thread_id, name)  # relays the clear when this name was typing
+            return
+        if resource_type not in ("NewMessage", "MessageUpdate"):
+            return
+        if msgtype.startswith("Control/") or msgtype in _SILENT_TYPES:
+            return
+        record = await asyncio.to_thread(chat_record, resource, thread_id, self.me, media)
+        if "content" not in resource:
+            del record["html"]  # a partial update (reaction): the page keeps the body it has
+        if resource_type == "NewMessage" and not _is_system(msgtype):
+            self._typing_stop(thread_id, await sender_of(resource, self.directory))  # their message ends it
+        self._relay(thread_id, {"msg" if resource_type == "NewMessage" else "edit": record})
+
+    def _relay(self, thread_id: str, frame: dict[str, Any]) -> None:
+        followers = [ws for ws, (tid, _) in self._follows.items() if tid == thread_id]
+        if followers:
+            broadcast(followers, json.dumps(frame, ensure_ascii=False))
+
+    def _background(self, work: Coroutine[Any, Any, None]) -> None:
+        task = asyncio.create_task(work)
+        self._replies.add(task)
+        task.add_done_callback(self._replies.discard)
+
+    async def _answer(self, ws: ServerConnection, work: Awaitable[dict[str, Any]]) -> None:
+        answer = await work
+        # A page closed while its answer was computed is not a handler failure.
+        with contextlib.suppress(ConnectionClosed):
+            await ws.send(json.dumps(answer, ensure_ascii=False))
 
     async def _reply(self, ws: ServerConnection, thread_id: str, text: Any) -> None:
         error = await self.send(thread_id, text)
@@ -796,6 +1004,16 @@ class Board:
         )
         msgtype = str(resource.get("messagetype") or "")
         log.debug("web_event", thread=thread_id, resource_type=resource_type, messagetype=msgtype)
+        await self._board_event(thread_id, resource_type, resource, msgtype)
+        if self._follows:  # after the board: a relay failure must not cost the row its update
+            try:
+                await self._forward(thread_id, resource_type, resource, msgtype)
+            except Exception as exc:  # noqa: BLE001 — a malformed event must not stop the stream
+                log.warning("follow_relay_failed", thread=thread_id, error_type=type(exc).__name__)
+
+    async def _board_event(
+        self, thread_id: str, resource_type: Any, resource: dict[str, Any], msgtype: str
+    ) -> None:
         if not in_scope(thread_id):
             return
         if resource_type == "ConversationUpdate":
@@ -945,24 +1163,31 @@ class Board:
             return
         if name not in row["typing"]:
             row["typing"].append(name)
+        self._typing_arm(thread_id, name)
+        self.broadcast()
+
+    def _typing_arm(self, thread_id: str, name: str) -> None:
+        """(Re)start the expiry: Teams does not always send ClearTyping."""
         key = (thread_id, name)
         if key in self._typing_timers:
             self._typing_timers[key].cancel()
         loop = asyncio.get_running_loop()
         self._typing_timers[key] = loop.call_later(self.typing_ttl, self._typing_expired, thread_id, name)
-        self.broadcast()
 
     def _typing_stop(self, thread_id: str, name: str) -> None:
         timer = self._typing_timers.pop((thread_id, name), None)
         if timer:
             timer.cancel()
+            if name != _YOU:  # my own typing on another device is not news to the page
+                self._relay(thread_id, {"typing": name, "on": False})
         row = self.rows.get(thread_id)
         if row and name in row["typing"]:
             row["typing"].remove(name)
 
     def _typing_expired(self, thread_id: str, name: str) -> None:
         self._typing_stop(thread_id, name)
-        self.broadcast()
+        if thread_id in self.rows:  # a followed chat off the board has nothing to repaint
+            self.broadcast()
 
     # --- pages ---
 
@@ -1047,15 +1272,38 @@ class Board:
                     self.set_muted(verb["unmute"], False)
                 elif isinstance(verb, dict) and isinstance(verb.get("send"), str):
                     # A send can take the whole HTTP timeout: the page's other verbs must not queue behind it.
-                    reply = asyncio.create_task(self._reply(ws, verb["send"], verb.get("text")))
-                    self._replies.add(reply)
-                    reply.add_done_callback(self._replies.discard)
+                    self._background(self._reply(ws, verb["send"], verb.get("text")))
+                elif isinstance(verb, dict) and isinstance(verb.get("history"), str):
+                    if ws in self._history_busy:  # one page in flight per socket
+                        busy = {**_history_head(verb["history"], verb.get("before")), "error": "busy"}
+                        with contextlib.suppress(ConnectionClosed):
+                            await ws.send(json.dumps(busy, ensure_ascii=False))
+                    else:
+                        # The API fallback is a network round trip: the page's other verbs must not wait.
+                        self._history_busy.add(ws)
+                        self._background(self._history_reply(ws, verb))
+                elif isinstance(verb, dict) and isinstance(verb.get("follow"), str):
+                    await self._answer(ws, self.follow(ws, verb["follow"]))
                 elif isinstance(verb, dict) and isinstance(verb.get("open"), str):
                     await self.open_row(verb["open"], web=verb.get("web") is True)
                 else:
                     log.debug("ws_client_message_ignored", data=str(raw)[:100])
         finally:
             self.clients.discard(ws)
+            self._follows.pop(ws, None)
+
+
+def _history_head(thread_id: str, before: Any) -> dict[str, Any]:
+    return {"history": thread_id, "before": before if isinstance(before, str) and before else None}
+
+
+def _failure(exc: Exception) -> str:
+    """Reason a failed Teams call shows on the page."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"Teams answered {exc.response.status_code}"
+    if isinstance(exc, httpx.TransportError):
+        return "network error"
+    return str(exc)[:200]
 
 
 def _save_marks(path: Path | None, marks: dict[str, str]) -> None:

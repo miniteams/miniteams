@@ -10,6 +10,23 @@ import structlog
 from miniteams.config import Settings
 from miniteams.directory import Directory
 
+_MEMORY_CAP = 4 << 30  # bytes of address space; glibc reserves 64 MiB per thread arena
+
+
+def _cap_memory() -> None:
+    """A runaway test fails with MemoryError instead of pushing the host into swap."""
+    try:
+        import resource
+    except ImportError:  # not on this platform
+        return
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    cap = _MEMORY_CAP if hard == resource.RLIM_INFINITY else min(_MEMORY_CAP, hard)
+    if soft == resource.RLIM_INFINITY or soft > cap:
+        resource.setrlimit(resource.RLIMIT_AS, (cap, hard))
+
+
+_cap_memory()
+
 
 @pytest.fixture(autouse=True)
 def _quiet_logs() -> None:

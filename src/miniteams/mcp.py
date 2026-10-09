@@ -23,7 +23,7 @@ import structlog
 
 from . import __version__
 from .archive import RefreshingToken
-from .archive_store import chat_dir_name, read_chats, read_meta
+from .archive_store import chat_dir_name, find_chat_dir, read_chats, read_meta
 from .auth import AuthExpired, AuthUnavailable, TokenSource, token_source
 from .chats import is_meeting, is_private, is_system, last_activity, parse_when
 from .config import Settings
@@ -246,20 +246,13 @@ class Archive:
 
     def chat_dir(self, thread_id: str) -> Path:
         """The folder of an indexed chat; a thread id the index does not know never becomes a path."""
-        path = self.data_dir / "index.db"
         try:
-            db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        except sqlite3.Error as exc:
+            found = find_chat_dir(self.data_dir, thread_id)
+        except (OSError, sqlite3.Error) as exc:
             raise self._unavailable(exc) from exc
-        try:
-            row = db.execute("SELECT dir FROM chats WHERE id = ?", (thread_id,)).fetchone()
-        except sqlite3.Error as exc:
-            raise self._unavailable(exc) from exc
-        finally:
-            db.close()
-        if row is None:
+        if found is None:
             raise ToolError(f"unknown chat: {thread_id}")
-        return self.data_dir / (row[0] or chat_dir_name(thread_id))
+        return found
 
     def find_chats(
         self, query: str, participant: str, kind: str, since: str, limit: int

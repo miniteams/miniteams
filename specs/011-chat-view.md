@@ -33,13 +33,16 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
   `before` pages back, `after` pages forward, `around` returns about N/2 on each side of the
   anchor (jump to a date or to a search hit). Source order: archive `messages.db` when the thread
   has one, else the API (`fetch_history`, one page), same rule as spec 008. Answer to the asking
-  socket only: `{"history": "<thread>", "messages": [...], "older": bool, "newer": bool, "source":
-  "archive"|"api"}`. The API source only serves the latest page and `before` (no `after`/`around`).
+  socket only: `{"history": "<thread>", "before": <cursor echoed, null for the latest page>,
+  "messages": [...], "older": bool, "newer": bool, "source": "archive"|"api"}`, or the same
+  `history` and `before` with `"error"`: `invalid before` (not an ISO time), `busy` (one history
+  request in flight per socket), `history unavailable` (any unexpected failure; the exception stays
+  in the log). A null or empty cursor means the latest page. The API source only serves the latest page and `before` (no `after`/`around`).
   Message record: `id`, `at` (composetime ISO), `from` (mri), `name`, `me` (bool), `type`
   (`text`, `system`, `call`, `other`), `html` (sanitised body), `edited` (bool), `deleted` (bool),
   `reactions` ([{key, emoji, count, mine}]), `mentions` (spec 003 kind: `me`, `all`, `null`).
-- **Sanitiser (server, stdlib `html.parser`).** Allowlist: `p br b strong i em u s del code pre
-  blockquote ul ol li a img span table tr td th`. Attributes kept: `a[href]` (`http(s)` only,
+- **Sanitiser (server, stdlib `html.parser`).** Allowlist: `p div br hr h1 h2 h3 b strong i em u s del
+  code pre blockquote ul ol li a img span table tr td th`, attribute-free unless listed. Attributes kept: `a[href]` (`http(s)` only,
   `rel=noopener target=_blank` forced), `img[src alt title width height]`, `span` only when it is a
   Teams emoji or mention (`itemtype` ending in `/Emoji`, `/CustomEmoji`, `/Mention`): emoji become
   their `alt` character when unicode, else `<img class="emoji" src=…>`; mentions become
@@ -62,7 +65,9 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
   detached by a jump, then scrolls to the bottom. Live: the page opens
   its own WS (`/ws`, same Origin check) and subscribes with `{"follow": "<thread>"}`; the server
   then forwards `NewMessage`, `MessageUpdate` (edit, delete, reactions) and typing events for that
-  thread as `{"msg": record}`, `{"edit": record}`, `{"typing": name|null}` to that socket. New
+  thread as `{"msg": record}`, `{"edit": record}`, `{"typing": name, "on": bool}` to that socket (one
+  frame per person, off on ClearTyping, on that person's next message, or after the board's typing
+  TTL; my own typing is never relayed). New
   messages append when the latest page is loaded (else they only bump the "↓ latest" count); the
   page sticks to the bottom only when already there.
 - **Search and jump.** A search field in the header: verb `{"search": "<thread>", "q": text}` runs
@@ -174,7 +179,7 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 ## Phases
 
 ### Phase 1 — history verb + sanitiser
-- Work: `Board.history()` (archive page via `ChatStore`, API fallback), `message_record()`,
+- Work: `Board.history()` (archive page via `ChatStore`, API fallback), `chat_record()`,
   `sanitize()` in a new `render.py` (stdlib parser, media rewrite), `follow` bookkeeping on the
   socket, forwarding of thread events to followers.
 - **Covers**: AC4, AC5, AC6, AC7 (server side), AC9
