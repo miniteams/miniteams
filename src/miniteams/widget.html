@@ -298,7 +298,7 @@
       // Without a message id the only link form is chat-only, which the desktop client cannot
       // route in page (it reloads, dropping a call): let that one open in the browser instead.
       name.onclick = (ev) => {
-        if (chatHere(ev)) return;  // onauxclick owns it
+        if (chatHere(ev)) { ev.preventDefault(); return; }  // onauxclick owns it: no Teams tab from the link too
         if (modified(ev)) { if (browser) { ev.preventDefault(); send({ open: r.id, web: true }); } return; }
         if (opener && r.last_id) { ev.preventDefault(); send({ open: r.id, web: false }); }
       };
