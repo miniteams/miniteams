@@ -1,6 +1,6 @@
 """Attachment reference extraction + host gating (no network)."""
 
-from miniteams.attachments import _downloadable, _object_id, _safe_name, extract
+from miniteams.attachments import _downloadable, _safe_name, extract, object_id
 
 IMG = '<img itemtype="http://schema.skype.com/AMSImage" src="https://api.asm.skype.com/v1/objects/abc/views/imgo">'
 
@@ -34,5 +34,5 @@ def test_safe_name_strips_path_traversal() -> None:
 
 
 def test_object_id_extraction() -> None:
-    assert _object_id("https://h/v1/objects/abc-123/views/imgo") == "abc-123"
-    assert _object_id("https://h/no-objects-here") == "object"
+    assert object_id("https://h/v1/objects/abc-123/views/imgo") == "abc-123"
+    assert object_id("https://h/no-objects-here") == "object"

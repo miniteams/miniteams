@@ -6,10 +6,12 @@ or handshakes start returning 4xx, re-capture from a live teams.microsoft.com se
 and override via the matching MINITEAMS_* env var.
 """
 
+import contextlib
 import os
+import tempfile
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,6 +23,22 @@ def _default_config_dir() -> Path:
 def _default_cache_dir() -> Path:
     base = os.environ.get("XDG_CACHE_HOME")
     return (Path(base) if base else Path.home() / ".cache") / "miniteams"
+
+
+def write_private(path: Path, text: str) -> None:
+    """Replace `path` with `text`, owner-only (0600) from its first byte; the parent is made 0700 if new.
+
+    Per-writer temp + os.replace: a reader never sees a partial file, two writers never share a temp."""
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)  # the umask can only remove bits
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")  # Security: O_EXCL, created 0600
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)  # may hold a partial secret
+        raise
 
 
 class Settings(BaseSettings):
@@ -55,6 +73,8 @@ class Settings(BaseSettings):
     contacts_host: str = "apac.ng.msg.teams.microsoft.com"
     # Chat-service aggregator (custom emojis); same fallback-only rule as contacts_host.
     csa_url: str = "https://teams.microsoft.com/api/csa/emea"
+    # Custom emoji image host the composer writes into a message; same fallback-only rule as contacts_host.
+    asyncgw_host: str = "fr-prod.asyncgw.teams.microsoft.com"
     # Batched MRI → display-name lookup (teams_contacts.c TEAMS_PROFILES_PREFIX). Bearer id_token.
     profiles_url: str = (
         "https://teams.microsoft.com/api/mt/beta/users/fetchShortProfile"
@@ -88,6 +108,15 @@ class Settings(BaseSettings):
     # steals its deliveries. A suffix gives it its own ids while sharing the token cache.
     endpoint_suffix: str = ""
     cache_dir: Path = Field(default_factory=_default_cache_dir)  # regenerable downloads
+    # `web` writes the launch token here as a page to open by file://, keeping it out of argv.
+    launch_file: Path = Field(
+        default_factory=lambda data: data["config_dir"] / "open.html", validate_default=True
+    )
+
+    @field_validator("launch_file")
+    @classmethod
+    def _absolute(cls, path: Path) -> Path:
+        return path.expanduser().absolute()
 
     @property
     def authority(self) -> str:

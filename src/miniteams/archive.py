@@ -27,10 +27,10 @@ from . import attachments, avatars
 from .archive_store import ChatStore, Index
 from .auth import AuthExpired, TokenSource
 from .chats import DRAFTS_THREAD, fetch_conversations, in_archive_scope, last_activity
-from .config import Settings
+from .config import Settings, write_private
 from .directory import Directory
 from .drafts import iter_draft_pages
-from .dump import _epoch_seconds, iter_history_pages
+from .dump import epoch_seconds, iter_history_pages
 from .skype import exchange_skype_token
 
 log = structlog.get_logger()
@@ -148,7 +148,7 @@ def _reached_start(oldest_iso: str | None, created_at_ms: Any) -> bool | None:
         return None  # createdat missing/garbage → completeness unknown
     # createdat is the thread-creation event; the first message lands a beat later. Allow a
     # small margin so "reached the start" isn't missed by that offset.
-    return _epoch_seconds(oldest_iso) <= created_s + 5
+    return epoch_seconds(oldest_iso) <= created_s + 5
 
 
 def _rate(n: int, start: float) -> float:
@@ -222,7 +222,7 @@ def _backfill(
 ) -> int:
     """Walk older than the oldest stored message until history is exhausted, then flag done."""
     oldest = store.oldest()
-    end_before = _epoch_seconds(oldest) - 1 if oldest else None
+    end_before = epoch_seconds(oldest) - 1 if oldest else None
     added = pages = 0
     start = time.monotonic()
     for messages in iter_history_pages(settings, skype_token, thread_id, _PAGE_SIZE, 0, end_before):
@@ -373,10 +373,10 @@ def _write_recordings_manifest(store: ChatStore, recordings: list[dict[str, Any]
         entries.append(entry)
     if not entries:
         return
-    store.media_dir.mkdir(parents=True, exist_ok=True)
-    path = store.media_dir / "recordings.json"
-    path.write_text(json.dumps(entries, ensure_ascii=False, indent=2) + "\n")
-    path.chmod(0o600)  # meeting titles: owner-only, like the transcripts it indexes
+    # meeting titles: owner-only, like the transcripts it indexes
+    write_private(
+        store.media_dir / "recordings.json", json.dumps(entries, ensure_ascii=False, indent=2) + "\n"
+    )
 
 
 async def _download_avatars(store: ChatStore, info: dict[str, Any], skype_token: str, bearer: str) -> int:
@@ -452,7 +452,7 @@ async def archive_chat(
         newest, last = probe.newest(), last_activity(conv)
         probe.close()
         # Second granularity is enough for "unchanged"; sub-second arrivals are caught next run.
-        caught_up = bool(newest and last and _epoch_seconds(last) <= _epoch_seconds(newest))
+        caught_up = bool(newest and last and epoch_seconds(last) <= epoch_seconds(newest))
         # Meeting chats often carry no lastMessage (last_activity falls back to `version`, bumped by
         # roster/meeting updates) or no message at all: only an unchanged version proves them idle.
         version = int(conv.get("version") or 0)

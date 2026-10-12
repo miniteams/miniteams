@@ -13,7 +13,7 @@ from urllib.parse import quote
 import httpx
 import structlog
 
-from .config import Settings
+from .config import Settings, write_private
 
 log = structlog.get_logger()
 
@@ -30,10 +30,8 @@ def get_or_create_epid(settings: Settings, name: str = "endpoint_id") -> str:
     path = settings.config_dir / f"{name}{settings.endpoint_suffix}"
     if path.exists():
         return path.read_text().strip()
-    settings.config_dir.mkdir(parents=True, exist_ok=True)
     epid = str(uuid.uuid4())
-    path.write_text(epid)
-    path.chmod(0o600)
+    write_private(path, epid)
     return epid
 
 

@@ -290,3 +290,34 @@ async def test_gap_hook_fires_after_registration(
     for task in client._tasks:
         task.cancel()
     assert order == ["auth", "register", "gap:connected"]  # subscribed before the catch-up starts
+
+
+async def test_run_forever_waits_for_a_login_when_asked(
+    settings: Settings, directory: Directory, monkeypatch
+) -> None:
+    """A dead refresh token parks the loop until the token cache file changes, then the same source
+    refreshes again (it rereads the rewritten cache); without the flag the loop returns (see above)."""
+    from miniteams.auth import AuthExpired
+
+    tokens = _Tokens(AuthExpired("dead"), {"access_token": "A", "id_token": "I"})
+    calls: list[int] = []
+
+    def refresh(_self: Any) -> Any:
+        calls.append(1)
+        return tokens.refresh()
+
+    monkeypatch.setattr(
+        S, "token_source", lambda _s: type("T", (), {"acquire": lambda self: None, "refresh": refresh})()
+    )
+    stamps = iter([(1, 1, 1)] * 3 + [(2, 2, 2)] * 10)
+    monkeypatch.setattr(S, "cache_stamp", lambda _s: next(stamps))
+    monkeypatch.setattr(S, "_LOGIN_POLL", 0.0)
+    monkeypatch.setattr(S, "force_blocking_stdout", lambda: None)
+
+    def exchange(*_a: Any) -> Any:
+        raise asyncio.CancelledError  # reached only by the refresh after the wait
+
+    monkeypatch.setattr(S, "exchange_skype_token", exchange)
+    with pytest.raises(asyncio.CancelledError):
+        await S.run_forever(settings, directory=directory, wait_for_login=True)
+    assert len(calls) == 2 and next(stamps) == (2, 2, 2)  # one refresh before the wait, one after it

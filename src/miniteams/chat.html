@@ -1,0 +1,1397 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>miniteams chat</title>
+<style>
+  /* ui.css */
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; }
+  #main { flex: 1; min-width: 0; display: flex; flex-direction: column; container-type: inline-size; }
+  button { font: inherit; color: inherit; }
+  .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+
+  /* The split list's filter row shares this height: the two bottom borders read as one line. */
+  :root { --bar-h: 47px; }
+  header { background: color-mix(in srgb, var(--bg) 85%, transparent); height: var(--bar-h); padding: 0 16px; display: flex; align-items: center;
+    gap: 12px; border-bottom: 1px solid var(--line); flex: none; position: relative; z-index: 2; }
+  #find { font: inherit; font-size: 12.5px; color: inherit; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 2px 8px; }
+  #find { width: 12em; }
+  #hits { position: absolute; top: 100%; right: 16px; width: min(440px, 92vw); max-height: 60vh; overflow-y: auto;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); padding: 4px; }
+  #hits[hidden] { display: none; }
+  #hits button { display: block; width: 100%; text-align: left; border: 0; background: transparent; border-radius: 6px;
+    padding: 4px 8px; cursor: pointer; }
+  #hits button:hover, #hits button:focus-visible { background: var(--panel-2); }
+  #hits b { font-weight: 600; margin-right: 6px; }
+  #hits .none { color: var(--dim); padding: 4px 8px; }
+  #hits .none.err { color: var(--hot); }
+  #back { color: var(--dim); text-decoration: none; font-size: 15px; border-radius: 8px; padding: 2px 6px; }
+  #back:hover { background: var(--panel-2); color: var(--text); }
+  #menu, #teams .icon { display: none; }
+  /* Narrow chat column: the header keeps one line, the label keeps room to be read. Breakpoints measured:
+     the full header needs ~596px with a long label, the compact one ~387px (~350 tightened). */
+  @container (max-width: 639px) {
+    #teams .full, #members { display: none; }
+    #teams .icon { display: inline; }
+    #find { width: 8em; }
+  }
+  @container (max-width: 399px) {
+    header { gap: 6px; padding: 0 12px; }
+  }
+
+  /* chatnav=split: the board's list beside the chat (rows as in widget.html, scoped: messages hold li too). */
+  #side { flex: none; width: var(--side-w, 300px); display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line);
+    background: var(--bg); container-type: inline-size; }
+  #side[hidden], #grip[hidden] { display: none; }
+  /* 8px to grab over the 1px border, drawn as a 2px accent line only while it is in use. */
+  #grip { flex: none; width: 8px; margin: 0 -4px; cursor: col-resize; position: relative; z-index: 3; touch-action: none; outline: none; }
+  #grip::after { content: ""; position: absolute; inset: 0 3px; border-radius: 1px; }
+  #grip:hover::after, #grip:focus-visible::after, body.resizing #grip::after { background: var(--accent); }
+  body.resizing { user-select: none; cursor: col-resize; }
+  @media (width > 700px) { body.side-off #side, body.side-off #grip { display: none; } }
+  #side .bar { flex: none; height: var(--bar-h); display: flex; align-items: center; padding: 0 8px; border-bottom: 1px solid var(--line); position: relative; }
+  #side .tabs { flex: none; padding: 6px 8px 4px; position: relative; }
+  .seg { display: flex; background: var(--panel-2); border-radius: 10px; padding: 3px; gap: 2px; }
+  .seg button { flex: 1 1 auto; border: 0; background: transparent; padding: 3px 4px; white-space: nowrap; border-radius: 8px; cursor: pointer; color: var(--dim); font-size: 12px; }
+  /* Seen and Muted live behind ⋯ until a 360px list (359 inside its 1px border) has room for all five. */
+  .seg .x { display: none; }
+  @container (min-width: 359px) { .seg .x { display: block; } .seg .more, #more { display: none; } }
+  #more { position: absolute; right: 8px; top: 100%; z-index: 4; display: grid; min-width: 120px; padding: 4px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); }
+  #more[hidden] { display: none; }
+  #more button { border: 0; background: transparent; text-align: left; padding: 3px 8px; border-radius: 6px; cursor: pointer; font-size: 12.5px; }
+  #more button:hover, #more button.on { background: var(--accent-soft); color: var(--accent); }
+  .seg button.on { background: var(--panel); color: var(--text); box-shadow: var(--shadow); font-weight: 550; }
+  .seg b { font-weight: 600; margin-left: 3px; font-size: 10.5px; padding: 0 4px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); }
+  .seg button.mention b { background: var(--mention-soft); color: var(--mention); }
+  #filter { flex: 1; min-width: 0; font: inherit; font-size: 12.5px; color: inherit; background: var(--panel-2); border: 0; border-radius: 10px;
+    padding: 5px 26px 5px 9px; outline: none; }
+  #filter::-webkit-search-cancel-button { display: none; }
+  #clear { position: absolute; right: 12px; border: 0; background: transparent; color: var(--dim); border-radius: 6px; width: 20px; height: 20px;
+    padding: 0; line-height: 20px; cursor: pointer; }
+  #clear[hidden] { display: none; }
+  #clear:hover { color: var(--text); background: var(--line); }
+  #filter:focus-visible, .seg button:focus-visible, #more button:focus-visible, #grip:focus-visible, #clear:focus-visible,
+  #rows .name:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  #rows { flex: 1; overflow-y: auto; list-style: none; margin: 0; padding: 4px 6px; display: grid; align-content: start; gap: 2px; }
+  #rows > li { display: grid; grid-template-columns: 34px minmax(0,1fr) auto; gap: 0 8px; padding: 7px 8px; border-radius: 10px; align-items: center; position: relative; }
+  #rows > li:hover { background: var(--panel); box-shadow: var(--shadow); }
+  #rows > li.unread { box-shadow: inset 3px 0 0 var(--stripe); }
+  #rows > li.mention { background: var(--mention-soft); box-shadow: inset 3px 0 0 var(--mention); }
+  #rows > li.sel { outline: 2px solid var(--accent); outline-offset: -2px; }
+  #rows > li.cur { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); opacity: 1; }
+  #rows .rav { grid-row: 1 / span 2; width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center; font-weight: 650; font-size: 12.5px; color: #fff; }
+  #rows .rav.round { border-radius: 50%; }
+  #rows .name { font-weight: 500; color: inherit; text-decoration: none; }
+  #rows .name mark { background: var(--accent-soft); color: var(--accent); border-radius: 4px; padding: 0 2px; }
+  #rows > li.unread .name, #rows > li.mention .name { font-weight: 700; }
+  /* Colour, not opacity: a faded row takes its time and preview under 4.5:1. */
+  #rows > li.seen .name { color: var(--dim); font-weight: 400; }
+  #rows .meta { grid-column: 3; grid-row: 1; justify-self: end; display: flex; align-items: center; gap: 4px; }
+  #rows .ago { font-size: 11.5px; color: var(--dim); white-space: nowrap; }
+  #rows > li.unread .ago { color: var(--accent); font-weight: 600; }
+  #rows .meta button { display: none; border: 1px solid var(--line); background: var(--panel); border-radius: 6px; height: 20px; padding: 0 5px; font-size: 11.5px; line-height: 18px; cursor: pointer; color: var(--dim); }
+  #rows > li:hover .meta button, #rows > li:focus-within .meta button, #rows > li.hold .meta button { display: inline-block; }
+  #rows .prev { grid-column: 2; grid-row: 2; color: var(--dim); font-size: 12.5px; }
+  #rows .prev b { color: var(--text); font-weight: 550; }
+  #rows .prev .at { color: var(--mention); font-weight: 650; }
+  #rows .prev.typing { color: var(--typing); font-style: italic; }
+  #rows .ind { grid-column: 3; grid-row: 2; justify-self: end; }
+  #rows .dot { display: block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+  #rows .tag { font-size: 10.5px; font-weight: 700; color: var(--on-mention); background: var(--mention); border-radius: 99px; padding: 0 6px; line-height: 16px; white-space: nowrap; }
+  #rows .tag.all { background: transparent; color: var(--mention); box-shadow: inset 0 0 0 1px var(--mention); }
+  body.compact #rows > li { grid-template-columns: minmax(0,1fr) auto; padding: 5px 8px; }
+  body.compact #rows .name, body.compact #rows .prev { grid-column: 1; }
+  body.compact #rows .meta, body.compact #rows .ind { grid-column: 2; }
+  #nochat { flex: none; padding: 10px 16px; text-align: center; color: var(--dim); }
+  #nochat[hidden] { display: none; }
+  body.split #menu { display: inline-block; }
+  /* Narrow window: the list folds behind ☰ and opens over the chat, which a backdrop dims. */
+  @media (max-width: 700px) {
+    body.split #grip { display: none; }
+    body.split #side { position: fixed; inset: var(--hdr, 0) auto 0 0; width: min(var(--side-w, 300px), 88vw); z-index: 5; box-shadow: var(--shadow); display: none; }
+    body.split.nav-open #side { display: flex; }
+    body.split.nav-open #main::after { content: ""; position: fixed; inset: var(--hdr, 0) 0 0 0; z-index: 4;
+      background: color-mix(in srgb, var(--bg) 60%, transparent); }
+  }
+  h1 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -.01em; }
+  #label { flex: 1 1 auto; min-width: 6em; }
+  #members { color: var(--faint); font-size: 12.5px; white-space: nowrap; }
+  #status { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); flex: none; }
+  #status.off { background: var(--hot); box-shadow: 0 0 0 3px color-mix(in srgb, var(--hot) 25%, transparent); }
+  .btn { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 3px 10px; cursor: pointer; color: var(--dim); font-size: 12.5px; white-space: nowrap; }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+
+  #pane { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
+  #list { flex: 1; overflow-y: auto; padding: 8px 12px; }
+  #latest { position: absolute; right: 20px; bottom: 10px; box-shadow: var(--shadow); color: var(--accent); }
+  #latest[hidden] { display: none; }
+  #note { text-align: center; color: var(--dim); padding: 1em; }
+  #note.err { color: var(--hot); }
+  .msg { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 0 10px; padding: 4px 8px; border-radius: 10px; position: relative; }
+  .msg:not(.cont) { margin-top: 10px; }
+  .msg:hover { background: var(--panel); }
+  .msg.hit { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
+  .av { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; font-weight: 650; font-size: 13px; color: #fff; }
+  .msg.cont .av, .msg.cont .head { display: none; }
+  .body { grid-column: 2; min-width: 0; }
+  .head { display: flex; align-items: baseline; gap: 8px; }
+  .head b { font-weight: 600; }
+  .msg.me .head b { color: var(--accent); }
+  .when, .edited { font-size: 11.5px; color: var(--faint); white-space: nowrap; }
+  .html { overflow-wrap: anywhere; }
+  .html p { margin: 0; }
+  .html p + p, .html ul, .html ol, .html pre, .html table { margin: 4px 0; }
+  .html pre, .html code { font: 12.5px/1.4 ui-monospace, monospace; background: var(--panel-2); border-radius: 4px; }
+  .html pre { padding: 6px 8px; overflow-x: auto; }
+  .html code { padding: 0 3px; }
+  .html pre code { padding: 0; background: none; }
+  .html blockquote { margin: 4px 0; padding: 2px 10px; border-left: 3px solid var(--line); color: var(--dim); }
+  .html blockquote.reply { border-left-color: var(--accent); background: var(--panel-2); border-radius: 0 6px 6px 0; }
+  .html blockquote.reply strong { display: block; color: var(--text); font-size: 12.5px; }
+  .html img { max-width: min(100%, 420px); max-height: 360px; height: auto; border-radius: 6px; display: block; margin: 4px 0; }
+  .html img.emoji { display: inline; height: 1.4em; width: auto; margin: 0; vertical-align: -.3em; border-radius: 0; }
+  .html a { color: var(--accent); }
+  .html table { border-collapse: collapse; }
+  .html td, .html th { border: 1px solid var(--line); padding: 2px 6px; }
+  .mention { color: var(--mention); font-weight: 600; }
+  .mention-me { background: var(--mention-soft); border-radius: 4px; padding: 0 3px; }
+  .msg.deleted .html { color: var(--faint); font-style: italic; }
+  .reacts { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
+  .reacts > * { font-size: 12px; border: 1px solid var(--line); background: var(--panel); border-radius: 99px; padding: 0 7px; }
+  .reacts button { cursor: pointer; }
+  .reacts button:hover:not(.mine) { border-color: var(--dim); }
+  .reacts > .mine { border-color: var(--accent); background: var(--accent-soft); }
+  body.readonly .reacts button { pointer-events: none; }
+  /* ≥2 consecutive deleted messages: the first carries the "N messages deleted" toggle, the rest fold. */
+  .msg.folded { display: none; }
+  .msg.run-head:not(.open) > :not(.run) { display: none; }
+  .msg > .run { grid-column: 1 / -1; justify-self: start; border: 0; background: transparent; padding: 0 4px; border-radius: 6px;
+    cursor: pointer; color: var(--faint); font-style: italic; font-size: 12.5px; }
+  .msg > .run:hover { color: var(--dim); background: var(--panel-2); }
+  .msg > .run::before { content: "▸ "; font-style: normal; }
+  .msg.open > .run::before { content: "▾ "; }
+  /* Cards: the server's card markup (render.cards_html), inside the sanitised body. */
+  .html .card { border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 8px; background: var(--panel);
+    padding: 6px 10px; margin: 4px 0; max-width: 560px; }
+  .html .card-app { font-size: 11.5px; color: var(--faint); margin-bottom: 2px; }
+  .html .card-fallback { color: var(--dim); }
+  .html .card .tb { margin: 2px 0; }
+  .html .card .w-bolder { font-weight: 650; }
+  .html .card .s-small { font-size: 12px; }
+  .html .card .s-medium { font-size: 15px; }
+  .html .card .s-large { font-size: 17px; }
+  .html .card .subtle { color: var(--dim); }
+  .html .card .cols { display: flex; gap: 10px; }
+  .html .card .col { flex: 1 1 0; min-width: 0; }
+  .html .card table.facts { border-collapse: collapse; margin: 4px 0; }
+  .html .card .facts th, .html .card .facts td { border: 0; padding: 1px 12px 1px 0; text-align: left; vertical-align: top; }
+  .html .card .facts th { font-weight: 600; white-space: nowrap; }
+  .html .card .acts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .html .card .act { border: 1px solid var(--line); border-radius: 8px; padding: 1px 10px; font-size: 12.5px; background: var(--panel-2);
+    color: var(--dim); text-decoration: none; }
+  .html .card a.act { color: var(--accent); }
+  .html .card a.act:hover { border-color: var(--accent); }
+  .html .card details { margin-top: 4px; }
+  .html .card summary { cursor: pointer; color: var(--accent); font-size: 12.5px; }
+  .msg.system { display: block; text-align: center; color: var(--faint); font-size: 12.5px; padding: 2px 8px; }
+  .msg.system .html { display: inline; }
+  .actions { display: none; position: absolute; right: 8px; top: -10px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; box-shadow: var(--shadow); padding: 2px; }
+  /* A click focuses the message itself (not focus-visible): no bar pinned. Not `:has(:focus-visible)`:
+     Chrome drops the focus when Tab leaves the message for its first button. */
+  .msg:hover .actions, .msg:focus-visible .actions, .msg:focus-within:not(:focus) .actions { display: flex; }
+  .msg:has(.editor) .actions { display: none !important; }  /* outranks the focus-within rule: the editor holds focus */
+  .actions button { border: 0; background: transparent; border-radius: 6px; padding: 0 6px; cursor: pointer; color: var(--dim); font-size: 12.5px; }
+  .actions button:hover { background: var(--panel-2); color: var(--accent); }
+  .actions .picker { display: flex; border-left: 1px solid var(--line); margin-left: 2px; padding-left: 2px; }
+  .actions .picker[hidden] { display: none; }
+  .actions .picker button.mine { background: var(--accent-soft); }
+  body.readonly .actions [data-act]:not([data-act="teams"]) { display: none; }
+  /* innerText skips what is not displayed: an edit starts from the message without its quotes. */
+  .plain blockquote.reply, .plain .card { display: none; }
+  .editor { display: block; width: 100%; resize: vertical; font: inherit; color: inherit; background: var(--panel);
+    border: 1px solid var(--accent); border-radius: 8px; padding: 6px 8px; }
+  .edit-err { display: block; color: var(--hot); font-size: 12px; }
+  #quotes { display: flex; flex-direction: column; gap: 3px; margin-bottom: 4px; }
+  #quotes[hidden] { display: none; }
+  .quote { display: flex; align-items: center; gap: 6px; border-left: 3px solid var(--accent); background: var(--panel-2);
+    border-radius: 0 6px 6px 0; padding: 2px 4px 2px 8px; font-size: 12.5px; color: var(--dim); }
+  .quote b { color: var(--text); font-weight: 600; white-space: nowrap; }
+  .quote span { flex: 1; }
+  .quote button { border: 0; background: transparent; cursor: pointer; color: var(--dim); border-radius: 4px; }
+  .quote button:hover { color: var(--hot); }
+  /* Avatars off: no avatar column, the same rhythm as the widget's compact mode. */
+  body.compact .msg { grid-template-columns: minmax(0, 1fr); }
+  body.compact .av { display: none; }
+  body.compact .body { grid-column: 1; }
+  body.compact .msg:not(.cont) { margin-top: 6px; }
+
+  #typing { flex: none; min-height: 1.45em; padding: 0 20px; color: var(--typing); font-style: italic; font-size: 12.5px; }
+  footer { flex: none; padding: 0 12px 10px; position: relative; }
+  #tools { display: flex; gap: 2px; margin-bottom: 4px; }
+  #tools button { border: 1px solid transparent; background: transparent; border-radius: 6px; min-width: 26px; padding: 0 6px;
+    cursor: pointer; color: var(--dim); font-size: 12.5px; line-height: 22px; }
+  #tools button:hover { border-color: var(--line); color: var(--accent); }
+  #tools [aria-pressed=true] { background: var(--accent-soft); color: var(--accent); }
+  #tools .sep { flex: 1; }
+  body.readonly #tools, body.readonly #view { display: none; }
+  #view { margin-bottom: 4px; padding: 6px 10px; max-height: 40vh; overflow-y: auto; background: var(--panel);
+    border: 1px dashed var(--line); border-radius: 10px; }
+  #view[hidden] { display: none; }
+  #view.err { color: var(--hot); }
+  #reply { display: block; width: 100%; resize: none; max-height: calc(8lh + 14px); overflow-y: auto; font: inherit; color: inherit;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
+  #reply:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+  #reply:disabled { opacity: .6; }
+  #err { display: block; color: var(--hot); font-size: 12px; margin-top: 2px; min-height: 0; }
+</style>
+</head>
+<body>
+<aside id="side" hidden>
+  <div class="bar">
+    <input id="filter" type="search" placeholder="filter · Ctrl+K" autocomplete="off" spellcheck="false" aria-label="filter chats by name">
+    <button id="clear" title="clear the filter" aria-label="clear the filter" hidden>×</button>
+  </div>
+  <div class="tabs">
+    <div class="seg" id="tabs"></div>
+    <div id="more" role="menu" aria-label="more filters" hidden></div>
+  </div>
+  <div id="nochat" hidden></div>
+  <ul id="rows"></ul>
+</aside>
+<div id="grip" role="separator" aria-orientation="vertical" aria-controls="side" aria-label="resize chat list" tabindex="0" hidden></div>
+<div id="main">
+<header>
+  <button id="menu" class="btn" title="chats" aria-label="chats" aria-controls="side">☰</button>
+  <a id="back" href="/?nav=chat" title="back to the chat list">◀</a>
+  <h1 id="label" class="truncate">…</h1>
+  <span id="members"></span>
+  <span id="status" class="off" title="connecting…"></span>
+  <input id="find" type="search" placeholder="search · Enter" aria-label="search this chat">
+  <button id="teams" class="btn" title="open this chat in Teams" aria-label="Open in Teams" disabled><span class="full">Open in Teams</span><span class="icon" aria-hidden="true">↗</span></button>
+  <div class="cog" id="cog"><button id="gear" title="settings" aria-label="settings" aria-controls="settings" aria-expanded="false">⚙</button></div>
+  <div id="hits" hidden></div>
+</header>
+<div id="pane">
+  <div id="list"><div id="note">loading…</div><div id="msgs"></div></div>
+  <button id="latest" class="btn" hidden>↓ latest</button>
+</div>
+<div id="typing" aria-live="polite"></div>
+<footer>
+  <div id="view" class="html" hidden aria-label="preview"></div>
+  <div id="tools" role="toolbar" aria-label="formatting">
+    <button data-fmt="bold" title="bold (Ctrl+B)" aria-label="bold"><b>B</b></button>
+    <button data-fmt="italic" title="italic (Ctrl+I)" aria-label="italic"><i>I</i></button>
+    <button data-fmt="strike" title="strikethrough" aria-label="strikethrough"><s>S</s></button>
+    <button data-fmt="code" title="code" aria-label="code">&lt;/&gt;</button>
+    <button data-fmt="list" title="list" aria-label="list">•</button>
+    <button data-fmt="quote" title="quote" aria-label="quote">❝</button>
+    <span class="sep"></span>
+    <button id="show" title="preview the formatted message" aria-label="preview" aria-pressed="false">preview</button>
+  </div>
+  <div id="quotes" hidden></div>
+  <textarea id="reply" rows="1" placeholder="message · Enter sends, Shift+Enter new line" aria-label="message"></textarea>
+  <div id="pop" hidden></div>
+  <small id="err"></small>
+</footer>
+</div>
+<script>
+(() => {
+  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn rowActions completion
+  /* ui.js */
+  let thread = null;
+  try { thread = decodeURIComponent(location.pathname.slice("/chat/".length)); } catch (e) {}
+  const $list = document.getElementById("list"), $msgs = document.getElementById("msgs"), $note = document.getElementById("note"),
+        $label = document.getElementById("label"), $members = document.getElementById("members"),
+        $status = document.getElementById("status"), $teams = document.getElementById("teams"),
+        $typing = document.getElementById("typing"), $reply = document.getElementById("reply"), $err = document.getElementById("err"),
+        $quotes = document.getElementById("quotes"), $latest = document.getElementById("latest"),
+        $find = document.getElementById("find"), $hits = document.getElementById("hits");
+
+  const BUSY_RETRY_MS = 500, BUSY_TRIES = 10;  // the server answers `busy` while it runs this socket's last ask
+  const CLOCK_TICK_MS = 30000;  // relative row times
+  const GROUP_MS = 300000;
+  let ws = null, opener = false, pageVersion = null;
+  const retry = backoff();
+  // What the screen shows of the chat's history and where a navigation (jump, reconnect) is heading.
+  const newHist = () => ({
+    loaded: false, followFailed: false,
+    records: new Map(),  // id → record, for the messages on screen
+    pending: new Set(),  // history requests asked and not answered: "<side>:<cursor>", "" = latest page
+    // Relayed frames the screen cannot take yet: while a page that replaces it is read, or while
+    // detached (`newer`), where they wait for the page to reach the latest message.
+    live: [], liveEdits: [],
+    older: false, newer: false,  // more history above / below what is shown; `newer` = detached by a jump
+    // Where the next page above / below starts when the server read past rows it could not show (its
+    // `cursor`), else "" and the edge message is the cursor.
+    olderAt: "", newerAt: "",
+    unseen: 0,  // live messages received while the latest one was out of view
+    source: "archive", target: null, restore: null,  // target: a jump's {at, id}; restore: a reconnect's anchor
+    aroundAt: "",  // the one `around` page still wanted: an answer for another is stale
+    stick: true,
+    // The edge `fill` last asked: asked again, it would bring nothing again. A new screen clears it, so
+    // it only stops two identical asks in a row.
+    filled: "",
+    unfolded: new Set(),  // members of the runs the reader opened: a run grows at either end
+    busy: 0,  // `busy` answers in a row to history asks
+  });
+  let hist = newHist();
+  // The one place a navigation in progress is dropped or redirected, per entry point.
+  const resetNav = (entry, to = null) => {
+    switch (entry) {
+      case "switch": hist = newHist(); break;
+      case "open": hist.pending.clear(); Object.assign(hist, { restore: to, target: null, aroundAt: "" }); break;  // asks died with the old socket, or a gap superseded them
+      case "jump": Object.assign(hist, { target: to, aroundAt: to.at }); break;
+      case "latest": Object.assign(hist, { restore: null, target: null, aroundAt: "" }); break;
+      case "fallback": hist.restore = null; break;  // a reconnect's anchor failed: the latest page instead
+    }
+  };
+  const sending = new Set();  // chats whose send awaits its ack (split: one per chat)
+  const split = pref("chatnav") === "split";
+  const LIVE_MAX = 600;  // messages kept on screen at the bottom (and buffered while detached)
+  const EDGE = 150;  // px from the top or bottom that loads the next page
+  const typing = new Set();
+  // Teams' 8 default reactions, the keys `react` accepts (messages.EMOJI).
+  const EMOJI = { like: "👍", heart: "❤️", laugh: "😆", surprised: "😮", sad: "😢", angry: "😡", yes: "✅", no: "❌" };
+  const QUOTE_MAX = 10;
+  let quotes = [];  // [{id, name, line}] quoted by the next send, in the order picked
+
+  const applyPrefs = () => {
+    const theme = ["light", "dark"].includes(pref("theme")) ? pref("theme") : "auto";
+    if (theme === "auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = theme;
+    document.body.classList.toggle("compact", pref("avatars") === "0");
+  };
+  addEventListener("storage", () => { applyPrefs(); renderRows(); });  // the widget tab changed theme or avatars
+
+  const send = (obj) => { if (!(ws && ws.readyState === 1)) return false; ws.send(JSON.stringify(obj)); return true; };
+  // Same shape as web.deep_link's https form.
+  const CTX = encodeURIComponent('{"contextType":"chat"}');
+  const teamsLink = (msgId) => msgId
+    ? `https://teams.microsoft.com/l/message/${encodeURIComponent(thread)}/${msgId}?context=${CTX}`
+    : `https://teams.microsoft.com/l/chat/${encodeURIComponent(thread)}/conversations?context=${CTX}`;
+  // Through the server's opener (desktop client) when it has one, else the https link in a new tab.
+  const openTeams = (msgId) => {
+    if (opener && send({ open: thread, msg: msgId || "" })) return;
+    window.open(teamsLink(msgId), "_blank", "noopener");
+  };
+  const lastId = () => $msgs.lastElementChild?.dataset.id || "";
+  // Detached by a jump, the last message shown is not the chat's last: open the chat itself.
+  $teams.onclick = () => openTeams(hist.newer ? "" : lastId());
+
+  const near = (px = 40) => $list.scrollHeight - $list.scrollTop - $list.clientHeight < px;
+  const showLatest = () => {
+    $latest.hidden = !hist.newer && near();
+    $latest.textContent = hist.unseen ? `↓ latest (${hist.unseen})` : "↓ latest";
+  };
+  const firstAt = () => $msgs.firstElementChild?.dataset.at || "", lastAt = () => $msgs.lastElementChild?.dataset.at || "";
+  const olderEdge = () => hist.olderAt || firstAt(), newerEdge = () => hist.newerAt || lastAt();
+  // The next page when the reader is at an edge: on scroll, and after a page past unreadable rows,
+  // which may bring nothing to scroll.
+  const more = () => {
+    if (!hist.loaded || hist.pending.size) return;  // one page at a time: the server answers `busy` to a second
+    if (hist.older && $list.scrollTop < EDGE) requestHistory("before", olderEdge());
+    else if (hist.newer && near(EDGE)) requestHistory("after", newerEdge());
+  };
+  $list.addEventListener("scroll", () => {
+    hist.stick = !hist.newer && near();
+    if (hist.stick) hist.unseen = 0;
+    showLatest();
+    more();
+  });
+  // A page shorter than the list never scrolls: ask the next one without waiting for a scroll.
+  const fill = () => {
+    if (hist.pending.size || $list.scrollHeight > $list.clientHeight) return;
+    const [side, at] = hist.older ? ["before", olderEdge()] : hist.newer ? ["after", newerEdge()] : ["", ""];
+    if (!at || side + at === hist.filled) return;
+    hist.filled = side + at;
+    requestHistory(side, at);
+  };
+  const toBottom = () => { $list.scrollTop = $list.scrollHeight; hist.stick = !hist.newer; if (hist.stick) hist.unseen = 0; showLatest(); };
+  const byId = (id) => $msgs.querySelector(`[data-id="${CSS.escape(id)}"]`);
+  // The reader's place as a message and its offset, not pixels: pages above it change the pixels.
+  const anchor = () => {
+    const top = $list.getBoundingClientRect().top;
+    const n = [...$msgs.children].find((x) => x.getBoundingClientRect().bottom > top);
+    return n ? { id: n.dataset.id, offset: n.getBoundingClientRect().top - top } : null;
+  };
+  const toAnchor = (a) => {
+    let n = a && byId(a.id);
+    if (!n) return false;
+    while (n.classList.contains("folded")) n = n.previousElementSibling;  // folded: no box to measure
+    $list.scrollTop += n.getBoundingClientRect().top - $list.getBoundingClientRect().top - a.offset;
+    return true;
+  };
+  // A jump's message: the hit itself, else the first message from its time on.
+  const land = (t) => {
+    let n = (t.id && byId(t.id)) || [...$msgs.children].find((x) => x.dataset.at >= t.at) || $msgs.lastElementChild;
+    if (!n) return;
+    while (n.classList.contains("folded")) n = n.previousElementSibling;  // a folded run shows its head
+    for (const old of $msgs.querySelectorAll(".hit")) old.classList.remove("hit");
+    n.classList.add("hit");
+    n.scrollIntoView({ block: t.id ? "center" : "start" });
+  };
+  // Images grow the list after it was laid out: keep the bottom in view when it was.
+  $list.addEventListener("load", () => { if (hist.stick) toBottom(); }, true);
+
+  const fmtTime = (iso) => {
+    const d = new Date(iso);
+    if (isNaN(d)) return "";
+    const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return d.toDateString() === new Date().toDateString() ? hm : d.toLocaleDateString([], { day: "numeric", month: "short", year: d.getFullYear() === new Date().getFullYear() ? undefined : "numeric" }) + " " + hm;
+  };
+
+  // The one place a record becomes DOM. `html` is the server's sanitised body: the only markup the page inserts.
+  const renderMessage = (r) => {
+    const sys = r.type === "system" || r.type === "call";
+    const node = el("div", "msg" + (r.me ? " me" : "") + (r.deleted ? " deleted" : "") + (sys ? " system" : ""));
+    node.dataset.id = r.id; node.dataset.from = r.from || ""; node.dataset.at = r.at || "";
+    const body = el("div", "body");
+    if (r.deleted) body.append(el("div", "html", "message deleted"));
+    else { const h = el("div", "html"); h.dir = "auto"; h.innerHTML = r.html || ""; body.append(h); }
+    if (sys) { node.append(body); node.title = r.at; return node; }
+    node.tabIndex = 0;  // keyboard users reach the actions through focus-visible
+    const name = r.name || (r.me ? "You" : "?");
+    const av = el("div", "av", initials(name));
+    av.style.background = `linear-gradient(135deg, hsl(${hue(r.from || name)} 62% 58%), hsl(${(hue(r.from || name) + 40) % 360} 62% 48%))`;
+    const head = el("div", "head");
+    head.append(Object.assign(el("b", null, name), { dir: "auto" }), Object.assign(el("span", "when", fmtTime(r.at)), { title: r.at }));
+    if (r.edited && !r.deleted) head.append(el("span", "edited", "edited"));
+    body.prepend(head);
+    if (!r.deleted && r.reactions && r.reactions.length) {
+      const line = el("div", "reacts");
+      for (const x of r.reactions) {
+        // `react` refuses keys outside Teams' 8: those chips only show the count.
+        const active = !readOnly && Object.hasOwn(EMOJI, x.key);
+        const chip = el(active ? "button" : "span", x.mine ? "mine" : null, `${x.emoji} ${x.count}`);
+        chip.title = x.key;
+        if (active) {
+          chip.setAttribute("aria-label", `${x.emoji} ${x.count}, ${x.mine ? "remove" : "add"}`);
+          chip.onclick = () => readOnly || send({ react: thread, msg: r.id, key: x.key, remove: x.mine }) || ($err.textContent = "offline, not sent");
+        }
+        line.append(chip);
+      }
+      body.append(line);
+    }
+    const actions = el("div", "actions");
+    actions.onmousedown = (e) => e.preventDefault();  // a mouse click must not leave focus on the button and pin the bar
+    const button = (act, text, title, onclick) => { const b = el("button", null, text); b.dataset.act = act; b.title = title; b.setAttribute("aria-label", title); b.onclick = onclick; actions.append(b); return b; };
+    if (!r.deleted) {
+      // Where `send` takes a quote: a text-type message (`editable`, whoever wrote it) with a sender.
+      if (r.editable && r.from) button("reply", "↩", "reply with quote", () => addQuote(r, node));
+      const picker = el("span", "picker");
+      picker.hidden = true;
+      for (const [key, emoji] of Object.entries(EMOJI)) {
+        const mine = (r.reactions || []).some((x) => x.key === key && x.mine);
+        const b = el("button", mine ? "mine" : null, emoji);
+        b.dataset.key = key; b.title = mine ? `remove ${key}` : key; b.setAttribute("aria-label", b.title);
+        b.onclick = () => { picker.hidden = true; send({ react: thread, msg: r.id, key, remove: mine }) || ($err.textContent = "offline, not sent"); };
+        picker.append(b);
+      }
+      button("react", "☺", "react", () => { picker.hidden = !picker.hidden; });
+      actions.append(picker);
+      node.addEventListener("mouseleave", () => { picker.hidden = true; });
+      node.addEventListener("keydown", (e) => { if (e.key === "Escape") picker.hidden = true; });
+      if (r.me && r.editable) button("edit", "✎", "edit", () => startEdit(node, r));
+      if (r.me) {
+        button("delete", "🗑", "delete", () => { if (confirm("Delete this message?")) send({ delete: thread, msg: r.id }) || ($err.textContent = "offline, not deleted"); });
+      }
+    }
+    button("teams", "↗ Teams", "open this message in Teams", () => openTeams(r.id));
+    node.append(av, body, actions);
+    return node;
+  };
+
+  // The rendered body as plain text, its reply quotes left out (they are lost on edit).
+  const plainOf = (node) => {
+    const h = node.querySelector(".html");
+    if (!h) return "";
+    h.classList.add("plain");
+    const text = h.innerText;
+    h.classList.remove("plain");
+    return text.trim();
+  };
+
+  const renderQuotes = () => {
+    $quotes.replaceChildren(...quotes.map((qt, i) => {
+      const chip = el("div", "quote"), drop = el("button", null, "✕");
+      chip.dataset.quote = qt.id;
+      drop.title = "drop this quote"; drop.setAttribute("aria-label", drop.title);
+      drop.onclick = () => { quotes.splice(i, 1); renderQuotes(); };
+      chip.append(Object.assign(el("b", null, qt.name), { dir: "auto" }), Object.assign(el("span", "truncate", qt.line), { dir: "auto" }), drop);
+      return chip;
+    }));
+    $quotes.hidden = !quotes.length;
+  };
+  const addQuote = (r, node) => {
+    if (quotes.some((qt) => qt.id === r.id)) return;
+    if (quotes.length >= QUOTE_MAX) { $err.textContent = `${QUOTE_MAX} quotes at most`; return; }
+    quotes.push({ id: r.id, name: r.name || (r.me ? "You" : "?"), line: plainOf(node).split("\n")[0] });
+    renderQuotes();
+    $reply.focus();
+  };
+
+  const editorsOf = () => [...$msgs.querySelectorAll(".editor")].map((box) => ({ id: box.closest(".msg").dataset.id, text: box.value,
+    focused: box === document.activeElement, note: box.nextElementSibling?.textContent || "", saving: !!box.dataset.saving }));
+  let carry = null;  // the editors a chat had open when left, reopened by its first page
+
+  // Edit in place: the body becomes a textarea; only the ack, a delete echo or Escape puts a message back.
+  const rerender = (id) => {
+    const node = $msgs.querySelector(`[data-id="${CSS.escape(id)}"]`), r = hist.records.get(id);
+    if (node && r) { node.replaceWith(renderMessage(r)); regroup(); }
+  };
+  const startEdit = (node, r, text = null, focus = true, note = "") => {
+    const h = node.querySelector(".html");
+    if (!h || node.querySelector(".editor")) return;
+    const box = el("textarea", "editor"), err = el("small", "edit-err");
+    box.value = text ?? plainOf(node);
+    err.textContent = note;
+    box.rows = Math.min(8, box.value.split("\n").length);
+    box.onkeydown = (e) => {
+      if (e.key === "Escape") { e.preventDefault(); rerender(r.id); return; }
+      if (e.key !== "Enter" || e.shiftKey || e.isComposing || e.keyCode === 229) return;
+      e.preventDefault();
+      if (box.dataset.saving) return;  // a flag, not `disabled`: Escape must still reach the field
+      if (!send({ edit: thread, msg: r.id, text: box.value })) { err.textContent = "offline, not saved"; return; }
+      err.textContent = ""; box.dataset.saving = "1";
+    };
+    h.replaceWith(box, err);
+    if (focus) box.focus();
+  };
+  // The server runs one action per socket: with chats switched mid-action, a second one can meet it.
+  const why = (e) => e === "busy" ? "another action is still running, try again" : e;
+  const onAction = (m) => {
+    const tid = m.edit ?? m.react ?? m.delete, what = "react" in m ? "reaction: " : "delete" in m ? "delete: " : "edit: ";
+    // A chat left since: its stashed editors start idle, so only a failure is worth keeping.
+    if (tid !== thread) { if (m.error) noteFor(tid, what + why(m.error)); return; }
+    if (m.edit !== undefined) {
+      const node = $msgs.querySelector(`[data-id="${CSS.escape(m.msg || "")}"]`), box = node?.querySelector(".editor");
+      // No editor waiting for it (cancelled, malformed id): only a failure is worth saying.
+      if (!box?.dataset.saving) { if (m.error) $err.textContent = "edit: " + why(m.error); return; }
+      delete box.dataset.saving;
+      if (m.ok) { rerender(m.msg); return; }
+      box.focus();
+      node.querySelector(".edit-err").textContent = why(m.error) || "not saved";
+      return;
+    }
+    if (m.error) $err.textContent = what + why(m.error);
+  };
+
+  // Bots delete their old notifications in bulk: ≥2 consecutive deleted messages fold behind one line.
+  const fold = () => {
+    for (const b of $msgs.querySelectorAll(":scope > .msg > .run")) b.remove();
+    let run = [];
+    const close = () => {
+      const members = run, many = members.length > 1, head = members[0];
+      const open = many && members.some((n) => hist.unfolded.has(n.dataset.id));
+      run = [];
+      members.forEach((n, i) => {
+        n.classList.toggle("in-run", many); n.classList.toggle("run-head", many && !i);
+        n.classList.toggle("folded", many && i > 0 && !open); n.classList.toggle("open", open);
+      });
+      if (!many) return;
+      const b = el("button", "run", `${members.length} messages deleted`);
+      b.setAttribute("aria-expanded", String(open));
+      b.onclick = () => {
+        for (const n of members) if (open) hist.unfolded.delete(n.dataset.id); else hist.unfolded.add(n.dataset.id);
+        fold();
+        head.querySelector(":scope > .run")?.focus();
+      };
+      head.prepend(b);
+    };
+    for (const n of $msgs.children) { if (n.classList.contains("deleted")) run.push(n); else close(); }
+    close();
+  };
+
+  // Consecutive messages from one sender within 5 minutes share one avatar and name.
+  const regroup = () => {
+    fold();
+    let prev = null;
+    for (const n of $msgs.children) {
+      const cont = !!prev && !n.classList.contains("system") && !prev.classList.contains("system")
+        && prev.classList.contains("in-run") === n.classList.contains("in-run")
+        && prev.dataset.from === n.dataset.from && Date.parse(n.dataset.at) - Date.parse(prev.dataset.at) < GROUP_MS;
+      n.classList.toggle("cont", cont);
+      prev = n;
+    }
+  };
+
+  // A page that replaces the screen: the latest one, a jump, a reconnect.
+  const showPage = (messages, more, jumped = false) => {
+    // Restored editors start idle: a save in flight lost its answer with the old socket (see onclose).
+    const editing = carry || editorsOf();
+    carry = null;
+    hist.older = !!more.older; hist.newer = !!more.newer;
+    hist.filled = "";
+    hist.records.clear();
+    for (const r of messages) hist.records.set(r.id, r);
+    if (!hist.newer) {  // landed while the page was read, or while detached
+      for (const r of hist.live) if (!hist.records.has(r.id)) hist.records.set(r.id, r);
+      hist.live = [];
+    }
+    $msgs.replaceChildren(...[...hist.records.values()].map(renderMessage));
+    regroup();
+    const edits = hist.liveEdits;
+    hist.liveEdits = [];
+    for (const r of edits) replace(r);
+    for (const e of editing) {
+      const node = $msgs.querySelector(`[data-id="${CSS.escape(e.id)}"]`), r = hist.records.get(e.id);
+      if (node && r && !r.deleted) startEdit(node, r, e.text, e.focused, e.note);
+      else $err.textContent = "edit lost: the message is no longer shown";
+    }
+    $note.hidden = hist.records.size > 0;
+    $note.className = ""; $note.textContent = "no message yet";
+    hist.loaded = true;
+    const t = jumped ? hist.target : null, back = hist.restore;
+    if (jumped) hist.target = null;
+    hist.restore = null;
+    if (t) land(t);
+    else if (!toAnchor(back)) toBottom();
+    hist.stick = !hist.newer && near();
+    showLatest();
+    fill();
+  };
+  // A page next to the screen: older above with the visible message kept in place, newer below.
+  const addPage = (messages, above) => {
+    const a = above && anchor();
+    const nodes = messages.filter((r) => !hist.records.has(r.id)).map((r) => { hist.records.set(r.id, r); return renderMessage(r); });
+    if (above) $msgs.prepend(...nodes); else $msgs.append(...nodes);
+    if (!above && !hist.newer) {  // reached the latest message: what arrived while detached follows it
+      for (const r of hist.live) if (!hist.records.has(r.id)) { hist.records.set(r.id, r); $msgs.append(renderMessage(r)); }
+      hist.live = [];
+    }
+    regroup();
+    if (a) toAnchor(a);
+    $note.hidden = hist.records.size > 0;
+    showLatest();
+    if (nodes.length) fill();
+  };
+  const replacing = () => [...hist.pending].some((k) => !k || k.startsWith("around:"));
+
+  // A long-open busy chat: the reader at the bottom keeps the newest LIVE_MAX, scrolling up reloads the rest.
+  const trim = () => {
+    const cut = [...$msgs.children].slice(0, Math.max(0, $msgs.children.length - LIVE_MAX));
+    const editor = cut.findIndex((n) => n.querySelector(".editor"));
+    if (editor >= 0) cut.length = editor;  // an unsaved edit outlives the trim
+    if (!cut.length) return;
+    for (const n of cut) { hist.records.delete(n.dataset.id); n.remove(); }
+    hist.older = true; hist.olderAt = "";  // the edge moved down past the cursor
+    regroup();
+  };
+
+  const append = (r) => {
+    if (hist.newer || replacing()) {
+      if (!hist.live.some((x) => x.id === r.id)) hist.live.push(r);
+      if (hist.live.length > LIVE_MAX) hist.live.shift();
+    }
+    if (hist.newer) { hist.unseen++; showLatest(); return; }  // not after what is shown: it waits for the latest page
+    if (hist.records.has(r.id)) return;
+    const was = hist.stick;
+    hist.records.set(r.id, r);
+    $msgs.append(renderMessage(r));
+    regroup();
+    $note.hidden = true;
+    if (was) { trim(); toBottom(); } else { hist.unseen++; showLatest(); }
+  };
+
+  // No `html`: a partial update (a reaction), whose other fields are blank, not news.
+  const patch = (old, r) => "html" in r ? r : { ...old, reactions: r.reactions, deleted: r.deleted };
+  const replace = (r) => {
+    if (replacing()) hist.liveEdits.push(r);
+    const held = hist.live.findIndex((x) => x.id === r.id);  // detached: it is shown once the latest page is
+    if (held >= 0) hist.live[held] = patch(hist.live[held], r);
+    const old = hist.records.get(r.id), node = $msgs.querySelector(`[data-id="${CSS.escape(r.id)}"]`);
+    if (!old || !node) return;  // not on screen: the next page read carries it
+    const merged = patch(old, r);
+    hist.records.set(r.id, merged);
+    if (node.querySelector(".editor") && !merged.deleted) return;  // an edit in progress: shown once it ends
+    node.replaceWith(renderMessage(merged));
+    regroup();
+  };
+
+  // History is keyed on its cursor, which the answer echoes: one request per cursor in flight.
+  const requestHistory = (side = "before", at = "") => {
+    const key = at ? side + ":" + at : "";
+    if (hist.pending.has(key)) return;
+    if (!send({ history: thread, [side]: at || null })) return;
+    hist.pending.add(key);
+    if (!at && !hist.newer) { hist.live = []; hist.liveEdits = []; }  // attached: what came before is on screen
+  };
+  const jump = (at, id = "") => { resetNav("jump", { at, id }); requestHistory("around", at); };
+  const onHistory = (m) => {
+    if (m.history !== thread) return;  // asked before a switch
+    const side = ["after", "around"].find((k) => k in m) || "before", at = m[side] || "";
+    hist.pending.delete(at ? side + ":" + at : "");
+    if (side === "around" && at !== hist.aroundAt) return;  // a later jump (or the latest page) replaced it
+    if (m.error === "busy" && hist.busy < BUSY_TRIES) {
+      hist.busy++;
+      const t = thread;
+      setTimeout(() => t === thread && requestHistory(side, at), BUSY_RETRY_MS);
+      return;
+    }
+    hist.busy = 0;
+    if (m.error === "busy") m = { ...m, error: "history unavailable" };  // the server's word for any failure
+    if (side === "around") hist.aroundAt = "";
+    if (m.error) {
+      if (side === "around" && hist.restore) { resetNav("fallback"); requestHistory(); return; }
+      if (side !== "before" && at) { $err.textContent = (side === "around" ? "jump: " : "history: ") + m.error; hist.target = null; return; }
+      if (hist.followFailed) return;  // its error says more than this one
+      $note.hidden = false; $note.className = "err";
+      $note.textContent = "history: " + m.error;
+      return;
+    }
+    hist.source = m.source;
+    const messages = m.messages || [];
+    const cursor = typeof m.cursor === "string" ? m.cursor : "";
+    if (!at || side === "around") {
+      // An `around` cursor would not say which side it continues: both edges are messages again.
+      Object.assign(hist, { olderAt: !at && m.older ? cursor : "", newerAt: "" });
+      showPage(messages, m, side === "around");
+    }
+    // A page asked for an edge that has moved since (a jump, a trim) is stale: the next scroll asks again.
+    else if (side === "before" && at === olderEdge()) {
+      Object.assign(hist, { older: !!m.older, olderAt: m.older ? cursor : "" });
+      addPage(messages, true);
+      if (cursor) more();
+    }
+    else if (side === "after" && at === newerEdge()) {
+      Object.assign(hist, { newer: !!m.newer, newerAt: m.newer ? cursor : "" });
+      addPage(messages, false);
+      if (cursor) more();
+    }
+  };
+  $latest.onclick = () => {
+    if (!hist.newer) { toBottom(); return; }
+    resetNav("latest");
+    requestHistory();  // showPage ends at the bottom
+  };
+
+  let searchBusy = 0;  // `busy` answers in a row to the current search
+  const onSearch = (m) => {
+    if (m.search !== thread || m.q !== $find.dataset.q) return;  // an answer to a search since replaced
+    if (m.error === "busy" && searchBusy < BUSY_TRIES) {
+      searchBusy++;
+      setTimeout(() => m.search === thread && send({ search: thread, q: m.q }), BUSY_RETRY_MS);
+      return;
+    }
+    searchBusy = 0;
+    if (m.error === "busy") m = { ...m, error: "search unavailable" };
+    $hits.replaceChildren();
+    if (m.error) $hits.append(el("div", "none err", m.error));
+    else if (!(m.hits || []).length) $hits.append(el("div", "none", "no match"));
+    for (const h of m.hits || []) {
+      const b = el("button");
+      b.dataset.id = h.id;
+      b.append(Object.assign(el("b", null, h.name || "?"), { dir: "auto" }), el("span", "when", fmtTime(h.at)),
+        Object.assign(el("div", "truncate", h.text), { dir: "auto" }));
+      b.onclick = () => { $hits.hidden = true; jump(h.at, h.id); };
+      $hits.append(b);
+    }
+    $hits.hidden = false;
+  };
+  // Closing the results drops the search: its answer, or a busy retry, must not reopen them.
+  const closeHits = () => { $hits.hidden = true; delete $find.dataset.q; };
+  $find.onkeydown = (e) => {
+    if (e.key === "Escape") { closeHits(); return; }
+    if (e.key !== "Enter" || e.isComposing) return;
+    e.preventDefault();
+    const needle = $find.value.trim();
+    if (!needle) return;
+    $find.dataset.q = needle;
+    searchBusy = 0;
+    if (!send({ search: thread, q: needle })) { $hits.replaceChildren(el("div", "none err", "offline")); $hits.hidden = false; }
+  };
+  document.addEventListener("click", (e) => { if (!$hits.contains(e.target) && e.target !== $find) closeHits(); });
+
+  const renderTyping = () => { $typing.textContent = typing.size ? "✍ " + [...typing].join(", ") + (typing.size > 1 ? " are" : " is") + " typing…" : ""; };
+
+  const onFollow = (m) => {
+    if (m.follow !== thread) return;  // a chat left since
+    if (m.error) { hist.followFailed = true; $note.hidden = false; $note.className = "err"; $note.textContent = m.error; return; }
+    // A newer chat.html on the server (restart, edit): this page is stale, reload it.
+    if (m.page) { if (pageVersion && m.page !== pageVersion) { saveDraft(); location.reload(); return; } pageVersion = m.page; }
+    hist.followFailed = false;
+    retry.reset();  // not on open: a socket whose follow fails must keep backing off
+    readOnly = !!m.read_only;
+    $reply.disabled = readOnly || sending.has(thread);
+    $reply.placeholder = readOnly ? "read-only chat" : PLACEHOLDER;
+    document.body.classList.toggle("readonly", readOnly);
+    opener = !!m.opener;
+    $teams.disabled = false;
+    const label = m.label || thread, n = label.match(/ · (\d+)p$/);
+    $label.textContent = n ? label.slice(0, n.index) : label;
+    $label.title = thread;
+    $members.textContent = n ? n[1] + " members" : "";
+    document.title = $label.textContent + " · miniteams";
+  };
+  const PLACEHOLDER = $reply.placeholder;
+
+  // Teams' keys (spec 006): Enter sends, Shift+Enter breaks the line, Ctrl+Enter sends too.
+  const grow = () => { $reply.style.height = "auto"; $reply.style.height = $reply.scrollHeight + 2 + "px"; };
+  let readOnly = false;
+  const setSending = (id, on) => {
+    if (on) sending.add(id); else sending.delete(id);
+    if (id !== thread) return;
+    $reply.disabled = on || readOnly;
+    if (!on) $reply.focus();
+  };
+  // What each chat left behind (split): composer text, quotes, open editors, the error line.
+  const drafts = new Map();
+  const stash = () => {
+    // An editor saving is left out: its answer lands on the chat's error line (onAction), not on stale text.
+    const editing = editorsOf().filter((e) => !e.saving).map((e) => ({ ...e, focused: false }));
+    const d = { text: $reply.value, quotes, editing, err: $err.textContent };
+    if (d.text || quotes.length || editing.length || d.err) drafts.set(thread, d); else drafts.delete(thread);
+  };
+  // Drafts (text and quotes) survive the reload a newer chat.html triggers.
+  const saveDraft = () => {
+    stash();
+    for (const [t, d] of drafts) {
+      if (t !== thread && !d.text && !d.quotes.length) continue;
+      try { sessionStorage.setItem("draft:" + t, JSON.stringify({ text: d.text, quotes: d.quotes, picked: complete.mentions(d.text, t) })); } catch (e) {}
+    }
+  };
+  const takeDraft = (t) => {
+    let d = null;
+    try { d = sessionStorage.getItem("draft:" + t); sessionStorage.removeItem("draft:" + t); } catch (e) { return null; }
+    if (d == null) return null;
+    // A page from before the quotes saved the bare text.
+    try { const o = JSON.parse(d); if (o && typeof o.text === "string") return o; } catch (e) {}
+    return { text: d, quotes: [] };
+  };
+  const unstash = () => {
+    const d = drafts.get(thread) || takeDraft(thread) || { text: "", quotes: [] };
+    drafts.delete(thread);
+    $reply.value = d.text; grow();
+    quotes = (Array.isArray(d.quotes) ? d.quotes : []).filter((qt) => qt && typeof qt.id === "string").slice(0, QUOTE_MAX)
+      .map((qt) => ({ id: qt.id, name: String(qt.name ?? ""), line: String(qt.line ?? "") }));
+    renderQuotes();
+    // Only a draft from sessionStorage carries its picks: in memory they never left the completion.
+    if (Array.isArray(d.picked)) complete.restore(d.picked);
+    carry = d.editing?.length ? d.editing : null;
+    $err.textContent = d.err || "";
+  };
+  // A message for another chat than the one shown: its line waits in that chat's draft.
+  const noteFor = (id, text) => {
+    if (id === thread) { $err.textContent = text; return; }
+    drafts.set(id, { text: "", quotes: [], editing: [], ...drafts.get(id), err: text });
+  };
+  const submit = () => {
+    const text = $reply.value;
+    if (!text.trim() || sending.has(thread)) return;
+    const verb = { send: thread, text, mentions: complete.mentions(text), format: "full", ...(quotes.length ? { quote: quotes.map((qt) => qt.id) } : {}) };
+    if (!send(verb)) { $err.textContent = "offline, not sent"; return; }
+    $err.textContent = "";
+    hideView();
+    setSending(thread, true);
+  };
+
+  const $pop = document.getElementById("pop");
+  // execCommand keeps the edit in the textarea's undo history (Ctrl+Z); setRangeText would not.
+  // Its `input` event runs the completion's lookup: an insert settles what it dismisses before calling.
+  const put = (text, a, b, selA, selB) => {
+    $reply.focus();
+    $reply.setSelectionRange(a, b);
+    if (!document.execCommand("insertText", false, text)) $reply.setRangeText(text, a, b);
+    $reply.setSelectionRange(selA, selB);
+  };
+  const complete = completion({
+    input: $reply, pop: $pop, send: (o) => send(o), chat: () => thread, edited: () => edited(), above: true,
+    put: (text, from, to) => put(text, from, to, from + text.length, from + text.length),
+  });
+
+  // Toolbar (spec 012, full format): markers around the selection, or around the caret to type into.
+  const MARK = { bold: "**", italic: "*", strike: "~~", code: "`" };
+  const format = (fmt) => {
+    if ($reply.disabled) return;
+    const v = $reply.value, a = $reply.selectionStart, b = $reply.selectionEnd, sel = v.slice(a, b);
+    if (fmt === "list" || fmt === "quote") {
+      // Whole lines: from the start of the first one to the end of the last (a trailing newline ends it).
+      const from = v.lastIndexOf("\n", a - 1) + 1, end = b > a && v[b - 1] === "\n" ? b - 1 : b;
+      const nl = v.indexOf("\n", end), to = nl < 0 ? v.length : nl;
+      const lines = v.slice(from, to).split("\n").map((l) => (fmt === "list" ? "- " : "> ") + l).join("\n");
+      put(lines, from, to, from, from + lines.length);
+    } else if (fmt === "code" && sel.includes("\n")) {
+      // A fence only opens and closes on a line of its own.
+      const pre = a && v[a - 1] !== "\n" ? "\n" : "", post = b < v.length && v[b] !== "\n" ? "\n" : "";
+      const text = pre + "```\n" + sel + "\n```" + post;
+      put(text, a, b, a, a + text.length);
+    } else if (!sel) {
+      const m = MARK[fmt];
+      put(m + m, a, b, a + m.length, a + m.length);
+    } else {
+      // The server never closes a marker across lines, nor one with a space inside it: each line gets
+      // its own pair, inside its list or quote prefix, around its text without the surrounding spaces.
+      const m = MARK[fmt], atLineStart = !a || v[a - 1] === "\n";
+      let inner = null;
+      const text = sel.split("\n").map((l, i) => {
+        const p = i || atLineStart ? /^\s*(?:(?:[-*]|\d+\.|>) +)*/.exec(l)[0] : "";
+        const [, lead, body, tail] = /^(\s*)(.*?)(\s*)$/.exec(l.slice(p.length));
+        if (!body) return l;
+        inner ??= [p.length + lead.length + m.length, body.length];
+        return p + lead + m + body + m + tail;
+      }).join("\n");
+      const one = inner && !sel.includes("\n");  // one line: its text stays selected, inside the markers
+      put(text, a, b, one ? a + inner[0] : a, one ? a + inner[0] + inner[1] : a + text.length);
+    }
+    complete.close();
+    edited();
+  };
+  const $tools = document.getElementById("tools");
+  for (const btn of $tools.querySelectorAll("[data-fmt]")) btn.onclick = () => format(btn.dataset.fmt);
+
+  // Preview: the server renders what `send` would post. Its HTML is compose output (escaped by
+  // construction, emoji images on /emoji/), the only markup besides the message bodies.
+  const $view = document.getElementById("view"), $show = document.getElementById("show");
+  // The server answers previews in the order asked: only the answer to the last ask, while on, shows.
+  let showing = false, asked = 0;
+  const hideView = () => { showing = false; $view.hidden = true; $view.replaceChildren(); $show.setAttribute("aria-pressed", "false"); };
+  $show.onclick = () => {
+    if (showing) { hideView(); return; }
+    showing = true;
+    $show.setAttribute("aria-pressed", "true");
+    if (send({ preview: $reply.value, format: "full" })) asked++;
+    else { $view.className = "err"; $view.textContent = "offline, no preview"; $view.hidden = false; }
+  };
+  const onPreview = (m) => {
+    asked = Math.max(0, asked - 1);
+    if (!showing || asked) return;  // toggled off, or a later ask (the text changed since) is pending
+    if (m.error) { $view.className = "err"; $view.textContent = m.error; }
+    else {
+      $view.className = "html"; $view.innerHTML = typeof m.preview === "string" ? m.preview : "";
+      // A link followed in place would replace the page and its drafts.
+      for (const a of $view.querySelectorAll("a")) Object.assign(a, { target: "_blank", rel: "noopener" });
+    }
+    $view.hidden = false;
+  };
+  const edited = () => { grow(); if (showing) hideView(); };
+
+  $reply.oninput = edited;
+  $reply.onkeydown = (e) => {
+    if (complete.key(e)) { e.preventDefault(); return; }
+    const k = e.key.toLowerCase();
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && !e.isComposing && e.keyCode !== 229 && (k === "b" || k === "i")) { e.preventDefault(); format(k === "b" ? "bold" : "italic"); return; }
+    if (e.key !== "Enter" || e.shiftKey || e.isComposing || e.keyCode === 229) return;
+    e.preventDefault();
+    submit();
+  };
+  const onSent = (m) => {
+    if (!sending.has(m.sent)) return;
+    if (m.ok) complete.forget(m.sent);
+    if (m.sent !== thread) {
+      const d = drafts.get(m.sent);
+      if (!m.ok) noteFor(m.sent, why(m.error) || "not sent");
+      else if (d) Object.assign(d, { text: "", quotes: [], err: "" });
+    } else if (m.ok) { $reply.value = ""; grow(); $err.textContent = ""; quotes = []; renderQuotes(); }
+    else $err.textContent = why(m.error) || "not sent";
+    setSending(m.sent, false);
+  };
+
+  // --- chatnav=split: the board's list beside the chat (row rules in ui.js) ---
+  const $side = document.getElementById("side"), $rows = document.getElementById("rows"), $tabs = document.getElementById("tabs"),
+        $filter = document.getElementById("filter"), $nochat = document.getElementById("nochat"), $menu = document.getElementById("menu"),
+        $more = document.getElementById("more"), $clear = document.getElementById("clear"), $grip = document.getElementById("grip");
+  let rows = [], browser = false, meName = "", query = "";
+  let sel = "";  // the row the arrow keys highlight; its name holds the list's one Tab stop
+  let moreOpen = false;
+  let reveal = true;  // centre the current row at the next render: first load, Back/Forward, never a broadcast
+  const TABS = { all: "Inbox", mention: "@", unread: "Unread", seen: "Seen", muted: "Muted" };
+  const EXTRA = ["seen", "muted"];  // behind ⋯ in a column under 360px
+  const EMPTY = { all: "Inbox zero", mention: "No mentions", unread: "No unread chats", seen: "Nothing seen yet", muted: "Nothing muted" };
+  // Read once, never written: the widget owns the stored tab.
+  let tab = Object.hasOwn(TABS, pref("tab") || "") ? pref("tab") : "all";
+  const chatPath = (id) => "/chat/" + encodeURIComponent(id);
+  const rowOf = (r) => {
+    const m = mentioned(r), dm = kind(r.id) === "dm";
+    const li = el("li", (r.unread ? "unread " : "") + ((isSeen(r) || r.muted) && !m ? "seen " : "") + (r.id === thread ? "cur " : "")
+      + (r.id === sel ? "sel " : "") + (m ? "mention " + r.mention.kind : ""));
+    li.dataset.id = r.id;
+    if (r.id === thread) li.setAttribute("aria-current", "page");
+    li.style.setProperty("--stripe", `hsl(${hue(r.id)} 62% 55%)`);
+    if (pref("avatars") !== "0") {
+      const av = el("div", "rav" + (dm ? " round" : ""), initials(rowTitle(r)));
+      av.style.background = `linear-gradient(135deg, hsl(${hue(r.id)} 62% 58%), hsl(${(hue(r.id) + 40) % 360} 62% 48%))`;
+      li.append(av);
+    }
+    const name = Object.assign(marked(el("a", "name truncate"), rowTitle(r), query), { href: r.link || "#", target: "_blank", rel: "noopener", title: r.label, dir: "auto" });
+    name.dataset.k = "name";
+    name.tabIndex = -1;  // renderRows gives one row the Tab stop
+    // Plain click switches in place; Ctrl click opens Teams as on the board; middle click is onauxclick's.
+    name.onclick = (ev) => {
+      if (ev.button === 1) { ev.preventDefault(); return; }
+      if (ev.ctrlKey || ev.metaKey || ev.shiftKey) { if (browser) { ev.preventDefault(); send({ open: r.id, web: true }); } return; }
+      ev.preventDefault();
+      switchTo(r.id, true);
+    };
+    name.onauxclick = (ev) => {
+      if (ev.button !== 1) return;
+      ev.preventDefault();
+      // The new tab opens in split too: --browser has none of this page's stored settings.
+      if (browser) send({ open: r.id, chat: true, chatnav: "split" });
+      else window.open(chatPath(r.id) + "?chatnav=split", "_blank", "noopener");
+    };
+    const meta = el("span", "meta"), [acts, menu] = actions(r);
+    meta.append(...acts, Object.assign(el("span", "ago", ago(r.last_activity)), { title: r.last_activity }));
+    const ind = el("span", "ind");
+    if (m) ind.append(el("span", "tag " + r.mention.kind, r.mention.kind === "all" ? "@ all" : "@ you"));
+    else if (r.unread) ind.append(el("span", "dot"));
+    li.append(name, meta, likeTitle(preview(r, el("span", "prev truncate"), meName), name), ind, ...menu);
+    return li;
+  };
+  const actions = rowActions($rows, () => renderRows(), send);
+  const renderRows = () => {
+    if (!split) return;
+    // Rebuilt on every broadcast: the keyboard focus moves to the same control of the new list.
+    const f = $side.contains(document.activeElement) ? document.activeElement : null;
+    const fk = f?.dataset.k, fid = f?.closest("#rows > li")?.dataset.id;
+    rows.sort((a, b) => (a.last_activity < b.last_activity) - (a.last_activity > b.last_activity));
+    const counts = Object.fromEntries(Object.entries(filters).map(([k, f]) => [k, rows.filter((r) => f(r) && named(r, query)).length]));
+    const tabs = Object.entries(TABS).map(([k, lbl]) => {
+      const b = el("button", (tab === k ? "on " : "") + (k === "mention" ? "mention " : "") + (EXTRA.includes(k) ? "x" : ""), lbl);
+      b.append(el("b", null, counts[k]));
+      b.dataset.k = "tab:" + k;
+      b.setAttribute("aria-pressed", String(tab === k));
+      b.onclick = () => { tab = k; renderRows(); };
+      return b;
+    });
+    // The 4th button of a narrow column: ⋯, or the Seen / Muted tab when that one is shown.
+    const away = EXTRA.includes(tab), more = el("button", "more" + (away ? " on" : ""), away ? TABS[tab] : "⋯");
+    if (away) more.append(el("b", null, counts[tab]));
+    else more.setAttribute("aria-label", "more filters");
+    more.dataset.k = "tab:more";
+    more.setAttribute("aria-haspopup", "menu");
+    more.setAttribute("aria-expanded", String(moreOpen));
+    more.onclick = (e) => { e.stopPropagation(); moreOpen = !moreOpen; renderRows(); if (moreOpen) $more.querySelector("button").focus(); };
+    $tabs.replaceChildren(...tabs, more);
+    $more.replaceChildren(...EXTRA.map((k) => {
+      const b = el("button", tab === k ? "on" : null, `${TABS[k]} ${counts[k]}`);
+      b.dataset.k = "menu:" + k;
+      b.setAttribute("role", "menuitemradio");
+      b.tabIndex = -1;  // a menu is one Tab stop: its items move with the arrow keys
+      b.setAttribute("aria-checked", String(tab === k));
+      b.onclick = (e) => { e.stopPropagation(); tab = k; closeMore(); };
+      return b;
+    }));
+    $more.hidden = !moreOpen;
+    const shown = rows.filter((r) => filters[tab](r) && named(r, query));
+    $rows.replaceChildren(...shown.map(rowOf));
+    const stop = $rows.querySelector("li.sel") || $rows.querySelector("li.cur") || $rows.firstElementChild;
+    if (stop) stop.querySelector(".name").tabIndex = 0;
+    $nochat.textContent = query ? `no chat matches «${$filter.value.trim()}»` : EMPTY[tab];
+    $nochat.hidden = shown.length > 0;
+    $clear.hidden = !$filter.value;
+    const fli = fid && $rows.querySelector(`li[data-id="${CSS.escape(fid)}"]`);
+    if (fli) focusIn(fli, fk);
+    else if (fk && !fid) $side.querySelector(`[data-k="${fk}"]`)?.focus();
+    // A hidden list (folded, drawer closed) keeps the reveal for when it shows.
+    if (reveal && rows.length && $rows.offsetParent) { reveal = false; $rows.querySelector("li.cur")?.scrollIntoView({ block: "center" }); }
+  };
+  const closeMore = (focus = true) => {
+    moreOpen = false;
+    renderRows();
+    if (focus) $tabs.querySelector(".more").focus();
+  };
+  // Arrow keys: from the filter they highlight a row and the focus stays in the box; in the list they
+  // move the focus and the Tab stop with it.
+  const highlight = (li, focus) => {
+    if (!li) return;
+    for (const o of $rows.querySelectorAll("li.sel")) o.classList.remove("sel");
+    for (const a of $rows.querySelectorAll('.name[tabindex="0"]')) a.tabIndex = -1;
+    li.classList.add("sel");
+    sel = li.dataset.id;
+    const name = li.querySelector(".name");
+    name.tabIndex = 0;
+    if (focus) name.focus(); else li.scrollIntoView({ block: "nearest" });
+  };
+  const clearFilter = () => { $filter.value = ""; query = ""; sel = ""; renderRows(); };
+  // The list's width: what the reader set, shown clamped to what the window leaves the chat.
+  const W_MIN = 280, W_DEF = 300;
+  const wMax = () => Math.max(W_MIN, Math.min(560, innerWidth - 420));
+  let wanted = parseInt(store("chatnav_w"), 10), width = W_DEF;
+  const setW = (w, save) => {
+    if (w !== undefined) wanted = w;
+    width = Math.round(Math.min(wMax(), Math.max(W_MIN, Number.isFinite(wanted) ? wanted : W_DEF)));
+    document.body.style.setProperty("--side-w", width + "px");
+    $grip.setAttribute("aria-valuenow", width); $grip.setAttribute("aria-valuemin", W_MIN); $grip.setAttribute("aria-valuemax", wMax());
+    if (save) { wanted = width; keep("chatnav_w", String(width)); }
+  };
+  const resetW = () => { setW(NaN); keep("chatnav_w", null); };
+  // ☰ folds the docked list in a wide window and opens it as a drawer in a narrow one.
+  const narrow = matchMedia("(max-width: 700px)");
+  const syncMenu = () => $menu.setAttribute("aria-expanded",
+    String(narrow.matches ? document.body.classList.contains("nav-open") : !document.body.classList.contains("side-off")));
+  // The drawer is modal: Tab cycles through it and the header, never into the chat under the backdrop.
+  const drawer = (open) => {
+    document.body.classList.toggle("nav-open", open);
+    for (const n of document.querySelectorAll("#pane, #typing, footer")) n.inert = open;
+    syncMenu();
+  };
+  const closeSide = () => drawer(false);
+  const showCur = () => {
+    if (!$rows.offsetParent) return;
+    reveal = false;
+    $rows.querySelector("li.cur")?.scrollIntoView({ block: "nearest" });
+  };
+  const openList = () => {
+    if (narrow.matches) {
+      document.body.style.setProperty("--hdr", document.querySelector("header").offsetHeight + "px");  // the list opens under ☰
+      drawer(true);
+    } else if (document.body.classList.contains("side-off")) {
+      document.body.classList.remove("side-off");
+      keep("chatnav_fold", null);
+      syncMenu();
+    }
+    showCur();
+    $filter.focus();
+  };
+  const onBoard = (m) => {
+    rows = m.rows; browser = !!m.browser; meName = m.me || "";
+    renderRows();
+  };
+  // A chat's whole screen state goes; its draft, quotes and open editors wait in `drafts`.
+  const reset = () => {
+    resetNav("switch");
+    typing.clear(); renderTyping();
+    $msgs.replaceChildren(); $note.hidden = false; $note.className = ""; $note.textContent = "loading…";
+    closeHits(); $find.value = "";
+    $teams.disabled = true; $members.textContent = "";
+    showLatest();
+  };
+  const switchTo = (id, push) => {
+    closeSide();
+    if (id === thread) return;
+    sel = "";
+    stash();
+    if (push) history.pushState(null, "", chatPath(id) + location.search);
+    thread = id;
+    reset();
+    complete.reset(); hideView();
+    unstash();
+    $reply.disabled = readOnly || sending.has(thread);
+    const row = rows.find((r) => r.id === id);
+    $label.textContent = row ? rowTitle(row) : id;
+    document.title = $label.textContent + " · miniteams";
+    renderRows();
+    if (send({ follow: thread })) requestHistory();
+    $reply.focus();
+  };
+  const startSplit = () => {
+    document.body.classList.add("split");
+    $side.hidden = false;
+    document.getElementById("back").hidden = true;
+    $grip.hidden = false;
+    setW();
+    addEventListener("resize", () => setW());  // the window's room changes, not the reader's choice
+    document.body.classList.toggle("side-off", store("chatnav_fold") === "1");
+    narrow.addEventListener("change", closeSide);
+    syncMenu();
+    $menu.onclick = (e) => {
+      e.stopPropagation();
+      if (!narrow.matches) {
+        const off = document.body.classList.toggle("side-off");
+        keep("chatnav_fold", off ? "1" : null);
+        syncMenu();
+        if (!off) showCur();
+      } else if (document.body.classList.contains("nav-open")) closeSide();
+      else openList();
+    };
+    $grip.onpointerdown = (e) => {
+      if (e.button) return;
+      e.preventDefault();
+      $grip.setPointerCapture(e.pointerId);
+      const x0 = e.clientX, w0 = width;
+      let moved = false;  // a plain click (or the first of a double click) stores nothing
+      document.body.classList.add("resizing");
+      $grip.onpointermove = (ev) => { moved ||= ev.clientX !== x0; setW(w0 + ev.clientX - x0); };
+      $grip.onpointerup = $grip.onpointercancel = () => {
+        $grip.onpointermove = $grip.onpointerup = $grip.onpointercancel = null;
+        document.body.classList.remove("resizing");
+        if (moved) setW(undefined, true);
+      };
+    };
+    $grip.ondblclick = resetW;
+    $grip.onkeydown = (e) => {
+      const d = e.shiftKey ? 64 : 16, to = { ArrowLeft: width - d, ArrowRight: width + d, Home: W_MIN, End: wMax() }[e.key];
+      if (e.key === "Enter") resetW();
+      else if (to === undefined) return;
+      else setW(to, true);
+      e.preventDefault();
+    };
+    addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        if (moreOpen) closeMore();
+        else if (document.body.classList.contains("nav-open")) { closeSide(); $menu.focus(); }
+      } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        openList();
+        $filter.select();
+      }
+    });
+    // The path, not contains(): a tab click re-renders the list, detaching its own target first.
+    addEventListener("click", (e) => {
+      if (moreOpen && !e.composedPath().includes($more)) closeMore(false);
+      if (!e.composedPath().includes($side)) closeSide();
+    });
+    $filter.oninput = () => { query = foldText($filter.value.trim())[0]; sel = ""; renderRows(); };
+    $filter.onkeydown = (e) => {
+      const cur = $rows.querySelector("li.sel");
+      if (e.key === "ArrowDown") highlight(cur ? cur.nextElementSibling || cur : $rows.firstElementChild, false);
+      else if (e.key === "ArrowUp") highlight(cur ? cur.previousElementSibling || cur : $rows.lastElementChild, false);
+      else if (e.key === "Enter") { const li = cur || $rows.firstElementChild; if (li) switchTo(li.dataset.id, true); }
+      else if (e.key === "Escape" && ($filter.value || sel)) { e.stopPropagation(); clearFilter(); }
+      else return;
+      e.preventDefault();
+    };
+    $clear.onclick = () => { clearFilter(); $filter.focus(); };
+    $rows.onkeydown = (e) => {
+      const li = e.target.closest?.(".name") && e.target.closest("li");
+      if (!li) return;
+      const to = { ArrowDown: li.nextElementSibling, ArrowUp: li.previousElementSibling, Home: $rows.firstElementChild, End: $rows.lastElementChild }[e.key];
+      if (to === undefined) return;
+      e.preventDefault();
+      highlight(to, true);
+    };
+    $more.onkeydown = (e) => {
+      const items = [...$more.children], i = items.indexOf(document.activeElement), n = items.length;
+      const to = { ArrowDown: (i + 1) % n, ArrowUp: (i + n - 1) % n, Home: 0, End: n - 1 }[e.key];
+      if (to === undefined) return;
+      e.preventDefault();
+      items[to].focus();
+    };
+    // After the move, not during it: closing re-renders the tabs the focus may be heading to.
+    $more.addEventListener("focusout", () => setTimeout(() => {
+      if (moreOpen && !$more.contains(document.activeElement)) closeMore(false);
+    }));
+    addEventListener("popstate", () => {
+      let id = null;
+      try { id = decodeURIComponent(location.pathname.slice("/chat/".length)); } catch (e) {}
+      if (!id) return;
+      reveal = id !== thread;
+      switchTo(id, false);
+    });
+    setInterval(renderRows, CLOCK_TICK_MS);
+  };
+
+  // After a drop, or frames the server dropped (`gap`): the reader scrolled up gets the page around
+  // their message back, else the latest page, which holds whatever landed meanwhile.
+  const resync = () => {
+    const back = hist.loaded && !hist.stick ? anchor() : null, at = back && byId(back.id).dataset.at;
+    resetNav("open", back);  // a jump asked before is superseded
+    if (at && hist.source === "archive") { hist.aroundAt = at; requestHistory("around", at); } else requestHistory();
+  };
+  const connect = () => {
+    ws = dial("/ws?chat");
+    ws.onopen = () => {
+      $status.title = "live"; $status.classList.remove("off");
+      send({ follow: thread });
+      if (split) send({ board: true });
+      resync();
+    };
+    ws.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      if (m.rows) { onBoard(m); return; }
+      // Relayed frames name their chat: those of a chat left since (split) are dropped.
+      if ("thread" in m && m.thread !== thread) return;
+      if ("gap" in m) { if (m.gap === thread) resync(); }  // no `thread` key: a gap of a chat left is ignored here
+      else if ("follow" in m) onFollow(m);
+      else if ("history" in m) onHistory(m);
+      else if ("search" in m) onSearch(m);
+      else if ("complete" in m) complete.answered(m);
+      else if ("preview" in m) onPreview(m);
+      // Acks name the thread; a relayed `edit` frame carries a record.
+      else if (typeof m.edit === "string" || "react" in m || "delete" in m) onAction(m);
+      else if (m.msg) {
+        append(m.msg);
+        if (typing.delete(m.msg.name)) renderTyping();
+      }
+      else if (m.edit) replace(m.edit);
+      else if ("typing" in m) { if (m.on) typing.add(m.typing); else typing.delete(m.typing); renderTyping(); }
+      else if ("sent" in m) onSent(m);
+    };
+    ws.onclose = () => {
+      $status.title = "disconnected"; $status.classList.add("off");
+      typing.clear(); renderTyping();
+      if (asked) hideView();  // its answer died with the socket: no pressed button over an empty box
+      asked = 0;
+      // No ack will come: the message may or may not have gone out.
+      for (const id of [...sending]) { noteFor(id, "connection lost: check the chat before resending"); setSending(id, false); }
+      for (const box of $msgs.querySelectorAll(".editor[data-saving]")) {
+        delete box.dataset.saving;
+        box.nextElementSibling.textContent = "connection lost: check the message before saving again";
+      }
+      setTimeout(connect, retry.next());
+    };
+  };
+  // ⚙: the settings this page reads, on the widget's keys: a tab opened in another browser through
+  // --browser has a storage of its own, set here. A choice drops its URL parameter: the URL outranks storage.
+  const $cog = document.getElementById("cog"), $gear = document.getElementById("gear");
+  let cogOpen = false;
+  const here = () => location.pathname + (q.size ? "?" + q : "");
+  const choose = (k, v) => { keep(k, v); q.delete(k); history.replaceState(history.state, "", here()); };
+  const segOf = (title, items, cur, pick) => {
+    const box = el("div"), seg = el("div", "seg");
+    for (const [k, label] of items) {
+      const b = el("button", cur === k ? "on" : null, label);
+      b.setAttribute("aria-pressed", String(cur === k));
+      b.onclick = () => {
+        for (const o of seg.children) { o.classList.toggle("on", o === b); o.setAttribute("aria-pressed", String(o === b)); }
+        pick(k);
+      };
+      seg.append(b);
+    }
+    box.append(el("h3", null, title), seg);
+    return box;
+  };
+  const renderCog = () => {
+    $cog.classList.toggle("open", cogOpen);
+    $gear.setAttribute("aria-expanded", String(cogOpen));
+    $cog.querySelector(".menu")?.remove();
+    if (!cogOpen) return;
+    const menu = el("div", "menu");
+    menu.id = "settings";
+    menu.setAttribute("role", "group"); menu.setAttribute("aria-label", "settings");
+    menu.onclick = (e) => e.stopPropagation();
+    const theme = ["light", "dark"].includes(pref("theme")) ? pref("theme") : "auto";
+    const themes = segOf("Theme", [["auto", "◐ Auto"], ["light", "☀ Light"], ["dark", "☾ Dark"]], theme,
+      (k) => { choose("theme", k); applyPrefs(); });
+    const dbox = el("div"), lab = el("label", null, "Show avatars"), sw = el("input", "switch");
+    sw.type = "checkbox"; sw.checked = pref("avatars") !== "0";
+    sw.onchange = () => { choose("avatars", sw.checked ? "1" : "0"); applyPrefs(); renderRows(); };
+    lab.append(sw); dbox.append(el("h3", null, "Display"), lab);
+    const nav = segOf("Chat navigation", [["list", "List"], ["split", "Split"]], split ? "split" : "list", (k) => {
+      keep("chatnav", k); q.delete("chatnav");
+      saveDraft();
+      location.replace(here());
+    });
+    menu.append(themes, dbox, nav);
+    $cog.append(menu);
+  };
+  const closeCog = (focus) => { cogOpen = false; renderCog(); if (focus) $gear.focus(); };
+  $gear.onclick = (e) => {
+    e.stopPropagation();
+    cogOpen = !cogOpen;
+    renderCog();
+    if (cogOpen) $cog.querySelector(".menu .on").focus();
+  };
+  $cog.onkeydown = (e) => { if (e.key === "Escape" && cogOpen) { e.stopPropagation(); closeCog(true); } };
+  $cog.addEventListener("focusout", () => setTimeout(() => { if (cogOpen && !$cog.contains(document.activeElement)) closeCog(false); }));
+  applyPrefs();
+  if (!thread) {
+    $note.className = "err"; $note.textContent = "malformed chat address";
+    $reply.disabled = true;
+    return;
+  }
+  unstash();
+  if (split) startSplit();
+  signIn.then(connect);
+  $reply.focus();
+})();
+</script>
+</body>
+</html>

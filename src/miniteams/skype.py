@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 import httpx
 import structlog
 
-from .config import Settings
+from .config import Settings, write_private
 
 log = structlog.get_logger()
 
@@ -53,6 +53,5 @@ def exchange_skype_token(settings: Settings, access_token: str) -> dict[str, Any
 
 def persist_skype_token(settings: Settings, token_data: dict[str, Any]) -> Path:
     path = settings.config_dir / "skype_token.json"
-    path.write_text(json.dumps(token_data, indent=2))
-    path.chmod(0o600)  # Security: bearer-equivalent secret — owner-only.
+    write_private(path, json.dumps(token_data, indent=2))  # Security: bearer-equivalent secret
     return path

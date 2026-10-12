@@ -1,7 +1,9 @@
 """TokenSource flow + device-code URL injection (no real MSAL/network)."""
 
 import json
+import os
 import threading
+from typing import Any
 
 import msal
 import pytest
@@ -115,7 +117,7 @@ def test_persist_cache_failure_leaves_no_temp_file(tmp_path, monkeypatch) -> Non
     path.write_text("old")
     with pytest.raises(OSError):
         A._persist_cache(_Broken(), path)  # type: ignore[arg-type]
-    monkeypatch.setattr(A.os, "replace", lambda *_a: (_ for _ in ()).throw(OSError(18, "cross-device")))
+    monkeypatch.setattr(os, "replace", lambda *_a: (_ for _ in ()).throw(OSError(18, "cross-device")))
     with pytest.raises(OSError):
         A._persist_cache(_Cache(), path)  # type: ignore[arg-type]
     assert [p.name for p in tmp_path.iterdir()] == ["msal_cache.json"]
@@ -368,3 +370,15 @@ def test_sync_survives_the_cache_vanishing_after_it_was_stamped(settings: Settin
     _sibling_write(settings.config_dir / "msal_cache.json", "rt-sibling")
     monkeypatch.setattr(A.Path, "read_text", lambda self, *a, **k: (_ for _ in ()).throw(OSError("vanished")))
     assert src.refresh()["access_token"] == "tok"
+
+
+def test_self_mri_from_access_token() -> None:
+    import base64
+
+    def jwt(claims: dict[str, Any]) -> str:
+        body = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        return f"eyJhbGciOiJub25lIn0.{body}.sig"
+
+    assert A.self_mri(jwt({"oid": "abc-123", "upn": "x"})) == "8:orgid:abc-123"
+    assert A.self_mri(jwt({"upn": "x"})) == ""
+    assert A.self_mri("not.a-jwt") == "" and A.self_mri("") == ""

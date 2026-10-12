@@ -22,7 +22,7 @@ import structlog
 import websockets
 
 from ._io import force_blocking_stdout
-from .auth import AuthExpired, TokenSource, token_source
+from .auth import AuthExpired, TokenSource, cache_stamp, token_source
 from .config import Settings
 from .directory import Directory
 from .messages import decode_event, emit_raw_delivery, emit_raw_named, handle_delivery
@@ -37,6 +37,7 @@ _BACKOFF_MAX = 60.0
 _STABLE_AFTER = 60.0  # a connection alive this long resets the backoff
 _TOKEN_REFRESH_RATIO = 0.8  # renew the directory's skype token at 80% of its lifetime
 _TOKEN_REFRESH_MIN = 60.0  # floor between renewals; a failed renewal retries after this
+_LOGIN_POLL = 5.0  # seconds between looks at the token cache while waiting for a `miniteams login`
 _TOKEN_LIFETIME_FALLBACK = 1800.0  # authz response without expiresIn: assume a short lifetime
 _CONNECT_FLOOD = 30.0  # seconds after registration in which a message_loss is the connect flood
 
@@ -337,6 +338,13 @@ async def _refresh_directory_token(
         log.info("directory_token_refreshed", expires_in=lifetime)
 
 
+async def _wait_for_login(settings: Settings) -> None:
+    """Return once another process (`miniteams login`) has rewritten the token cache."""
+    before = cache_stamp(settings)
+    while cache_stamp(settings) == before:
+        await asyncio.sleep(_LOGIN_POLL)
+
+
 async def run_forever(
     settings: Settings,
     jsonl: bool = False,
@@ -349,6 +357,7 @@ async def run_forever(
     on_alive: AliveHook | None = None,
     epid: str | None = None,
     prompt: bool = True,
+    wait_for_login: bool = False,
 ) -> None:
     """Re-establish a full session on every disconnect.
 
@@ -408,8 +417,13 @@ async def run_forever(
         except AuthExpired as exc:
             # Refresh token dead: reconnecting can't fix it and re-auth needs a prompt — stop
             # cleanly so the user re-runs, rather than spinning the loop forever.
-            log.error("auth_expired", error=str(exc))
-            return
+            log.error("auth_expired", error=str(exc), waiting_for_login=wait_for_login)
+            if not wait_for_login:
+                return
+            await _wait_for_login(settings)  # the next refresh rereads the rewritten cache (_sync_cache)
+            log.info("login_detected")
+            backoff = 1.0
+            continue
         except Exception as exc:  # noqa: BLE001 — any other failure is recoverable via reconnect
             log.warning("stream_error", error=str(exc), error_type=type(exc).__name__)
 

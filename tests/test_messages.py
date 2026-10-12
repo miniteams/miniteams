@@ -5,6 +5,7 @@ import gzip
 import json
 from typing import Any
 
+from miniteams import messages as M
 from miniteams.directory import Directory
 from miniteams.messages import (
     _decode_body,
@@ -88,7 +89,12 @@ async def test_resource_to_record_surfaces_fields(directory: Directory) -> None:
     assert rec["raw"] is res
 
 
-async def test_event_to_record_includes_delivery_envelope(directory: Directory) -> None:
+async def test_event_to_record_includes_delivery_envelope(directory: Directory, monkeypatch) -> None:
+    async def offline(self: Directory, key: str) -> str:
+        return key
+
+    monkeypatch.setattr(Directory, "display", offline)
+    monkeypatch.setattr(Directory, "label", offline)
     obj = {"type": "EventMessage", "resourceType": "NewMessage", "resource": {"from": "8:o:u"}}
     req = {"id": 42, "method": "POST", "url": "https://h/x/messaging", "headers": {"a": "b"}}
     rec = await event_to_record(obj, req, directory)
@@ -214,3 +220,14 @@ async def test_handle_delivery_message_update_without_emotions_is_silent(
     body = {"type": "EventMessage", "resourceType": "MessageUpdate", "resource": {"id": "1"}}
     await handle_delivery({"url": "https://h/x/messaging", "body": json.dumps(body)}, directory)
     assert capsys.readouterr().out == ""
+
+
+def test_is_edited_reads_both_edit_marks() -> None:
+    """M9: an edit is `skypeeditedid` (live echo) or `properties.edittime` (stored copy)."""
+    assert M.is_edited({"skypeeditedid": "1"}) and M.is_edited({"properties": {"edittime": "2"}})
+    assert not M.is_edited({}) and not M.is_edited({"properties": {"edittime": ""}})
+    assert not M.is_edited({"properties": "not a dict", "skypeeditedid": ""})
+
+
+def test_fold_drops_case_and_accents() -> None:
+    assert M.fold("ZOÉ Élodie") == "zoe elodie"

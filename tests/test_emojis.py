@@ -159,3 +159,32 @@ async def test_image_url_escapes_the_document_id(settings: Settings, monkeypatch
     parts = urlsplit(urls[0])
     assert parts.path.count("/") == 5  # /v1/objects/<id>/views/imgpsh_fullsize, nothing injected
     assert parts.path.endswith("/views/imgpsh_fullsize") and not parts.query and not parts.fragment
+
+
+def test_ids_by_name_falls_back_to_the_key_tail() -> None:
+    """012: the composer's custom set, name → AMS object id; first name wins, id-less entries dropped."""
+    got = emojis.ids_by_name(
+        [
+            {"name": "party", "key": "party;0-weu-d1-key", "document_id": "0-weu-d1-doc"},
+            {"name": "wave", "key": "wave;0-weu-d1-tail", "document_id": ""},
+            {"name": "party", "key": "party;0-weu-d1-other", "document_id": ""},
+            {"name": "bare", "key": "bare", "document_id": ""},
+        ]
+    )
+    assert got == {"party": "0-weu-d1-doc", "wave": "0-weu-d1-tail"}
+
+
+async def test_cached_image_downloads_once_into_the_cache(settings: Settings, monkeypatch) -> None:
+    """012-AC9: the image lands under cache_dir/emojis; a failed download is None."""
+    seen: list[tuple[str, str, Path]] = []
+
+    async def fake_image(client: Any, token: str, document_id: str, dest: Path) -> str:
+        seen.append((token, document_id, dest))
+        return str(dest / f"{document_id}.png") if document_id == "ok" else ""
+
+    monkeypatch.setattr(emojis, "_image", fake_image)
+    dest = settings.cache_dir / "emojis"
+    assert await emojis.cached_image(settings, "SK", "ok") == dest / "ok.png"
+    assert dest.is_dir()
+    assert await emojis.cached_image(settings, "SK", "bad") is None
+    assert seen == [("SK", "ok", dest), ("SK", "bad", dest)]

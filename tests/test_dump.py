@@ -4,12 +4,12 @@ from typing import Any
 
 from miniteams import dump
 from miniteams.config import Settings
-from miniteams.dump import _epoch_seconds
+from miniteams.dump import epoch_seconds
 
 
 def test_epoch_seconds_truncates_to_seconds() -> None:
-    assert _epoch_seconds("1970-01-01T00:00:10.5000000Z") == 10
-    assert _epoch_seconds("garbage") == 0
+    assert epoch_seconds("1970-01-01T00:00:10.5000000Z") == 10
+    assert epoch_seconds("garbage") == 0
 
 
 class _Resp:

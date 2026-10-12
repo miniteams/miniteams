@@ -1,7 +1,9 @@
 """Outbound send + skype-token exchange (httpx mocked)."""
 
+import json
 from typing import Any
 
+import httpx
 import pytest
 
 from miniteams import send, skype
@@ -56,6 +58,29 @@ def test_send_message_html_mode_sends_raw(settings: Settings, monkeypatch) -> No
     assert captured["json"]["content"] == "<b>hi</b> & <i>x</i>"  # verbatim, not escaped
 
 
+def test_send_message_properties_in_body(settings: Settings, monkeypatch) -> None:
+    """012-AC7: `properties` goes in the body as given; without it the body is byte-identical."""
+    bodies: list[bytes] = []
+
+    def fake_post(url: str, **kw: Any) -> _Resp:
+        bodies.append(httpx.Request("POST", url, json=kw["json"]).content)
+        return _Resp({}, status=201)
+
+    monkeypatch.setattr(send._CLIENT, "post", fake_post)
+    monkeypatch.setattr(send.time, "time", lambda: 1781920776.714)
+    props = {"mentions": '[{"itemid": 0}]'}
+    send.send_message(settings, "sk", "48:notes", "hi", "Me")
+    send.send_message(settings, "sk", "48:notes", "hi", "Me", properties=None)
+    send.send_message(settings, "sk", "48:notes", "hi", "Me", properties=props)
+
+    today = (
+        b'{"clientmessageid":"1781920776714","content":"hi","messagetype":"RichText/Html",'
+        b'"contenttype":"text","imdisplayname":"Me"}'
+    )
+    assert bodies[0] == bodies[1] == today
+    assert json.loads(bodies[2]) == {**json.loads(today), "properties": props}
+
+
 def test_send_typing_builds_request(settings: Settings, monkeypatch) -> None:
     captured: dict[str, Any] = {}
 
@@ -98,6 +123,24 @@ def test_edit_message_puts_with_skypeeditedid(settings: Settings, monkeypatch) -
     assert captured["url"].endswith("/conversations/48%3Anotes/messages/1781920776714")
     assert captured["json"]["skypeeditedid"] == "1781920776714"
     assert captured["json"]["content"] == "new <b>text</b>"
+
+
+def test_delete_message_sends_a_bare_delete(settings: Settings, monkeypatch) -> None:
+    """011-AC14: DELETE on the message URL, no query, no body (the wire captured from Teams web)."""
+    captured: dict[str, Any] = {}
+
+    def fake_delete(url: str, **kw: Any) -> _Resp:
+        captured["url"] = url
+        captured.update(kw)
+        return _Resp({}, status=200, content=b"")
+
+    monkeypatch.setattr(send._CLIENT, "delete", fake_delete)
+    assert send.delete_message(settings, "sk", "19:a b@thread.v2", "1781920776714") == {"status": 200}
+    assert captured["url"] == (
+        f"https://{settings.contacts_host}/v1/users/ME/conversations/19%3Aa%20b%40thread.v2/messages/1781920776714"
+    )
+    assert set(captured) == {"url", "headers"}  # no json, content or params
+    assert captured["headers"]["X-Skypetoken"] == "sk"
 
 
 def test_send_message_raises_on_error_envelope(settings: Settings, monkeypatch) -> None:
@@ -256,3 +299,12 @@ def test_exchange_skype_token_keeps_an_explicit_csa(monkeypatch) -> None:
     )
     skype.exchange_skype_token(pinned, "aad")
     assert pinned.csa_url == "https://pinned.example/api/csa/x"
+
+
+def test_too_long_caps_the_posted_html_bytes() -> None:
+    """M10: the cap is on the HTML Teams receives: escaping and multi-byte characters count."""
+    cap = send.MAX_HTML_BYTES
+    assert not send.too_long("x" * cap) and send.too_long("x" * (cap + 1))
+    assert send.too_long("<" * (cap // 4 + 1))  # &lt; is four bytes
+    assert not send.too_long("<b>" * (cap // 3), is_html=True)
+    assert send.too_long("é" * (cap // 2 + 1))

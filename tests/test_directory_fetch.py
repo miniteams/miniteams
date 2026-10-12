@@ -212,12 +212,12 @@ async def test_new_token_and_forget_lift_the_failure_window(directory: Directory
     assert calls["n"] == 3
 
 
-async def test_failure_window_map_stays_bounded(directory: Directory, monkeypatch) -> None:
-    clock = {"now": 1000.0}
-    monkeypatch.setattr(directory_mod.time, "monotonic", lambda: clock["now"])
+async def test_failure_window_map_is_capped(directory: Directory, monkeypatch) -> None:
+    monkeypatch.setattr(directory_mod, "_THREADS_MAX", 2)
     _patch(monkeypatch, lambda url: _Resp(fail=True))
-    for i in range(3):
+    for i in range(4):  # all inside the window: only the cap can drop them
         await directory.thread(f"19:{i}@thread.v2")
-        clock["now"] += directory_mod._THREAD_RETRY_AFTER  # each earlier failure expires
-    await directory.thread("19:last@thread.v2")
-    assert list(directory._thread_failed) == ["19:last@thread.v2"]
+    assert list(directory._thread_failed) == ["19:2@thread.v2", "19:3@thread.v2"]
+    await directory._load_thread("19:2@thread.v2")  # re-stamped: now the newest, 19:3 goes first
+    await directory.thread("19:4@thread.v2")
+    assert list(directory._thread_failed) == ["19:2@thread.v2", "19:4@thread.v2"]

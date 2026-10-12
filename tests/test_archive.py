@@ -10,7 +10,7 @@ from miniteams import archive as AR
 from miniteams.archive_store import ChatStore, Index, chat_dir_name
 from miniteams.auth import AuthExpired
 from miniteams.config import Settings
-from miniteams.dump import _epoch_seconds
+from miniteams.dump import epoch_seconds
 
 C1 = "19:alice@unq.gbl.spaces"
 C2 = "19:bob@unq.gbl.spaces"
@@ -31,7 +31,7 @@ class _FakeApi:
         self.calls.append((thread_id, end_before))
         msgs = sorted(self.data.get(thread_id, []), key=lambda m: m["composetime"], reverse=True)
         if end_before is not None:
-            msgs = [m for m in msgs if _epoch_seconds(m["composetime"]) <= end_before]
+            msgs = [m for m in msgs if epoch_seconds(m["composetime"]) <= end_before]
         for i in range(0, len(msgs), page_size):
             yield msgs[i : i + page_size]
 

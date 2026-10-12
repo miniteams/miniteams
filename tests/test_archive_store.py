@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from miniteams.archive_store import ChatStore, Index, chat_dir_name
+from miniteams.archive_store import ChatStore, Index, chat_dir_name, messages_by_id, search_chat
 
 THREAD = "19:user1_user2@unq.gbl.spaces"
 
@@ -248,3 +248,35 @@ def test_apply_message_partial_update_merges(tmp_path: Path) -> None:
     store.apply_message({"id": "1", "version": "2", "properties": {"b": 2}}, NOW)  # no content
     raw = _raw(store, "1")
     assert raw["content"] == "msg 1" and raw["properties"] == {"a": 1, "b": 2}
+
+
+def test_search_chat_folds_caps_and_says_when_more_match(tmp_path: Path) -> None:
+    store = ChatStore(tmp_path, "19:s@thread.v2")
+    texts = ["Réunion demain", "reunion lundi", "rien", "REUNION", "<p>re<b>u</b>nion</p>"]
+    store.insert_page(
+        [
+            {
+                "id": str(n),
+                "composetime": f"2026-07-0{n}T00:00:00Z",
+                "messagetype": "RichText/Html",
+                "content": t,
+            }
+            for n, t in enumerate(texts, 1)
+        ]
+    )
+    store.close()
+    found, more = search_chat(store.dir, "reunion", 10)
+    assert ([m["id"] for m in found], more) == (["4", "2", "1"], False)  # newest first; tags are not text
+    found, more = search_chat(store.dir, "reunion", 2)
+    assert ([m["id"] for m in found], more) == (["4", "2"], True)
+    assert search_chat(store.dir, "x", 2, since="2026-07-03") == ([], False)
+    assert search_chat(tmp_path / "none", "x", 2) == ([], False)
+
+
+def test_messages_by_id_skips_unreadable_rows(tmp_path: Path) -> None:
+    store = ChatStore(tmp_path, "19:s@thread.v2")
+    store.insert_page([_msg("1", "2026-07-01T00:00:00Z"), _msg("2", "2026-07-02T00:00:00Z")])
+    store._db.execute("UPDATE messages SET raw = '[1]' WHERE id = '2'")
+    store._db.commit()
+    store.close()
+    assert list(messages_by_id(store.dir, ["1", "2", "3"])) == ["1"]

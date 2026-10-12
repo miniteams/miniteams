@@ -8,6 +8,7 @@ A sent/edited message echoes back over the live stream (same `clientmessageid`),
 `teams_conv_send_typing_to_channel`. `edit_message` is reconstructed from
 the inbound `MessageUpdate` + `skypeeditedid` wire format (purple-teams only *consumes* edits) and
 the SkPy client: PUT the message id with `skypeeditedid` set to it — confirmed against live Teams.
+`delete_message` was captured from the Teams web client.
 """
 
 import html
@@ -25,6 +26,8 @@ log = structlog.get_logger()
 
 # Kept open: a fresh TLS handshake per send doubles its latency. httpx clients are thread-safe.
 _CLIENT = httpx.Client(timeout=30.0)
+
+MAX_HTML_BYTES = 28 * 1024  # Teams' per-message limit, on the posted HTML
 
 # "Notes to self" — the write-safe default target.
 NOTES_THREAD = "48:notes"
@@ -44,6 +47,11 @@ def parse_message_link(value: str) -> tuple[str, str] | None:
 def message_html(text: str, is_html: bool) -> str:
     # messagetype is RichText/Html; plain text is escaped (newlines → <br>), --html sent verbatim.
     return text if is_html else html.escape(text).replace("\n", "<br>")
+
+
+def too_long(text: str, *, is_html: bool = False) -> bool:
+    """Over Teams' limit once posted: the cap is on the HTML bytes, so escaping counts."""
+    return len(message_html(text, is_html).encode()) > MAX_HTML_BYTES
 
 
 def _headers(skype_token: str, settings: Settings) -> dict[str, str]:
@@ -83,17 +91,20 @@ def send_message(
     display_name: str,
     *,
     is_html: bool = False,
+    properties: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     base = f"https://{settings.contacts_host}/v1/users/ME/conversations/{quote(thread_id, safe='')}"
     # JS-style epoch milliseconds; also the de-dup key for the self-echo over Trouter.
     client_message_id = str(int(time.time() * 1000))
-    body = {
+    body: dict[str, Any] = {
         "clientmessageid": client_message_id,
         "content": message_html(text, is_html),
         "messagetype": "RichText/Html",
         "contenttype": "text",
         "imdisplayname": display_name,
     }
+    if properties is not None:
+        body["properties"] = properties
     resp = _CLIENT.post(f"{base}/messages", headers=_headers(skype_token, settings), json=body)
     result = _check(resp, "send")
     log.info("message_sent", thread=thread_id, clientmessageid=client_message_id, status=result["status"])
@@ -144,6 +155,18 @@ def edit_message(
     }
     result = _check(_CLIENT.put(url, headers=_headers(skype_token, settings), json=body), "edit")
     log.info("message_edited", thread=thread_id, message_id=message_id, status=result["status"])
+    return result
+
+
+def delete_message(settings: Settings, skype_token: str, thread_id: str, message_id: str) -> dict[str, Any]:
+    """Delete your message: `DELETE …/messages/<id>`, no query, no body (captured from Teams web,
+    answers 200). The message stays, with `properties.deletetime` set and an empty content."""
+    url = (
+        f"https://{settings.contacts_host}/v1/users/ME/conversations"
+        f"/{quote(thread_id, safe='')}/messages/{quote(message_id, safe='')}"
+    )
+    result = _check(_CLIENT.delete(url, headers=_headers(skype_token, settings)), "delete")
+    log.info("message_deleted", thread=thread_id, message_id=message_id, status=result["status"])
     return result
 
 

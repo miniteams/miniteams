@@ -11,9 +11,11 @@ import re
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import structlog
+
+from .messages import fold, message_text
 
 log = structlog.get_logger()
 
@@ -101,6 +103,194 @@ def read_meta(data_dir: Path) -> dict[str, str]:
         return {str(k): str(v) for k, v in db.execute("SELECT key, value FROM meta")}
     finally:
         db.close()
+
+
+def find_chat_dir(data_dir: Path, thread_id: str) -> Path | None:
+    """Folder of an indexed chat, read-only; None when the index does not know the thread.
+
+    Same rule as `read_chats`: raises OSError without an index, sqlite3.Error when unreadable.
+    """
+    path = data_dir / "index.db"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        row = db.execute("SELECT dir FROM chats WHERE id = ?", (thread_id,)).fetchone()
+    finally:
+        db.close()
+    return None if row is None else data_dir / (row[0] or chat_dir_name(thread_id))
+
+
+def chat_label(data_dir: Path, thread_id: str) -> str:
+    """The index's label for a chat, else its topic; "" when it has neither or does not know it.
+
+    Same rule as `read_chats`: raises OSError without an index, sqlite3.Error when unreadable.
+    """
+    path = data_dir / "index.db"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        row = db.execute("SELECT label, topic FROM chats WHERE id = ?", (thread_id,)).fetchone()
+    finally:
+        db.close()
+    return "" if row is None else str(row[0] or row[1] or "")
+
+
+_COLS = "SELECT id, composetime, raw FROM messages"
+# ponytail: unreachable in practice (the real archive's largest same-composetime group is 1); a bound,
+# not a size.
+_TIES_MAX = 200
+_SKIP_PAGES = 5  # windows read past when every row of one is unreadable
+
+
+def _row_message(raw: str) -> dict[str, Any] | None:
+    """A stored row's message; None when it is not a JSON object."""
+    try:
+        message = json.loads(raw)
+    except ValueError:
+        return None
+    return message if isinstance(message, dict) else None
+
+
+def _parsed(chat_dir: Path, rows: list[Any]) -> list[dict[str, Any]]:
+    """The readable messages of `rows`, oldest first, once each."""
+    messages = []
+    for msg_id, _, raw in sorted({r[0]: r for r in rows}.values(), key=lambda r: (r[1], r[0])):
+        if (message := _row_message(raw)) is not None:
+            messages.append(message)
+        else:
+            log.warning("archive_row_unreadable", chat_dir=str(chat_dir), msg_id=msg_id)
+    return messages
+
+
+def _with_ties(db: sqlite3.Connection, rows: list[Any]) -> list[Any]:
+    """Messages sharing the far edge's time join the page: a cursor at that time would otherwise
+    skip the ones left out."""
+    if not rows:
+        return rows
+    ties = db.execute(f"{_COLS} WHERE composetime = ? ORDER BY id LIMIT ?", (rows[-1][1], _TIES_MAX))
+    return [*rows, *ties]
+
+
+class Page(NamedTuple):
+    messages: list[dict[str, Any]]
+    older: bool
+    newer: bool
+    cursor: str = ""  # an empty page with more beyond: where reading past unreadable windows stopped
+
+
+def read_page(chat_dir: Path, limit: int, *, before: str = "", after: str = "", around: str = "") -> Page:
+    """A page of messages oldest first, and whether older and newer ones exist.
+
+    `before` ("" = the latest): the `limit` newest composed before it; `after`: the `limit` oldest
+    composed after it; `around`: about `limit / 2` on each side, those at the anchor time on the
+    newer side, a short side's share going to the other. Past _SKIP_PAGES unreadable windows the page
+    is empty and `cursor` is the `before` (or `after`) to ask next.
+    """
+    path = chat_dir / "messages.db"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    latest = not (before or after or around)
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+    def older(cursor: str, size: int) -> list[Any]:
+        return _with_ties(
+            db,
+            db.execute(
+                f"{_COLS} WHERE composetime < ? ORDER BY composetime DESC, id DESC LIMIT ?", (cursor, size)
+            ).fetchall(),
+        )
+
+    def newer(cursor: str, size: int, op: str) -> list[Any]:
+        return _with_ties(
+            db,
+            db.execute(
+                f"{_COLS} WHERE composetime {op} ? ORDER BY composetime, id LIMIT ?", (cursor, size)
+            ).fetchall(),
+        )
+
+    try:
+        for _ in range(_SKIP_PAGES):
+            if around:
+                n_up, n_down = (
+                    db.execute(
+                        f"SELECT COUNT(*) FROM (SELECT 1 FROM messages WHERE composetime {op} ? LIMIT ?)",
+                        (around, limit),
+                    ).fetchone()[0]
+                    for op in ("<", ">=")
+                )
+                up = min(n_up, max(limit // 2, limit - n_down))
+                rows = older(around, up) + newer(around, limit - up, ">=")
+            elif after:
+                rows = newer(after, limit, ">")
+            else:
+                rows = older(before or "\uffff", limit)
+            if not rows:
+                return Page([], False, False)
+            first, last = min(r[1] for r in rows), max(r[1] for r in rows)
+            has_older = bool(
+                db.execute("SELECT 1 FROM messages WHERE composetime < ? LIMIT 1", (first,)).fetchone()
+            )
+            has_newer = bool(
+                db.execute("SELECT 1 FROM messages WHERE composetime > ? LIMIT 1", (last,)).fetchone()
+            )
+            messages = _parsed(chat_dir, rows)
+            # "Empty, but more" would have the page ask the same edge again: read past the bad window.
+            if messages or around or not (has_newer if after else has_older):
+                break
+            if after:
+                after = last
+            else:
+                before = first
+    finally:
+        db.close()
+    # Newer than the latest: unreadable rows only.
+    page = Page(messages, has_older, has_newer and not latest)
+    if messages or around or not (page.newer if after else page.older):
+        return page
+    return page._replace(cursor=after or before)
+
+
+def messages_by_id(chat_dir: Path, ids: list[str]) -> dict[str, dict[str, Any]]:
+    """The archived messages among `ids`, by id, read-only; same errors as `read_page`."""
+    path = chat_dir / "messages.db"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        marks = ",".join("?" * len(ids))
+        rows = db.execute(f"SELECT id, raw FROM messages WHERE id IN ({marks})", ids).fetchall()
+    finally:
+        db.close()
+    return {str(msg_id): message for msg_id, raw in rows if (message := _row_message(raw)) is not None}
+
+
+def search_chat(
+    chat_dir: Path, query: str, limit: int, *, since: str = "", until: str = ""
+) -> tuple[list[dict[str, Any]], bool]:
+    """The chat's messages whose text holds `query` (case and accents folded), newest first, at most
+    `limit`, and whether more match. Read-only; ([], False) without a `messages.db`."""
+    path = chat_dir / "messages.db"
+    if not path.is_file():
+        return [], False
+    needle = fold(query)
+    hits: list[dict[str, Any]] = []
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        rows = db.execute(
+            "SELECT raw FROM messages WHERE composetime >= ? AND composetime < ? ORDER BY composetime DESC",
+            (since, until or "\uffff"),
+        )
+        for (raw,) in rows:
+            message = json.loads(raw)
+            if needle in fold(message_text(message)):
+                if len(hits) == limit:
+                    return hits, True
+                hits.append(message)
+    finally:
+        db.close()
+    return hits, False
 
 
 class Index:
