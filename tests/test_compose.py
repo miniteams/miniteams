@@ -324,9 +324,9 @@ def _best_ms(fn: Callable[[], object]) -> float:
     try:
         runs = []
         for _ in range(7):  # best of 7: a 1 ms run is at the mercy of one scheduler hiccup
-            start = time.perf_counter()
+            start = time.process_time()  # CPU time: a loaded host preempts long runs more
             fn()
-            runs.append(time.perf_counter() - start)
+            runs.append(time.process_time() - start)
     finally:
         gc.enable()
     return min(runs) * 1000

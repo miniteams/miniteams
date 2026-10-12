@@ -3,7 +3,8 @@
 Each verb has a pure parser (wire dict → typed request or the refusal shown to the page) and a
 `ChatVerbs` method on the typed request; `handlers()` wires both to the socket with the per-socket
 busy slots. The board (`web.Board`) owns the rows and the followed chats; it lends `scope`, the
-chats a socket may act on. Archive reads go through `io`: the archive pool, with a deadline.
+chats a socket may act on. Archive reads go through `io`: one archive pool per kind group (media
+apart), with a deadline.
 """
 
 import asyncio
@@ -74,7 +75,10 @@ _COMPLETE_Q_MAX = 64
 _ROSTER_TTL = 600.0  # seconds a roster is trusted: members join and leave without a board event
 _ARCHIVE_WORKERS = 4
 _THREAD_PREFIX = "archive"
-_MEDIA_READS = 2  # concurrent media reads: 50 MiB bodies must leave pool threads for the rest
+_MEDIA_READS = 2  # media pool threads: concurrent media reads
+# Reads queued per pool before io() refuses at once: a hung mount would otherwise queue every call
+# (deadline-cancelled ones included) forever. Ceiling: 64 work items (~4 KB each) per pool.
+_BACKLOG = 64
 # Seconds an archive read may take before its caller stops waiting (the thread itself cannot be killed).
 _DEADLINES: dict[IoKind, float] = {
     "history": 10.0,
@@ -94,55 +98,46 @@ _ASYNCGW_SRC_RE = re.compile(
 
 
 class ArchiveUnavailable(Exception):
-    """An archive read outlived its deadline: a hung mount. Its thread stays; the caller moves on."""
+    """An archive read outlived its deadline (a hung mount; its thread stays), or was refused at once:
+    `_BACKLOG` reads queued, or the pool closed. The caller moves on."""
 
 
-_pool: ThreadPoolExecutor | None = None
+_pools: dict[str, ThreadPoolExecutor] = {}  # by thread name prefix
 _closed = False
-_busy = 0  # archive threads running a read, hung ones included
-_busy_lock = threading.Lock()
 _UNAVAILABLE_EVERY = 30.0  # seconds between two `archive_unavailable` warnings
 _unavailable_warned = -_UNAVAILABLE_EVERY
 
 
-def archive_pool() -> ThreadPoolExecutor:
-    """The process's archive pool, made on first use; ArchiveUnavailable once closed."""
-    global _pool
+def archive_pool(kind: IoKind) -> ThreadPoolExecutor:
+    """The process's archive pool for `kind`, made on first use; ArchiveUnavailable once closed."""
     if _closed:
         raise ArchiveUnavailable("archive pool closed")
-    if _pool is None:
-        # Archive reads can hang on NFS: they must not starve the default pool the Teams calls use.
-        _pool = ThreadPoolExecutor(max_workers=_ARCHIVE_WORKERS, thread_name_prefix=_THREAD_PREFIX)
-    return _pool
+    media = kind == "media"
+    # Archive reads can hang on NFS: they must not starve the default pool the Teams calls use, nor
+    # (50 MiB media bodies) the other archive reads.
+    prefix = f"{_THREAD_PREFIX}-media" if media else _THREAD_PREFIX
+    if prefix not in _pools:
+        workers = _MEDIA_READS if media else _ARCHIVE_WORKERS
+        _pools[prefix] = ThreadPoolExecutor(max_workers=workers, thread_name_prefix=prefix)
+    return _pools[prefix]
 
 
 def close_archive_pool() -> None:
-    global _pool, _closed
+    global _closed
     _closed = True
-    if _pool is not None:
+    for pool in _pools.values():
         # A thread stuck on a dead mount must not hold the shutdown.
-        _pool.shutdown(wait=False, cancel_futures=True)
-        _pool = None
+        pool.shutdown(wait=False, cancel_futures=True)
+    _pools.clear()
 
 
 def stuck_archive_threads(grace: float = 1.0) -> int:
-    """Archive threads still alive `grace` seconds from now: reads hung on a dead mount."""
+    """Archive threads (media ones too) alive `grace` seconds from now: reads hung on a dead mount."""
     until = time.monotonic() + grace
     threads = [t for t in threading.enumerate() if t.name.startswith(_THREAD_PREFIX)]
     for thread in threads:
         thread.join(max(0.0, until - time.monotonic()))
     return sum(thread.is_alive() for thread in threads)
-
-
-def _counted[R](work: Callable[[], R]) -> R:
-    global _busy
-    with _busy_lock:
-        _busy += 1
-    try:
-        return work()
-    finally:
-        with _busy_lock:
-            _busy -= 1
 
 
 def _warn_unavailable(kind: IoKind) -> None:
@@ -151,33 +146,19 @@ def _warn_unavailable(kind: IoKind) -> None:
     now = time.monotonic()
     if now - _unavailable_warned >= _UNAVAILABLE_EVERY:
         _unavailable_warned = now
-        log.warning("archive_unavailable", kind=kind, busy_workers=_busy)
+        log.warning("archive_unavailable", kind=kind)
 
 
 async def io[**P, R](kind: IoKind, fn: Callable[P, R], /, *args: P.args, **kwargs: P.kwargs) -> R:
-    """Blocking archive or NFS work on the archive pool; ArchiveUnavailable past the kind's deadline."""
-    return await run_io(kind, functools.partial(fn, *args, **kwargs))
-
-
-async def run_io[R](kind: IoKind, work: Callable[[], R], finished: Callable[[], None] | None = None) -> R:
-    """`io` for a prepared call; `finished` runs on the loop once its thread is really done (or the
-    call was cancelled before it started), however long after the deadline that is.
+    """Blocking archive or NFS work on the kind's archive pool; ArchiveUnavailable past its deadline,
+    or at once when `_BACKLOG` reads are queued or the pool is closed.
 
     A read still queued when the deadline passes is cancelled; a running one keeps its thread."""
-    loop = asyncio.get_running_loop()
-    try:
-        job = archive_pool().submit(_counted, work)
-    except BaseException:
-        if finished is not None:
-            finished()  # no thread to wait for
-        raise
-    if finished is not None:
-
-        def done(_: object) -> None:
-            with contextlib.suppress(RuntimeError):  # the loop closed while a hung read went on
-                loop.call_soon_threadsafe(finished)
-
-        job.add_done_callback(done)
+    pool = archive_pool(kind)
+    if pool._work_queue.qsize() >= _BACKLOG:
+        _warn_unavailable(kind)
+        raise ArchiveUnavailable(f"archive unavailable ({kind})")
+    job = pool.submit(fn, *args, **kwargs)
     try:
         async with asyncio.timeout(_DEADLINES[kind]) as deadline:
             return await asyncio.wrap_future(job)
@@ -561,7 +542,6 @@ class ChatVerbs:
         self._history_busy: set[ServerConnection] = set()  # sockets with a history answer pending
         self._action_busy: set[ServerConnection] = set()  # sockets with a message action pending
         self._search_busy: set[ServerConnection] = set()  # sockets with a search pending
-        self._media_reads = 0  # media reads whose thread is still running, past their deadline too
 
     # --- socket wiring ---
 
@@ -871,16 +851,8 @@ class ChatVerbs:
     # --- archive and API reads ---
 
     async def media(self, path: str) -> tuple[bytes, str] | None:
-        """`media_file` on the archive pool, _MEDIA_READS threads at most; ArchiveUnavailable past its
-        deadline, or at once when every slot is taken (waiting would only queue more hung reads)."""
-        if self._media_reads >= _MEDIA_READS:
-            _warn_unavailable("media")
-            raise ArchiveUnavailable("archive unavailable (media busy)")
-        self._media_reads += 1
-        return await run_io("media", functools.partial(self.media_file, path), self._media_done)
-
-    def _media_done(self) -> None:
-        self._media_reads -= 1
+        """`media_file` on the media pool; ArchiveUnavailable past its deadline."""
+        return await io("media", self.media_file, path)
 
     def media_file(self, path: str) -> tuple[bytes, str] | None:
         """`/media/<thread>/<file>`: (body, content type) of an archived asset, None for anything

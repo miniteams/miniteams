@@ -28,10 +28,9 @@ def _default_cache_dir() -> Path:
 def make_private_dir(path: Path) -> bool:
     """Create `path` owner-only; False when it already existed (left as it is)."""
     try:
-        path.mkdir(parents=True)
+        path.mkdir(parents=True, mode=0o700)  # the umask can only remove bits
     except FileExistsError:
         return False
-    path.chmod(0o700)  # Security: mkdir's mode is masked by the umask
     return True
 
 
@@ -40,10 +39,9 @@ def write_private(path: Path, text: str) -> None:
 
     Per-writer temp + os.replace: a reader never sees a partial file, two writers never share a temp."""
     make_private_dir(path.parent)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")  # O_CREAT|O_EXCL, 0600
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")  # Security: O_EXCL, created 0600
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as out:
-            os.fchmod(out.fileno(), 0o600)
             out.write(text)
         os.replace(tmp, path)
     except BaseException:

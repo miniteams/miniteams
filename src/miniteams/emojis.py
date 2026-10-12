@@ -140,7 +140,7 @@ async def _image(client: httpx.AsyncClient, skype_token: str, document_id: str, 
         url = _IMAGE_URL.format(quote(document_id, safe=""))
         return await fetch_image(client, skype_token, url, dest, suffix="")
     except Exception as exc:  # noqa: BLE001 — one missing image must not end the listing
-        log.warning("emoji_image_failed", document_id=document_id, error=str(exc))
+        log.warning("emoji_image_failed", document_id=document_id, error=failure(exc))
         return ""
 
 

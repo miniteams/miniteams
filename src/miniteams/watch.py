@@ -18,7 +18,7 @@ import structlog
 
 from ._io import emit, force_blocking_stdout
 from .auth import AuthExpired, self_mri, token_source
-from .config import Settings
+from .config import Settings, write_private
 from .directory import Directory
 from .dump import iter_history_pages
 from .messages import SNIPPET_LEN, TEXT_TYPES, is_me, plain_text, thread_of
@@ -126,8 +126,7 @@ def note_sent(settings: Settings, client_message_id: str) -> None:
     ids = [x for x in sorted(load_sent_ids(settings)) if x != client_message_id][-(_SENT_MAX - 1) :]
     ids.append(client_message_id)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(ids))
+        write_private(path, json.dumps(ids))
     except OSError as exc:
         log.warning("sent_file_write_failed", path=str(path), error=str(exc))
 

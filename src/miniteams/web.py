@@ -18,6 +18,7 @@ import asyncio
 import base64
 import contextlib
 import errno
+import fcntl
 import functools
 import hashlib
 import hmac
@@ -66,6 +67,7 @@ from .config import Settings, make_private_dir, write_private
 from .directory import Directory, roster_label
 from .dump import fetch_history
 from .emojis import EmojiCache
+from .http import failure
 from .messages import (
     EMOJI,
     is_activity,
@@ -112,7 +114,6 @@ _SECRET_RE = re.compile(r"[\w-]{32,}", re.ASCII)
 _COOKIE = "mt"
 _COOKIE_AGE = 365 * 24 * 3600
 _LAUNCH_FILE = "open.html"
-_LAUNCH_TTL = 600.0  # seconds the launch file's nonce stays valid; replaced once used or found expired
 _NONCE_TTL = 60.0  # seconds a --browser chat open's nonce stays valid; its file goes on the next write
 _NONCE_MAX = 64  # nonces kept; the oldest goes first
 
@@ -195,22 +196,29 @@ def _seed_label(chat: dict[str, Any], me: str) -> str:
     return roster_label(str(chat["topic"] or ""), members, me)
 
 
-def _index_stamp(data_dir: Path | None) -> tuple[int, int, int]:
-    """Identity of the index file's content; (0, 0, 0) when there is none to read."""
-    if data_dir is None:
-        return (0, 0, 0)
+_NO_INDEX: tuple[int, ...] = (0, 0, 0, 0, 0)
+
+
+def _index_stamp(data_dir: Path) -> tuple[int, ...]:
+    """Identity of the index's content; `_NO_INDEX` when there is none to read."""
     try:
         st = (data_dir / "index.db").stat()
     except OSError:
-        return (0, 0, 0)
-    return (st.st_ino, st.st_mtime_ns, st.st_size)
+        return _NO_INDEX
+    try:
+        # WAL mode: a live archiver's commits land in the -wal file, index.db only moves at checkpoints.
+        wal = (data_dir / "index.db-wal").stat()
+    except OSError:
+        return (st.st_ino, st.st_mtime_ns, st.st_size, 0, 0)
+    # A reader opening the index creates an empty -wal: that is no new content.
+    return (st.st_ino, st.st_mtime_ns, st.st_size, wal.st_mtime_ns if wal.st_size else 0, wal.st_size)
 
 
 def _reseed(
-    data_dir: Path, me: str, known: tuple[int, int, int]
-) -> tuple[tuple[int, int, int], dict[str, dict[str, Any]] | None]:
+    data_dir: Path, me: str, known: tuple[int, ...] | None
+) -> tuple[tuple[int, ...], dict[str, dict[str, Any]] | None]:
     """(index stamp, its seed), the seed None when the index is still the `known` one. Blocking."""
-    stamp = _index_stamp(data_dir)
+    stamp = _index_stamp(data_dir)  # before the read: a rewrite in between is caught by the next one
     return stamp, None if stamp == known else seed_from_archive(data_dir, me)
 
 
@@ -403,7 +411,7 @@ async def _recent(thread_id: str, directory: Directory) -> list[dict[str, Any]]:
             fetch_history, directory.settings, directory.skype_token, thread_id, _HISTORY_PAGE, 1
         )
     except Exception as exc:  # noqa: BLE001 — cosmetic enrichment: keep the row as listed
-        log.debug("history_fetch_failed", thread=thread_id, error=str(exc))
+        log.debug("history_fetch_failed", thread=thread_id, error=failure(exc))
         return []
 
 
@@ -504,24 +512,21 @@ def load_secret(settings: Settings) -> str:
 
 
 def _read_owner_only(path: Path) -> str | None:
-    """`path`'s text; None when absent, not a regular file of ours, or open to group/other."""
+    """`path`'s text; None when absent, a symlink, not a regular file of ours, or open to group/other."""
     try:
-        # O_NONBLOCK: a FIFO planted there must not hang the start.
+        # O_NOFOLLOW: a planted symlink fails with ELOOP; O_NONBLOCK: a planted FIFO must not hang the start.
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError:
-        return None
     except OSError as exc:
-        if exc.errno == errno.ELOOP:  # a symlink: whoever planted it may read its target
+        if exc.errno in (errno.ENOENT, errno.ELOOP):
             return None
         raise
-    with os.fdopen(fd, encoding="utf-8", errors="replace") as fh:
+    with open(fd, encoding="utf-8", errors="replace") as fh:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
-            return None
-        return fh.read()
+        ours = stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077
+        return fh.read() if ours else None
 
 
-def run_dir(settings: Settings) -> Path:
+def resolve_run_dir(settings: Settings) -> Path:
     """Where the launch files go: MINITEAMS_RUN_DIR when set, else `$XDG_RUNTIME_DIR/miniteams` when that
     runtime dir is ours, else `<config_dir>/run`. Made 0700; refused when it exists open to anyone else."""
     base = os.environ.get("XDG_RUNTIME_DIR", "")
@@ -529,14 +534,28 @@ def run_dir(settings: Settings) -> Path:
         ours = bool(base) and Path(base).stat().st_uid == os.getuid()
     except OSError:
         ours = False
-    path = Path(base) / "miniteams" if ours else settings.config_dir / "run"
-    if settings.run_dir is not None:
-        path = settings.run_dir.expanduser()
+    path = settings.run_dir or (Path(base) / "miniteams" if ours else settings.config_dir / "run")
+    path = path.expanduser().absolute()  # a relative path has no file:// URI
     if not make_private_dir(path):
         st = path.lstat()
         if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
             raise RuntimeError(f"refusing {path}: it must be a directory only you can open (0700)")
     return path
+
+
+def lock_run_dir(run_dir: Path) -> int:
+    """Hold `<run_dir>/lock` or refuse: a second web on this run dir would overwrite, then delete, the live
+    launch files. Returns the fd; the lock lives as long as it."""
+    lock = os.open(run_dir / "lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock)
+        raise RuntimeError(
+            f"another `miniteams web` is running with {run_dir}; give this one its own "
+            "MINITEAMS_RUN_DIR, MINITEAMS_ENDPOINT_SUFFIX and --bind"
+        ) from None
+    return lock
 
 
 def _launch_page(url: str) -> str:
@@ -574,8 +593,7 @@ def load_bind(settings: Settings, override: str | None = None) -> tuple[str, int
 
 
 def save_bind(settings: Settings, host: str, port: int) -> None:
-    settings.config_dir.mkdir(parents=True, exist_ok=True)
-    (settings.config_dir / "web.json").write_text(json.dumps({"host": host, "port": port}))
+    write_private(settings.config_dir / "web.json", json.dumps({"host": host, "port": port}))
 
 
 # --- server ---
@@ -599,6 +617,7 @@ class Board:
         busy: bool = False,
         seed: dict[str, dict[str, Any]] | None = None,
         data_dir: Path | None = None,
+        seed_stamp: tuple[int, ...] = _NO_INDEX,
     ) -> None:
         self.rows = rows
         self.directory = directory
@@ -614,14 +633,14 @@ class Board:
         self.base_url = ""  # http://host:port, set once bound: `chat` opens point back at us
         self.secret = ""  # the `mt` cookie every route needs: serve_board loads it, routes read it here
         self.run_dir: Path | None = None  # the launch files' dir, set by serve_board
-        self.launch_url = ""  # what `open.html` points at now
-        self._nonces: dict[str, tuple[float, Path]] = {}  # single-use nonce → (monotonic expiry, its file)
+        self._launch_nonce = ""  # `open.html`'s: single use, no TTL, so the file never goes stale
+        self._nonces: dict[str, tuple[float, Path]] = {}  # chat file nonce → (monotonic expiry, its file)
         self.clients: set[ServerConnection] = set()
         self.busy = busy  # the page shows a spinner until the background fill says otherwise
         self.seed = seed or {}
         self.data_dir = data_dir
         self._seed_read = time.monotonic()
-        self._seed_stamp = _index_stamp(data_dir)
+        self._seed_stamp = seed_stamp  # `seed`'s index stamp, read with it: a stat here would block the loop
         self._seed_lock = asyncio.Lock()
         self._typing_timers: dict[tuple[str, str], asyncio.TimerHandle] = {}
         self._follows: dict[ServerConnection, tuple[str, Path | None]] = {}  # socket → (thread, media dir)
@@ -756,7 +775,7 @@ class Board:
                 mark_read, self.directory.settings, self.directory.skype_token, thread_id, row["last_id"]
             )
         except Exception as exc:  # noqa: BLE001 — a failed read marker must not drop the socket
-            log.warning("mark_read_failed", thread=thread_id, error=str(exc))
+            log.warning("mark_read_failed", thread=thread_id, error=failure(exc))
             return False
         return True
 
@@ -807,9 +826,9 @@ class Board:
             name = await sender_of(resource, self.directory)
             if msgtype == "Control/Typing":
                 self._typing_arm(thread_id, name)
-                self._relay(thread_id, {"typing": name, "on": True})
+                self._relay_now(thread_id, {"typing": name, "on": True})
             else:
-                self._typing_stop(thread_id, name)  # relays the clear when this name was typing
+                self._typing_stop(thread_id, name, self._relay_now)
             return
         if resource_type not in ("NewMessage", "MessageUpdate"):
             return
@@ -819,8 +838,9 @@ class Board:
         if "content" not in resource:
             del record["html"]  # a partial update (reaction): the page keeps the body it has
         if resource_type == "NewMessage" and not is_activity(msgtype):
-            self._typing_stop(thread_id, await sender_of(resource, self.directory))  # their message ends it
-        self._relay(thread_id, {"msg" if resource_type == "NewMessage" else "edit": record})
+            name = await sender_of(resource, self.directory)
+            self._typing_stop(thread_id, name, self._relay_now)  # their message ends it
+        self._relay_now(thread_id, {"msg" if resource_type == "NewMessage" else "edit": record})
 
     async def _record(self, resource: dict[str, Any], thread_id: str, media: Path | None) -> dict[str, Any]:
         """The relayed record; past a media read's deadline, records skip the folder for a while."""
@@ -837,28 +857,36 @@ class Board:
     def _followers(self, thread_id: str) -> list[ServerConnection]:
         return [ws for ws, (tid, _) in self._follows.items() if tid == thread_id]
 
-    def _relay(self, thread_id: str, frame: dict[str, Any]) -> None:
-        followers = self._followers(thread_id)
-        if followers and self._relay_task is not None and asyncio.current_task() is not self._relay_task:
-            # From the board or a timer: behind the queued relays, a typing clear must not overtake them.
-            self._enqueue_relay(thread_id, "frame", functools.partial(self._relay_async, thread_id, frame))
-        elif followers:
-            # Named: a page switching chats may still receive frames of the one it left.
-            broadcast(followers, json.dumps({**frame, "thread": thread_id}, ensure_ascii=False))
+    def _relay_now(self, thread_id: str, frame: dict[str, Any]) -> None:
+        """Frame to the thread's followers; only the relay task calls it, so frames keep their order."""
+        # Named: a page switching chats may still receive frames of the one it left.
+        broadcast(self._followers(thread_id), json.dumps({**frame, "thread": thread_id}, ensure_ascii=False))
+
+    def _relay_queued(self, thread_id: str, frame: dict[str, Any]) -> None:
+        """From the board or a timer: behind the queued relays, a typing clear must not overtake them."""
+        if self._followers(thread_id):
+            self._enqueue_relay(thread_id, functools.partial(self._relay_async, thread_id, frame))
 
     # --- launch files: single-use nonces that set the cookie ---
 
     def issue_launch(self) -> None:
         """(Re)write `open.html` with a fresh nonce for the board page; the previous one stops working."""
-        for nonce in [n for n, (_, file) in self._nonces.items() if file.name == _LAUNCH_FILE]:
-            del self._nonces[nonce]
+        assert self.run_dir is not None
+        nonce = secrets.token_urlsafe(24)
         try:
-            self._issue(_LAUNCH_FILE, "/", _LAUNCH_TTL)
+            write_private(self.run_dir / _LAUNCH_FILE, _launch_page(f"{self.base_url}/?n={nonce}"))
         except OSError as exc:
             log.warning("launch_file_failed", error=str(exc))
+            return  # the file still holds the previous nonce: keep it valid
+        self._launch_nonce = nonce
 
-    def _issue(self, name: str, path: str, ttl: float, extra: str = "") -> Path:
-        """Write `<run dir>/<name>`, a redirect to `path` with a nonce good once within `ttl` seconds."""
+    @property
+    def launch_url(self) -> str:
+        """What `open.html` points at now."""
+        return f"{self.base_url}/?n={self._launch_nonce}" if self._launch_nonce else ""
+
+    def _issue(self, name: str, path: str, extra: str = "") -> Path:
+        """Write `<run dir>/<name>`, a redirect to `path` with a nonce good once within _NONCE_TTL."""
         assert self.run_dir is not None
         now = time.monotonic()
         for expired in [n for n, (until, _) in self._nonces.items() if until <= now]:
@@ -866,27 +894,23 @@ class Board:
         while len(self._nonces) >= _NONCE_MAX:
             self._retire(next(iter(self._nonces)))
         nonce = secrets.token_urlsafe(24)
-        url = f"{self.base_url}{path}?n={nonce}{extra}"
         file = self.run_dir / name
-        write_private(file, _launch_page(url))
-        self._nonces[nonce] = (now + ttl, file)
-        if name == _LAUNCH_FILE:
-            self.launch_url = url
+        write_private(file, _launch_page(f"{self.base_url}{path}?n={nonce}{extra}"))
+        self._nonces[nonce] = (now + _NONCE_TTL, file)
         return file
 
     def _retire(self, nonce: str) -> None:
-        """A nonce is spent or found expired: its chat file goes, the launch file gets a fresh nonce."""
+        """A chat file's nonce is spent or found expired: the file goes."""
         entry = self._nonces.pop(nonce, None)
-        if entry is None:
-            return
-        if entry[1].name == _LAUNCH_FILE:
-            self.issue_launch()
-        else:
+        if entry is not None:
             with contextlib.suppress(OSError):
                 entry[1].unlink(missing_ok=True)
 
     def take_nonce(self, nonce: str) -> bool:
-        """A nonce is good once, within its TTL; any use consumes it."""
+        """A nonce is good once (a chat file's, within its TTL); any use consumes it."""
+        if self._launch_nonce and nonce == self._launch_nonce:
+            self.issue_launch()
+            return True
         entry = self._nonces.get(nonce)
         if entry is None:
             return False
@@ -894,10 +918,14 @@ class Board:
         return time.monotonic() < entry[0]
 
     def drop_launch_files(self) -> None:
-        for _, file in self._nonces.values():
+        """Delete every launch file of the run dir: a previous run's nonces died with it, ours die now."""
+        self._nonces.clear()
+        self._launch_nonce = ""
+        if self.run_dir is None:
+            return
+        for file in (self.run_dir / _LAUNCH_FILE, *self.run_dir.glob("chat-*.html")):
             with contextlib.suppress(OSError):
                 file.unlink(missing_ok=True)
-        self._nonces.clear()
 
     def mark_unseen(self, thread_id: str) -> bool:
         """Undo `seen`: the row shows again until the next click."""
@@ -944,16 +972,16 @@ class Board:
         if any(tid == thread_id for tid, _ in self._follows.values()):
             # Queued, not awaited: a record globs the (NFS) media folder, the shared stream must not wait.
             forward = functools.partial(self._forward, thread_id, resource_type, resource, msgtype)
-            self._enqueue_relay(thread_id, resource_type, forward)
+            self._enqueue_relay(thread_id, forward)
 
-    def _enqueue_relay(self, thread_id: str, kind: Any, work: Callable[[], Awaitable[None]]) -> None:
+    def _enqueue_relay(self, thread_id: str, work: Callable[[], Awaitable[None]]) -> None:
         if self._relay_task is None:
             self._relay_task = asyncio.create_task(self._relay_forever())
         try:
             self._relays.put_nowait((thread_id, work))
         except asyncio.QueueFull:
             if not self._dropped:
-                log.warning("follow_relay_stalled", thread=thread_id, resource_type=kind)
+                log.warning("follow_relay_stalled", thread=thread_id)
             if thread_id not in self._dropped:
                 # Once per stall: the page knows its view has a hole (a message, a typing clear).
                 self._gap(thread_id)
@@ -979,15 +1007,13 @@ class Board:
                 self._dropped.clear()
 
     async def _relay_async(self, thread_id: str, frame: dict[str, Any]) -> None:
-        self._relay(thread_id, frame)
+        self._relay_now(thread_id, frame)
 
     def close(self) -> None:
-        """Stop the relays, delete the launch files (the archive pool is the
-        process's: run() closes it)."""
+        """Stop the relays (serve_board owns the launch files, run() the archive pool)."""
         if self._relay_task is not None:
             self._relay_task.cancel()
             self._relay_task = None
-        self.drop_launch_files()
 
     async def _board_event(
         self, thread_id: str, resource_type: Any, resource: dict[str, Any], msgtype: str
@@ -1054,7 +1080,7 @@ class Board:
             text=snippet(msgtype, str(resource.get("content") or ""), resource.get("properties")),
         )
         await self._note_mention(row, resource)
-        self._typing_stop(thread_id, sender)  # their message is the end of their typing
+        self._typing_stop(thread_id, sender, self._relay_queued)  # their message is the end of their typing
         self.broadcast()
 
     async def _message_update(self, thread_id: str, resource: dict[str, Any], msgtype: str) -> None:
@@ -1136,7 +1162,7 @@ class Board:
             return  # a thread we never listed: nothing to annotate
         name = await sender_of(resource, self.directory)
         if not started:
-            self._typing_stop(thread_id, name)
+            self._typing_stop(thread_id, name, self._relay_queued)
             self.broadcast()
             return
         if name not in row["typing"]:
@@ -1152,18 +1178,19 @@ class Board:
         loop = asyncio.get_running_loop()
         self._typing_timers[key] = loop.call_later(self.typing_ttl, self._typing_expired, thread_id, name)
 
-    def _typing_stop(self, thread_id: str, name: str) -> None:
+    def _typing_stop(self, thread_id: str, name: str, relay: Callable[[str, dict[str, Any]], None]) -> None:
+        """Clear `name`'s typing; `relay` tells a follower's page: `_relay_now` from the relay task."""
         timer = self._typing_timers.pop((thread_id, name), None)
         if timer:
             timer.cancel()
             if name != _YOU:  # my own typing on another device is not news to the page
-                self._relay(thread_id, {"typing": name, "on": False})
+                relay(thread_id, {"typing": name, "on": False})
         row = self.rows.get(thread_id)
         if row and name in row["typing"]:
             row["typing"].remove(name)
 
     def _typing_expired(self, thread_id: str, name: str) -> None:
-        self._typing_stop(thread_id, name)
+        self._typing_stop(thread_id, name, self._relay_queued)
         if thread_id in self.rows:  # a followed chat off the board has nothing to repaint
             self.broadcast()
 
@@ -1212,7 +1239,7 @@ class Board:
             )  # the --browser has none of the widget's settings
             name = f"chat-{secrets.token_hex(8)}.html"
             try:
-                url = self._issue(name, f"/chat/{quote(thread_id, safe='')}", _NONCE_TTL, split).as_uri()
+                url = self._issue(name, f"/chat/{quote(thread_id, safe='')}", split).as_uri()
             except OSError as exc:
                 log.warning("launch_file_failed", error=str(exc))
                 return False
@@ -1342,8 +1369,7 @@ def _is_str(value: Any) -> bool:
 
 def _save_marks(path: Path | None, marks: dict[str, str]) -> None:
     if path is not None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(marks, ensure_ascii=False, indent=0))
+        write_private(path, json.dumps(marks, ensure_ascii=False, indent=0))
 
 
 def _load_seen(path: Path | None) -> dict[str, str]:
@@ -1452,7 +1478,8 @@ def _see_other(ws: ServerConnection, location: str) -> Response:
 
 def _not_signed_in(ws: ServerConnection, board: Board) -> Response:
     """403 for a page: how to get the cookie, never the secret."""
-    launch = (board.run_dir / _LAUNCH_FILE).as_uri() if board.run_dir else f"file://…/{_LAUNCH_FILE}"
+    assert board.run_dir is not None  # set before serving
+    launch = (board.run_dir / _LAUNCH_FILE).as_uri()
     hint = (
         f"Not signed in to this miniteams page: open the launch file printed by `miniteams web` ({launch})\n"
     )
@@ -1543,46 +1570,46 @@ async def _route(board: Board, ws: ServerConnection, path: str) -> Response:
 
 
 async def serve_board(board: Board, settings: Settings, bind: str | None) -> None:
-    host, port = load_bind(settings, bind)
     for name in ("widget.html", "chat.html"):
         _page(name)  # a missing ui.js / ui.css or marker fails here, not on the first page load
     board.secret = load_secret(settings)  # never logged: it is every route's only credential
-    board.run_dir = run_dir(settings)
-    for stale in board.run_dir.glob("chat-*.html"):  # a previous run's: their nonces died with it
-        stale.unlink(missing_ok=True)
-    try:
-        for attempt in range(_BIND_ATTEMPTS):
-            bound = netloc(host, port)
-            board.base_url = f"http://{bound}"
-            try:
-                # Only the page we serve may open the socket — any other site's Origin gets 403,
-                # else every open tab could read the chat list (cross-site websocket hijacking).
-                server = await serve(
-                    board.handle,
-                    host,
-                    port,
-                    origins=[Origin(board.base_url)],
-                    process_request=functools.partial(_process_request, board, bound),
-                )
-                break
-            except OSError as exc:
-                if bind or attempt == _BIND_ATTEMPTS - 1:
-                    raise
-                # Persisted port got taken by something else since the draw. Same host: the cookie is
-                # scoped to it, a new address would sign every open page out.
-                log.warning("bind_failed", host=host, port=port, error=str(exc))
-                port = _draw_port()
-                save_bind(settings, host, port)
-        async with server:
-            log.info("web_listening", url=f"{board.base_url}/")
+    board.run_dir = resolve_run_dir(settings)
+    host, port = load_bind(settings, bind)
+    for attempt in range(_BIND_ATTEMPTS):
+        bound = netloc(host, port)
+        board.base_url = f"http://{bound}"
+        try:
+            # Only the page we serve may open the socket — any other site's Origin gets 403,
+            # else every open tab could read the chat list (cross-site websocket hijacking).
+            server = await serve(
+                board.handle,
+                host,
+                port,
+                origins=[Origin(board.base_url)],
+                process_request=functools.partial(_process_request, board, bound),
+            )
+            break
+        except OSError as exc:
+            if bind or attempt == _BIND_ATTEMPTS - 1:
+                raise
+            # Persisted port got taken by something else since the draw. Same host: the cookie is
+            # scoped to it, a new address would sign every open page out.
+            log.warning("bind_failed", host=host, port=port, error=str(exc))
+            port = _draw_port()
+            save_bind(settings, host, port)
+    async with server:
+        log.info("web_listening", url=f"{board.base_url}/")
+        # Only once bound: a second run failing on the port must not delete the live run's files.
+        board.drop_launch_files()
+        try:
             board.issue_launch()
             # The user's own terminal: where the launch file is, never the nonce it holds. A closed
             # stderr must not read as a failed start.
             with contextlib.suppress(OSError):
                 print(f"open: {(board.run_dir / _LAUNCH_FILE).as_uri()}", file=sys.stderr, flush=True)
             await board.watch_page()  # until cancelled
-    finally:
-        board.drop_launch_files()
+        finally:
+            board.drop_launch_files()
 
 
 def resolve_limit(limit: int | None, seeded: bool) -> int:
@@ -1633,7 +1660,7 @@ async def fill_from_listing(
         dropped = board.prune({str(conv.get("id") or "") for conv in convs}, started)
         log.info("web_bootstrap", rows=len(board.rows), listed=len(convs), seeded=len(seed), dropped=dropped)
     except Exception as exc:  # noqa: BLE001 — a failed fill leaves the seeded table, not a dead page
-        log.error("web_bootstrap_failed", error=str(exc), error_type=type(exc).__name__)
+        log.error("web_bootstrap_failed", error=failure(exc), error_type=type(exc).__name__)
     finally:
         board.set_busy(False)  # a spinner that never stops is worse than no spinner
 
@@ -1651,65 +1678,81 @@ async def run(
     me: str = "",
     data_dir: Path | None = None,
 ) -> None:
-    directory = Directory(settings)
-    directory.set_token(skype_token, bearer)
-    directory.me = me
-    seen_path = settings.config_dir / "seen.json"
-    seen = _load_seen(seen_path)
-    seed: dict[str, dict[str, Any]] = {}
-    if data_dir is not None:
-        try:
-            seed = await io("index", seed_from_archive, data_dir, me)
-        except ArchiveUnavailable:
-            log.warning("archive_index_timeout", data_dir=str(data_dir))  # the listing fills the table
-    cap = resolve_limit(limit, seeded=bool(seed))
-    board = Board(
-        seeded_rows(seed, cap),
-        directory,
-        reactions=reactions,
-        seen_path=seen_path,
-        muted_path=settings.config_dir / "muted.json",
-        opener=None if opener in ("", "none") else opener.split(),
-        open_scheme=open_scheme,
-        browser=None if browser in ("", "none") else browser.split(),
-        me=me,
-        busy=True,
-        seed=seed,
-        data_dir=data_dir,
-    )
-    log.info("web_seeded", rows=len(board.rows), seeded=len(seed), limit=cap, me=bool(me))
-    # The stream only returns when auth is dead: a page that silently stops updating is worse
-    # than an exit, so the server goes down with it and the user re-runs.
-    server = asyncio.create_task(serve_board(board, settings, bind))
-    # The page is up before the listing is walked: it fills in, it does not wait.
-    fill = asyncio.create_task(
-        fill_from_listing(board, settings, skype_token, directory, cap, me, seen, seed)
-    )
-    # Own endpoint id: sharing `stream`'s would make whichever registered last the only receiver.
-    stream = asyncio.create_task(
-        run_forever(settings, on_event=board.on_event, directory=directory, epid_name="endpoint_id-web")
-    )
-    emojis = asyncio.create_task(board.emojis.refresh())
+    # Ctrl-C while an archive read hangs on a dead mount must still exit: see `_leave_if_stuck`.
     try:
-        done, pending = await asyncio.wait({server, stream}, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        for task in done:
-            task.result()  # re-raise a server failure (e.g. bind) instead of exiting 0
-        raise RuntimeError("live stream ended (auth expired?) — re-run")
+        directory = Directory(settings)
+        directory.set_token(skype_token, bearer)
+        directory.me = me
+        seen_path = settings.config_dir / "seen.json"
+        seen = _load_seen(seen_path)
+        seed: dict[str, dict[str, Any]] = {}
+        stamp = _NO_INDEX
+        if data_dir is not None:
+            try:
+                stamp, read = await io("index", _reseed, data_dir, me, None)
+                seed = read or {}
+            except ArchiveUnavailable:
+                log.warning("archive_index_timeout", data_dir=str(data_dir))  # the listing fills the table
+        cap = resolve_limit(limit, seeded=bool(seed))
+        board = Board(
+            seeded_rows(seed, cap),
+            directory,
+            reactions=reactions,
+            seen_path=seen_path,
+            muted_path=settings.config_dir / "muted.json",
+            opener=None if opener in ("", "none") else opener.split(),
+            open_scheme=open_scheme,
+            browser=None if browser in ("", "none") else browser.split(),
+            me=me,
+            busy=True,
+            seed=seed,
+            data_dir=data_dir,
+            seed_stamp=stamp,
+        )
+        log.info("web_seeded", rows=len(board.rows), seeded=len(seed), limit=cap, me=bool(me))
+        # The stream only returns when auth is dead: a page that silently stops updating is worse
+        # than an exit, so the server goes down with it and the user re-runs.
+        server = asyncio.create_task(serve_board(board, settings, bind))
+        # The page is up before the listing is walked: it fills in, it does not wait.
+        fill = asyncio.create_task(
+            fill_from_listing(board, settings, skype_token, directory, cap, me, seen, seed)
+        )
+        # Own endpoint id: sharing `stream`'s would make whichever registered last the only receiver.
+        stream = asyncio.create_task(
+            run_forever(settings, on_event=board.on_event, directory=directory, epid_name="endpoint_id-web")
+        )
+        emojis = asyncio.create_task(board.emojis.refresh())
+        try:
+            done, pending = await asyncio.wait({server, stream}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            for task in done:
+                task.result()  # re-raise a server failure (e.g. bind) instead of exiting 0
+            raise RuntimeError("live stream ended (auth expired?) — re-run")
+        finally:
+            fill.cancel()  # the page is going away; a half-finished walk has nobody to tell
+            emojis.cancel()
+            board.close()
     finally:
-        fill.cancel()  # the page is going away; a half-finished walk has nobody to tell
-        emojis.cancel()
-        board.close()
-        close_archive_pool()
+        _leave_if_stuck()
+
+
+def _leave_if_stuck() -> None:
+    """Close the archive pools; exit at once when archive threads outlive the run (see `stuck_exit_code`)."""
+    exc = sys.exception()
+    close_archive_pool()
+    try:
         stuck = stuck_archive_threads()
-        code = stuck_exit_code(sys.exception(), stuck)
-        if code is not None:
-            log.error("archive_threads_stuck", threads=stuck, exit_code=code)
-            for out in (sys.stdout, sys.stderr):
-                with contextlib.suppress(Exception):
-                    out.flush()
-            os._exit(code)  # the interpreter's exit joins the pool's threads: a dead mount would hold it
+    except KeyboardInterrupt:  # a second Ctrl-C during the grace join must not skip the exit
+        stuck = stuck_archive_threads(0)
+    code = stuck_exit_code(exc, stuck)
+    if code is not None:
+        error = failure(exc) if isinstance(exc, Exception) else None
+        log.error("archive_threads_stuck", threads=stuck, exit_code=code, error=error)
+        for out in (sys.stdout, sys.stderr):
+            with contextlib.suppress(Exception):
+                out.flush()
+        os._exit(code)  # the interpreter's exit joins the pool's threads: a dead mount would hold it
 
 
 def stuck_exit_code(exc: BaseException | None, stuck: int) -> int | None:

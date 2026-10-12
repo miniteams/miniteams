@@ -121,9 +121,10 @@ the draft until the page reloads; a failed send keeps the text and shows why. Th
 process exits non-zero when the stream dies (auth expired) — re-run it.
 
 **First launch**
-- Run `web`: at each start it writes a private launch file (`$XDG_RUNTIME_DIR/miniteams/open.html`, else `~/.config/miniteams/run/`; directory `0700`, file `0600`) and prints `open: file://…/open.html` on stderr.
-- Open that file once per browser profile, e.g. `chromium --app=file:///run/user/<uid>/miniteams/open.html`. It redirects through a single-use link (valid 10 min); a valid link answers a small page that sets the `mt` cookie (`HttpOnly; SameSite=Strict`, one year, refreshed on each page load) and refreshes to the bare URL. The file is re-minted after each use, so the same command always works.
-- `MINITEAMS_RUN_DIR` sets the run directory (created `0700`): snap-packaged browsers (e.g. snap Chromium) cannot read files under `/run/user/<uid>` or in hidden directories like `~/.config`, so point it at a non-hidden directory such as `~/miniteams-run`.
+- Run `web`: at each start it writes a private launch file (`$XDG_RUNTIME_DIR/miniteams/open.html`, else `<config dir>/run/` (`~/.config/miniteams/run/` by default); directory `0700`, file `0600`) and prints `open: file://…/open.html` on stderr.
+- Open that file once per browser profile, e.g. `chromium --app=file:///run/user/<uid>/miniteams/open.html`. It redirects through a single-use link; a valid link answers a small page that sets the `mt` cookie (`HttpOnly; SameSite=Strict`, one year, refreshed on each page load) and refreshes to the bare URL. The file is re-minted after each use, so the same command always works.
+- `MINITEAMS_RUN_DIR` sets the run directory (created `0700`; an existing one must already be `0700`): snap-packaged browsers (e.g. snap Chromium) cannot read files under `/run/user/<uid>` or in hidden directories like `~/.config`, so point it at a non-hidden directory such as `~/miniteams-run` (`MINITEAMS_RUN_DIR=~/miniteams-run` in `.env`). Keep it inside a directory only you can write to.
+- One `web` per run directory: a second one (e.g. a test run) refuses to start; give it its own `MINITEAMS_RUN_DIR`, `MINITEAMS_ENDPOINT_SUFFIX` and `--bind`.
 - No secret or token appears on a command line, in the terminal or in the browser history.
 - Any browser without the cookie (a widget window included) opens the launch file once. Without the cookie, pages answer 403 with a hint pointing at it.
 - Open the page by the bound address: any other `Host` name (e.g. `localhost`) gets 404 (DNS-rebinding guard).
@@ -147,7 +148,8 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   - ☰ folds the list, or opens it over the chat below 700px.
   - Ctrl+K jumps to the list's filter: ↑/↓ pick a row, Enter opens it. Seen and Muted sit behind ⋯ in a narrow list.
 - **Composer** (also the widget's quick reply): completes `:emoji` and `@member` (`@everyone` on group chats, not 1:1;
-  picked members are notified). Messages are limited to 28 KB.
+  picked members are notified; a mention needs a non-word character before `@`, and two members with the same name map
+  in the order they were picked). Messages are limited to 28 KB.
   - Widget: inline formatting.
   - Chat page: bold, italic, strike, code, lists, quotes through a toolbar or Ctrl+B / Ctrl+I, plus a preview of the message as posted.
 - **Messages**: hover for actions: reply with a quote, react (Teams' 8 reactions), edit and delete your own. Reaction chips toggle.
@@ -213,9 +215,11 @@ token expires. Downloaded media (from `stream`) lives under `~/.cache/miniteams/
 
 All via `MINITEAMS_*` env vars / `.env` (see `.env.example`). `MINITEAMS_ENDPOINT_SUFFIX=-test` gives a
 second `web`, `stream` or `archive --live` its own Trouter endpoint ids, so it does not take the
-deliveries of the one already running. Defaults are the purple-teams
+deliveries of the one already running; a second `web` also needs its own `MINITEAMS_RUN_DIR` and
+`--bind`. Defaults are the purple-teams
 **work/TFW** constants — override only if auth starts returning 4xx, after re-capturing from a
-live browser session. `MINITEAMS_ASYNCGW_HOST` sets the custom emoji host (default `fr-prod.asyncgw.teams.microsoft.com`).
+live browser session. `MINITEAMS_ASYNCGW_HOST` sets the custom emoji host (default `fr-prod.asyncgw.teams.microsoft.com`); set it when your tenant lives in another region.
+`MINITEAMS_RUN_DIR` sets where `web` writes its launch files (see First launch).
 
 ## Dev
 

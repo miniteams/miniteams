@@ -1372,11 +1372,11 @@ async def test_a_chat_open_sets_the_cookie_once(
             assert got.status_code == 403 and "set-cookie" not in got.headers, bad
         assert await board.open_row(B, "chat")
         stale = _target(launched[-1][1])
-        [nonce] = [n for n, (_, f) in board._nonces.items() if f.name != "open.html"]
+        [nonce] = board._nonces
         board._nonces[nonce] = (time.monotonic() - 1, board._nonces[nonce][1])  # its _NONCE_TTL is over
         got = await client.get(stale)  # expired
         assert got.status_code == 403 and "set-cookie" not in got.headers
-        assert [f.name for _, f in board._nonces.values()] == ["open.html"]  # consumed even when expired
+        assert board._nonces == {}  # consumed even when expired
 
 
 async def test_a_chat_file_goes_when_its_nonce_expires_or_the_server_stops(
@@ -1401,7 +1401,7 @@ def test_the_nonce_store_is_bounded(board: W.Board, tmp_path: Path) -> None:
 
     async def run() -> None:
         board.run_dir, board.base_url = tmp_path, "http://127.0.0.9:1"
-        files = [board._issue(f"chat-{i}.html", "/chat/x", 60.0) for i in range(W._NONCE_MAX + 5)]
+        files = [board._issue(f"chat-{i}.html", "/chat/x") for i in range(W._NONCE_MAX + 5)]
         assert len(board._nonces) == W._NONCE_MAX
         assert [f.exists() for f in files] == [False] * 5 + [True] * W._NONCE_MAX
         nonce = next(reversed(board._nonces))
@@ -2272,7 +2272,7 @@ async def test_the_relay_queue_is_bounded_and_says_once_what_it_drops(
                 "NewMessage", thread, id=str(i), composetime=_at(i), messagetype="Text", content="x"
             )
             forward = functools.partial(board._forward, thread, "NewMessage", resource["resource"], "Text")
-            board._enqueue_relay(thread, "NewMessage", forward)
+            board._enqueue_relay(thread, forward)
 
     def relayed() -> list[str]:
         return [f["msg"]["id"] for f in sent if "msg" in f]
@@ -2348,7 +2348,7 @@ async def test_a_relay_that_hangs_is_cut_and_the_next_one_goes(
         await asyncio.sleep(5)
 
     with structlog.testing.capture_logs() as logs:
-        board._enqueue_relay(C, "NewMessage", stuck)
+        board._enqueue_relay(C, stuck)
         await board.on_event(
             _event("NewMessage", C, id="9", composetime=_at(9), messagetype="Text", content="x")
         )
@@ -2358,48 +2358,86 @@ async def test_a_relay_that_hangs_is_cut_and_the_next_one_goes(
     board.close()
 
 
-async def test_archive_reads_have_their_own_bounded_pool(
-    board: W.Board, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """H2 + M11: 40 media reads hung on NFS take exactly _ARCHIVE_WORKERS archive threads; a Teams
+async def test_archive_reads_have_their_own_bounded_pool() -> None:
+    """H2 + M11: 40 archive reads hung on NFS take exactly _ARCHIVE_WORKERS archive threads; a Teams
     call's to_thread is not held; closing the pool does not wait and cancels the queued reads."""
     release = threading.Event()
     names: list[str] = []
-    monkeypatch.setattr(CV, "_MEDIA_READS", 40)  # the pool's own bound is what this measures
 
-    def hung(path: str) -> None:
+    def hung(i: int) -> None:
         names.append(threading.current_thread().name)
         release.wait(5)
 
-    monkeypatch.setattr(board.chat, "media_file", hung)
-    reads = [asyncio.ensure_future(board.chat.media(f"/media/{T}/{i}")) for i in range(40)]
+    reads = [asyncio.ensure_future(CV.io("dir", hung, i)) for i in range(40)]
+    media = [asyncio.ensure_future(CV.io("media", hung, i)) for i in range(CV._MEDIA_READS + 1)]
     try:
-        await wait(lambda: len(names) == CV._ARCHIVE_WORKERS, "the pool's threads busy")
+        await wait(lambda: len(names) == CV._ARCHIVE_WORKERS + CV._MEDIA_READS, "the pools' threads busy")
         await asyncio.wait_for(asyncio.to_thread(lambda: None), 1)
         started = time.monotonic()
         CV.close_archive_pool()
         assert time.monotonic() - started < 0.5
         with pytest.raises(CV.ArchiveUnavailable, match="archive pool closed"):  # L5: a 503, not a 500
-            CV.archive_pool()
-        # The cancelled reads never ran: their slots come back; the running ones keep theirs.
-        await wait(lambda: board.chat._media_reads == CV._ARCHIVE_WORKERS, "the cancelled reads' slots")
+            CV.archive_pool("dir")
         with pytest.raises(CV.ArchiveUnavailable, match="archive pool closed"):
-            await board.chat.media(f"/media/{T}/late")
+            await CV.io("dir", hung, 40)
     finally:
         release.set()
         outcomes = await asyncio.gather(*reads, return_exceptions=True)
-    assert len(names) == CV._ARCHIVE_WORKERS and len(set(names)) == CV._ARCHIVE_WORKERS
+        media_outcomes = await asyncio.gather(*media, return_exceptions=True)
+    workers = CV._ARCHIVE_WORKERS + CV._MEDIA_READS
+    assert len(names) == workers and len(set(names)) == workers
     assert all(name.startswith("archive") for name in names)
     cancelled = [o for o in outcomes if isinstance(o, asyncio.CancelledError)]
     assert len(cancelled) == 40 - CV._ARCHIVE_WORKERS
+    media_cancelled = [isinstance(o, asyncio.CancelledError) for o in media_outcomes]
+    assert media_cancelled == [False] * CV._MEDIA_READS + [True]
+
+
+async def test_a_full_backlog_refuses_at_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """M2: with the workers hung and the backlog full of deadline-cancelled reads, a further read is
+    refused at once and the queue stops growing."""
+    monkeypatch.setattr(CV, "_BACKLOG", 3)
+    monkeypatch.setitem(CV._DEADLINES, "dir", 0.1)
+    release = threading.Event()
+    try:
+        timed_out = await asyncio.gather(
+            *(CV.io("dir", release.wait, 5) for _ in range(CV._ARCHIVE_WORKERS + 3)), return_exceptions=True
+        )
+        assert all(isinstance(o, CV.ArchiveUnavailable) for o in timed_out)
+        queue = CV.archive_pool("dir")._work_queue
+        assert queue.qsize() == 3
+        started = time.monotonic()
+        with pytest.raises(CV.ArchiveUnavailable):
+            await CV.io("dir", release.wait, 5)
+        assert time.monotonic() - started < 0.05
+        assert queue.qsize() == 3
+    finally:
+        release.set()
+
+
+async def test_stuck_archive_threads_counts_media_threads() -> None:
+    """M3: a read hung in the media pool is an archive thread too."""
+    release, started = threading.Event(), threading.Event()
+
+    def hung() -> bool:
+        started.set()
+        return release.wait(5)
+
+    read = asyncio.ensure_future(CV.io("media", hung))
+    try:
+        # Not a thread count: a previous test's exiting thread would pass it before this read runs.
+        await wait(started.is_set, "the media read running")
+        assert await asyncio.to_thread(CV.stuck_archive_threads, 0.05) == 1
+    finally:
+        release.set()
+    assert await read is True
 
 
 async def test_media_reads_hold_two_threads_until_they_really_end(
     board: W.Board, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """H2 + H3: a media read keeps its slot until its thread ends, past the deadline too; with both slots
-    taken the next read is refused at once instead of queueing behind them. 6 hung reads, in a burst
-    or one after another, never take more than _MEDIA_READS pool threads, and none waits long."""
+    """H2 + H3: 6 hung media reads, in a burst or one after another, never take more than _MEDIA_READS
+    threads, past their deadline too; each gives up at its deadline and the other archive reads stay free."""
     release = threading.Event()
     running: set[str] = set()
     most = 0
@@ -2413,46 +2451,50 @@ async def test_media_reads_hold_two_threads_until_they_really_end(
 
     monkeypatch.setattr(board.chat, "media_file", hung)
     monkeypatch.setitem(CV._DEADLINES, "media", 0.1)
-    started = time.monotonic()
     try:
         burst = await asyncio.gather(
             *(board.chat.media(f"/media/{T}/{i}") for i in range(3)), return_exceptions=True
         )
         assert all(isinstance(o, CV.ArchiveUnavailable) for o in burst)
-        for i in range(3, 6):  # past the deadline: the two hung threads still hold their slots
+        for i in range(3, 6):  # past the deadline: the two hung threads still hold the media pool
             refused = time.monotonic()
-            with pytest.raises(CV.ArchiveUnavailable, match="media busy"):
+            with pytest.raises(CV.ArchiveUnavailable):
                 await board.chat.media(f"/media/{T}/{i}")
-            assert time.monotonic() - refused < 0.05
-        assert await CV.io("dir", lambda: "free") == "free"  # the pool's other threads stay free
+            assert time.monotonic() - refused < 0.5
+        assert await CV.io("dir", lambda: "free") == "free"  # the other archive pool stays free
         assert most == CV._MEDIA_READS == len(running)
-        assert time.monotonic() - started < 1
     finally:
         release.set()
-    await wait(lambda: board.chat._media_reads == 0, "the slots released when the threads end")
+    await wait(lambda: not running, "the hung threads end")
     monkeypatch.setattr(board.chat, "media_file", lambda path: (b"x", "image/png"))
     assert await board.chat.media(f"/media/{T}/again") == (b"x", "image/png")
-    assert board.chat._media_reads == 0
 
 
-async def test_a_third_media_request_answers_503_at_once(
+async def test_a_third_media_request_answers_503_at_its_deadline(
     board: W.Board, settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """H2: over HTTP, with both media slots on hung reads, the next image is a 503 without waiting."""
+    """H2: over HTTP, with both media threads on hung reads, the next image is a 503 at its deadline."""
     release = threading.Event()
-    monkeypatch.setattr(board.chat, "media_file", lambda path: None if release.wait(5) else None)
+    started_reads: list[str] = []
+
+    def hung(path: str) -> None:
+        started_reads.append(path)
+        release.wait(5)
+
+    monkeypatch.setattr(board.chat, "media_file", hung)
+    monkeypatch.setitem(CV._DEADLINES, "media", 0.1)
     try:
         async with _served(board, settings) as host, httpx.AsyncClient(headers=_cookie(board)) as client:
-            hung = [
+            hung_gets = [
                 asyncio.ensure_future(client.get(f"http://{host}/media/{quote(T, safe='')}/{i}.png"))
                 for i in (1, 2)
             ]
-            await wait(lambda: board.chat._media_reads == 2, "two reads running")
+            await wait(lambda: len(started_reads) == 2, "two reads running")
             started = time.monotonic()
             got = await client.get(f"http://{host}/media/{quote(T, safe='')}/3.png")
             assert (got.status_code, time.monotonic() - started < 0.5) == (503, True)
             release.set()
-            assert [r.status_code for r in await asyncio.gather(*hung)] == [404, 404]  # None: not found
+            assert [r.status_code for r in await asyncio.gather(*hung_gets)] == [503, 503]  # past deadline
     finally:
         release.set()
 
@@ -2484,14 +2526,14 @@ async def test_archive_unavailable_is_logged_once_per_window(monkeypatch: pytest
                 await CV.io("dir", release.wait, 5)
     finally:
         release.set()
-    warned = [(e["kind"], e["busy_workers"]) for e in logs if e["event"] == "archive_unavailable"]
-    assert warned == [("dir", 1), ("dir", 4)]
+    warned = [e["kind"] for e in logs if e["event"] == "archive_unavailable"]
+    assert warned == ["dir", "dir"]
 
 
 async def test_board_close_leaves_the_pool_to_the_process(board: W.Board) -> None:
     """M6: closing a board stops its relays only; the archive pool is closed once, by run()."""
     await _following(board, T)
-    board._enqueue_relay(T, "frame", lambda: asyncio.sleep(0))
+    board._enqueue_relay(T, lambda: asyncio.sleep(0))
     task = board._relay_task
     board.close()
     assert board._relay_task is None and task is not None

@@ -382,10 +382,12 @@ None.
   year, refreshed on each page load), derived from a persistent secret (`~/.config/miniteams/web-secret`,
   `0600`; delete to rotate).
 - Launch: `web` writes a private launch file (`$XDG_RUNTIME_DIR/miniteams/open.html`, fallback
-  `~/.config/miniteams/run/`, or `MINITEAMS_RUN_DIR`; dir `0700`, file `0600`) and prints `open: file://…` on stderr at each start. The
-  file redirects through a single-use 10 min link; a valid link answers a small page that sets the cookie and refreshes to the bare URL (no 303). The file is re-minted after each use. No
+  `<config dir>/run/`, or `MINITEAMS_RUN_DIR`; dir `0700`, file `0600`) and prints `open: file://…` on stderr at each start. The
+  file redirects through a single-use link (no expiry); a valid link answers a small page that sets the cookie and refreshes to the bare URL (no 303). The file is re-minted after each use. No
   secret or token ever reaches a command line, the terminal or browser history (a command line is readable by
   other users through `/proc`).
+- One server per run dir (`flock` on `<run dir>/lock`, taken first thing in `cmd_web`, before the login, the archive seed, the stream and `web.json`): a second one refuses
+  to start instead of redrawing the port and overwriting, then deleting, the live launch files.
 - Chat pages opened through `--browser`: a per-open private file (`chat-<random>.html`) redirects through a
   single-use 60 s link; a spent link with a valid cookie just lands on the page.
 - Without the cookie, pages answer 403 with a hint pointing at the launch file; a foreign Host name gets 404.

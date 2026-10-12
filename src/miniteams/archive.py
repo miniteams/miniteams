@@ -27,7 +27,7 @@ from . import attachments, avatars
 from .archive_store import ChatStore, Index
 from .auth import AuthExpired, TokenSource
 from .chats import DRAFTS_THREAD, fetch_conversations, in_archive_scope, last_activity
-from .config import Settings
+from .config import Settings, write_private
 from .directory import Directory
 from .drafts import iter_draft_pages
 from .dump import epoch_seconds, iter_history_pages
@@ -373,10 +373,10 @@ def _write_recordings_manifest(store: ChatStore, recordings: list[dict[str, Any]
         entries.append(entry)
     if not entries:
         return
-    store.media_dir.mkdir(parents=True, exist_ok=True)
-    path = store.media_dir / "recordings.json"
-    path.write_text(json.dumps(entries, ensure_ascii=False, indent=2) + "\n")
-    path.chmod(0o600)  # meeting titles: owner-only, like the transcripts it indexes
+    # meeting titles: owner-only, like the transcripts it indexes
+    write_private(
+        store.media_dir / "recordings.json", json.dumps(entries, ensure_ascii=False, indent=2) + "\n"
+    )
 
 
 async def _download_avatars(store: ChatStore, info: dict[str, Any], skype_token: str, bearer: str) -> int:

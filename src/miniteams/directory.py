@@ -20,8 +20,8 @@ from urllib.parse import quote
 import httpx
 import structlog
 
-from .config import Settings
-from .http import aget_with_retry
+from .config import Settings, write_private
+from .http import aget_with_retry, failure
 
 log = structlog.get_logger()
 
@@ -83,7 +83,8 @@ class Directory:
         # thread_id → (monotonic time fetched, info); LRU-bounded (see _THREADS_MAX).
         self._threads: OrderedDict[str, tuple[float, dict[str, Any] | None]] = OrderedDict()
         self._thread_fetch: dict[str, asyncio.Task[dict[str, Any] | None]] = {}  # in flight
-        self._thread_failed: dict[str, float] = {}  # thread_id → monotonic time of a transient failure
+        # thread_id → monotonic time of a transient failure; capped like _threads.
+        self._thread_failed: OrderedDict[str, float] = OrderedDict()
         self._names_path = settings.cache_dir / "names.json"
         self._names: dict[str, str] = self._load_names()  # MRI → display name (persisted)
         # msg_id → {key → set(MRI)}; LRU-bounded (see _REACTION_LRU_MAX) to cap memory.
@@ -98,8 +99,7 @@ class Directory:
 
     def _save_names(self) -> None:
         try:
-            self._names_path.parent.mkdir(parents=True, exist_ok=True)
-            self._names_path.write_text(json.dumps(self._names, ensure_ascii=False))
+            write_private(self._names_path, json.dumps(self._names, ensure_ascii=False))
         except OSError as exc:  # cache is best-effort; a write failure must not break the stream
             log.debug("names_cache_save_failed", error=str(exc))
 
@@ -138,7 +138,7 @@ class Directory:
                 resp.raise_for_status()
                 data = resp.json()
         except Exception as exc:  # noqa: BLE001 — transient failure: leave uncached, retry later
-            log.debug("profile_resolve_failed", count=len(todo), error=str(exc))
+            log.debug("profile_resolve_failed", count=len(todo), error=failure(exc))
             return
         for user in data.get("value") or data.get("resolvedUsers") or []:
             self.note_name(user.get("mri", ""), user.get("displayName"))
@@ -204,7 +204,7 @@ class Directory:
                 return self._thread_failure(thread_id)
             info = None
         except Exception as exc:  # noqa: BLE001 — enrichment is best-effort, never fatal
-            log.debug("thread_fetch_failed", thread=thread_id, error=str(exc))
+            log.debug("thread_fetch_failed", thread=thread_id, error=failure(exc))
             return self._thread_failure(thread_id)
         self._thread_failed.pop(thread_id, None)
         self._threads[thread_id] = (time.monotonic(), info)  # a definitive 404 is cached too
@@ -215,12 +215,11 @@ class Directory:
 
     def _thread_failure(self, thread_id: str) -> dict[str, Any] | None:
         """Note a transient failure; the stale copy, if any, is kept and returned."""
-        now = time.monotonic()
-        # Forever-running stream: keep only failures still inside the window, so the map stays bounded.
-        self._thread_failed = {
-            t: at for t, at in self._thread_failed.items() if now - at < _THREAD_RETRY_AFTER
-        }
-        self._thread_failed[thread_id] = now
+        # Forever-running stream: cap it; thread() ignores entries past _THREAD_RETRY_AFTER anyway.
+        self._thread_failed[thread_id] = time.monotonic()
+        self._thread_failed.move_to_end(thread_id)
+        while len(self._thread_failed) > _THREADS_MAX:
+            self._thread_failed.popitem(last=False)
         stale = self._threads.get(thread_id)
         return stale[1] if stale else None
 

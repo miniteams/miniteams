@@ -10,7 +10,7 @@ import httpx
 import pytest
 import websockets
 from conftest import board_socket, cookie_header, wait
-from test_web_chat import _send
+from test_web_chat import _relayed, _send
 
 from miniteams import chat_verbs as CV
 from miniteams import web as W
@@ -668,6 +668,33 @@ async def test_message_ends_senders_typing(board: W.Board) -> None:
     await board.on_event(_msg("19:a@thread.v2", "2026-09-15T12:00:00Z", "sent"))
     assert board.rows["19:a@thread.v2"]["typing"] == []
     assert board._typing_timers == {}
+
+
+async def test_typing_clears_queue_behind_pending_relays(
+    board: W.Board, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M4: an expiry and a board message clear typing through the relay queue, never ahead of it."""
+    frames = _relayed(monkeypatch)
+    thread = "19:a@thread.v2"
+    board._follows[object()] = (thread, None)  # type: ignore[index]
+    gate = asyncio.Event()
+
+    async def parked() -> None:
+        await gate.wait()
+        board._relay_now(thread, {"msg": "queued"})
+
+    board._enqueue_relay(thread, parked)
+    await asyncio.sleep(0)  # the relay task is now parked on it
+    board._typing_arm(thread, "Bob")
+    board._typing_expired(thread, "Bob")
+    board._typing_arm(thread, "Bob")
+    await board.on_event(_msg(thread, "2026-09-15T12:00:00Z", "sent", msg_id="11"))
+    assert frames == []
+    gate.set()
+    await wait(lambda: len(frames) >= 4, "4 frames")
+    assert [next(iter(f)) for f in frames] == ["msg", "typing", "typing", "msg"]
+    assert frames[0]["msg"] == "queued"
+    board.close()
 
 
 async def test_edit_and_delete_only_touch_the_last_message(board: W.Board) -> None:

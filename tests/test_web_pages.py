@@ -1,6 +1,7 @@
 """The served pages and the socket handshake (spec 011 fix rounds): the persisted cookie secret, the
 launch URL, the page headers, and ui.css / ui.js inlined into both pages."""
 
+import argparse
 import asyncio
 import base64
 import hashlib
@@ -11,6 +12,8 @@ import socket
 import stat
 import threading
 import time
+import types
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import quote
 
@@ -19,9 +22,10 @@ import pytest
 import structlog
 import structlog.testing
 import websockets
-from conftest import auth_cookie, board_socket, cookie_header, launch_url
+from conftest import auth_cookie, board_socket, cookie_header
 from test_web_chat import _cookie, _served
 
+from miniteams import auth, cli
 from miniteams import chat_verbs as CV
 from miniteams import web as W
 from miniteams.config import Settings, write_private
@@ -104,6 +108,13 @@ def test_the_secret_persists_owner_only(settings: Settings) -> None:
     path.symlink_to(planted)
     assert W.load_secret(settings) != "p" * 43
     assert not path.is_symlink() and planted.read_text() == "p" * 43  # the link is replaced, not followed
+    path.unlink()
+    os.mkfifo(path)
+    got: list[str] = []
+    reader = threading.Thread(target=lambda: got.append(W.load_secret(settings)), daemon=True)
+    reader.start()
+    reader.join(5)  # a blocking open would hang here: fail instead
+    assert got and re.fullmatch(r"[\w-]{43}", got[0]) and path.is_file()
 
 
 def test_an_unreadable_secret_is_one_clear_error(settings: Settings) -> None:
@@ -116,26 +127,6 @@ def test_an_unreadable_secret_is_one_clear_error(settings: Settings) -> None:
     with pytest.raises(RuntimeError, match=f"cannot read {re.escape(str(path))}: Permission denied") as exc:
         W.load_secret(settings)
     assert exc.value.__cause__ is None and exc.value.__suppress_context__
-
-
-def test_write_private_never_exposes_a_byte(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """M10: 0600 whatever the umask, a new parent 0700, the old content until the swap, no temp left."""
-    target = tmp_path / "new" / "f"
-    old = os.umask(0)
-    try:
-        write_private(target, "one")
-    finally:
-        os.umask(old)
-    assert target.read_text() == "one" and stat.S_IMODE(target.stat().st_mode) == 0o600
-    assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
-
-    def failing(src: object, dst: object) -> None:
-        raise OSError("disk full")
-
-    monkeypatch.setattr(os, "replace", failing)
-    with pytest.raises(OSError, match="disk full"):
-        write_private(target, "two")
-    assert target.read_text() == "one" and os.listdir(target.parent) == ["f"]
 
 
 def test_the_token_files_are_owner_only(settings: Settings) -> None:
@@ -163,26 +154,61 @@ def test_the_token_files_are_owner_only(settings: Settings) -> None:
     ]
 
 
+def _bind(settings: Settings) -> Path:
+    W.save_bind(settings, "127.0.0.1", 1)
+    return settings.config_dir / "web.json"
+
+
+def _marks(settings: Settings) -> Path:
+    W._save_marks(settings.config_dir / "seen.json", {"a": "b"})
+    return settings.config_dir / "seen.json"
+
+
+def _names(settings: Settings) -> Path:
+    from miniteams.directory import Directory
+
+    Directory(settings)._save_names()
+    return settings.cache_dir / "names.json"
+
+
+def _sent(settings: Settings) -> Path:
+    from miniteams.watch import note_sent
+
+    note_sent(settings, "c1")
+    return settings.cache_dir / "mcp-sent.json"
+
+
+@pytest.mark.parametrize("write", [_bind, _marks, _names, _sent])
+def test_the_state_files_are_owner_only(settings: Settings, write: Callable[[Settings], Path]) -> None:
+    """M5: the bind, the marks, the names cache and the sent ids go through write_private, umask or not."""
+    old = os.umask(0o022)
+    try:
+        path = write(settings)
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
 def test_the_run_dir_is_private(settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """H1: the launch files live in $XDG_RUNTIME_DIR/miniteams when that dir is ours, else
     <config_dir>/run; made 0700, refused when open to others or not a plain directory."""
-    assert W.run_dir(settings) == settings.config_dir / "run"
+    assert W.resolve_run_dir(settings) == settings.config_dir / "run"
     runtime = tmp_path / "xdg"
     runtime.mkdir()
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
-    made = W.run_dir(settings)
+    made = W.resolve_run_dir(settings)
     assert made == runtime / "miniteams" and stat.S_IMODE(made.stat().st_mode) == 0o700
     made.chmod(0o750)
     with pytest.raises(RuntimeError, match="0700"):
-        W.run_dir(settings)
+        W.resolve_run_dir(settings)
     made.rmdir()
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir(mode=0o700)
     made.symlink_to(elsewhere)
     with pytest.raises(RuntimeError, match="0700"):
-        W.run_dir(settings)
+        W.resolve_run_dir(settings)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "missing"))
-    assert W.run_dir(settings) == settings.config_dir / "run"
+    assert W.resolve_run_dir(settings) == settings.config_dir / "run"
 
 
 async def test_the_run_dir_setting_wins(
@@ -195,7 +221,7 @@ async def test_the_run_dir_setting_wins(
     settings.config_dir, settings.cache_dir = tmp_path / "cfg", tmp_path / "cache"
     board = _board()
     async with _served(board, settings) as host, httpx.AsyncClient() as client:
-        assert board.run_dir == tmp_path / "launch" == W.run_dir(settings)
+        assert board.run_dir == tmp_path / "launch" == W.resolve_run_dir(settings)
         path, url = _launch_file(board)
         assert path == tmp_path / "launch" / "open.html"
         hint = (await client.get(f"http://{host}/")).text
@@ -231,7 +257,7 @@ async def test_the_launch_file_sets_the_cookie_once(
     with structlog.testing.capture_logs() as logs:
         async with _served(board, settings) as host, httpx.AsyncClient() as client:
             path, url = _launch_file(board)
-            assert url == board.launch_url == launch_url(board)
+            assert url == board.launch_url
             assert re.fullmatch(rf"http://{re.escape(host)}/\?n=[\w-]{{32}}", url)
             cookie = f"mt={board.secret}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000"
             thread = quote(B, safe="")
@@ -264,17 +290,134 @@ async def test_the_launch_file_sets_the_cookie_once(
     assert [e["url"] for e in logs if e["event"] == "web_listening"] == [f"http://{host}/"]
 
 
-async def test_an_expired_launch_nonce_is_replaced_when_found(settings: Settings) -> None:
-    """H1: no timer: a launch nonce found past _LAUNCH_TTL is refused and the file gets a fresh one."""
+async def test_the_launch_nonce_never_expires(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """H1: `open.html` is the user's way in at any time: its nonce has no TTL, only its single use."""
     board = _board()
-    async with _served(board, settings) as host, httpx.AsyncClient() as client:
+    async with _served(board, settings), httpx.AsyncClient() as client:
         first = board.launch_url
-        [nonce] = board._nonces
-        board._nonces[nonce] = (time.monotonic() - 1, board._nonces[nonce][1])
-        assert (await client.get(first)).status_code == 403
+        later = time.monotonic() + 24 * 3600
+        monkeypatch.setattr(W, "time", types.SimpleNamespace(monotonic=lambda: later))  # web's clock only
+        assert (await client.get(first)).status_code == 200
         assert board.launch_url != first and _launch_file(board)[1] == board.launch_url
-        assert len(board._nonces) == 1 and host in board.launch_url
-        assert (await client.get(board.launch_url)).status_code == 200
+        client.cookies.clear()
+        assert (await client.get(first)).status_code == 403
+
+
+async def test_startup_drops_a_previous_runs_launch_files(settings: Settings) -> None:
+    """H1: a previous run's chat files hold dead nonces: the server deletes them when it starts."""
+    run = W.resolve_run_dir(settings)
+    stale = [run / "chat-0123456789abcdef.html", run / "chat-x.html"]
+    for file in stale:
+        write_private(file, "dead")
+    kept = run / "notes.html"
+    write_private(kept, "not ours")
+    async with _served(_board(), settings):
+        assert not any(file.exists() for file in stale) and kept.exists()
+
+
+def _web_args(tmp_path: Path) -> argparse.Namespace:
+    return argparse.Namespace(
+        limit=None,
+        bind=None,
+        reactions=False,
+        opener="none",
+        open_scheme="msteams",
+        browser="",
+        data_dir=str(tmp_path),
+    )
+
+
+def test_a_second_web_on_the_same_run_dir_refuses_before_any_network(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M1: a second web on a live run dir stops before the login, the skype exchange and the server."""
+
+    def started(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("reached the network before the run dir lock")
+
+    for name in ("acquire_aad_token", "exchange_skype_token"):
+        monkeypatch.setattr(cli, name, started)
+    monkeypatch.setattr(auth, "self_mri", started)
+    monkeypatch.setattr(W, "run", started)
+    held = W.lock_run_dir(W.resolve_run_dir(settings))
+    try:
+        with pytest.raises(RuntimeError, match="another `miniteams web` is running") as refused:
+            cli.cmd_web(settings, _web_args(tmp_path))
+    finally:
+        os.close(held)
+    assert "MINITEAMS_ENDPOINT_SUFFIX" in str(refused.value) and "--bind" in str(refused.value)
+
+
+def test_web_holds_the_run_dir_lock_while_it_serves(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M1: the lock taken by `cmd_web` is still held while the server runs."""
+    fds: list[int] = []
+    lock = W.lock_run_dir
+
+    def locking(run_dir: Path) -> int:
+        fds.append(lock(run_dir))
+        return fds[-1]
+
+    async def serving(*_args: object, **_kwargs: object) -> None:
+        with pytest.raises(RuntimeError, match="another `miniteams web` is running"):
+            lock(W.resolve_run_dir(settings))
+        served.append(True)
+
+    served: list[bool] = []
+    monkeypatch.setattr(W, "lock_run_dir", locking)
+    monkeypatch.setattr(W, "run", serving)
+    monkeypatch.setattr(cli, "_ensure_skype_token", lambda s: ({"access_token": "a"}, "sk"))
+    monkeypatch.setattr(auth, "self_mri", lambda token: "8:me")
+    try:
+        assert cli.cmd_web(settings, _web_args(tmp_path)) == 0
+    finally:
+        for fd in fds:
+            os.close(fd)
+    assert served == [True] and len(fds) == 1
+
+
+def test_a_relative_run_dir_is_made_absolute(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L2: a relative MINITEAMS_RUN_DIR or MINITEAMS_CONFIG_DIR resolves against the cwd, so its launch
+    file has a file:// URI."""
+    monkeypatch.chdir(tmp_path)
+    path = W.resolve_run_dir(settings.model_copy(update={"run_dir": Path("rel")}))
+    assert path == tmp_path / "rel" and path.as_uri().startswith("file:///")
+    path = W.resolve_run_dir(settings.model_copy(update={"config_dir": Path("cfg-rel")}))
+    assert path == tmp_path / "cfg-rel" / "run" and path.as_uri().startswith("file:///")
+
+
+async def test_a_second_run_on_the_same_port_leaves_the_live_files(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """M1: the launch files are dropped only once bound: a run failing on the port keeps the live ones."""
+    board = _board()
+    async with _served(board, settings) as host:
+        path, url = _launch_file(board)
+        with pytest.raises(OSError):
+            await W.serve_board(_board(), settings.model_copy(update={"run_dir": tmp_path / "other"}), host)
+        assert _launch_file(board) == (path, url)
+
+
+async def test_a_failed_launch_file_write_keeps_the_previous_nonce(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L1: re-minting `open.html` fails: the nonce it still holds stays the valid one."""
+    board = _board()
+    async with _served(board, settings):
+        path, url = _launch_file(board)
+        assert url == board.launch_url
+
+        def fail(*_: object) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(W, "write_private", fail)
+        with structlog.testing.capture_logs() as logs:
+            assert board.take_nonce(url.split("?n=", 1)[1])
+        assert board.launch_url == url and _launch_file(board) == (path, url)
+        assert [e["error"] for e in logs if e["event"] == "launch_file_failed"] == ["disk full"]
 
 
 async def test_a_spent_nonce_with_the_cookie_lands_without_it(settings: Settings) -> None:

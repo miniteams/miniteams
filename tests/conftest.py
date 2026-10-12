@@ -139,6 +139,7 @@ def settings(tmp_path: Any) -> Settings:
     s = Settings(tenant_id="tenant-123")
     s.config_dir = tmp_path / "cfg"
     s.cache_dir = tmp_path / "cache"
+    s.run_dir = None  # the developer's .env MINITEAMS_RUN_DIR holds the live server's launch files
     return s
 
 
@@ -152,11 +153,6 @@ def directory(settings: Settings) -> Directory:
 def auth_cookie(board: Any) -> dict[str, str]:
     """The `mt` cookie of a served board, in Playwright's `context.add_cookies` shape."""
     return {"name": "mt", "value": board.secret, "url": board.base_url}
-
-
-def launch_url(board: Any) -> str:
-    """The `http://…/?n=<nonce>` the served board's `open.html` points at now (single use)."""
-    return str(board.launch_url)
 
 
 def cookie_header(secret: str) -> dict[str, str]:

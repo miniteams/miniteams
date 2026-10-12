@@ -214,8 +214,10 @@ def cmd_web(settings: Settings, args: argparse.Namespace) -> int:
     from pathlib import Path
 
     from .auth import self_mri
-    from .web import run
+    from .web import lock_run_dir, resolve_run_dir, run
 
+    # Before any login or network call; the fd stays open, the lock is released with the process.
+    _lock = lock_run_dir(resolve_run_dir(settings))
     aad, skype_token = _ensure_skype_token(settings)
     bearer = str(aad.get("id_token") or aad["access_token"])
     me = self_mri(str(aad["access_token"]))
