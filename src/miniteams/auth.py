@@ -60,10 +60,19 @@ def _stamp(path: Path) -> tuple[int, int, int]:
     return (st.st_ino, st.st_mtime_ns, st.st_size)
 
 
+def _cache_file(settings: Settings) -> Path:
+    return settings.config_dir / "msal_cache.json"
+
+
+def cache_stamp(settings: Settings) -> tuple[int, int, int]:
+    """The token cache file's identity: it changes when any process (`miniteams login`) writes it."""
+    return _stamp(_cache_file(settings))
+
+
 def _build_cache(settings: Settings) -> tuple[msal.SerializableTokenCache, Path]:
     settings.config_dir.mkdir(parents=True, exist_ok=True)
     settings.config_dir.chmod(0o700)
-    cache_path = settings.config_dir / "msal_cache.json"
+    cache_path = _cache_file(settings)
     cache = _load_cache(cache_path)
     atexit.register(_persist_cache, cache, cache_path)
     return cache, cache_path

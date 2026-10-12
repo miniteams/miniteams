@@ -1599,8 +1599,8 @@ async def run(
             seed_stamp=stamp,
         )
         log.info("web_seeded", rows=len(board.rows), seeded=len(seed), limit=cap, me=bool(me))
-        # The stream only returns when auth is dead: a page that silently stops updating is worse
-        # than an exit, so the server goes down with it and the user re-runs.
+        # The stream waits out a dead login (see run_forever) and returns only on failure: a page that
+        # silently stops updating is worse than an exit, so the server goes down with it.
         server = asyncio.create_task(serve_board(board, settings, bind))
         # The page is up before the listing is walked: it fills in, it does not wait.
         fill = asyncio.create_task(
@@ -1608,7 +1608,13 @@ async def run(
         )
         # Own endpoint id: sharing `stream`'s would make whichever registered last the only receiver.
         stream = asyncio.create_task(
-            run_forever(settings, on_event=board.on_event, directory=directory, epid_name="endpoint_id-web")
+            run_forever(
+                settings,
+                on_event=board.on_event,
+                directory=directory,
+                epid_name="endpoint_id-web",
+                wait_for_login=True,  # a `miniteams login` elsewhere brings the widget back
+            )
         )
         emojis = asyncio.create_task(board.emojis.refresh())
         try:
@@ -1617,7 +1623,7 @@ async def run(
                 task.cancel()
             for task in done:
                 task.result()  # re-raise a server failure (e.g. bind) instead of exiting 0
-            raise RuntimeError("live stream ended (auth expired?) — re-run")
+            raise RuntimeError("live stream ended — re-run")
         finally:
             fill.cancel()  # the page is going away; a half-finished walk has nobody to tell
             emojis.cancel()

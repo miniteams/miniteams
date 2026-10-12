@@ -358,3 +358,21 @@ async def test_run_stats_the_index_off_the_loop(
     with pytest.raises(RuntimeError, match="live stream ended"):
         await W.run(settings, "sk", "", None, None, data_dir=tmp_path)
     assert stats and all(name.startswith("archive") for name in stats)
+
+
+async def test_the_widget_s_stream_waits_out_a_dead_login(
+    settings: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A widget left open must come back after a `miniteams login` elsewhere, not exit on it."""
+    _stream_ends_once_served(monkeypatch)
+    ended = W.run_forever
+    asked: list[Any] = []
+
+    async def spy(*a: Any, **kw: Any) -> None:
+        asked.append(kw.get("wait_for_login"))
+        await ended(*a, **kw)
+
+    monkeypatch.setattr(W, "run_forever", spy)
+    with pytest.raises(RuntimeError, match="live stream ended"):
+        await W.run(settings, "sk", "", None, None)
+    assert asked == [True]
