@@ -8,17 +8,17 @@ Routes: `/` the board page, `/chat/<thread>` a chat page, `/media/<thread>/<file
 archived and custom-emoji images, `/ws` the socket (`/ws?chat` for a chat page).
 
 Bind is `127.0.0.X:PORT` with X and PORT drawn once and persisted (`web.json`) so the URL
-survives restarts; the whole 127/8 is loopback on Linux, no interface setup needed. Every route
-needs the `mt` cookie, the persisted `web-secret`. No secret goes through argv, the terminal or the
-history: a page opened with `?n=<nonce>` (single use) gets the cookie, and the nonces live in owner-only
-launch files of the run dir — `open.html`, printed at start, and one `chat-*.html` per --browser open.
+survives restarts; the whole 127/8 is loopback on Linux, no interface setup needed. Pages are static
+shells; every route carrying data needs the `mt` cookie, the persisted `web-secret`. A browser gets it by
+loading a page with `#<token>`: the page trades the single-use token at `/auth`; `web.json` and the
+launch file (`open.html`) hold the current one. The secret never goes through argv, the terminal or
+the history.
 """
 
 import asyncio
 import base64
 import contextlib
 import errno
-import fcntl
 import functools
 import hashlib
 import hmac
@@ -39,7 +39,7 @@ from http import HTTPStatus
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import structlog
 from websockets.asyncio.server import ServerConnection, broadcast, serve
@@ -63,7 +63,7 @@ from .chat_verbs import (
     stuck_archive_threads,
 )
 from .chats import fetch_conversations, is_meeting, is_private, last_activity
-from .config import Settings, make_private_dir, write_private
+from .config import Settings, write_private
 from .directory import Directory, roster_label
 from .dump import fetch_history
 from .emojis import EmojiCache
@@ -113,9 +113,7 @@ _COOKIE_FILE = "web-secret"
 _SECRET_RE = re.compile(r"[\w-]{32,}", re.ASCII)
 _COOKIE = "mt"
 _COOKIE_AGE = 365 * 24 * 3600
-_LAUNCH_FILE = "open.html"
-_NONCE_TTL = 60.0  # seconds a --browser chat open's nonce stays valid; its file goes on the next write
-_NONCE_MAX = 64  # nonces kept; the oldest goes first
+_TOKEN_HEADER = "X-Miniteams-Token"
 
 type OpenTarget = Literal["app", "web", "chat", "split"]
 
@@ -526,47 +524,6 @@ def _read_owner_only(path: Path) -> str | None:
         return fh.read() if ours else None
 
 
-def resolve_run_dir(settings: Settings) -> Path:
-    """Where the launch files go: MINITEAMS_RUN_DIR when set, else `$XDG_RUNTIME_DIR/miniteams` when that
-    runtime dir is ours, else `<config_dir>/run`. Made 0700; refused when it exists open to anyone else."""
-    base = os.environ.get("XDG_RUNTIME_DIR", "")
-    try:
-        ours = bool(base) and Path(base).stat().st_uid == os.getuid()
-    except OSError:
-        ours = False
-    path = settings.run_dir or (Path(base) / "miniteams" if ours else settings.config_dir / "run")
-    path = path.expanduser().absolute()  # a relative path has no file:// URI
-    if not make_private_dir(path):
-        st = path.lstat()
-        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
-            raise RuntimeError(f"refusing {path}: it must be a directory only you can open (0700)")
-    return path
-
-
-def lock_run_dir(run_dir: Path) -> int:
-    """Hold `<run_dir>/lock` or refuse: a second web on this run dir would overwrite, then delete, the live
-    launch files. Returns the fd; the lock lives as long as it."""
-    lock = os.open(run_dir / "lock", os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        os.close(lock)
-        raise RuntimeError(
-            f"another `miniteams web` is running with {run_dir}; give this one its own "
-            "MINITEAMS_RUN_DIR, MINITEAMS_ENDPOINT_SUFFIX and --bind"
-        ) from None
-    return lock
-
-
-def _launch_page(url: str) -> str:
-    """A launch file's whole content: straight on to `url`, a plain link if the refresh is blocked."""
-    href = html.escape(url)
-    return (
-        f'<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url={href}">'
-        f'<a href="{href}">miniteams</a>\n'
-    )
-
-
 def _draw_port() -> int:
     return random.randint(32768, 60999)
 
@@ -577,23 +534,42 @@ def _draw_bind() -> tuple[str, int]:
     return f"127.0.0.{random.randint(2, 254)}", _draw_port()
 
 
-def load_bind(settings: Settings, override: str | None = None) -> tuple[str, int]:
-    """`--bind` wins; else the persisted draw; else draw now and persist."""
-    if override:
-        return parse_bind(override)
-    path = settings.config_dir / "web.json"
+def _persisted_bind(settings: Settings) -> tuple[str, int] | None:
     try:
-        data = json.loads(path.read_text())
+        data = json.loads((settings.config_dir / "web.json").read_text())
         return str(data["host"]), int(data["port"])
     except OSError, ValueError, KeyError, TypeError:
-        pass
-    host, port = _draw_bind()
-    save_bind(settings, host, port)
-    return host, port
+        return None
 
 
-def save_bind(settings: Settings, host: str, port: int) -> None:
-    write_private(settings.config_dir / "web.json", json.dumps({"host": host, "port": port}))
+def load_bind(settings: Settings, override: str | None = None) -> tuple[str, int]:
+    """`--bind` wins; else the persisted draw; else a new draw (serve_board persists it once bound)."""
+    if override:
+        return parse_bind(override)
+    return _persisted_bind(settings) or _draw_bind()
+
+
+def save_bind(settings: Settings, host: str, port: int, token: str) -> None:
+    """`web.json`: the bind, and the launch token a browser trades for the cookie."""
+    write_private(settings.config_dir / "web.json", json.dumps({"host": host, "port": port, "token": token}))
+
+
+def launch_page(host: str, port: int, token: str) -> str:
+    url = html.escape(f"http://{netloc(host, port)}/#{token}")
+    return f'<!doctype html><meta http-equiv="refresh" content="0;url={url}"><a href="{url}">miniteams</a>\n'
+
+
+def publish(settings: Settings, host: str, port: int, guarded: bool, token: str) -> bool:
+    """Write `token` into web.json and the launch file; False, writing nothing, when `guarded` (a --bind
+    run) and web.json names another server, whose launch token lives there."""
+    if guarded and _persisted_bind(settings) not in (None, (host, port)):
+        return False
+    save_bind(settings, host, port, token)
+    try:
+        write_private(settings.launch_file, launch_page(host, port, token))
+    except OSError as exc:  # web.json holds the token: rotation must go on
+        log.warning("launch_file_failed", path=str(settings.launch_file), error=str(exc))
+    return True
 
 
 # --- server ---
@@ -632,9 +608,8 @@ class Board:
         self.browser = browser  # argv for the https link on Ctrl/middle click; None = page's own browser
         self.base_url = ""  # http://host:port, set once bound: `chat` opens point back at us
         self.secret = ""  # the `mt` cookie every route needs: serve_board loads it, routes read it here
-        self.run_dir: Path | None = None  # the launch files' dir, set by serve_board
-        self._launch_nonce = ""  # `open.html`'s: single use, no TTL, so the file never goes stale
-        self._nonces: dict[str, tuple[float, Path]] = {}  # chat file nonce → (monotonic expiry, its file)
+        self.token = secrets.token_urlsafe(24)  # single use: `/auth` trades it for the cookie
+        self.publish: Callable[[str], bool] | None = None  # a new token into web.json, set by serve_board
         self.clients: set[ServerConnection] = set()
         self.busy = busy  # the page shows a spinner until the background fill says otherwise
         self.seed = seed or {}
@@ -867,65 +842,19 @@ class Board:
         if self._followers(thread_id):
             self._enqueue_relay(thread_id, functools.partial(self._relay_async, thread_id, frame))
 
-    # --- launch files: single-use nonces that set the cookie ---
-
-    def issue_launch(self) -> None:
-        """(Re)write `open.html` with a fresh nonce for the board page; the previous one stops working."""
-        assert self.run_dir is not None
-        nonce = secrets.token_urlsafe(24)
-        try:
-            write_private(self.run_dir / _LAUNCH_FILE, _launch_page(f"{self.base_url}/?n={nonce}"))
-        except OSError as exc:
-            log.warning("launch_file_failed", error=str(exc))
-            return  # the file still holds the previous nonce: keep it valid
-        self._launch_nonce = nonce
-
-    @property
-    def launch_url(self) -> str:
-        """What `open.html` points at now."""
-        return f"{self.base_url}/?n={self._launch_nonce}" if self._launch_nonce else ""
-
-    def _issue(self, name: str, path: str, extra: str = "") -> Path:
-        """Write `<run dir>/<name>`, a redirect to `path` with a nonce good once within _NONCE_TTL."""
-        assert self.run_dir is not None
-        now = time.monotonic()
-        for expired in [n for n, (until, _) in self._nonces.items() if until <= now]:
-            self._retire(expired)
-        while len(self._nonces) >= _NONCE_MAX:
-            self._retire(next(iter(self._nonces)))
-        nonce = secrets.token_urlsafe(24)
-        file = self.run_dir / name
-        write_private(file, _launch_page(f"{self.base_url}{path}?n={nonce}{extra}"))
-        self._nonces[nonce] = (now + _NONCE_TTL, file)
-        return file
-
-    def _retire(self, nonce: str) -> None:
-        """A chat file's nonce is spent or found expired: the file goes."""
-        entry = self._nonces.pop(nonce, None)
-        if entry is not None:
-            with contextlib.suppress(OSError):
-                entry[1].unlink(missing_ok=True)
-
-    def take_nonce(self, nonce: str) -> bool:
-        """A nonce is good once (a chat file's, within its TTL); any use consumes it."""
-        if self._launch_nonce and nonce == self._launch_nonce:
-            self.issue_launch()
-            return True
-        entry = self._nonces.get(nonce)
-        if entry is None:
+    def take_token(self, offered: str) -> bool:
+        """The launch token is good once: a use re-mints it into web.json and the launch file."""
+        if not _same(offered, self.token):
             return False
-        self._retire(nonce)
-        return time.monotonic() < entry[0]
-
-    def drop_launch_files(self) -> None:
-        """Delete every launch file of the run dir: a previous run's nonces died with it, ours die now."""
-        self._nonces.clear()
-        self._launch_nonce = ""
-        if self.run_dir is None:
-            return
-        for file in (self.run_dir / _LAUNCH_FILE, *self.run_dir.glob("chat-*.html")):
-            with contextlib.suppress(OSError):
-                file.unlink(missing_ok=True)
+        token = secrets.token_urlsafe(24)
+        try:
+            if self.publish is not None and not self.publish(token):
+                print(f"{self.base_url}/#{token}", file=sys.stderr)  # not in web.json: its only way in
+        except OSError as exc:
+            log.warning("web_json_failed", error=str(exc))
+            return True  # web.json still holds this one: keep it valid, never strand the user
+        self.token = token
+        return True
 
     def mark_unseen(self, thread_id: str) -> bool:
         """Undo `seen`: the row shows again until the next click."""
@@ -1010,7 +939,7 @@ class Board:
         self._relay_now(thread_id, frame)
 
     def close(self) -> None:
-        """Stop the relays (serve_board owns the launch files, run() the archive pool)."""
+        """Stop the relays (run() owns the archive pool)."""
         if self._relay_task is not None:
             self._relay_task.cancel()
             self._relay_task = None
@@ -1230,19 +1159,12 @@ class Board:
         if (row is None and not self._following(ws, thread_id)) or argv is None:
             return False
         if target in ("chat", "split"):
-            if not self.base_url or self.run_dir is None:
+            if not self.base_url:
                 return False
-            # A fresh --browser profile has no cookie yet. argv is world-readable: it carries the path of
-            # an owner-only file, which holds the nonce.
-            split = (
-                "&chatnav=split" if target == "split" else ""
-            )  # the --browser has none of the widget's settings
-            name = f"chat-{secrets.token_hex(8)}.html"
-            try:
-                url = self._issue(name, f"/chat/{quote(thread_id, safe='')}", split).as_uri()
-            except OSError as exc:
-                log.warning("launch_file_failed", error=str(exc))
-                return False
+            # argv is world-readable: only the single-use token, never the secret; split rides in the
+            # URL (--browser has none of the widget's settings).
+            split = "?chatnav=split" if target == "split" else ""
+            url = f"{self.base_url}/chat/{quote(thread_id, safe='')}{split}#{self.token}"
         else:
             last = msg_id or str((row or {}).get("last_id") or "")
             url = deep_link(thread_id, last, "https" if target == "web" else self.open_scheme)
@@ -1455,12 +1377,17 @@ def _put(resp: Response, name: str, value: str) -> None:
     resp.headers[name] = value
 
 
+def _same(offered: str, expected: str) -> bool:
+    # websockets decodes header bytes >= 0x80 with surrogateescape: a plain encode() would raise.
+    return hmac.compare_digest(offered.encode(errors="surrogateescape"), expected.encode())
+
+
 def _authorized(request: Request, secret: str) -> bool:
     """The request carries the `mt` cookie (compared in constant time)."""
     for header in request.headers.get_all("Cookie"):
         for pair in header.split(";"):
             name, _, value = pair.strip().partition("=")
-            if name == _COOKIE and hmac.compare_digest(value.encode(), secret.encode()):
+            if name == _COOKIE and _same(value, secret):
                 return True
     return False
 
@@ -1468,46 +1395,6 @@ def _authorized(request: Request, secret: str) -> bool:
 def _set_cookie(resp: Response, secret: str) -> None:
     _put(resp, "Set-Cookie", f"{_COOKIE}={secret}; HttpOnly; SameSite=Strict; Path=/; Max-Age={_COOKIE_AGE}")
     _put(resp, "Cache-Control", "no-store")  # the response carries the secret
-
-
-def _see_other(ws: ServerConnection, location: str) -> Response:
-    resp = ws.respond(HTTPStatus.SEE_OTHER, "")
-    resp.headers["Location"] = location
-    return resp
-
-
-def _not_signed_in(ws: ServerConnection, board: Board) -> Response:
-    """403 for a page: how to get the cookie, never the secret."""
-    assert board.run_dir is not None  # set before serving
-    launch = (board.run_dir / _LAUNCH_FILE).as_uri()
-    hint = (
-        f"Not signed in to this miniteams page: open the launch file printed by `miniteams web` ({launch})\n"
-    )
-    return ws.respond(HTTPStatus.FORBIDDEN, hint)
-
-
-def _launch(ws: ServerConnection, request: Request, board: Board, path: str, query: str) -> Response | None:
-    """`?n=<nonce>` on a page: a live nonce sets the cookie and moves on to the same URL without `n`; a
-    spent one 303s there a page that already has the cookie. 403 otherwise; None without `n`."""
-    params = parse_qsl(query, keep_blank_values=True)
-    nonce = dict(reversed(params)).get("n")  # the first `n`
-    if nonce is None:
-        return None
-    kept = urlencode([(key, value) for key, value in params if key != "n"])
-    landing = path + (f"?{kept}" if kept else "")
-    if board.take_nonce(nonce):
-        # Not a 303: the launch file would stay the initiator, a cross-site one, and the browser would
-        # withhold the SameSite=Strict cookie it just got. A refresh from our own origin is same-site.
-        resp = _respond(
-            ws,
-            _launch_page(landing).encode(),
-            _PAGE_HEADERS | {"Content-Security-Policy": "default-src 'none'"},
-        )
-        _set_cookie(resp, board.secret)
-        return resp
-    if _authorized(request, board.secret):  # a reload of the launch URL, a reopened tab
-        return _see_other(ws, landing)
-    return _not_signed_in(ws, board)
 
 
 _FILE_HEADERS = {
@@ -1531,27 +1418,37 @@ async def _process_request(
     # DNS rebinding: a foreign name resolving to our address must not read a page, a chat or its files.
     if request.headers.get("Host") != bound:
         return ws.respond(HTTPStatus.NOT_FOUND, "not found\n")
+    if path == "/auth":
+        # A header, not the URL: no history, and only a preflight could carry it cross-site — never
+        # answered, websockets serves GET alone.
+        offered = request.headers.get_all(_TOKEN_HEADER)
+        if len(offered) != 1 or not board.take_token(offered[0]):
+            return ws.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
+        resp = ws.respond(HTTPStatus.NO_CONTENT, "")
+        _set_cookie(resp, board.secret)
+        return resp
     page_route = path == "/" or path.startswith("/chat/")
-    if page_route and (launched := _launch(ws, request, board, path, url.query)) is not None:
-        return launched
-    if not _authorized(request, board.secret):
-        return _not_signed_in(ws, board) if page_route else ws.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
+    authorized = _authorized(request, board.secret)
+    if not (authorized or page_route):
+        return ws.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
     try:
-        resp = await _route(board, ws, path)
+        resp = await _route(board, ws, path, authorized)
     except ArchiveUnavailable:
         return ws.respond(HTTPStatus.SERVICE_UNAVAILABLE, "archive unavailable\n")
-    if page_route and resp.status_code == HTTPStatus.OK:
+    if authorized and page_route and resp.status_code == HTTPStatus.OK:
         _set_cookie(resp, board.secret)  # a year from the last use, not from the launch
     return resp
 
 
-async def _route(board: Board, ws: ServerConnection, path: str) -> Response:
+async def _route(board: Board, ws: ServerConnection, path: str, authorized: bool) -> Response:
     if path == "/":
         page = _page("widget.html")
         return _respond(ws, page.encode(), _PAGE_HEADERS | {"Content-Security-Policy": _page_csp(page)})
     if path.startswith("/chat/"):
         thread_id = unquote(path.removeprefix("/chat/"))
-        if thread_id in board.rows or await io("dir", archive_dir, board.data_dir, thread_id) is not None:
+        # Without the cookie the shell, unchecked: whether a chat exists is data.
+        known = not authorized or thread_id in board.rows
+        if known or await io("dir", archive_dir, board.data_dir, thread_id) is not None:
             page = _page("chat.html")
             return _respond(ws, page.encode(), _PAGE_HEADERS | {"Content-Security-Policy": _page_csp(page)})
     if path.startswith("/media/"):
@@ -1573,7 +1470,6 @@ async def serve_board(board: Board, settings: Settings, bind: str | None) -> Non
     for name in ("widget.html", "chat.html"):
         _page(name)  # a missing ui.js / ui.css or marker fails here, not on the first page load
     board.secret = load_secret(settings)  # never logged: it is every route's only credential
-    board.run_dir = resolve_run_dir(settings)
     host, port = load_bind(settings, bind)
     for attempt in range(_BIND_ATTEMPTS):
         bound = netloc(host, port)
@@ -1596,20 +1492,13 @@ async def serve_board(board: Board, settings: Settings, bind: str | None) -> Non
             # scoped to it, a new address would sign every open page out.
             log.warning("bind_failed", host=host, port=port, error=str(exc))
             port = _draw_port()
-            save_bind(settings, host, port)
     async with server:
         log.info("web_listening", url=f"{board.base_url}/")
-        # Only once bound: a second run failing on the port must not delete the live run's files.
-        board.drop_launch_files()
-        try:
-            board.issue_launch()
-            # The user's own terminal: where the launch file is, never the nonce it holds. A closed
-            # stderr must not read as a failed start.
-            with contextlib.suppress(OSError):
-                print(f"open: {(board.run_dir / _LAUNCH_FILE).as_uri()}", file=sys.stderr, flush=True)
-            await board.watch_page()  # until cancelled
-        finally:
-            board.drop_launch_files()
+        # Once bound: a run failing on the port keeps the live one's web.json.
+        board.publish = functools.partial(publish, settings, host, port, bool(bind))
+        if not board.publish(board.token):
+            print(f"{board.base_url}/#{board.token}", file=sys.stderr)  # this run's only way in
+        await board.watch_page()  # until cancelled
 
 
 def resolve_limit(limit: int | None, seeded: bool) -> int:

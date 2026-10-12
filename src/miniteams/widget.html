@@ -46,6 +46,7 @@
   li.mention, li.mention:hover { background: var(--mention-soft); box-shadow: inset 3px 0 0 var(--mention); }
   li.mention.all, li.mention.all:hover { background: color-mix(in srgb, var(--mention-soft) 50%, transparent); box-shadow: inset 3px 0 0 color-mix(in srgb, var(--mention) 45%, transparent); }
   li.seen { opacity: .5; }
+  li.seen:has(> .rowmenu) { opacity: 1; }  /* the menu would fade with its row */
   .av { grid-row: 1 / span 2; width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center; font-weight: 650; font-size: 14px; color: #fff; position: relative; }
   .av.round { border-radius: 50%; }
   .av small { position: absolute; right: -4px; bottom: -4px; font-size: 11px; background: var(--bg); border-radius: 6px; padding: 0 2px; line-height: 16px; }
@@ -57,7 +58,7 @@
   .when { font-size: 12px; color: var(--faint); white-space: nowrap; }
   li.unread .when { color: var(--accent); font-weight: 600; }
   .meta button { display: none; border: 1px solid var(--line); background: var(--panel); border-radius: 6px; height: 20px; padding: 0 6px; font-size: 12px; line-height: 18px; cursor: pointer; color: var(--dim); }
-  li:hover .meta button { display: inline-block; }
+  li:hover .meta button, li:focus-within .meta button, li.hold .meta button { display: inline-block; }
   .meta button:hover { color: var(--ok); border-color: var(--ok); }
   .meta button.read:hover, .meta button.reply:hover { color: var(--accent); border-color: var(--accent); }
   .prev { grid-column: 2; grid-row: 2; color: var(--dim); font-size: 13px; }
@@ -110,7 +111,7 @@
 <div id="spin" class="spin" hidden title="loading the live list…"></div>
 <script>
 (() => {
-  // ui.js defines store keep q pref el hue initials wsUrl backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview completion
+  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn rowActions completion
   /* ui.js */
   const $rows = document.getElementById("rows"), $empty = document.getElementById("empty"),
         $status = document.getElementById("status"), $tabs = document.getElementById("tabs"),
@@ -177,6 +178,8 @@
     document.body.classList.toggle("compact", !avatars);
     rows.sort((a, b) => (a.last_activity < b.last_activity) - (a.last_activity > b.last_activity));
     renderHeader();
+    // Rebuilt on every broadcast: the keyboard focus moves to the same control of the new row.
+    const f = document.activeElement, fk = $rows.contains(f) ? f.dataset.k : undefined, fid = fk && f.closest("li").dataset.id;
     const shown = pick();
     const items = shown.map((r) => {
       const m = mentioned(r), k = kind(r.id);
@@ -211,31 +214,20 @@
         }
         if (ev.button === 1 && browser) { ev.preventDefault(); send({ open: r.id, web: true }); }
       };
-      const replyBtn = el("button", "reply", "✎"); replyBtn.title = "reply (r)";
+      const replyBtn = el("button", "reply", "✎"); replyBtn.title = "reply (r)"; replyBtn.dataset.k = "reply";
       replyBtn.onclick = () => openReply(r.id);
-      const meta = el("span", "meta"), seenBtn = el("button", null, isSeen(r) && !m ? "↺" : "✓");
-      seenBtn.title = isSeen(r) && !m ? "unseen" : "mark seen";
-      // Send what was on screen: a message or mention landing between render and click must stay visible.
-      const shownAt = m && Date.parse(r.mention.at) > Date.parse(r.last_activity) ? r.mention.at : r.last_activity;
-      seenBtn.onclick = () => send(isSeen(r) && !m ? { unseen: r.id } : { seen: r.id, at: shownAt });
-      meta.append(replyBtn, seenBtn);
-      if (r.last_id) {  // "read" is Teams' own marker, seen on every device — unlike the private seen
-        const readBtn = el("button", "read", "👁"); readBtn.title = "mark read in Teams";
-        readBtn.onclick = () => send({ read: r.id }); meta.append(readBtn);
-      }
-      const muteBtn = el("button", "mute", r.muted ? "🔔" : "🔕"); muteBtn.title = r.muted ? "unmute" : "mute (hide until unmuted)";
-      muteBtn.onclick = () => send(r.muted ? { unmute: r.id } : { mute: r.id });
-      meta.append(muteBtn, Object.assign(el("span", "when", ago(r.last_activity)), { title: r.last_activity }));
+      const meta = el("span", "meta"), [acts, menu] = actions(r);
+      meta.append(replyBtn, ...acts, Object.assign(el("span", "when", ago(r.last_activity)), { title: r.last_activity }));
       const ind = el("span", "ind");
       if (m) {
         const tag = el("span", "tag " + r.mention.kind, r.mention.kind === "all" ? "@ all" : "@ you");
         if (r.mention.edited) tag.append(el("i", null, " · edited " + ago(r.mention.at)));
         tag.title = r.mention.at; ind.append(tag);
       } else if (r.unread) ind.append(el("span", "dot"));
-      const prev = preview(r, el("span", "prev truncate"), meName);
+      const prev = likeTitle(preview(r, el("span", "prev truncate"), meName), name);
       // Only a line the row width cut gets the whole text on hover; width is known at hover time.
       prev.onmouseenter = () => { prev.title = prev.scrollWidth > prev.clientWidth ? prev.textContent : ""; };
-      li.append(name, meta, prev, ind);
+      li.append(name, meta, prev, ind, ...menu);
       return li;
     });
     // The rows move around the composer, never the composer: detaching it would drop its focus
@@ -246,10 +238,12 @@
     else { if (!$composer.isConnected) $rows.append($composer); $composer.before(...items.slice(0, at + 1)); $composer.after(...items.slice(at + 1)); }
     $reply.disabled = sending.has(replyTo);
     $err.textContent = errors.get(replyTo) || "";
+    if (fk) focusIn($rows.querySelector(`li[data-id="${CSS.escape(fid)}"]`), fk);
     $empty.textContent = query ? "no chat matches" : "nothing yet";
     $empty.hidden = shown.length > 0;
   };
 
+  const actions = rowActions($rows, () => render(), send);
   const $composer = el("li", "composer"), $reply = el("textarea"), $err = el("small"), $pop = el("div");
   $reply.id = "reply"; $reply.rows = 1; $reply.placeholder = "reply · Enter sends, Shift+Enter new line";
   $reply.setAttribute("aria-label", "reply");
@@ -325,7 +319,7 @@
 
   const retry = backoff();
   const connect = () => {
-    ws = new WebSocket(wsUrl("/ws"));
+    ws = dial("/ws");
     ws.onopen = () => { retry.reset(); $status.title = "live"; $status.classList.remove("off"); };
     ws.onmessage = (e) => {
       const msg = JSON.parse(e.data);
@@ -354,7 +348,7 @@
     };
   };
   render();
-  connect();
+  signIn.then(connect);
   setInterval(render, CLOCK_TICK_MS);
 })();
 </script>

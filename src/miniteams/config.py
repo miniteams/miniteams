@@ -11,7 +11,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -25,20 +25,11 @@ def _default_cache_dir() -> Path:
     return (Path(base) if base else Path.home() / ".cache") / "miniteams"
 
 
-def make_private_dir(path: Path) -> bool:
-    """Create `path` owner-only; False when it already existed (left as it is)."""
-    try:
-        path.mkdir(parents=True, mode=0o700)  # the umask can only remove bits
-    except FileExistsError:
-        return False
-    return True
-
-
 def write_private(path: Path, text: str) -> None:
     """Replace `path` with `text`, owner-only (0600) from its first byte; the parent is made 0700 if new.
 
     Per-writer temp + os.replace: a reader never sees a partial file, two writers never share a temp."""
-    make_private_dir(path.parent)
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)  # the umask can only remove bits
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")  # Security: O_EXCL, created 0600
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as out:
@@ -117,8 +108,15 @@ class Settings(BaseSettings):
     # steals its deliveries. A suffix gives it its own ids while sharing the token cache.
     endpoint_suffix: str = ""
     cache_dir: Path = Field(default_factory=_default_cache_dir)  # regenerable downloads
-    # `web` launch files; a snap browser reads neither /run/user nor dot dirs, so it may need ~/somedir.
-    run_dir: Path | None = None
+    # `web` writes the launch token here as a page to open by file://, keeping it out of argv.
+    launch_file: Path = Field(
+        default_factory=lambda data: data["config_dir"] / "open.html", validate_default=True
+    )
+
+    @field_validator("launch_file")
+    @classmethod
+    def _absolute(cls, path: Path) -> Path:
+        return path.expanduser().absolute()
 
     @property
     def authority(self) -> str:

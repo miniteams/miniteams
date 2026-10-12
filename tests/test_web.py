@@ -413,12 +413,14 @@ def test_parse_bind_refuses_non_loopback() -> None:
         W.parse_bind("[::]:80")
 
 
-def test_load_bind_draws_once_then_persists(settings: Settings) -> None:
+def test_load_bind_draws_then_reads_the_persisted_draw(settings: Settings) -> None:
+    """serve_board persists a draw once bound; load_bind reads the bind back and ignores the token."""
     host, port = W.load_bind(settings)
     assert host.startswith("127.0.0.") and 2 <= int(host.rsplit(".", 1)[1]) <= 254
     assert 32768 <= port <= 60999
-    assert W.load_bind(settings) == (host, port)  # second run: same URL
-    assert json.loads((settings.config_dir / "web.json").read_text()) == {"host": host, "port": port}
+    assert not (settings.config_dir / "web.json").exists()
+    W.save_bind(settings, "127.0.0.9", 40000, "tok")
+    assert W.load_bind(settings) == ("127.0.0.9", 40000)  # second run: same URL
 
 
 def test_load_bind_override_wins_and_does_not_persist(settings: Settings) -> None:
@@ -429,9 +431,8 @@ def test_load_bind_override_wins_and_does_not_persist(settings: Settings) -> Non
 def test_load_bind_recovers_from_corrupt_file(settings: Settings) -> None:
     settings.config_dir.mkdir(parents=True)
     (settings.config_dir / "web.json").write_text("{not json")
-    host, port = W.load_bind(settings)
+    host, _ = W.load_bind(settings)
     assert host.startswith("127.0.0.")
-    assert json.loads((settings.config_dir / "web.json").read_text())["port"] == port
 
 
 # --- serving ---
@@ -495,7 +496,7 @@ async def test_serve_redraws_when_persisted_port_is_taken(settings: Settings, mo
     taken.bind((host, 0))
     taken.listen()
     busy = int(taken.getsockname()[1])
-    W.save_bind(settings, host, busy)
+    W.save_bind(settings, host, busy, "old")
     with socket.socket() as probe:
         probe.bind((host, 0))
         free = int(probe.getsockname()[1])
@@ -504,8 +505,9 @@ async def test_serve_redraws_when_persisted_port_is_taken(settings: Settings, mo
     board = W.Board({})
     task = asyncio.create_task(W.serve_board(board, settings, None))
     try:
-        await wait(lambda: board.launch_url != "", "bound")
-        assert json.loads((settings.config_dir / "web.json").read_text()) == {"host": host, "port": free}
+        await wait(lambda: board.publish is not None, "bound")
+        saved = {"host": host, "port": free, "token": board.token}
+        assert json.loads((settings.config_dir / "web.json").read_text()) == saved
         assert board.base_url == f"http://{host}:{free}"
         async with board_socket(f"{host}:{free}", board.secret) as ws:
             assert json.loads(await ws.recv())["rows"] == []

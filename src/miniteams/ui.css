@@ -22,6 +22,7 @@
       --shadow: 0 1px 2px #00000066, 0 6px 20px #00000055;
     }
   }
+  #signin { position: fixed; inset: 0 0 auto 0; z-index: 10; padding: 8px 12px; background: var(--hot); color: #fff; font-size: 13px; }
   .switch { appearance: none; width: 32px; height: 18px; border-radius: 99px; background: var(--line); position: relative; cursor: pointer; transition: background .15s; margin: 0; }
   .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: left .15s; box-shadow: 0 1px 2px #0003; }
   .switch:checked { background: var(--accent); }
@@ -32,6 +33,16 @@
   #pop [role=option] { display: flex; align-items: center; gap: 8px; padding: 3px 8px; border-radius: 6px; cursor: pointer; }
   #pop [aria-selected=true] { background: var(--accent-soft); color: var(--accent); }
   #pop img, #pop .ch { width: 20px; height: 20px; flex: none; text-align: center; }
+  /* The preview line opens the chat like its title (likeTitle). */
+  li > .prev { cursor: pointer; }
+  /* A row's ⋯ menu; its row stacks above the next rows, which would paint over it. */
+  li:has(> .rowmenu) { z-index: 1; }
+  .rowmenu { position: absolute; right: 8px; top: calc(100% - 4px); display: grid; min-width: 120px; padding: 4px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); }
+  .rowmenu.up { top: auto; bottom: calc(100% - 4px); }
+  .rowmenu button { border: 0; background: transparent; text-align: left; padding: 3px 8px; border-radius: 6px; cursor: pointer; font-size: 12.5px; white-space: nowrap; }
+  .rowmenu button:hover { background: var(--accent-soft); color: var(--accent); }
+  .rowmenu button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   .cog { position: relative; flex: none; }
   .cog > button { border: 0; background: transparent; color: var(--dim); font-size: 16px; width: 28px; height: 28px; border-radius: 8px; cursor: pointer; }
   .cog > button:hover, .cog.open > button { background: var(--panel-2); color: var(--text); }

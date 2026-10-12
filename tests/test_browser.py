@@ -1124,6 +1124,7 @@ class Widget:
     pages: Pages
     verbs: list[Verb]
     page: Page | None = None
+    part: str = "a.name"  # what the tests click: the row's title, or its preview line (the same target)
 
     @property
     def base(self) -> str:
@@ -1167,7 +1168,7 @@ class Widget:
 
         async def clicked() -> None:
             async with self.ctx.expect_page() as tab:
-                await page.locator("a.name").click(**click)
+                await page.locator(self.part).click(**click)
             await (await tab.value).wait_for_url(url)
 
         verbs, tabs = await self.act(clicked)
@@ -1200,31 +1201,84 @@ async def widget(settings: Settings, pages: Pages, monkeypatch: pytest.MonkeyPat
     assert pages.external == []
 
 
+async def test_widget_row_shows_read_and_more_and_its_menu_marks_seen(widget: Widget) -> None:
+    """The widget's row: ✎ 👁 ⋯ inline; ⋯ opens a menu that a broadcast keeps, focus included; Mark seen
+    reaches the board and closes it."""
+    page = await widget.load(False)
+    row = page.locator(f'li[data-id="{T}"]')
+    await row.hover()
+    labels = await row.locator(".meta button").evaluate_all("bs => bs.map(b => b.textContent)")
+    assert labels == ["✎", "👁", "⋯"]
+    await row.locator('[data-k="more"]').click()
+    frames = await page.evaluate("window.__frames.filter(f => 'rows' in f).length")
+    widget.board.broadcast()
+    await page.wait_for_function(f"window.__frames.filter(f => 'rows' in f).length > {frames}")
+    assert await page.evaluate("document.activeElement.dataset.k") == "seen"
+    await row.locator('[data-k="seen"]').click()
+    assert await page.locator(".rowmenu").count() == 0
+    await wait(lambda: widget.board.rows[T]["seen_at"] == _at(1), "seen")
+
+
+async def test_widget_row_menu_never_opens_under_the_sticky_header(widget: Widget) -> None:
+    """L1: the window scrolls under a sticky header: a row just below it, with little room under it,
+    opens its menu downwards, clickable, rather than up under the header."""
+    for i in range(2, 14):
+        widget.board.rows[f"19:r{i}@thread.v2"] = row(
+            f"19:r{i}@thread.v2", f"Row {i}", _at(i), last_id=str(i)
+        )
+    page = await widget.load(False)
+    li = page.locator("#rows > li").nth(6)
+    hdr, top, height = await li.evaluate(
+        "li => [document.querySelector('header').getBoundingClientRect().bottom,"
+        " li.getBoundingClientRect().top + scrollY, li.offsetHeight]"
+    )
+    # 10px between the header and the row, 40px under it: neither side fits the menu, below has more.
+    await page.set_viewport_size({"width": 600, "height": int(hdr + height + 50)})
+    await page.evaluate(f"scrollTo(0, {top - hdr - 10})")
+    await li.hover()
+    await li.locator('[data-k="more"]').click()
+    first = li.locator(".rowmenu button").first
+    await first.wait_for()
+    hit = "b => { const r = b.getBoundingClientRect(), x = r.x + r.width / 2, y = r.y + r.height / 2;"
+    hit += " return document.elementFromPoint(x, y) === b; }"
+    assert await first.evaluate(hit)
+
+
 def _teams_tab(widget: Widget) -> str:
     return f"{widget.base}/teams/1789466400000"
 
 
+_PARTS = pytest.mark.parametrize("part", ["a.name", "li .prev"], ids=["title", "preview"])
+
+
+@_PARTS
 @pytest.mark.parametrize("browser", [True, False], ids=["browser", "no-browser"])
-async def test_middle_click_default_is_unchanged(widget: Widget, browser: bool) -> None:
-    """011-AC1: with the setting at `teams` (default), `open`+`web` with --browser, else the plain link."""
+async def test_middle_click_default_is_unchanged(widget: Widget, browser: bool, part: str) -> None:
+    """011-AC1: with the setting at `teams` (default), `open`+`web` with --browser, else the plain link;
+    the preview line does the same as the title, a native middle-click tab included."""
     page = await widget.load(browser)
+    widget.part = part
     if browser:
-        assert await widget.act(lambda: page.locator("a.name").click(button="middle")) == ([(T, True)], [])
+        assert await widget.act(lambda: page.locator(part).click(button="middle")) == ([(T, True)], [])
     else:
         assert await widget.opens_tab(_teams_tab(widget), button="middle") == []
 
 
+@_PARTS
 @pytest.mark.parametrize("browser", [True, False], ids=["browser", "no-browser"])
-async def test_middle_click_chat_setting_opens_the_chat_page(widget: Widget, browser: bool) -> None:
-    """011-AC1: the ⚙ `chat` setting persists; middle click sends `open`+`chat` through --browser
-    when set, else opens /chat/<id> in a tab and sends no verb."""
+async def test_middle_click_chat_setting_opens_the_chat_page(
+    widget: Widget, browser: bool, part: str
+) -> None:
+    """011-AC1: the ⚙ `chat` setting persists; middle click (on the title or the preview line) sends
+    `open`+`chat` through --browser when set, else opens /chat/<id> in a tab and sends no verb."""
     page = await widget.load(browser)
     await page.click("#gear")
     await page.get_by_role("button", name="Chat here").click()
     assert await page.evaluate("localStorage.getItem('midclick')") == "chat"
     await widget.load(browser)
+    widget.part = part
     if browser:
-        assert await widget.act(lambda: page.locator("a.name").click(button="middle")) == ([(T, "chat")], [])
+        assert await widget.act(lambda: page.locator(part).click(button="middle")) == ([(T, "chat")], [])
     else:
         assert await widget.opens_tab(widget.base + _chat(T), button="middle") == []
     # A browser that also fires `click` for button 1 must not add a verb or a second tab. dispatchEvent
@@ -1240,17 +1294,22 @@ async def test_middle_click_chat_setting_opens_the_chat_page(widget: Widget, bro
     assert dispatched == [False]
 
 
+@_PARTS
 @pytest.mark.parametrize("setting", ["teams", "chat"])
 @pytest.mark.parametrize("browser", [True, False], ids=["browser", "no-browser"])
-async def test_ctrl_and_plain_click_are_unchanged(widget: Widget, setting: str, browser: bool) -> None:
-    """011-AC2: Ctrl click and plain click do the same whatever the middle-click setting."""
+async def test_ctrl_and_plain_click_are_unchanged(
+    widget: Widget, setting: str, browser: bool, part: str
+) -> None:
+    """011-AC2: Ctrl click and plain click do the same whatever the middle-click setting, on the title
+    and on the preview line."""
     page = await widget.load(browser, midclick=setting)
+    widget.part = part
     if browser:
-        ctrl = await widget.act(lambda: page.locator("a.name").click(modifiers=["Control"]))
+        ctrl = await widget.act(lambda: page.locator(part).click(modifiers=["Control"]))
         assert ctrl == ([(T, True)], [])
     else:
         assert await widget.opens_tab(_teams_tab(widget), modifiers=["Control"]) == []
-    assert await widget.act(lambda: page.locator("a.name").click()) == ([(T, False)], [])
+    assert await widget.act(lambda: page.locator(part).click()) == ([(T, False)], [])
 
 
 async def test_midclick_url_param_overrides_the_stored_choice(widget: Widget) -> None:
@@ -1564,16 +1623,18 @@ async def test_split_busy_answers_say_why(split: Pages) -> None:
 
 
 async def test_split_list_is_reachable_by_keyboard_and_keeps_focus(board: W.Board, split: Pages) -> None:
-    """011-AC23: Tab from a row's name reaches its seen and mute buttons, shown; a broadcast or a tab
+    """011-AC23: Tab from a row's name reaches its 👁 and ⋯, shown, and ⋯ its mute; a broadcast or a tab
     switch keeps the focus where it was; the shown tab and the current row are announced."""
     page = await _open_split(split)
     await page.locator(f'#rows li[data-id="{L}"] a.name').focus()
     await page.keyboard.press("Tab")
-    seen = page.locator(f'#rows li[data-id="{L}"] [data-k="seen"]')
-    assert await seen.evaluate("b => b === document.activeElement && getComputedStyle(b).opacity === '1'")
+    read = page.locator(f'#rows li[data-id="{L}"] [data-k="read"]')
+    assert await read.evaluate("b => b === document.activeElement && getComputedStyle(b).opacity === '1'")
     board.broadcast()
     await page.wait_for_function("window.__frames.filter(f => 'rows' in f).length >= 2")
-    assert await seen.evaluate("b => b === document.activeElement")
+    assert await read.evaluate("b => b === document.activeElement")
+    await page.keyboard.press("Tab")
+    await page.keyboard.press("Enter")  # ⋯: the focus lands on Mark seen
     await page.keyboard.press("Tab")
     await page.keyboard.press("Enter")
     await page.wait_for_function(f"!document.querySelector('#rows li[data-id={json.dumps(L)}]')")
@@ -1604,11 +1665,13 @@ async def test_split_list_updates_live_and_its_actions_work(board: W.Board, spli
     )
     await page.wait_for_selector(f'#rows li.mention[data-id="{L}"] .tag')
     await page.locator(f'#rows li[data-id="{R}"]').hover()
-    await page.locator(f'#rows li[data-id="{R}"] .meta button').first.click()
+    await page.locator(f'#rows li[data-id="{R}"] [data-k="more"]').click()
+    await page.locator(f'#rows li[data-id="{R}"] [data-k="seen"]').click()
     await page.wait_for_function(f"!document.querySelector('#rows li[data-id={json.dumps(R)}]')")
     assert board.rows[R]["seen_at"] == _at(200)
     await page.locator(f'#rows li[data-id="{T}"]').hover()
-    await page.locator(f'#rows li[data-id="{T}"] .mute').click()
+    await page.locator(f'#rows li[data-id="{T}"] [data-k="more"]').click()
+    await page.locator(f'#rows li[data-id="{T}"] [data-k="mute"]').click()
     await page.wait_for_function(f"!document.querySelector('#rows li[data-id={json.dumps(T)}]')")
     assert board.rows[T]["muted"] is True
     await page.locator("#tabs .more").click()  # Muted sits behind ⋯ in a 300px list (011-AC28)
@@ -1644,12 +1707,13 @@ async def test_split_narrow_window_folds_the_list(split: Pages) -> None:
     assert page.url.endswith(_chat(L) + "?chatnav=split")
 
 
+@_PARTS
 @pytest.mark.parametrize("browser", [True, False], ids=["browser", "no-browser"])
 async def test_split_middle_click_opens_a_new_tab(
-    board: W.Board, split: Pages, monkeypatch: pytest.MonkeyPatch, browser: bool
+    board: W.Board, split: Pages, monkeypatch: pytest.MonkeyPatch, browser: bool, part: str
 ) -> None:
-    """011-AC21: middle click on a row opens that chat in a new tab, in split too, through --browser when
-    set; the shown chat does not change."""
+    """011-AC21: middle click on a row (its title or its preview line) opens that chat in a new tab, in
+    split too, through --browser when set; Ctrl click opens Teams through it. The shown chat stays."""
     opened: list[Verb] = []
 
     async def spy(
@@ -1664,11 +1728,12 @@ async def test_split_middle_click_opens_a_new_tab(
     monkeypatch.setattr(board, "open_row", spy)
     board.browser = ["firefox"] if browser else None
     page = await _open_split(split)
-    name = page.locator(f'#rows li[data-id="{L}"] a.name')
+    name = page.locator(f'#rows li[data-id="{L}"] {part.removeprefix("li ")}')
     if browser:
         await name.click(button="middle")
-        await _until(opened, 1)
-        assert opened == [(L, "split")]
+        await name.click(modifiers=["Control"])
+        await _until(opened, 2)
+        assert opened == [(L, "split"), (L, False)]
     else:
         async with page.context.expect_page() as tab:
             await name.click(button="middle")
@@ -1726,7 +1791,8 @@ async def test_open_in_teams_after_a_jump_opens_the_chat(
 async def test_pages_redial_a_restarted_server_with_their_cookie(
     board: W.Board, settings: Settings, pages: Pages, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """M2: after a restart, open pages reconnect on their `mt` cookie alone: no reload, nothing fetched."""
+    """M2: after a restart, open pages reconnect on their `mt` cookie alone: no reload, nothing fetched
+    but the sign-in probe of a refused dial (a plain GET of /ws)."""
     port = test_web_chat._free_port()
     monkeypatch.setattr(test_web_chat, "_free_port", lambda: port)  # the restart binds the same port
     live = "document.getElementById('status').title === 'live'"
@@ -1745,8 +1811,49 @@ async def test_pages_redial_a_restarted_server_with_their_cookie(
             await until(page, live, tries=1500)  # backoff 1 s, then 2 s if the first dial was early
             assert await page.evaluate("window.__same") == 1
         await pages.close()
-    assert [u for u in requests if not u.startswith("ws")] == []
+    assert [u for u in requests if not u.startswith("ws") and not u.endswith("/ws")] == []
     assert pages.external == []
+
+
+_LIVE = "document.getElementById('status').title === 'live'"
+
+
+@pytest.mark.parametrize("path", ["/", f"{_chat(T)}?chatnav=split"])
+async def test_a_launch_url_signs_a_fresh_browser_in(
+    board: W.Board, settings: Settings, pages: Pages, path: str
+) -> None:
+    """A fresh profile loading `<page>#<token>` (web.json's launch URL, a --browser chat open) trades the
+    token for the cookie under the real CSP: the socket connects, the fragment leaves the address bar."""
+    async with _served(board, settings) as host:
+        pages.host = host  # no cookie: the token is the way in
+        token = board.token
+        page = await pages.open(f"{path}#{token}", csp=True)
+        await until(page, _LIVE)
+        assert await page.evaluate("location.href") == f"http://{host}{path}"
+        assert board.token != token and await page.locator("#signin").count() == 0
+        await pages.close()
+    assert pages.external == []
+
+
+@pytest.mark.parametrize("path", ["/", _chat(T)])
+async def test_a_page_without_the_cookie_says_how_to_sign_in(
+    board: W.Board, settings: Settings, pages: Pages, path: str
+) -> None:
+    """No cookie, no token: the refused socket shows how to sign in, never the secret nor the token."""
+    async with _served(board, settings) as host:
+        pages.host = host
+        page = await pages.open(path, csp=True)
+        hint = page.locator("#signin")
+        await hint.wait_for()
+        expected = "open the launch file (~/.config/miniteams/open.html by default) or web.json's URL"
+        expected += " (host, port and #token)"
+        assert await hint.text_content() == f"Not signed in: {expected}"
+        # M3: a banner over the top, not a flex column eating the chat page's row layout.
+        box = await hint.bounding_box()
+        assert box is not None and box["y"] == 0 and box["height"] < 80
+        assert box["width"] == await page.evaluate("document.documentElement.clientWidth")
+        assert board.secret not in await page.content() and board.token not in await page.content()
+        await pages.close()
 
 
 @pytest.mark.parametrize("theme", ["light", "dark"])

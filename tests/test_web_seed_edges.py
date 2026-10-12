@@ -292,7 +292,8 @@ async def test_a_seed_past_its_deadline_starts_an_empty_board(
 async def test_an_interrupted_seed_still_leaves_when_its_read_hangs(
     settings: Any, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """R9: Ctrl-C during a hung index read exits at once, or the process would keep the run-dir lock."""
+    """R9: Ctrl-C during a hung index read exits at once, or the interpreter's exit would join the stuck
+    pool thread."""
 
     async def interrupted(*a: Any) -> None:
         raise asyncio.CancelledError  # what asyncio.run turns a Ctrl-C into inside run()

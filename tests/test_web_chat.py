@@ -5,12 +5,9 @@ import base64
 import contextlib
 import functools
 import hashlib
-import html
 import json
-import re
 import socket
 import sqlite3
-import stat
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -1292,9 +1289,9 @@ async def test_open_chat_runs_the_browser_on_our_own_chat_page(
             await ws.send(json.dumps({"open": NOPE, "chat": True}))
             await ws.send(json.dumps({"follow": B}))
             await _frame(ws)
-            opened = _nonceless(launched)  # the files go with the server
-    assert opened == [("firefox", "--new-tab", f"http://{host}/chat/19%3Abbbb%40thread.v2?n=N")]
-    assert board.secret not in repr(launched) and "n=" not in repr(launched)
+    token = board.token
+    assert launched == [("firefox", "--new-tab", f"http://{host}/chat/19%3Abbbb%40thread.v2#{token}")]
+    assert board.secret not in repr(launched)
 
 
 async def test_open_chat_carries_the_split_setting(
@@ -1322,94 +1319,28 @@ async def test_open_chat_carries_the_split_setting(
             await ws.send(json.dumps({"open": B, "chat": "split", "chatnav": "split"}))
             await ws.send(json.dumps({"follow": B}))
             await _frame(ws)
-            opened = _nonceless(launched)  # the files go with the server
-            nonces = [re.search(r"n=([\w-]+)", _target(argv[-1]))[1] for argv in launched]  # type: ignore[index]
-    page = f"http://{host}/chat/19%3Abbbb%40thread.v2?n=N"
-    assert opened == [("firefox", page + "&chatnav=split")] + [("firefox", page)] * 5
+    page, token = f"http://{host}/chat/19%3Abbbb%40thread.v2", f"#{board.token}"
+    assert launched == [("firefox", page + "?chatnav=split" + token)] + [("firefox", page + token)] * 5
     assert board.secret not in repr(launched)
-    assert len(set(nonces)) == 6  # one per open
 
 
-def _target(arg: str) -> str:
-    """The URL a launch file passed as `file://…` redirects to; any other argument as it is."""
-    if not arg.startswith("file://"):
-        return arg
-    path = Path(arg.removeprefix("file://"))
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600 and stat.S_IMODE(path.parent.stat().st_mode) == 0o700
-    found = re.search(r'content="0;url=([^"]+)"', path.read_text())
-    assert found, arg
-    return html.unescape(found[1])
-
-
-def _nonceless(launched: list[tuple[str, ...]]) -> list[tuple[str, ...]]:
-    return [tuple(re.sub(r"n=[\w-]{32}", "n=N", _target(arg)) for arg in argv) for argv in launched]
-
-
-async def test_a_chat_open_sets_the_cookie_once(
+async def test_a_chat_open_carries_the_launch_token(
     board: W.Board, settings: Settings, launched: list[tuple[str, ...]]
 ) -> None:
-    """H1: `--browser` gets the path of an owner-only file holding a single-use nonce, never the secret
-    nor the nonce (argv is readable by other users): the first use sets the cookie and lands without
-    `n`, deleting the file; a reused, expired or unknown nonce is a 403."""
+    """--browser gets the chat URL with the current token as its fragment, never the secret: the page
+    trades it once at /auth for the cookie."""
     board.browser = ["firefox"]
     async with _served(board, settings) as host, httpx.AsyncClient() as client:
         assert await board.open_row(B, "split")
-        [(_, arg)] = launched
-        file = Path(arg.removeprefix("file://"))
-        assert arg.startswith(f"file://{board.run_dir}/chat-") and file.exists()
-        url = _target(arg)
-        assert board.secret not in url + file.read_text() and url.startswith(f"http://{host}/chat/")
-        cookie = f"mt={board.secret}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000"
-        got = await client.get(url)
-        assert got.status_code == 200 and got.headers["set-cookie"] == cookie
-        assert f'content="0;url=/chat/{quote(B, safe="")}?chatnav=split"' in got.text
-        assert not file.exists()  # spent: its file goes
-        client.cookies.clear()
-        again = await client.get(url)  # spent
-        assert again.status_code == 403 and "set-cookie" not in again.headers
-        for bad in ("x" * 32, ""):  # unknown
-            got = await client.get(f"http://{host}/?n={bad}")
-            assert got.status_code == 403 and "set-cookie" not in got.headers, bad
-        assert await board.open_row(B, "chat")
-        stale = _target(launched[-1][1])
-        [nonce] = board._nonces
-        board._nonces[nonce] = (time.monotonic() - 1, board._nonces[nonce][1])  # its _NONCE_TTL is over
-        got = await client.get(stale)  # expired
-        assert got.status_code == 403 and "set-cookie" not in got.headers
-        assert board._nonces == {}  # consumed even when expired
-
-
-async def test_a_chat_file_goes_when_its_nonce_expires_or_the_server_stops(
-    board: W.Board, settings: Settings, launched: list[tuple[str, ...]]
-) -> None:
-    """H1: an expired chat file is purged when the next one is written; all go at shutdown."""
-    board.browser = ["firefox"]
-    async with _served(board, settings):
-        assert await board.open_row(B, "chat")
-        expiring = Path(launched[-1][1].removeprefix("file://"))
-        [nonce] = [n for n, (_, f) in board._nonces.items() if f == expiring]
-        board._nonces[nonce] = (time.monotonic() - 1, expiring)
-        assert await board.open_row(B, "chat")
-        kept = Path(launched[-1][1].removeprefix("file://"))
-        assert not expiring.exists() and kept.exists()
-        assert board.run_dir is not None and (board.run_dir / "open.html").exists()
-    assert not kept.exists() and not (board.run_dir / "open.html").exists()
-
-
-def test_the_nonce_store_is_bounded(board: W.Board, tmp_path: Path) -> None:
-    """Past _NONCE_MAX the oldest nonce goes, and its file with it."""
-
-    async def run() -> None:
-        board.run_dir, board.base_url = tmp_path, "http://127.0.0.9:1"
-        files = [board._issue(f"chat-{i}.html", "/chat/x") for i in range(W._NONCE_MAX + 5)]
-        assert len(board._nonces) == W._NONCE_MAX
-        assert [f.exists() for f in files] == [False] * 5 + [True] * W._NONCE_MAX
-        nonce = next(reversed(board._nonces))
-        assert board.take_nonce(nonce) and not board.take_nonce(nonce)
-        board.drop_launch_files()
-        assert not any(f.exists() for f in files) and board._nonces == {}
-
-    asyncio.run(run())
+        [(_, url)] = launched
+        page, _, token = url.partition("#")
+        assert page == f"http://{host}/chat/{quote(B, safe='')}?chatnav=split" and token == board.token
+        auth = {"X-Miniteams-Token": token}
+        got = await client.get(f"http://{host}/auth", headers=auth)
+        assert got.status_code == 204 and got.headers["set-cookie"].startswith(f"mt={board.secret};")
+        assert (await client.get(f"http://{host}/auth", headers=auth)).status_code == 403  # spent
+        assert board.token != token and await board.open_row(B, "chat")
+        assert launched[-1][1].endswith(f"#{board.token}")
 
 
 # --- message actions: quote, react, edit, delete (011 phase 4) ---

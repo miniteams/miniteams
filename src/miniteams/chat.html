@@ -304,7 +304,7 @@
 </div>
 <script>
 (() => {
-  // ui.js defines store keep q pref el hue initials wsUrl backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview completion
+  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn rowActions completion
   /* ui.js */
   let thread = null;
   try { thread = decodeURIComponent(location.pathname.slice("/chat/".length)); } catch (e) {}
@@ -1036,24 +1036,15 @@
       if (browser) send({ open: r.id, chat: true, chatnav: "split" });
       else window.open(chatPath(r.id) + "?chatnav=split", "_blank", "noopener");
     };
-    const meta = el("span", "meta"), undo = isSeen(r) && !m;
-    const seenBtn = el("button", null, undo ? "↺" : "✓");
-    seenBtn.title = undo ? "unseen" : "mark seen";
-    seenBtn.dataset.k = "seen";
-    // What was on screen: a message landing between render and click must keep the row visible.
-    const shownAt = m && Date.parse(r.mention.at) > Date.parse(r.last_activity) ? r.mention.at : r.last_activity;
-    seenBtn.onclick = () => send(undo ? { unseen: r.id } : { seen: r.id, at: shownAt });
-    const muteBtn = el("button", "mute", r.muted ? "🔔" : "🔕");
-    muteBtn.title = r.muted ? "unmute" : "mute (hide until unmuted)";
-    muteBtn.dataset.k = "mute";
-    muteBtn.onclick = () => send(r.muted ? { unmute: r.id } : { mute: r.id });
-    meta.append(seenBtn, muteBtn, Object.assign(el("span", "ago", ago(r.last_activity)), { title: r.last_activity }));
+    const meta = el("span", "meta"), [acts, menu] = actions(r);
+    meta.append(...acts, Object.assign(el("span", "ago", ago(r.last_activity)), { title: r.last_activity }));
     const ind = el("span", "ind");
     if (m) ind.append(el("span", "tag " + r.mention.kind, r.mention.kind === "all" ? "@ all" : "@ you"));
     else if (r.unread) ind.append(el("span", "dot"));
-    li.append(name, meta, preview(r, el("span", "prev truncate"), meName), ind);
+    li.append(name, meta, likeTitle(preview(r, el("span", "prev truncate"), meName), name), ind, ...menu);
     return li;
   };
+  const actions = rowActions($rows, () => renderRows(), send);
   const renderRows = () => {
     if (!split) return;
     // Rebuilt on every broadcast: the keyboard focus moves to the same control of the new list.
@@ -1096,8 +1087,7 @@
     $nochat.hidden = shown.length > 0;
     $clear.hidden = !$filter.value;
     const fli = fid && $rows.querySelector(`li[data-id="${CSS.escape(fid)}"]`);
-    // A new row's ✓ / 🔕 are display:none until focus is inside it: shown for the focus() call only.
-    if (fli) { fli.classList.add("hold"); fli.querySelector(`[data-k="${fk}"]`)?.focus(); fli.classList.remove("hold"); }
+    if (fli) focusIn(fli, fk);
     else if (fk && !fid) $side.querySelector(`[data-k="${fk}"]`)?.focus();
     // A hidden list (folded, drawer closed) keeps the reveal for when it shows.
     if (reveal && rows.length && $rows.offsetParent) { reveal = false; $rows.querySelector("li.cur")?.scrollIntoView({ block: "center" }); }
@@ -1296,7 +1286,7 @@
     if (at && hist.source === "archive") { hist.aroundAt = at; requestHistory("around", at); } else requestHistory();
   };
   const connect = () => {
-    ws = new WebSocket(wsUrl("/ws?chat"));
+    ws = dial("/ws?chat");
     ws.onopen = () => {
       $status.title = "live"; $status.classList.remove("off");
       send({ follow: thread });
@@ -1399,7 +1389,7 @@
   }
   unstash();
   if (split) startSplit();
-  connect();
+  signIn.then(connect);
   $reply.focus();
 })();
 </script>

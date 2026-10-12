@@ -11,6 +11,30 @@
 
   // The `mt` cookie authenticates the handshake: it survives a server restart, so a redial needs nothing else.
   const wsUrl = (path) => (location.protocol === "https:" ? "wss://" : "ws://") + location.host + path;
+  // A launch URL's `#<token>` buys the cookie once; it leaves the address bar at once, spent or not.
+  const signIn = (() => {
+    const token = location.hash.slice(1);
+    if (!token) return Promise.resolve();
+    history.replaceState(null, "", location.pathname + location.search);
+    return fetch("/auth", { headers: { "X-Miniteams-Token": token } }).catch(() => {});
+  })();
+  const SIGNED_OUT = "Not signed in: open the launch file (~/.config/miniteams/open.html by default) or web.json's URL (host, port and #token)";
+  // A socket refused before it opened hides its status: a plain GET of /ws tells no cookie (403) from a server down.
+  const dial = (path) => {
+    const sock = new WebSocket(wsUrl(path));
+    let up = false;
+    sock.addEventListener("open", () => { up = true; document.getElementById("signin")?.remove(); });
+    sock.addEventListener("close", () => {
+      if (up) return;
+      fetch("/ws").then((r) => {
+        if (r.status !== 403 || document.getElementById("signin")) return;
+        const hint = el("div", null, SIGNED_OUT);
+        hint.id = "signin"; hint.setAttribute("role", "alert");
+        document.body.prepend(hint);
+      }).catch(() => {});
+    });
+    return sock;
+  };
   // Reconnect delays: 1 s doubling up to 30 s; the page resets it once the server proves usable.
   const backoff = () => {
     let ms = 1000;
@@ -86,6 +110,68 @@
     if (r.sender) into.append(el("b", null, r.sender + ": "));
     into.append(r.text || "");
     return into;
+  };
+
+  // Row buttons are display:none until the row is hovered or holds the focus: shown for the focus() call only.
+  const focusIn = (li, k) => { if (!li) return; li.classList.add("hold"); li.querySelector(`[data-k="${k}"]`)?.focus(); li.classList.remove("hold"); };
+  // A row's preview line opens the chat as its title does: the same click, modifiers and button, on the title.
+  // A synthetic middle click has no default action: the title's native new tab is done here when nothing took it.
+  const likeTitle = (prev, name) => {
+    prev.onclick = prev.onauxclick = (ev) => {
+      ev.preventDefault();
+      if (name.dispatchEvent(new MouseEvent(ev.type, ev)) && ev.type === "auxclick" && ev.button === 1) window.open(name.href, "_blank", "noopener");
+    };
+    return prev;
+  };
+
+  // A row's actions: 👁 (Teams' read, seen on every device) inline, the private seen and the mute behind ⋯.
+  // Rows are rebuilt on every broadcast: the open menu is kept by row id and comes back with its row.
+  // Returns the inline buttons and the menu (none or one) to append to the row's `li`.
+  const rowActions = (list, render, send) => {
+    let open = "", up = false;
+    const close = (id) => { open = ""; render(); focusIn(list.querySelector(`li[data-id="${CSS.escape(id)}"]`), "more"); };
+    addEventListener("click", (e) => { if (open && !e.target.closest?.(".rowmenu, [data-k=more]")) { open = ""; render(); } });
+    // After the move, not during it: a broadcast re-render puts the focus back into the menu first. Its own ⋯ keeps it, to toggle.
+    // Only the menu node goes: a full render between press and release would drop the click that moved the focus.
+    list.addEventListener("focusout", () => setTimeout(() => {
+      const menu = list.querySelector(".rowmenu");
+      if (!open || !menu || menu.parentElement.contains(document.activeElement)) return;
+      open = "";
+      menu.parentElement.querySelector("[data-k=more]")?.setAttribute("aria-expanded", "false");
+      menu.remove();
+    }));
+    const btn = (cls, text, k, act) => { const b = el("button", cls, text); b.dataset.k = k; b.onclick = act; return b; };
+    return (r) => {
+      const inline = [];
+      if (r.last_id) inline.push(Object.assign(btn("read", "👁", "read", () => send({ read: r.id })), { title: "mark read in Teams" }));
+      const more = btn("more", "⋯", "more", () => {
+        if (open === r.id) { close(r.id); return; }
+        open = r.id; up = false; render();
+        const menu = list.querySelector(".rowmenu");
+        if (menu) {
+          // Rows near the bottom of what scrolls (the list, or else the window under its sticky header) open upwards when that has more room.
+          const box = getComputedStyle(list).overflowY === "visible"
+            ? { top: document.querySelector("header")?.getBoundingClientRect().bottom ?? 0, bottom: innerHeight } : list.getBoundingClientRect();
+          const row = menu.parentElement.getBoundingClientRect(), bottom = Math.min(innerHeight, box.bottom);
+          if (menu.getBoundingClientRect().bottom > bottom && row.top - Math.max(0, box.top) > bottom - row.bottom) { up = true; menu.classList.add("up"); }
+          menu.querySelector("button")?.focus();
+        }
+      });
+      more.title = "more"; more.setAttribute("aria-label", "more"); more.setAttribute("aria-expanded", String(open === r.id));
+      inline.push(more);
+      if (open !== r.id) return [inline, []];
+      const m = mentioned(r), undo = isSeen(r) && !m;
+      // What was on screen: a message or mention landing between render and click must keep the row visible.
+      const shownAt = m && Date.parse(r.mention.at) > Date.parse(r.last_activity) ? r.mention.at : r.last_activity;
+      const act = (verb) => () => { close(r.id); send(verb); };
+      const menu = el("div", up ? "rowmenu up" : "rowmenu");
+      menu.append(
+        btn(null, undo ? "↺ Unseen" : "✓ Mark seen", "seen", act(undo ? { unseen: r.id } : { seen: r.id, at: shownAt })),
+        Object.assign(btn(null, r.muted ? "🔔 Unmute" : "🔕 Mute", "mute", act(r.muted ? { unmute: r.id } : { mute: r.id })),
+          { title: r.muted ? "" : "hide until unmuted" }));
+      menu.onkeydown = (e) => { if (e.key === "Escape") { e.stopPropagation(); close(r.id); } };
+      return [inline, [menu]];
+    };
   };
 
   // `:` / `@` completion (spec 012) on `input`, its list in `pop`. The pages differ only in the hooks:

@@ -370,22 +370,23 @@ async def test_ctrl_k_focuses_the_filter_from_anywhere(split: Split, how: str) -
 
 
 async def test_row_buttons_take_no_width_until_hover_or_focus(split: Split) -> None:
-    """011-AC29: ✓ and 🔕 take no width off hover, show on hover and on keyboard focus in the row."""
+    """011-AC29: ⋯ (👁 too, on a row Teams can mark read) takes no width off hover, shows on hover and on
+    keyboard focus in the row."""
     page = await split.open()
     row = page.locator(f'#rows li[data-id="{_id(4)}"]')
     widths = "li => [...li.querySelectorAll('.meta button')].map(b => b.getBoundingClientRect().width)"
-    assert await row.evaluate(widths) == [0, 0]
+    assert await row.evaluate(widths) == [0]
     await row.hover()
     assert all(w > 0 for w in await row.evaluate(widths))
     await page.mouse.move(900, 400)
-    assert await row.evaluate(widths) == [0, 0]
+    assert await row.evaluate(widths) == [0]
     await row.locator(".name").focus()
     assert all(w > 0 for w in await row.evaluate(widths))
 
 
 async def test_the_chat_header_is_ten_tabs_from_the_filter_with_many_rows(split: Split) -> None:
     """011-AC29: one row name in the Tab order (roving tabindex): with 400 rows, Tab goes filter → tabs →
-    current row (→ ✓ 🔕) → separator → ☰ → search within 10 presses."""
+    current row (→ ⋯) → separator → ☰ → search within 10 presses."""
     split.fake.rows = _board(400)
     page = await split.open(viewport={"width": 1300, "height": 800})
     assert await page.locator('#rows .name[tabindex="0"]').count() == 1
@@ -402,8 +403,7 @@ async def test_the_chat_header_is_ten_tabs_from_the_filter_with_many_rows(split:
         "k:tab:unread",
         "k:tab:more",
         "k:name",
-        "k:seen",
-        "k:mute",
+        "k:more",
         "#grip",
         "#menu",
         "#find",
@@ -840,3 +840,128 @@ async def test_avatars_changed_in_another_tab_reach_the_rows(split: Split) -> No
     await other.evaluate("localStorage.setItem('avatars', '0')")
     await until(page, "document.body.classList.contains('compact')")
     assert await page.locator("#rows .rav").count() == 0
+
+
+# --- row actions: 👁 inline, seen and mute behind ⋯ ---
+
+
+async def _row_menu(split: Split, i: int) -> tuple[Page, Any]:
+    """The list with row `i` Teams-readable (👁), its ⋯ menu open."""
+    split.fake.rows[i]["last_id"] = str(i)
+    page = await split.open()
+    row = page.locator(f'#rows li[data-id="{_id(i)}"]')
+    await row.hover()
+    await row.locator('[data-k="more"]').click()
+    return page, row
+
+
+async def test_row_read_sends_read_and_the_menu_sends_seen(split: Split) -> None:
+    """👁 marks the chat read in Teams; ⋯ opens a menu, focus on its first entry; Mark seen sends the
+    seen of what was on screen and closes the menu."""
+    page, row = await _row_menu(split, 4)
+    assert await _focused(page) == "k:seen"
+    assert await row.locator('[data-k="more"]').get_attribute("aria-expanded") == "true"
+    assert await row.locator(".rowmenu").inner_text() == "✓ Mark seen\n🔕 Mute"
+    await row.locator('[data-k="seen"]').click()
+    assert await page.locator(".rowmenu").count() == 0
+    await row.locator('[data-k="read"]').click()
+    await split.fake.settled()
+    assert split.fake.of("read") == [{"read": _id(4)}]
+    assert split.fake.of("seen") == [{"seen": _id(4), "at": split.fake.rows[4]["last_activity"]}]
+
+
+async def test_row_menu_mute_escape_and_outside_click(split: Split) -> None:
+    """Mute sends mute; Escape closes the menu back to its ⋯; a click outside closes it."""
+    page, row = await _row_menu(split, 4)
+    await page.keyboard.press("Escape")
+    assert await row.locator(".rowmenu").count() == 0
+    assert await _focused(page) == "k:more"
+    assert await page.evaluate("document.activeElement.closest('li').dataset.id") == _id(4)
+    await page.keyboard.press("Enter")
+    await page.keyboard.press("Tab")
+    await page.keyboard.press("Enter")
+    await split.fake.settled()
+    assert split.fake.of("mute") == [{"mute": _id(4)}]
+    await row.hover()
+    await row.locator('[data-k="more"]').click()
+    await page.locator("#label").click()
+    assert await page.locator(".rowmenu").count() == 0
+
+
+async def test_row_menu_closes_when_the_focus_leaves_it(split: Split) -> None:
+    """L3: like ⚙ and the filter ⋯: Tab out of an open row menu closes it; opening ⚙ over it leaves ⚙
+    alone open."""
+    page, row = await _row_menu(split, 4)
+    await page.keyboard.press("Tab")
+    assert await _focused(page) == "k:mute"
+    await page.keyboard.press("Tab")
+    await until(page, "!document.querySelector('.rowmenu')")
+    await row.hover()
+    await row.locator('[data-k="more"]').click()
+    await page.locator("#gear").click()
+    await until(page, "!document.querySelector('.rowmenu')")
+    assert await page.locator("#cog .menu").is_visible()
+    assert await page.evaluate("document.getElementById('cog').contains(document.activeElement)")
+
+
+async def test_row_menu_survives_a_broadcast_and_moves_to_another_row(split: Split) -> None:
+    """A broadcast rebuilds the rows: the menu comes back open with the focus on the same entry;
+    opening another row's ⋯ closes the first."""
+    page, row = await _row_menu(split, 4)
+    await page.keyboard.press("Tab")
+    split.fake.broadcast()
+    await until(page, "window.__frames.filter(f => 'rows' in f).length >= 2")
+    assert await row.locator(".rowmenu").count() == 1
+    assert await _focused(page) == "k:mute"
+    other = page.locator(f'#rows li[data-id="{_id(8)}"]')  # 6 lies under the menu
+    await other.hover()
+    await other.locator('[data-k="more"]').click()
+    assert await page.locator(".rowmenu").count() == 1
+    assert await other.locator(".rowmenu").count() == 1
+
+
+async def test_the_last_row_s_menu_opens_upwards_in_sight(split: Split) -> None:
+    """A menu dropping under the list's bottom row would leave its entries out of sight: it opens
+    upwards there, and keeps doing so across a broadcast."""
+    page = await split.open(viewport={"width": 1000, "height": 420})
+    row = page.locator("#rows > li").last
+    await row.scroll_into_view_if_needed()
+    await row.hover()
+    await row.locator('[data-k="more"]').click()
+    js = (
+        "(() => { const m = document.querySelector('.rowmenu').getBoundingClientRect(),"
+        " list = document.getElementById('rows').getBoundingClientRect();"
+        " return m.bottom <= Math.min(innerHeight, list.bottom); })()"
+    )
+    assert await page.evaluate(js)
+    split.fake.broadcast()
+    await until(page, "window.__frames.filter(f => 'rows' in f).length >= 2")
+    assert await page.evaluate(js)
+
+
+@pytest.mark.parametrize("part", ["a.name", ".prev"], ids=["title", "preview"])
+async def test_a_click_on_the_preview_line_switches_like_the_title(split: Split, part: str) -> None:
+    """The preview line under a row's title is part of the same target: a click there switches chat."""
+    page = await split.open(viewport={"width": 1300, "height": 800})
+    target = _id(6)
+    await page.locator(f'#rows li[data-id="{target}"] {part}').click()
+    await wait(lambda: split.fake.follows()[-1:] == [target])
+    assert await page.locator("#rows li.cur").get_attribute("data-id") == target
+
+
+async def test_a_held_click_elsewhere_is_not_lost_when_the_menu_closes(split: Split) -> None:
+    """A press moves the focus out of an open menu before the release: closing it must not rebuild
+    the row the click lands on, or the browser drops that click."""
+    split.fake.rows[8]["last_id"] = "8"
+    page, _ = await _row_menu(split, 4)
+    read = page.locator(f'#rows li[data-id="{_id(8)}"] [data-k="read"]')
+    await page.locator(f'#rows li[data-id="{_id(8)}"]').hover()
+    box = await read.bounding_box()
+    assert box is not None
+    await page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    await page.mouse.down()
+    await page.wait_for_timeout(120)
+    await page.mouse.up()
+    await split.fake.settled()
+    assert split.fake.of("read") == [{"read": _id(8)}]
+    assert await page.locator(".rowmenu").count() == 0

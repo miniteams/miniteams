@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from miniteams._io import emit, force_blocking_stdout
-from miniteams.config import Settings, make_private_dir, write_private
+from miniteams.config import Settings, write_private
 
 
 def test_authority_and_scope() -> None:
@@ -36,17 +36,27 @@ def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
 
-def test_make_private_dir_new_is_0700_existing_left_alone(tmp_path: Path) -> None:
+def test_write_private_new_parent_is_0700_existing_left_alone(tmp_path: Path) -> None:
     old = os.umask(0)
     try:
-        assert make_private_dir(tmp_path / "a" / "b") is True
+        write_private(tmp_path / "a" / "b" / "f", "x")
     finally:
         os.umask(old)
     assert _mode(tmp_path / "a" / "b") == 0o700
     loose = tmp_path / "loose"
     loose.mkdir()
     loose.chmod(0o755)
-    assert make_private_dir(loose) is False and _mode(loose) == 0o755
+    write_private(loose / "f", "x")
+    assert _mode(loose) == 0o755
+
+
+def test_launch_file_defaults_under_config_dir_and_is_absolute(tmp_path: Path, monkeypatch) -> None:
+    assert Settings(tenant_id="t", config_dir=tmp_path).launch_file == tmp_path / "open.html"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MINITEAMS_LAUNCH_FILE", "rel/open.html")
+    assert Settings(tenant_id="t").launch_file == tmp_path / "rel" / "open.html"
+    monkeypatch.setenv("MINITEAMS_LAUNCH_FILE", "~/x.html")
+    assert Settings(tenant_id="t").launch_file == Path.home() / "x.html"
 
 
 def test_write_private_replaces_atomically_owner_only(tmp_path: Path) -> None:

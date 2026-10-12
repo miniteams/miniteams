@@ -100,7 +100,7 @@ soon as the seed is read and fills in from the live listing afterwards; a small 
 bottom right means that walk is still running, and the rows may reshuffle when it lands. Mentions
 are scanned at startup on the newest rows only (50); older chats surface theirs when the next
 message arrives. It binds a random `127.0.0.X:PORT` drawn once and kept in `~/.config/miniteams/web.json` so the
-URL stays bookmarkable; `--bind` overrides it and refuses anything but loopback (IPv6 as `[::1]:PORT`). Every page, media file, emoji and the WebSocket
+URL stays bookmarkable; `--bind` overrides it and refuses anything but loopback (IPv6 as `[::1]:PORT`). Media files, emoji and the WebSocket
 need the auth cookie, see *First launch*. Clicking a row opens the chat at its last message through `--opener` (default `xdg-open`
 on an `msteams://` deep link, i.e. the desktop client; `--open-scheme https` for Teams web,
 `--opener none` to let the page follow its plain https link); opening does not mark the row
@@ -108,12 +108,13 @@ seen. Ctrl/middle click opens the https link, through `--browser firefox` when s
 page's own browser (middle click can open the chat page instead, see the ⚙ setting below). `xdg-open` only works when the `msteams` handler's `.desktop` entry passes the
 URL along (`Exec=… %u`); otherwise point `--opener` at the client binary, e.g.
 `--opener "/path/to/teams-for-linux --no-sandbox"`. Hovering a preview cut by the row width shows the whole message (up to 1000 characters).
-Hovering a row shows its **seen** button (✓): the row leaves the Inbox until something
+Hovering (or tabbing into) a row shows `✎`, `👁` (mark read in Teams) and `⋯`, a menu with **✓ Mark seen** and
+**🔕 Mute** (same rows in the chat page's split list, without `✎`). Seen: the row leaves the Inbox until something
 newer lands on that chat (state in `~/.config/miniteams/seen.json`); the **Seen** tab lists those rows dimmed,
-where ↺ undoes it. A message that @mentions you gets a blue stripe and an `@ you` tag (`@ all` for an
+where ⋯ → ↺ Unseen undoes it. A message that @mentions you gets a blue stripe and an `@ you` tag (`@ all` for an
 @everyone), also when the mention was added by editing an older message; it clears once you mark the row seen
 or read the chat in Teams after the mention. The `@` tab lists mentioned rows, **Unread** follows Teams' own
-read marker. `🔕` mutes a chat (out of Inbox whatever lands on it, listed under **Muted** until `🔔`; mentions still
+read marker. Mute takes a chat out of Inbox whatever lands on it (listed under **Muted** until ⋯ → 🔔 Unmute; mentions still
 surface; state in `muted.json`). `✎` (or `r` on the row selected with the arrow keys, `Tab` from the filter) opens
 a reply box under the row: Enter sends it to the chat as you, Shift+Enter adds a line, Escape closes it and keeps
 the draft until the page reloads; a failed send keeps the text and shows why. The ⚙ menu picks the theme (system by default), hides avatars for a denser list, and sets
@@ -121,15 +122,14 @@ the draft until the page reloads; a failed send keeps the text and shows why. Th
 process exits non-zero when the stream dies (auth expired) — re-run it.
 
 **First launch**
-- Run `web`: at each start it writes a private launch file (`$XDG_RUNTIME_DIR/miniteams/open.html`, else `<config dir>/run/` (`~/.config/miniteams/run/` by default); directory `0700`, file `0600`) and prints `open: file://…/open.html` on stderr.
-- Open that file once per browser profile, e.g. `chromium --app=file:///run/user/<uid>/miniteams/open.html`. It redirects through a single-use link; a valid link answers a small page that sets the `mt` cookie (`HttpOnly; SameSite=Strict`, one year, refreshed on each page load) and refreshes to the bare URL. The file is re-minted after each use, so the same command always works.
-- `MINITEAMS_RUN_DIR` sets the run directory (created `0700`; an existing one must already be `0700`): snap-packaged browsers (e.g. snap Chromium) cannot read files under `/run/user/<uid>` or in hidden directories like `~/.config`, so point it at a non-hidden directory such as `~/miniteams-run` (`MINITEAMS_RUN_DIR=~/miniteams-run` in `.env`). Keep it inside a directory only you can write to.
-- One `web` per run directory: a second one (e.g. a test run) refuses to start; give it its own `MINITEAMS_RUN_DIR`, `MINITEAMS_ENDPOINT_SUFFIX` and `--bind`.
-- No secret or token appears on a command line, in the terminal or in the browser history.
-- Any browser without the cookie (a widget window included) opens the launch file once. Without the cookie, pages answer 403 with a hint pointing at it.
+- Launch with `chromium --app=file://$HOME/.config/miniteams/open.html` (or the `MINITEAMS_LAUNCH_FILE` path). `web` writes that launch file (`0600`) and `web.json` (`0600`, the bind) with a single-use token; the page trades the token at `/auth` for the `mt` cookie (`HttpOnly; SameSite=Strict`, one year, refreshed on each page load) and drops it from the address bar. `web` writes a new token after each use, so the same command always works, and once a browser holds the cookie the plain `http://host:port/` URL works too.
+- Snap Chromium: its confinement (the snap `home` interface) denies hidden files and directories under `~`, so it cannot open `~/.config/miniteams/open.html`. Set `MINITEAMS_LAUNCH_FILE=~/snap/chromium/common/miniteams/open.html` in `.env` (the snap's own data directory, kept across snap refreshes) and launch `chromium --app=file://$HOME/snap/chromium/common/miniteams/open.html`. Non-snap browsers (`google-chrome` or Firefox from a `.deb`) read the default path.
+- Alternative: `chromium --app="http://$(jq -r '"\(.host):\(.port)/#\(.token)"' ~/.config/miniteams/web.json)"`. It puts the single-use token in argv, where a process reading `/proc` could spend it first; the page then shows `Not signed in`.
+- The secret never appears on a command line, in the terminal or in the browser history.
+- Pages load without the cookie, but show `Not signed in` and stay empty until launched with a token: data (the socket, media, emoji) needs the cookie.
 - Open the page by the bound address: any other `Host` name (e.g. `localhost`) gets 404 (DNS-rebinding guard).
-- The secret is persistent, in `~/.config/miniteams/web-secret` (`0600`); delete it to rotate, then reopen the launch file in each browser.
-- Chat pages opened through `--browser` get their own private file (`file://…/chat-<random>.html`) that redirects through a single-use link (valid 60 s). A spent or expired link with a valid cookie just lands on the page.
+- The secret is persistent, in `~/.config/miniteams/web-secret` (`0600`); delete it to rotate, then relaunch each browser with a token.
+- Chat pages opened through `--browser` get the current token in their URL fragment, so a fresh `--browser` profile signs in on the first open.
 - Known limit: the cookie is host-scoped, not port-scoped, so another HTTP server on the same `127.0.0.X` address receives it. `web` draws a dedicated `127.0.0.X` and keeps it across restarts to make that unlikely.
 - Archive reads have a deadline: a hung mount answers `archive unavailable` (history, search, follow) or HTTP 503 (pages, media) and logs one `archive_unavailable` warning per 30 s. A chat page that missed live frames reloads its latest page. At exit, threads stuck on a dead mount do not hold the process.
 
@@ -215,11 +215,12 @@ token expires. Downloaded media (from `stream`) lives under `~/.cache/miniteams/
 
 All via `MINITEAMS_*` env vars / `.env` (see `.env.example`). `MINITEAMS_ENDPOINT_SUFFIX=-test` gives a
 second `web`, `stream` or `archive --live` its own Trouter endpoint ids, so it does not take the
-deliveries of the one already running; a second `web` also needs its own `MINITEAMS_RUN_DIR` and
-`--bind`. Defaults are the purple-teams
+deliveries of the one already running; a second `web` also needs its own `--bind` (sharing the config
+dir, it leaves the first one's `web.json` and launch file alone, and prints its own launch URL on
+stderr at start and after each use: enter it through that URL, or with a cookie a browser already holds for that host).
+`MINITEAMS_LAUNCH_FILE` moves the launch file (default `~/.config/miniteams/open.html`). Defaults are the purple-teams
 **work/TFW** constants — override only if auth starts returning 4xx, after re-capturing from a
 live browser session. `MINITEAMS_ASYNCGW_HOST` sets the custom emoji host (default `fr-prod.asyncgw.teams.microsoft.com`); set it when your tenant lives in another region.
-`MINITEAMS_RUN_DIR` sets where `web` writes its launch files (see First launch).
 
 ## Dev
 

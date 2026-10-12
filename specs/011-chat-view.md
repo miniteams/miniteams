@@ -161,11 +161,12 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 
 - [x] **AC1** Given the ⚙ setting at `chat`, a middle click on a row sends `{"open": id, "chat":
       true}` when `--browser` is set and the server runs `--browser` on `http://<bind>/chat/<encoded
-      id>`; without `--browser` it opens a new tab on `/chat/<encoded id>` and sends no verb; with the setting at `teams` (default) the
+      id>` (changed by the 2026-10-12 decision: plus `#<launch token>`); without `--browser` it opens a new tab on `/chat/<encoded id>` and sends no verb; with the setting at `teams` (default) the
       behaviour of today is unchanged (`open`+`web` when `--browser` is set, else the plain link).
 - [x] **AC2** Ctrl click and plain click are unchanged whatever the setting.
 - [x] **AC3** `GET /chat/<id>` returns the chat page for a thread on the board or in the archive,
-      404 otherwise; `GET /media/<id>/<file>` returns the file for an existing archived asset, 404
+      404 otherwise (changed by the 2026-10-12 decision: 404 only with the cookie, without it every
+      `/chat/<id>` gets the empty shell); `GET /media/<id>/<file>` returns the file for an existing archived asset, 404
       for a missing one and for any path escaping the media directory (`..`, absolute, encoded).
 - [x] **AC4** `history` on an archived thread returns the last `limit` messages oldest-first,
       `older: true` while earlier ones exist; a second call with `before` returns the page before
@@ -186,7 +187,8 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 - [x] **AC9** `follow`, `history` and `send` for a thread that is neither on the board nor in the
       archive are refused with an `error` and no API call.
 - [x] **AC10** The page is reachable only from the bound loopback address (same bind and Origin
-      rules as the board) and carries the auth cookie (see Decisions); no token or MRI other than those of the chat's own messages reaches
+      rules as the board) and its data needs the auth cookie (see Decisions; changed by the 2026-10-12
+      decision: the page shell itself loads without it); no token or MRI other than those of the chat's own messages reaches
       the page.
 - [x] **AC11** Reply with quote: `send` with `quote: [a, b]` posts a body starting with the
       Reply blockquotes of `a` then `b`, author MRI, name and preview from the server's copy; any
@@ -243,7 +245,8 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
       within 1 px); tabs Inbox, @, Unread and a "⋯" menu holding Seen and Muted fit a 280 px column
       without scrolling, the active tab always visible; from 360 px the five tabs show inline; the
       filter has a × clear, ↑/↓/Enter/Escape like the widget's, and Ctrl+K focuses it from anywhere.
-- [x] **AC29** Split rows and focus: seen/mute buttons take no width until hover or focus; rows use a
+- [x] **AC29** Split rows and focus: row buttons (👁 Teams read, ⋯ menu with seen and mute, as on the
+      widget) take no width until hover or focus; rows use a
       roving tabindex (↑/↓/Home/End move, Enter switches), so the chat header is at most 10 Tab
       presses from the filter; ☰ toggles the docked list above 700 px (saved) and opens a drawer
       with a backdrop below it, with `aria-expanded`, focus into the filter, Escape back to ☰.
@@ -331,7 +334,7 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 
 ## Data model impact (summary)
 
-None. Archive read-only; auth adds `~/.config/miniteams/web-secret` and the launch files (see Decisions).
+None. Archive read-only; auth adds `~/.config/miniteams/web-secret` and the launch token in `web.json` and the launch file (see Decisions).
 
 ## Open questions
 
@@ -378,19 +381,24 @@ None.
 - Fix round, "fix everything before ship" (babs, 2026-10-10): the chat-page verbs move out of
   `web.py` into their own module.
 - The code shared by the two pages becomes one file, inlined into both at serve time (no new route).
-- Every route (pages, media, emoji) and the WebSocket require the `mt` cookie (`HttpOnly; SameSite=Strict`, one
+- Media, emoji and the WebSocket require the `mt` cookie (`HttpOnly; SameSite=Strict`, one
   year, refreshed on each page load), derived from a persistent secret (`~/.config/miniteams/web-secret`,
   `0600`; delete to rotate).
-- Launch: `web` writes a private launch file (`$XDG_RUNTIME_DIR/miniteams/open.html`, fallback
-  `<config dir>/run/`, or `MINITEAMS_RUN_DIR`; dir `0700`, file `0600`) and prints `open: file://…` on stderr at each start. The
-  file redirects through a single-use link (no expiry); a valid link answers a small page that sets the cookie and refreshes to the bare URL (no 303). The file is re-minted after each use. No
-  secret or token ever reaches a command line, the terminal or browser history (a command line is readable by
-  other users through `/proc`).
-- One server per run dir (`flock` on `<run dir>/lock`, taken first thing in `cmd_web`, before the login, the archive seed, the stream and `web.json`): a second one refuses
-  to start instead of redrawing the port and overwriting, then deleting, the live launch files.
-- Chat pages opened through `--browser`: a per-open private file (`chat-<random>.html`) redirects through a
-  single-use 60 s link; a spent link with a valid cookie just lands on the page.
-- Without the cookie, pages answer 403 with a hint pointing at the launch file; a foreign Host name gets 404.
+- Launch through a single-use token in the URL fragment (babs, 2026-10-12; replaces the
+  `$XDG_RUNTIME_DIR` launch files, the run dir and its lock, KISS): pages are static shells served without the cookie; `web.json` (`0600`)
+  holds `{host, port, token}`; the page strips the fragment at once and sends its token in an
+  `X-Miniteams-Token` header to `GET /auth` (204 + cookie, token re-minted into `web.json`; 403 otherwise).
+  A header, not the URL: no history, and cross-site it needs a preflight, which the GET-only websockets
+  server never answers. A failed `web.json` write keeps the old token valid. Middle click "chat here"
+  through `--browser` opens `/chat/<id>#<token>`. Each token also goes into a launch file
+  (`MINITEAMS_LAUNCH_FILE`, default `~/.config/miniteams/open.html`, `0600`), a page redirecting to
+  `http://<host:port>/#<token>`: `chromium --app=file://<launch file>` keeps the token out of argv (a
+  failed launch-file write is logged, rotation goes on). A `--bind` run leaves a `web.json` naming another
+  bind alone, re-checked at every re-mint, and prints its launch URL on stderr at start and after each re-mint. Known limit: the jq
+  launch and `--browser` middle-click opens put the token in argv; a process reading `/proc` may spend it
+  first, and the page then shows "Not signed in".
+- Without the cookie the page shows "Not signed in" (its socket is refused: a plain `GET /ws` answers
+  403); a foreign Host name gets 404.
   Origin checks kept. Known limit: another local user cannot read the secret (file mode); the remaining
   exposure is a process running as the same user, which can read the file.
 - Known limit: the cookie is host-scoped, not port-scoped, so another HTTP server on the same `127.0.0.X`

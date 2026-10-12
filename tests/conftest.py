@@ -128,18 +128,12 @@ def _fresh_archive_pool() -> Iterator[None]:
     chat_verbs._closed = False
 
 
-@pytest.fixture(autouse=True)
-def _private_run_dir(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Launch files go under each test's config dir: the real runtime dir holds the live server's."""
-    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
-
-
 @pytest.fixture
 def settings(tmp_path: Any) -> Settings:
     s = Settings(tenant_id="tenant-123")
     s.config_dir = tmp_path / "cfg"
     s.cache_dir = tmp_path / "cache"
-    s.run_dir = None  # the developer's .env MINITEAMS_RUN_DIR holds the live server's launch files
+    s.launch_file = s.config_dir / "open.html"  # never the real one, nor a .env override
     return s
 
 
