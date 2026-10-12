@@ -6,6 +6,8 @@ import time
 from typing import Any
 
 import pytest
+import structlog.testing
+from conftest import wait
 
 from miniteams import web as W
 from miniteams.archive_store import Index
@@ -76,9 +78,40 @@ async def test_the_index_is_re_read_when_it_changed_since_the_seed(
     monkeypatch.setattr(W, "_SEED_REREAD", 0.0)  # the 30s floor is not what this test is about
     _write_index(tmp_path, "19:late@thread.v2", "Jean Dupont")
 
-    await board.on_event(_message("19:late@thread.v2"))
+    assert await board.archived_label("19:late@thread.v2") == "Jean Dupont"
 
-    assert board.rows["19:late@thread.v2"]["label"] == "Jean Dupont"
+
+async def test_the_stream_never_reads_the_index(
+    board_directory: Directory, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M7: an unnamed chat's event takes the seed's name or keeps the bare id: the index re-read may
+    wait on a hung mount, and on_event must not."""
+    _write_index(tmp_path, "19:early@thread.v2", "Jean Martin")
+    board = W.Board({}, board_directory, seed=W.seed_from_archive(tmp_path, ME), data_dir=tmp_path, me=ME)
+    monkeypatch.setattr(W, "_SEED_REREAD", 0.0)
+    monkeypatch.setattr(W, "_reseed", lambda *a: pytest.fail("the stream read the index"))
+    await asyncio.wait_for(board.on_event(_message("19:late@thread.v2")), 0.5)
+    await asyncio.wait_for(board.on_event(_message("19:early@thread.v2")), 0.5)
+    assert board.rows["19:late@thread.v2"]["label"] == "19:late@thread.v2"
+    assert board.rows["19:early@thread.v2"]["label"] == "Jean Martin"
+
+
+async def test_an_index_timeout_names_nothing(
+    board_directory: Directory, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M13: past the index deadline the archive name lookup is "" and the caller moves on."""
+    from miniteams import chat_verbs as CV
+
+    _write_index(tmp_path, "19:early@thread.v2", "Jean Martin")
+    board = W.Board({}, board_directory, seed=W.seed_from_archive(tmp_path, ME), data_dir=tmp_path, me=ME)
+    monkeypatch.setattr(W, "_SEED_REREAD", 0.0)
+    monkeypatch.setitem(CV._DEADLINES, "index", 0.05)
+    release = threading.Event()
+    monkeypatch.setattr(W, "_reseed", lambda *a: release.wait(5))
+    try:
+        assert await asyncio.wait_for(board.archived_label("19:late@thread.v2"), 1) == ""
+    finally:
+        release.set()
 
 
 async def test_an_unchanged_index_is_not_re_read(
@@ -160,3 +193,58 @@ def test_the_seed_reads_while_the_archive_writes(tmp_path: Any) -> None:
     assert not thread.is_alive()
     assert failed == []  # the writer was never blocked by us
     assert min(seen) >= 1  # and every read returned rows, none raised
+
+
+async def test_the_index_stat_runs_off_the_loop_and_only_past_the_floor(
+    board_directory: Directory, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M4: an unnamed event inside the floor costs no stat at all; past it, the stat runs on an archive
+    thread with the re-read, never on the loop."""
+    _write_index(tmp_path, "19:early@thread.v2", "Jean Martin")
+    board = W.Board({}, board_directory, seed=W.seed_from_archive(tmp_path, ME), data_dir=tmp_path, me=ME)
+    stats: list[str] = []
+    real = W._index_stamp
+
+    def stamp(data_dir: Any) -> Any:
+        stats.append(threading.current_thread().name)
+        return real(data_dir)
+
+    monkeypatch.setattr(W, "_index_stamp", stamp)
+    assert await board.archived_label("19:late@thread.v2") == ""
+    assert stats == []
+    monkeypatch.setattr(W, "_SEED_REREAD", 0.0)
+    _write_index(tmp_path, "19:late@thread.v2", "Jean Dupont")
+    assert await board.archived_label("19:late@thread.v2") == "Jean Dupont"
+    assert len(stats) == 1 and stats[0].startswith("archive")
+
+
+async def test_a_seed_past_its_deadline_starts_an_empty_board(
+    settings: Any, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M13: a hung index at start: the board starts empty, the listing fills it, the log says why."""
+    from miniteams import chat_verbs as CV
+
+    monkeypatch.setitem(CV._DEADLINES, "index", 0.05)
+    release = threading.Event()
+    monkeypatch.setattr(W, "seed_from_archive", lambda *a: release.wait(5) and {"x": {}})
+    boards: list[W.Board] = []
+
+    async def serve(board: W.Board, *a: Any) -> None:
+        boards.append(board)
+        await asyncio.Event().wait()
+
+    async def fill(board: W.Board, *a: Any) -> None:
+        release.set()  # the hung read ends before run() checks for stuck threads
+        await asyncio.Event().wait()
+
+    async def ended(*a: Any, **kw: Any) -> None:
+        await wait(lambda: bool(boards), "served")
+
+    monkeypatch.setattr(W, "serve_board", serve)
+    monkeypatch.setattr(W, "fill_from_listing", fill)
+    monkeypatch.setattr(W, "run_forever", ended)
+    monkeypatch.setattr(W.EmojiCache, "refresh", fill)  # no token fetch
+    with structlog.testing.capture_logs() as logs, pytest.raises(RuntimeError, match="live stream ended"):
+        await W.run(settings, "sk", "", None, None, data_dir=tmp_path)
+    assert [board.rows for board in boards] == [{}]
+    assert [e["event"] for e in logs if e["event"].startswith("archive_index")] == ["archive_index_timeout"]

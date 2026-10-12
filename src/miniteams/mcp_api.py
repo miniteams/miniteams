@@ -10,10 +10,11 @@ from typing import Any
 
 import structlog
 
-from .chats import fetch_conversations, is_system, last_activity
+from .chats import chat_kind, fetch_conversations, is_system, last_activity
 from .config import Settings
 from .directory import Directory
-from .dump import _epoch_seconds, iter_history_pages
+from .dump import epoch_seconds, iter_history_pages
+from .messages import fold
 from .send import NOTES_THREAD
 
 log = structlog.get_logger()
@@ -25,16 +26,12 @@ _MAX_CHATS = 50  # chats a search reads
 _PAGE_SIZE = 100
 
 Record = Callable[[dict[str, Any]], dict[str, Any]]
-Kind = Callable[[str], str]
-Fold = Callable[[str], str]
 
 
 class ApiReader:
-    def __init__(
-        self, settings: Settings, skype_token: str, bearer: str, *, record: Record, kind: Kind, fold: Fold
-    ):
+    def __init__(self, settings: Settings, skype_token: str, bearer: str, *, record: Record):
         self.settings, self.skype_token = settings, skype_token
-        self.record, self.kind, self.fold = record, kind, fold
+        self.record = record
         self.directory = Directory(settings)
         self.directory.set_token(skype_token, bearer)
 
@@ -54,11 +51,11 @@ class ApiReader:
         return rows
 
     def find_chats(self, query: str, participant: str, kind: str, since: str, limit: int) -> dict[str, Any]:
-        q, who = self.fold(query), self.fold(participant)
+        q, who = fold(query), fold(participant)
         candidates = [
             c
             for c in self._conversations(since)
-            if (not kind or self.kind(str(c["id"])) == kind) and (not since or last_activity(c) >= since)
+            if (not kind or chat_kind(str(c["id"])) == kind) and (not since or last_activity(c) >= since)
         ]
         found: list[dict[str, Any]] = []
 
@@ -70,16 +67,16 @@ class ApiReader:
         for conv, label in zip(head, labels, strict=True):
             thread_id = str(conv["id"])
             topic = str((conv.get("threadProperties") or {}).get("topic") or "")
-            haystack = self.fold(f"{label} {topic}")
+            haystack = fold(f"{label} {topic}")
             if q and q not in haystack:
                 continue
-            if who and who not in self.fold(label):
+            if who and who not in fold(label):
                 continue
             found.append(
                 {
                     "id": thread_id,
                     "label": label,
-                    "kind": self.kind(thread_id),
+                    "kind": chat_kind(thread_id),
                     "last_activity": last_activity(conv),
                     "participants": [],
                 }
@@ -90,7 +87,7 @@ class ApiReader:
 
     def _history(self, thread_id: str, since: str, until: str) -> list[dict[str, Any]]:
         """Messages inside [since, until), oldest first, walking the history back from `until`."""
-        end_before = _epoch_seconds(until) if until else None
+        end_before = epoch_seconds(until) if until else None
         collected: dict[str, dict[str, Any]] = {}
         pages = 0
         for page in iter_history_pages(self.settings, self.skype_token, thread_id, _PAGE_SIZE, 0, end_before):
@@ -116,7 +113,7 @@ class ApiReader:
     def search_messages(
         self, query: str, since: str, until: str, thread_id: str, limit: int
     ) -> dict[str, Any]:
-        needle = self.fold(query)
+        needle = fold(query)
         active: list[dict[str, Any]] = []
         if thread_id:
             targets = [(thread_id, "")]
@@ -131,7 +128,7 @@ class ApiReader:
         for chat_id, label in targets:
             for message in self._history(chat_id, since, until):
                 record = self.record(message)
-                if needle in self.fold(record["text"]):
+                if needle in fold(record["text"]):
                     hits.append({**record, "thread_id": chat_id, "chat": label})
         hits.sort(key=lambda h: h["time"], reverse=True)
         left_out = max(0, len(active) - _MAX_CHATS)

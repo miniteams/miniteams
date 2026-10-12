@@ -3,17 +3,18 @@
 Run: `uv run --with playwright pytest tests/test_browser_nav.py`.
 """
 
-import asyncio
 import re
 from typing import Any
 
+import browser_helpers
 import pytest
 import test_browser
-from test_browser import Page, Route, Widget, _chat, _teams_tab  # its import skips without playwright
+from browser_helpers import Page, Route, wait  # its import skips without playwright
+from test_browser import Widget, _chat, _teams_tab
 from test_web_chat import T
 
 pytestmark = pytest.mark.browser
-pages, widget = test_browser.pages, test_browser.widget
+pages, widget = browser_helpers.pages, test_browser.widget
 
 _DISPATCH = (
     "document.querySelector('a.name').dispatchEvent("
@@ -26,6 +27,11 @@ _SUFFIX = {"list": "", "split": "?chatnav=split"}
 async def _stub_chat(route: Route) -> None:
     # The real chat page would follow T on a board that has no archive for it.
     await route.fulfill(body="<title>chat</title>", content_type="text/html")
+
+
+async def _left(widget: Widget) -> None:
+    """The page that navigated away closed its socket: the server handled every verb it sent first."""
+    await wait(lambda: not widget.board.clients, "the old page's socket closed")
 
 
 async def _load(widget: Widget, browser: bool, path: str, **stored: str) -> Page:
@@ -45,7 +51,7 @@ async def test_nav_plain_click_opens_the_chat_page_in_the_same_tab(widget: Widge
     await page.locator("a.name").click()
     await page.wait_for_url(widget.base + _chat(T) + _SUFFIX[chatnav])
     assert "%3A" in page.url and "%40" in page.url
-    await asyncio.sleep(0.2)  # a verb sent before the navigation would have reached the spy by now
+    await _left(widget)
     assert widget.verbs == []
     assert len(widget.ctx.pages) == 1
 
@@ -59,7 +65,7 @@ async def test_nav_enter_on_the_filtered_selection_opens_the_chat_page(widget: W
     await page.locator("#q").press("ArrowDown")
     await page.locator("#q").press("Enter")
     await page.wait_for_url(widget.base + _chat(T), timeout=5000)
-    await asyncio.sleep(0.2)  # a verb sent before the navigation would have reached the spy by now
+    await _left(widget)
     assert widget.verbs == []
     assert len(widget.ctx.pages) == 1
 
@@ -94,13 +100,11 @@ async def test_middle_click_carries_the_split_setting(
 
     async def spy(
         thread_id: str,
-        web: bool = False,
+        target: str = "app",
         ws: Any = None,
         msg_id: str = "",
-        chat: bool = False,
-        split: bool = False,
     ) -> bool:
-        widget.verbs.append((thread_id, "split" if split else chat or web))
+        widget.verbs.append((thread_id, "split" if target == "split" else target in ("chat", "web")))
         return True
 
     page = await _load(widget, browser, "/?nav=chat", chatnav=chatnav)

@@ -27,7 +27,7 @@ _TARGET_TYPE = "Passport|Skype|Lync|Thread|PSTN|Agent"
 _ISO_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
 
 
-def _epoch_seconds(composetime: str) -> int:
+def epoch_seconds(composetime: str) -> int:
     match = _ISO_RE.match(composetime or "")
     if not match:
         return 0
@@ -74,7 +74,7 @@ def iter_history_pages(
             if max_pages and page >= max_pages:
                 log.info("history_truncated", pages=page, hint="raise max_pages for more")
                 return
-            oldest = _epoch_seconds(messages[-1].get("composetime", ""))  # newest-first → last
+            oldest = epoch_seconds(messages[-1].get("composetime", ""))  # newest-first → last
             if oldest <= 0:
                 return
             new_end = oldest - 1

@@ -4,59 +4,59 @@ contract (`complete`, `send` with `mentions` + `format`). Synthetic data, no net
 Run: `uv run --with playwright pytest tests/test_browser_compose.py`.
 """
 
-import asyncio
-import json
-from collections.abc import AsyncIterator, Callable
+import re
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from importlib.resources import files
 from typing import Any
 
+import browser_helpers
 import pytest
-import test_browser
-from test_browser import PNG, Page, Pages, Route  # its import skips without playwright
+from browser_helpers import (  # skips without playwright
+    ANN,
+    ANN2,
+    BOB,
+    CONTRAST,
+    EMOJIS,
+    EVERYONE,
+    MALFORMED,
+    ORIGIN,
+    POP_ASK_MS,
+    Pages,
+    T,
+    closed,
+    open_fake,
+    past,
+    pick_namesakes,
+    pick_out_of_order,
+    pick_then_glue,
+    rendered,
+    row,
+    shows,
+    wait,
+)
+
+from miniteams import web as W
 
 pytestmark = pytest.mark.browser
-pages = test_browser.pages
+pages = browser_helpers.pages
 
-ORIGIN = "http://127.0.0.1:9"  # never dialled: every request on it is answered by a route
-T = "19:fake@thread.v2"
-ANN = {"name": "Ann Lee", "mri": "8:orgid:ann"}
-BOB = {"name": "Bob Roe", "mri": "8:orgid:bob"}
-EVERYONE = {"name": "everyone", "mri": T, "everyone": True}
-EMOJIS = [
-    {"name": "fire", "char": "🔥"},
-    {"name": "fish", "char": "🐟"},
-    {"name": "partyparrot", "custom": "0-abc", "src": "/emoji/0-abc"},
-    {"name": "pacman", "custom": "0-far", "src": "https://evil.example/x.png"},
-    {"name": "pa<img src=x onerror=alert(1)>", "char": "x"},
-    {"name": "trok", "custom": "0-ok", "src": "/emoji/0-ok"},
-    *({"name": f"tr{i}", "custom": i, "src": f"/emoji/{i}"} for i in ("..", "%2e%2e", "a\nb", "a/b")),
-    *({"name": f"zz{i:02d}", "char": "z"} for i in range(12)),  # more rows than the list shows
-]
-MALFORMED: list[Any] = [None, {"name": 5}, "x", {"name": "nuke", "char": "☢"}]
-_BARRIER = {"barrier": 1}
+# A module global read by the fixture: a mutation run swaps it for an altered copy.
+PAGE = W._page("widget.html")  # as served: ui.css and ui.js inlined
 
 
 @dataclass
-class Fake:
-    """The board side of the socket: answers `complete` from the tables above, acks `send`."""
+class Fake(browser_helpers.Fake):
+    """The board side of the widget socket: answers `complete` from the tables above, acks `send`."""
 
-    page: Page | None = None
-    verbs: list[dict[str, Any]] = field(default_factory=list)
-    held: list[dict[str, Any]] = field(default_factory=list)
-    hold: bool = False  # queue `complete` answers instead of sending them
     fail: bool = False
-    ws: Any = None
+    label: str = "Fictional chat"
+    members: list[dict[str, Any]] = field(default_factory=lambda: [EVERYONE, ANN, BOB])
 
     def attach(self, ws: Any) -> None:
-        self.ws = ws
-        ws.on_message(self._on_message)
-        row = {"id": T, "label": "Fictional chat", "last_activity": "2026-10-09T10:00:00.000Z", "typing": []}
-        ws.send(json.dumps({"rows": [row], "page": "1", "opener": False, "browser": False, "me": "Me"}))
+        super().attach(ws)
+        self.send({"rows": [row(T, self.label)], "page": "1", "opener": False, "browser": False, "me": "Me"})
 
-    def _on_message(self, raw: str | bytes) -> None:
-        msg = json.loads(raw)
-        self.verbs.append(msg)
+    def on_verb(self, msg: dict[str, Any]) -> None:
         if "complete" in msg:
             q = msg["q"].lower()
             if q == "nu":
@@ -64,97 +64,44 @@ class Fake:
             elif msg["complete"] == "emoji":
                 items = [e for e in EMOJIS if e["name"].startswith(q)]
             else:
-                names = {
-                    m["name"]: [m["name"].lower(), *m["name"].lower().split()] for m in (EVERYONE, ANN, BOB)
-                }
-                items = [m for m in (EVERYONE, ANN, BOB) if any(n.startswith(q) for n in names[m["name"]])]
-            answer = {"complete": msg["complete"], "q": msg["q"], "items": items[:12]}
-            if self.hold:
-                self.held.append(answer)
-            else:
-                self.ws.send(json.dumps(answer))
+                items = [
+                    m
+                    for m in self.members
+                    if any(n.startswith(q) for n in [m["name"].lower(), *m["name"].lower().split()])
+                ]
+            self.answer({"complete": msg["complete"], "q": msg["q"], "items": items[:12]})
         elif "send" in msg:
-            ack = {"sent": msg["send"], "ok": not self.fail, "error": "boom" if self.fail else None}
-            self.ws.send(json.dumps(ack))
-
-    def release(self, i: int) -> None:
-        self.ws.send(json.dumps(self.held[i]))
-
-    def of(self, verb: str) -> list[dict[str, Any]]:
-        return [v for v in self.verbs if verb in v]
-
-    async def settled(self) -> None:
-        """Every verb the page sent so far reached us: the socket is ordered, a barrier closes it."""
-        assert self.page is not None
-        await self.page.evaluate(f"window.__ws.send({json.dumps(json.dumps(_BARRIER))})")
-        await _wait(lambda: _BARRIER in self.verbs)
-        self.verbs.remove(_BARRIER)
+            self.send({"sent": msg["send"], "ok": not self.fail, "error": "boom" if self.fail else None})
 
 
-async def _wait(cond: Callable[[], bool]) -> None:
-    for _ in range(500):
-        if cond():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("condition not met in 5 s")
+async def _open(pages: Pages, board: Fake) -> None:
+    page = await open_fake(
+        pages,
+        board,
+        ORIGIN + "/",
+        PAGE,
+        page_route=ORIGIN + "/",
+        ws_route=re.compile(r"^ws://127\.0\.0\.1:9/ws$"),
+    )
+    await page.wait_for_selector("a.name")
+    await page.locator("button.reply").dispatch_event("click")
+    await page.wait_for_function("document.activeElement.id === 'reply'")
 
 
 @pytest.fixture
 async def fake(pages: Pages) -> AsyncIterator[Fake]:
-    widget = files("miniteams").joinpath("widget.html").read_text(encoding="utf-8")
-    ctx = await pages.browser.new_context()
     board = Fake()
-    await ctx.route_web_socket(ORIGIN.replace("http", "ws") + "/ws", board.attach)
-    # After the socket route: its own WebSocket stand-in must be the class _FRAMES wraps.
-    await ctx.add_init_script(test_browser._FRAMES)
-
-    async def other(route: Route) -> None:
-        if not route.request.url.startswith(ORIGIN + "/"):
-            pages.external.append(route.request.url)
-        await route.abort()
-
-    async def emoji(route: Route) -> None:
-        await route.fulfill(body=PNG, content_type="image/png")
-
-    async def page_html(route: Route) -> None:
-        await route.fulfill(body=widget, content_type="text/html; charset=utf-8")
-
-    # Last registered wins: the catch-all goes first.
-    await ctx.route("**/*", other)
-    await ctx.route(ORIGIN + "/emoji/*", emoji)
-    await ctx.route(ORIGIN + "/", page_html)
-    page = board.page = await ctx.new_page()
-    page.on("pageerror", lambda exc: pages.errors.append(str(exc)))
-    await page.goto(ORIGIN + "/")
-    await page.wait_for_selector("a.name")
-    await page.locator("button.reply").dispatch_event("click")
-    await page.wait_for_function("document.activeElement.id === 'reply'")
+    await _open(pages, board)
     yield board
-    await ctx.close()
+    await pages.close()
     assert pages.external == []
-
-
-async def _shows(page: Page, expected: list[str]) -> None:
-    """The open list reads `expected`: an answer to an earlier prefix may show first."""
-    seen: list[str] = []
-    for _ in range(500):
-        if not await page.locator("#pop").is_hidden():
-            seen = await page.locator("#pop [role=option]").all_text_contents()
-            if seen == expected:
-                return
-        await asyncio.sleep(0.01)
-    raise AssertionError(f"list shows {seen}, expected {expected}")
-
-
-async def _closed(page: Page) -> bool:
-    return await page.locator("#pop").is_hidden()
 
 
 async def test_colon_opens_the_emoji_list_and_enter_inserts_without_sending(fake: Fake) -> None:
     """012-AC8: `:fi` asks once the typing pauses, lists the answer; Enter inserts 🔥 and sends nothing."""
     page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
     await box.press_sequentially("hot :fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     assert fake.of("complete") == [{"complete": "emoji", "q": "fi", "thread": T}]
     assert await page.locator("#pop").get_attribute("role") == "listbox"
     assert await box.get_attribute("aria-activedescendant") == "pop-0"
@@ -163,7 +110,7 @@ async def test_colon_opens_the_emoji_list_and_enter_inserts_without_sending(fake
     await box.press("ArrowUp")
     await box.press("Enter")
     assert await box.input_value() == "hot 🔥"
-    assert await _closed(page)
+    assert await closed(page)
     await fake.settled()
     assert fake.of("send") == []
 
@@ -173,18 +120,18 @@ async def test_at_lists_members_everyone_first_and_send_carries_the_mentions(fak
     too; the send carries the picked mentions and `format: inline`."""
     page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
     await box.press_sequentially("@")
-    await _shows(page, ["everyone", "Ann Lee", "Bob Roe"])
+    await shows(page, ["everyone", "Ann Lee", "Bob Roe"])
     assert fake.of("complete")[-1] == {"complete": "member", "q": "", "thread": T}
     await box.press("ArrowDown")
     await box.press("Enter")
     assert await box.input_value() == "@Ann Lee "
     await box.press_sequentially("hi @ev")
-    await _shows(page, ["everyone"])
+    await shows(page, ["everyone"])
     await box.press("Tab")
     assert await box.input_value() == "@Ann Lee hi @everyone "
     assert await page.evaluate("document.activeElement.id") == "reply"
     await box.press("Enter")
-    await _wait(lambda: len(fake.of("send")) == 1)
+    await wait(lambda: len(fake.of("send")) == 1)
     assert fake.of("send") == [
         {"send": T, "text": "@Ann Lee hi @everyone ", "mentions": [ANN, EVERYONE], "format": "inline"}
     ]
@@ -196,7 +143,7 @@ async def test_a_removed_mention_is_not_sent_and_picks_survive_a_failure_only(fa
     page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
     for prefix in ("ann", "bob"):
         await box.press_sequentially("@" + prefix)
-        await _shows(page, [{"ann": "Ann Lee", "bob": "Bob Roe"}[prefix]])
+        await shows(page, [{"ann": "Ann Lee", "bob": "Bob Roe"}[prefix]])
         await box.press("Enter")
     assert await box.input_value() == "@Ann Lee @Bob Roe "
     await box.fill("@Ann Lee only")
@@ -209,7 +156,7 @@ async def test_a_removed_mention_is_not_sent_and_picks_survive_a_failure_only(fa
     await page.locator("button.reply").dispatch_event("click")
     await box.fill("@Ann Lee again")
     await box.press("Enter")
-    await _wait(lambda: len(fake.of("send")) == 3)
+    await wait(lambda: len(fake.of("send")) == 3)
     assert [v["mentions"] for v in fake.of("send")] == [[ANN], [ANN], []]
 
 
@@ -218,16 +165,15 @@ async def test_escape_closes_the_list_keeps_the_text_then_enter_sends(fake: Fake
     and Enter with the list closed sends."""
     page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
     await box.press_sequentially(":fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     await box.press("Escape")
-    assert await _closed(page)
+    assert await closed(page)
     assert await box.input_value() == ":fi"
     await box.press_sequentially("s")
-    await asyncio.sleep(0.3)  # past the debounce
-    await fake.settled()
+    await fake.settled(past_ms=POP_ASK_MS)
     assert [v["q"] for v in fake.of("complete")] == ["fi"]
     await box.press("Enter")
-    await _wait(lambda: len(fake.of("send")) == 1)
+    await wait(lambda: len(fake.of("send")) == 1)
     assert fake.of("send") == [{"send": T, "text": ":fis", "mentions": [], "format": "inline"}]
 
 
@@ -235,12 +181,12 @@ async def test_a_typed_shortcode_is_sent_as_typed(fake: Fake) -> None:
     """012-AC8: `:fire:` typed by hand closes the list at the second colon and goes out as text."""
     page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
     await box.press_sequentially("a :fire", delay=20)  # under the debounce, over a task turn
-    await _shows(page, ["🔥:fire:"])
+    await shows(page, ["🔥:fire:"])
     assert [v["q"] for v in fake.of("complete")] == ["fire"]  # one question once the typing pauses
     await box.press_sequentially(": b")
-    assert await _closed(page)
+    assert await closed(page)
     await box.press("Enter")
-    await _wait(lambda: len(fake.of("send")) == 1)
+    await wait(lambda: len(fake.of("send")) == 1)
     assert fake.of("send")[0]["text"] == "a :fire: b"
 
 
@@ -249,7 +195,7 @@ async def test_mid_word_colon_and_at_ask_nothing(fake: Fake) -> None:
     box = fake.page.locator("#reply")  # type: ignore[union-attr]
     for part in ("at 10:30", " to me@ann"):  # each pause outlasts the debounce: both ends get their chance
         await box.press_sequentially(part)
-        await asyncio.sleep(0.3)
+        await past(fake.page, POP_ASK_MS)  # type: ignore[arg-type]
     await fake.settled()
     assert fake.of("complete") == []
 
@@ -259,14 +205,14 @@ async def test_a_stale_answer_is_ignored(fake: Fake) -> None:
     page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
     fake.hold = True
     await box.press_sequentially(":fi")
-    await _wait(lambda: len(fake.held) == 1)
+    await wait(lambda: len(fake.held) == 1)
     await box.press_sequentially("s")
-    await _wait(lambda: len(fake.held) == 2)
+    await wait(lambda: len(fake.held) == 2)
     fake.release(0)
-    await asyncio.sleep(0.2)
-    assert await _closed(page)
+    await fake.handled()
+    assert await closed(page)
     fake.release(1)
-    await _shows(page, ["🐟:fish:"])
+    await shows(page, ["🐟:fish:"])
 
 
 async def test_ime_composition_never_asks_nor_picks(fake: Fake) -> None:
@@ -277,16 +223,15 @@ async def test_ime_composition_never_asks_nor_picks(fake: Fake) -> None:
     cdp = await page.context.new_cdp_session(page)
     await cdp.send("Input.imeSetComposition", {"text": ":fi", "selectionStart": 3, "selectionEnd": 3})
     assert await box.input_value() == ":fi"
-    await asyncio.sleep(0.3)  # past the debounce
-    await fake.settled()
+    await fake.settled(past_ms=POP_ASK_MS)
     assert fake.of("complete") == []
     await cdp.send("Input.insertText", {"text": ""})
     await box.fill(":fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     composing = "{key: 'Enter', keyCode: 229, isComposing: true, bubbles: true, cancelable: true}"
     await box.evaluate(f"b => b.dispatchEvent(new KeyboardEvent('keydown', {composing}))")
     assert await box.input_value() == ":fi"
-    assert not await _closed(page)
+    assert not await closed(page)
     await fake.settled()
     assert fake.of("send") == []
 
@@ -297,7 +242,7 @@ async def test_custom_emoji_shows_its_image_and_inserts_its_name(fake: Fake) -> 
     page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
     assert page is not None
     await box.press_sequentially(":pa")
-    await _shows(page, [":partyparrot:", ":pacman:", "x:pa<img src=x onerror=alert(1)>:"])
+    await shows(page, [":partyparrot:", ":pacman:", "x:pa<img src=x onerror=alert(1)>:"])
     imgs = page.locator("#pop img")
     assert await imgs.count() == 1
     assert await imgs.get_attribute("src") == "/emoji/0-abc"
@@ -311,14 +256,14 @@ async def test_a_list_for_a_shorter_prefix_is_not_picked_while_the_longer_one_is
     once answered it picks from the new list."""
     page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
     await box.press_sequentially(":fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     fake.hold = True
     await box.press_sequentially("s")
     await box.press("Enter")
     assert await box.input_value() == ":fis"
-    await _wait(lambda: len(fake.held) == 1)
+    await wait(lambda: len(fake.held) == 1)
     fake.release(0)
-    await _shows(page, ["🐟:fish:"])
+    await shows(page, ["🐟:fish:"])
     await box.press("Enter")
     assert await box.input_value() == "🐟"
     await fake.settled()
@@ -332,11 +277,11 @@ async def test_combobox_attributes_follow_the_list(fake: Fake) -> None:
     assert await box.get_attribute("role") == "combobox"
     assert await box.get_attribute("aria-expanded") == "false"
     await box.press_sequentially(":fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     assert await box.get_attribute("aria-expanded") == "true"
     assert await page.locator("#pop").get_attribute("aria-label") == "emoji"
     await box.fill("@")
-    await _shows(page, ["everyone", "Ann Lee", "Bob Roe"])
+    await shows(page, ["everyone", "Ann Lee", "Bob Roe"])
     assert await page.locator("#pop").get_attribute("aria-label") == "members"
     await box.press("Escape")
     assert await box.get_attribute("aria-expanded") == "false"
@@ -348,17 +293,16 @@ async def test_member_query_reaches_a_last_name_and_an_inserted_mention_stays_cl
     page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
     assert page is not None
     await box.press_sequentially("@ann l")
-    await _shows(page, ["Ann Lee"])
+    await shows(page, ["Ann Lee"])
     assert fake.of("complete")[-1]["q"] == "ann l"
     await box.press("Enter")
     await box.press_sequentially("hi @every")
-    await _shows(page, ["everyone"])
+    await shows(page, ["everyone"])
     await box.press("Enter")
     await box.press_sequentially("x")
-    await asyncio.sleep(0.3)  # past the debounce
-    await fake.settled()
-    await asyncio.sleep(0.1)  # an answer to the last question has landed
-    assert await _closed(page)
+    await fake.settled(past_ms=POP_ASK_MS)
+    await fake.handled()  # an answer to the last question has landed
+    assert await closed(page)
     assert await box.input_value() == "@Ann Lee hi @everyone x"
     assert [v["q"] for v in fake.of("complete")][-1] == "every"  # the inserted mention is not asked again
 
@@ -368,13 +312,13 @@ async def test_a_press_on_the_list_scrollbar_keeps_it_open(fake: Fake) -> None:
     page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
     assert page is not None
     await box.press_sequentially(":zz")
-    await _shows(page, [f"z:zz{i:02d}:" for i in range(12)])
+    await shows(page, [f"z:zz{i:02d}:" for i in range(12)])
     assert await page.evaluate("(p => p.scrollHeight > p.clientHeight)(document.getElementById('pop'))")
     rect = await page.locator("#pop").bounding_box()
     assert rect is not None
     await page.mouse.click(rect["x"] + rect["width"] - 4, rect["y"] + rect["height"] - 8)
-    await asyncio.sleep(0.1)
-    assert not await _closed(page)
+    await rendered(page)
+    assert not await closed(page)
     assert await page.evaluate("document.activeElement.id") == "reply"
 
 
@@ -382,10 +326,10 @@ async def test_blur_closes_the_list(fake: Fake) -> None:
     """012-AC8: focus leaving the textarea closes the list."""
     page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
     await box.press_sequentially(":fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     await box.blur()
     assert page is not None
-    assert await _closed(page)
+    assert await closed(page)
 
 
 async def test_enter_after_the_caret_left_the_word_sends(fake: Fake) -> None:
@@ -393,10 +337,10 @@ async def test_enter_after_the_caret_left_the_word_sends(fake: Fake) -> None:
     page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
     await box.press_sequentially("ab :fi")
     assert page is not None
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     await box.press("Home")
     await box.press("Enter")
-    await _wait(lambda: len(fake.of("send")) == 1)
+    await wait(lambda: len(fake.of("send")) == 1)
     assert fake.of("send") == [{"send": T, "text": "ab :fi", "mentions": [], "format": "inline"}]
 
 
@@ -405,7 +349,7 @@ async def test_only_plain_emoji_paths_load_an_image(fake: Fake) -> None:
     page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
     assert page is not None
     await box.press_sequentially(":tr")
-    await _shows(page, [":trok:", ":tr..:", ":tr%2e%2e:", ":tra\nb:", ":tra/b:"])
+    await shows(page, [":trok:", ":tr..:", ":tr%2e%2e:", ":tra\nb:", ":tra/b:"])
     srcs = await page.locator("#pop img").evaluate_all("imgs => imgs.map(i => i.getAttribute('src'))")
     assert srcs == ["/emoji/0-ok"]
 
@@ -415,7 +359,7 @@ async def test_malformed_items_are_skipped(fake: Fake) -> None:
     page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
     assert page is not None
     await box.press_sequentially(":nu")
-    await _shows(page, ["☢:nuke:"])
+    await shows(page, ["☢:nuke:"])
     await box.press("Enter")
     assert await box.input_value() == "☢"
 
@@ -425,13 +369,13 @@ async def test_an_unanswered_prefix_releases_enter_after_a_while(fake: Fake) -> 
     page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
     assert page is not None
     await box.press_sequentially(":fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     fake.hold = True
     await box.press_sequentially("s")
-    await _wait(lambda: len(fake.held) == 1)
+    await wait(lambda: len(fake.held) == 1)
     await page.wait_for_selector("#pop", state="hidden", timeout=3000)
     await box.press("Enter")
-    await _wait(lambda: len(fake.of("send")) == 1)
+    await wait(lambda: len(fake.of("send")) == 1)
     assert fake.of("send")[0]["text"] == ":fis"
 
 
@@ -441,7 +385,7 @@ async def test_a_prefix_typed_offline_lets_enter_report_the_failure(fake: Fake) 
     page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
     assert page is not None
     await box.press_sequentially(":fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     await fake.ws.close()
     await page.wait_for_function("window.__ws.readyState === 3")
     await box.press_sequentially("s")
@@ -455,12 +399,11 @@ async def test_typing_after_an_inserted_mention_asks_nothing(fake: Fake) -> None
     page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
     assert page is not None
     await box.press_sequentially("@every")
-    await _shows(page, ["everyone"])
+    await shows(page, ["everyone"])
     await box.press("Enter")
     asked = len(fake.of("complete"))
     await box.press_sequentially("thanks")
-    await asyncio.sleep(0.3)  # past the debounce
-    await fake.settled()
+    await fake.settled(past_ms=POP_ASK_MS)
     assert len(fake.of("complete")) == asked
     assert await box.input_value() == "@everyone thanks"
 
@@ -471,9 +414,71 @@ async def test_enter_on_another_trigger_word_sends_instead_of_inserting(fake: Fa
     page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
     assert page is not None
     await box.press_sequentially("@fi :fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     for _ in range(4):
         await box.press("ArrowLeft")
     await box.press("Enter")
-    await _wait(lambda: len(fake.of("send")) == 1)
+    await wait(lambda: len(fake.of("send")) == 1)
     assert fake.of("send")[0]["text"] == "@fi :fi"
+
+
+# --- review fixes: same-name mentions, direction, contrast ---
+
+
+async def test_two_people_with_one_name_are_both_mentioned(fake: Fake) -> None:
+    """012-AC8: two members sharing a display name are two picks; the send carries both mentions."""
+    fake.members = [ANN, ANN2]
+    page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
+    assert page is not None
+    await box.press_sequentially("@ann")
+    await shows(page, ["Ann Lee", "Ann Lee"])
+    await box.press("Enter")
+    await box.press_sequentially("and @ann")
+    await shows(page, ["Ann Lee", "Ann Lee"])
+    await box.press("ArrowDown")
+    await box.press("Enter")
+    await box.press("Enter")
+    await wait(lambda: len(fake.of("send")) == 1)
+    assert fake.of("send")[0]["mentions"] == [ANN, ANN2]
+
+
+@pytest.mark.parametrize(
+    ("picks", "sent"), [([0, 1], [ANN2]), ([0, 1, 0], [ANN])], ids=["other", "re-picked"]
+)
+async def test_a_deleted_pick_does_not_mention_its_namesake(fake: Fake, picks: list[int], sent: Any) -> None:
+    """M1: a namesake picked then deleted from the text is not mentioned; the one picked last is."""
+    fake.members = [ANN, ANN2]
+    assert await pick_namesakes(fake, picks) == sent
+
+
+async def test_picks_out_of_text_order_mention_both(fake: Fake) -> None:
+    """M1: a mention inserted before an earlier pick still counts, and so does the earlier one."""
+    assert await pick_out_of_order(fake) == [BOB, ANN]
+
+
+async def test_a_longer_word_is_no_mention(fake: Fake) -> None:
+    """L4: `@Ann Leeds` is no mention of Ann Lee, as the server reads it (a raw substring would count it)."""
+    assert await pick_then_glue(fake) == []
+
+
+async def test_row_names_and_snippets_take_their_own_direction(pages: Pages) -> None:
+    """A right-to-left chat name and snippet read right to left: both carry dir=auto."""
+    board = Fake(label="קבוצת עבודה")
+    await _open(pages, board)
+    assert board.page is not None
+    dirs = await board.page.evaluate(
+        "['li .name', 'li .prev'].map((s) => document.querySelector(s).getAttribute('dir'))"
+    )
+    assert dirs == ["auto", "auto"]
+    await pages.close()
+
+
+async def test_dim_text_reaches_4_5_to_1(fake: Fake) -> None:
+    """The widget's dim texts (inactive tabs, a plain row's snippet) contrast at least 4.5:1 in light."""
+    page = fake.page
+    assert page is not None
+    await page.evaluate("document.documentElement.dataset.theme = 'light'")
+    ratios = await page.evaluate(
+        f"[...document.querySelectorAll('#tabs button:not(.on), li .prev')].map((e) => ({CONTRAST})(e))"
+    )
+    assert len(ratios) == 5 and min(ratios) >= 4.5, ratios

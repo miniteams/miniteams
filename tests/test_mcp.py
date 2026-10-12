@@ -18,7 +18,7 @@ from miniteams import mcp_api as API
 from miniteams.archive_store import ChatStore, Index
 from miniteams.auth import AuthExpired, AuthUnavailable
 from miniteams.config import Settings
-from miniteams.dump import _epoch_seconds
+from miniteams.dump import epoch_seconds
 
 _REAL_CLIENT = httpx.Client
 
@@ -258,6 +258,15 @@ def test_read_messages_plain_text_oldest_first_with_flags(settings: Settings, da
     assert edited["edited"] and not edited["deleted"]
     assert deleted["deleted"] and deleted["text"] == ""
     assert files["attachments"] == 2
+
+
+def test_message_record_reads_edits_and_files_like_the_other_views() -> None:
+    """M9 + L8: `edited` is messages.is_edited (the live echo's skypeeditedid too); files go through
+    json_list whatever their shape."""
+    assert M.message_record({"skypeeditedid": "1"})["edited"] is True
+    assert M.message_record({"properties": {"edittime": ""}})["edited"] is False
+    for files, count in (('[{"a": 1}, {"b": 2}]', 2), ([{"a": 1}], 1), ("not json", 0), (7, 0), (None, 0)):
+        assert M.message_record({"properties": {"files": files}})["attachments"] == count, files
 
 
 def test_read_messages_window_is_since_inclusive_until_exclusive(settings: Settings, data: Path) -> None:
@@ -745,7 +754,7 @@ def _api(
         calls.append(thread_id)
         msgs = sorted(history.get(thread_id, []), key=lambda m: m["composetime"], reverse=True)
         if end_before is not None:
-            msgs = [m for m in msgs if _epoch_seconds(m["composetime"]) <= end_before]
+            msgs = [m for m in msgs if epoch_seconds(m["composetime"]) <= end_before]
         for i in range(0, len(msgs), page_size):
             yield msgs[i : i + page_size]
 

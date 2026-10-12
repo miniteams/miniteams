@@ -14,7 +14,8 @@ app for one chat.
 ## Solution
 
 A ⚙ setting, "middle click opens the chat here", off by default. When on, a middle click on a row
-opens a new tab on `/chat/<thread>` served by the same `miniteams web` process: the conversation's
+opens a new tab on `/chat/<thread>` served by the same `miniteams web` process (a second setting,
+`chatnav`, adds a chat picker at `/?nav=chat` and a split list beside the chat): the conversation's
 history, newest at the bottom, rendered like Teams (bold, links, lists, quotes, emoji, images from
 the archive), followed live, with the same composer as the widget at the bottom. Reply there,
 Enter sends. Ctrl click and plain click keep their current behaviour.
@@ -23,9 +24,9 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 
 - **Setting.** ⚙ menu gains "Middle click: Teams web / chat here" (per browser, `localStorage`
   key `midclick`, default `teams`). With `chat`, `onauxclick` button 1 opens the chat page: when
-  `--browser` is set, through it (verb `{"open": id, "chat": true}`; the server runs `--browser` on
-  its own `http://<bind>/chat/<encoded id>`), else in a new tab of the page's browser
-  (`window.open`, `noopener`).
+  `--browser` is set, through it (verb `{"open": id, "chat": true, "chatnav"?: "split"}`; the server
+  runs `--browser` on its own `http://<bind>/chat/<encoded id>`), else in a new tab of the page's
+  browser (`window.open`, `noopener`).
 - **Route.** `GET /chat/<thread>` serves `chat.html` (new static page next to `widget.html`),
   `GET /media/<thread>/<file>` serves a file from `<data-dir>/<thread>/media/` (read-only, path
   confined to that directory, 404 otherwise). The thread id is taken from the URL path, url-decoded.
@@ -36,10 +37,11 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
   anchor (jump to a date or to a search hit). Source order: archive `messages.db` when the thread
   has one, else the API (`fetch_history`, one page), same rule as spec 008. Answer to the asking
   socket only: `{"history": "<thread>", "before": <cursor echoed, null for the latest page>,
-  "messages": [...], "older": bool, "newer": bool, "source": "archive"|"api"}`, or the same
-  `history` and `before` with `"error"`: `invalid before` (not an ISO time), `busy` (one history
-  request in flight per socket), `history unavailable` (any unexpected failure; the exception stays
-  in the log). A null or empty cursor means the latest page. The API source only serves the latest page and `before` (no `after`/`around`).
+  "messages": [...], "older": bool, "newer": bool, "source": "archive"|"api", "cursor": <opaque>}`
+  (`cursor`: on an empty page with more beyond, the `before`/`after` to ask next), or the same `history` and `before` with `"error"`:
+  `invalid before` (not an ISO time), `busy` (one history request in flight per socket), `archive unavailable` (archive read deadline hit). Any verb that raises
+  (history and search included) answers a generic `failed`; the exception stays in the log. "history unavailable" /
+  "search unavailable" are only the page's own messages after 10 busy retries. A null or empty cursor means the latest page. The API source only serves the latest page and `before` (no `after`/`around`).
   Message record: `id`, `at` (composetime ISO), `from` (mri), `name`, `me` (bool), `type`
   (`text`, `system`, `call`, `other`), `html` (sanitised body), `edited` (bool), `deleted` (bool),
   `reactions` ([{key, emoji, count, mine}]), `mentions` (spec 003 kind: `me`, `all`, `null`).
@@ -120,6 +122,8 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
     (`history.pushState`; Back returns to the previous chat). Each chat keeps its composer draft
     and quotes while the page stays open. Below ~700px wide the list collapses behind a ☰ button.
     No ◀ in this mode.
+  - The widget carries `chatnav=split` in the chat URLs it opens, since the target browser has its
+    own storage.
 - **Cards.** Bot and app messages carry an Adaptive Card: `RichText/Media_Card` holds it base64
   in `<Swift b64>` (`attachments[].content`, with `summary`), a `RichText/Html` may hold one in
   `properties.cards[].content`. The server renders the card body to the same sanitised HTML
@@ -182,7 +186,7 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 - [x] **AC9** `follow`, `history` and `send` for a thread that is neither on the board nor in the
       archive are refused with an `error` and no API call.
 - [x] **AC10** The page is reachable only from the bound loopback address (same bind and Origin
-      rules as the board); no token or MRI other than those of the chat's own messages reaches
+      rules as the board) and carries the auth cookie (see Decisions); no token or MRI other than those of the chat's own messages reaches
       the page.
 - [x] **AC11** Reply with quote: `send` with `quote: [a, b]` posts a body starting with the
       Reply blockquotes of `a` then `b`, author MRI, name and preview from the server's copy; any
@@ -290,13 +294,13 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 - **DoD**: `pytest` green with one test per AC above (API mocked); on a throwaway chat, a quoted
   reply, a reaction added then removed, an edit and a delete made from the page all show in Teams.
 
-### Phase 5 — scroll, latest button, search, jump
+### Phase 5 — scroll, latest button, search
 - Work: `after` / `around` on `history`, `search` verb, infinite scroll both ways, "↓ latest",
-  search field and date picker in `chat.html`, tests.
+  search field in `chat.html`, tests.
 - **Covers**: AC15, AC16, AC17, AC18
 - **Data model impact**: none
 - **DoD**: `pytest` green for `after`, `around` and `search` on archive fixtures; on the live
-  page, a chat with 1000+ messages scrolls back to its start, a search hit and a date jump land on
+  page, a chat with 1000+ messages scrolls back to its start, a search hit lands on
   the right message, "↓ latest" returns to the bottom.
 
 ### Phase 6 — navigation between chats
@@ -327,7 +331,7 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 
 ## Data model impact (summary)
 
-None. Archive read-only, no new file under `~/.config/miniteams`.
+None. Archive read-only; auth adds `~/.config/miniteams/web-secret` and the launch files (see Decisions).
 
 ## Open questions
 
@@ -371,3 +375,28 @@ None.
 - Quote author and preview come from the server's copy of the message: the page could otherwise
   post a quote attributing any text to anyone.
 - Emoji and mention markup is rendered now (read side) so spec 012 only adds the write side.
+- Fix round, "fix everything before ship" (babs, 2026-10-10): the chat-page verbs move out of
+  `web.py` into their own module.
+- The code shared by the two pages becomes one file, inlined into both at serve time (no new route).
+- Every route (pages, media, emoji) and the WebSocket require the `mt` cookie (`HttpOnly; SameSite=Strict`, one
+  year, refreshed on each page load), derived from a persistent secret (`~/.config/miniteams/web-secret`,
+  `0600`; delete to rotate).
+- Launch: `web` writes a private launch file (`$XDG_RUNTIME_DIR/miniteams/open.html`, fallback
+  `~/.config/miniteams/run/`, or `MINITEAMS_RUN_DIR`; dir `0700`, file `0600`) and prints `open: file://…` on stderr at each start. The
+  file redirects through a single-use 10 min link; a valid link answers a small page that sets the cookie and refreshes to the bare URL (no 303). The file is re-minted after each use. No
+  secret or token ever reaches a command line, the terminal or browser history (a command line is readable by
+  other users through `/proc`).
+- Chat pages opened through `--browser`: a per-open private file (`chat-<random>.html`) redirects through a
+  single-use 60 s link; a spent link with a valid cookie just lands on the page.
+- Without the cookie, pages answer 403 with a hint pointing at the launch file; a foreign Host name gets 404.
+  Origin checks kept. Known limit: another local user cannot read the secret (file mode); the remaining
+  exposure is a process running as the same user, which can read the file.
+- Known limit: the cookie is host-scoped, not port-scoped, so another HTTP server on the same `127.0.0.X`
+  loopback address receives it. Nothing in HTTP fixes that; miniteams draws a dedicated `127.0.0.X` host and
+  keeps it across redraws to make that unlikely.
+- Archive reads have deadlines: `archive unavailable` (history, search, follow) or 503 (pages, media) when the
+  mount hangs, with one `archive_unavailable` warning per 30 s in the log; a follower gets a `gap` frame and
+  reloads the latest page when live frames were dropped.
+- Known limits after the fix round: the custom emoji host defaults to the fr-prod region
+  (`MINITEAMS_ASYNCGW_HOST` overrides it; per-region wiring waits for a check of the authz
+  response); at exit, threads stuck on a dead mount do not hold the process.

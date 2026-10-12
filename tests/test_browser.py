@@ -4,37 +4,40 @@ Run: `uv run --with playwright pytest tests/test_browser.py` (playwright stays o
 """
 
 import asyncio
-import contextlib
 import json
-import os
-import re
-import resource
 import threading
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
-from dataclasses import dataclass, field
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+import browser_helpers
 import httpx
 import pytest
 import test_web_chat
+from browser_helpers import (  # skips without playwright
+    CONTRAST,
+    PNG,
+    BrowserContext,
+    Page,
+    Pages,
+    Route,
+    rendered,
+    row,
+    until,
+    wait,
+)
 from test_web_chat import ANN, ME, OBJ, C, T, _archive, _at, _event, _m, _served, _until
 
+from miniteams import archive_store, compose
+from miniteams import chat_verbs as CV
 from miniteams import web as W
 from miniteams.archive_store import ChatStore, find_chat_dir
 from miniteams.config import Settings
 
-CHROME = Path("/usr/bin/google-chrome")
-# e2e layers must not silently skip in CI: there a missing playwright or Chrome fails instead.
-if os.environ.get("CI", "").lower() not in ("1", "true"):
-    pytest.importorskip("playwright.async_api", reason="run with `uv run --with playwright`")
-    if not CHROME.exists():
-        pytest.skip(f"{CHROME} missing", allow_module_level=True)
-
-from playwright.async_api import Browser, BrowserContext, Page, Route, async_playwright  # noqa: E402
-
 pytestmark = pytest.mark.browser
+pages = browser_helpers.pages
 # test_web_chat's fixtures; `board` builds on this module's `data_dir`.
 board, calls, launched, quiet_directory, sent = (
     test_web_chat.board,
@@ -51,73 +54,12 @@ D = "19:dddd@thread.v2"  # archived, messages on several days
 K = "19:kkkk@thread.v2"  # archived, a bot card
 R = "19:rrrr@thread.v2"  # archived, deleted runs and reaction chips
 GONE = {"deletetime": "1789466600000"}
-PNG = bytes.fromhex(
-    "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
-    "1f15c4890000000d49444154789c63000100000500010d0a2db40000000049454e44ae426082"  # pragma: allowlist secret
-)
-# Each socket frame lands in window.__frames once the page's own handler ran (setTimeout: after it);
-# window.__ws is the page's latest socket, for the tests' own verbs.
-_FRAMES = """(() => { const Real = WebSocket; window.__frames = [];
-  window.WebSocket = class extends Real { constructor(...a) { super(...a); window.__ws = this;
-    this.addEventListener("message", (e) => setTimeout(() => window.__frames.push(JSON.parse(e.data)))); } };
-})();"""
+# An `open` the spy records, not browser_helpers.BARRIER: the real board drops an unknown verb unseen.
 _BARRIER = ("barrier", False)
 # (thread, web) for an `open` verb; (thread, "chat") when it asks for our own chat page.
 Verb = tuple[str, bool | str]
 _LIST = "document.getElementById('list')"
 _AT_BOTTOM = f"(l => l.scrollHeight - l.scrollTop - l.clientHeight < 40)({_LIST})"
-
-
-@dataclass
-class Pages:
-    browser: Browser
-    host: str = ""
-    external: list[str] = field(default_factory=list)  # requests that tried to leave 127.0.0.1
-    errors: list[str] = field(default_factory=list)
-
-    async def open(self, path: str, *, csp: bool = False, **ctx: Any) -> Page:
-        """A page on `path` of the served board. wait_for_function evaluates, which the chat CSP
-        forbids: contexts bypass it unless `csp` asks for the real policy."""
-        context = await self.browser.new_context(bypass_csp=not csp, **ctx)
-        await context.add_init_script(_FRAMES)
-        await context.route(re.compile(r"^(?!http://127\.0\.0\.1:)"), self._block)
-        page = await context.new_page()
-        page.on("pageerror", lambda exc: self.errors.append(str(exc)))
-        await page.goto(f"http://{self.host}{path}")
-        return page
-
-    async def _block(self, route: Route) -> None:
-        self.external.append(route.request.url)
-        await route.abort()
-
-
-@contextlib.contextmanager
-def _uncapped() -> Iterator[None]:
-    """Chrome reserves far more address space than conftest's RLIMIT_AS cap: lift it while the
-    playwright driver (and so Chrome, its child) is spawned, then restore it for this process."""
-    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
-    resource.setrlimit(resource.RLIMIT_AS, (hard, hard))
-    try:
-        yield
-    finally:
-        resource.setrlimit(resource.RLIMIT_AS, (soft, hard))
-
-
-@pytest.fixture
-async def pages() -> AsyncIterator[Pages]:
-    with _uncapped():
-        driver = async_playwright()
-        p = await driver.__aenter__()
-    browser = None
-    try:
-        browser = await p.chromium.launch(executable_path=str(CHROME), headless=True)
-        found = Pages(browser)
-        yield found
-    finally:
-        if browser is not None:
-            await browser.close()
-        await driver.__aexit__(None, None, None)
-    assert found.errors == []
 
 
 def _chat(thread_id: str) -> str:
@@ -201,8 +143,9 @@ def data_dir(tmp_path: Path) -> Path:
 @pytest.fixture
 async def chat(board: W.Board, settings: Settings, pages: Pages) -> AsyncIterator[Pages]:
     async with _served(board, settings) as host:
-        pages.host = host
+        pages.serve(host, board)
         yield pages
+        await pages.close()
     assert pages.external == []
 
 
@@ -262,7 +205,7 @@ async def test_composer_keys_success_and_failure(
     def failing(*args: Any) -> None:
         raise httpx.ConnectError("boom", request=httpx.Request("POST", "https://x"))
 
-    monkeypatch.setattr(W, "send_message", failing)
+    monkeypatch.setattr(CV, "send_message", failing)
     await box.fill("keep me")
     await box.press("Control+Enter")
     await page.wait_for_function("document.getElementById('err').textContent !== ''")
@@ -307,7 +250,7 @@ async def test_csp_blocks_an_inline_handler_the_sanitiser_let_through(
     """011-AC6: with the real CSP, an event attribute in a message body never runs."""
     page = await chat.open(_chat(T), csp=True)
     await page.wait_for_selector("#status:not(.off)")  # the page's own script and socket pass the CSP
-    monkeypatch.setattr(W, "sanitize", lambda content, *a: content)
+    monkeypatch.setattr(CV, "sanitize", lambda content, *a: content)
     body = '<p>x<img src="/nope.png" onerror="window.__pwned=1"></p>'
     async with page.expect_console_message(lambda msg: "inline event handler" in msg.text):
         await board.on_event(_event("NewMessage", T, **_m("20", _at(20), body)))
@@ -340,14 +283,14 @@ async def test_edit_during_the_history_read_is_applied_after_it(
     page = await chat.open(_chat(T))
     await _handled(page, "history")
     reading, release = threading.Event(), threading.Event()
-    real_read = W.read_page
+    real_read = CV.read_page
 
     def held_read(*args: Any, **kwargs: Any) -> Any:
         reading.set()
         release.wait(5)
         return real_read(*args, **kwargs)
 
-    monkeypatch.setattr(W, "read_page", held_read)
+    monkeypatch.setattr(CV, "read_page", held_read)
     since = await _frames(page)
     await _drop(board)
     assert await asyncio.to_thread(reading.wait, 10)
@@ -383,7 +326,7 @@ async def test_channel_page_has_no_composer(chat: Pages) -> None:
     page = await chat.open(_chat(C))
     await _handled(page, "follow")
     assert await page.locator("#reply").is_disabled()
-    assert await page.locator("#reply").get_attribute("placeholder") == "read-only: team channel"
+    assert await page.locator("#reply").get_attribute("placeholder") == "read-only chat"
     await page.wait_for_selector('[data-id="1"] .reacts')
     assert await page.locator(".reacts button").count() == 0  # 011-AC26: no react on a channel
     assert await page.locator(".reacts span").count() == 4
@@ -392,7 +335,7 @@ async def test_channel_page_has_no_composer(chat: Pages) -> None:
 async def test_malformed_chat_address_is_guarded(chat: Pages) -> None:
     """The page refuses an address it cannot decode (no AC; served by a stub: the server 404s it)."""
     html = W._page("chat.html")
-    headers = {"Content-Type": "text/html", "Content-Security-Policy": W._chat_csp(html)}
+    headers = {"Content-Type": "text/html", "Content-Security-Policy": W._page_csp(html)}
     page = await chat.open("/")
 
     async def stub(route: Route) -> None:
@@ -418,7 +361,7 @@ async def test_follow_error_is_not_overwritten_by_the_history_error(
         raise RuntimeError("no API in tests")
 
     monkeypatch.setattr(board, "follow", refuse)
-    monkeypatch.setattr(W, "fetch_history", offline)
+    monkeypatch.setattr(CV, "fetch_history", offline)
     page = await chat.open(_chat(nope))
     await _handled(page, "follow")
     await _handled(page, "history")
@@ -540,7 +483,7 @@ async def test_edit_escape_cancels_enter_saves_errors_stay_inline(
     await page.wait_for_selector('[data-id="3"] .html')  # the ack closes the editor
     assert calls == [("edit", T, "3", "mine v2\nmore")]
 
-    monkeypatch.setattr(W, "edit_message", _refused)
+    monkeypatch.setattr(CV, "edit_message", _refused)
     await page.locator('[data-id="3"]').hover()
     await _act(page, "3", "edit").click()
     await box.fill("kept")
@@ -583,7 +526,10 @@ async def test_edit_starts_from_the_text_without_its_reply_quote(board: W.Board,
     """011-AC13: quotes are lost on edit: the field holds only what I wrote."""
     page = await chat.open(_chat(T))
     await _handled(page, "history")
-    body = W.reply_quote(_m("1", _at(1), "<p>hello there</p>"), "Ann Lee") + "<p>my answer</p><p>second</p>"
+    body = (
+        compose.reply_quote(_m("1", _at(1), "<p>hello there</p>"), "Ann Lee")
+        + "<p>my answer</p><p>second</p>"
+    )
     await board.on_event(_event("NewMessage", T, **_m("9", _at(9), body, **_MINE)))
     await page.wait_for_selector('[data-id="9"] blockquote.reply')
     assert await (await _edit(page, "9")).input_value() == "my answer\n\nsecond"
@@ -628,10 +574,9 @@ async def test_an_open_editor_survives_a_reload_of_the_page_of_messages(
     await _drop(board)
     await _handled(page, "history", since)
     assert await page.locator('[data-id="3"] .editor').input_value() == "kept across"
-    real_read = W.read_page
-    monkeypatch.setattr(
-        W, "read_page", lambda *a, **k: ([m for m in real_read(*a, **k)[0] if m["id"] != "3"], False, False)
-    )
+    real_read = CV.read_page
+    without_3 = lambda *a, **k: [m for m in real_read(*a, **k).messages if m["id"] != "3"]  # noqa: E731
+    monkeypatch.setattr(CV, "read_page", lambda *a, **k: archive_store.Page(without_3(*a, **k), False, False))
     since = await _frames(page)
     await _drop(board)
     await _handled(page, "history", since)
@@ -654,7 +599,7 @@ async def test_a_save_cut_by_a_reconnect_can_be_retried_and_the_composer_keeps_f
             release.wait(5)
         return {"status": 200}
 
-    monkeypatch.setattr(W, "edit_message", first_held)
+    monkeypatch.setattr(CV, "edit_message", first_held)
     page = await chat.open(_chat(T))
     await _handled(page, "history")
     box = await _edit(page, "3")
@@ -688,7 +633,7 @@ async def test_escape_during_a_save_then_its_failure_lands_on_the_composer_line(
         release.wait(5)
         _refused()
 
-    monkeypatch.setattr(W, "edit_message", held)
+    monkeypatch.setattr(CV, "edit_message", held)
     page = await chat.open(_chat(T))
     await _handled(page, "history")
     box = await _edit(page, "3")
@@ -760,13 +705,13 @@ async def _ids(page: Page) -> list[str]:
 
 
 def _slow_pages(monkeypatch: pytest.MonkeyPatch, wait: float = 0.3) -> None:
-    real = W.read_page
+    real = CV.read_page
 
     def slow(*args: Any, **kwargs: Any) -> Any:
         threading.Event().wait(wait)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(W, "read_page", slow)
+    monkeypatch.setattr(CV, "read_page", slow)
 
 
 async def _open_long(chat: Pages) -> Page:
@@ -796,8 +741,7 @@ async def test_scroll_to_top_loads_older_once_and_keeps_the_place(
     await _scroll(page, "0")
     await page.wait_for_function("document.querySelectorAll('#msgs .msg').length === 250")
     assert (await _ids(page))[0] == "0"
-    await _scroll(page, "0")
-    await asyncio.sleep(0.5)
+    await _scroll(page, "0")  # the page's scroll handler runs inside this call
     assert len(await _history_sent(page)) == 2  # older: false, nothing more to ask
 
 
@@ -862,7 +806,7 @@ async def test_search_errors_show_in_the_results(
     """011-AC18: a chat without archive says so where the results would be."""
     b = test_web_chat.B
     board.rows[b] = {"id": b, "label": "B", "last_activity": _at(1), "typing": []}
-    monkeypatch.setattr(W, "fetch_history", lambda *a: [])
+    monkeypatch.setattr(CV, "fetch_history", lambda *a: [])
     page = await chat.open(_chat(b))
     await _handled(page, "history")
     await _search(page, "x")
@@ -922,7 +866,7 @@ async def test_jump_without_archive_says_so(
     """011-AC17: a chat read from the API cannot jump; the page says why and keeps its messages."""
     b = test_web_chat.B
     board.rows[b] = {"id": b, "label": "B", "last_activity": _at(1), "typing": []}
-    monkeypatch.setattr(W, "fetch_history", lambda *a: [_m("1", _at(1))])
+    monkeypatch.setattr(CV, "fetch_history", lambda *a: [_m("1", _at(1))])
     page = await chat.open(_chat(b))
     await _handled(page, "history")
     await _search(page, "x")  # answered "no archive": a hit offered anyway still cannot jump
@@ -992,7 +936,7 @@ async def test_two_quick_jumps_land_on_the_second(chat: Pages, monkeypatch: pyte
     await page.wait_for_selector("#msgs .msg.hit")
     assert await page.locator("#msgs .msg.hit").evaluate_all("ns => ns.map(n => n.dataset.id)") == ["245"]
     assert await _in_view(page, "245")
-    await asyncio.sleep(0.5)
+    await rendered(page)  # the landing's scroll event, handled
     assert [v for v in await _history_sent(page) if "after" in v or "before" in v] == []
 
 
@@ -1008,12 +952,12 @@ async def test_a_short_page_asks_for_older_without_a_scroll(
         asked.append(end)
         return [_m(str(i), _at(i)) for i in (3, 4, 5)]
 
-    monkeypatch.setattr(W, "fetch_history", three)
+    monkeypatch.setattr(CV, "fetch_history", three)
     page = await chat.open(_chat(b))
     await page.wait_for_function("window.__frames.filter(f => 'history' in f).length === 2")
     assert len(asked) == 2 and asked[1] is not None  # the latest page, then `before` its first message
-    await asyncio.sleep(0.3)
-    assert len(asked) == 2  # that page was empty: older false, no more
+    await rendered(page)  # a third ask would go out while the second answer is handled, or on a scroll
+    assert len(await page.evaluate("window.__out.filter(v => 'history' in v)")) == 2  # older false, no more
 
 
 async def test_a_failed_older_page_is_asked_again_after_a_reconnect(
@@ -1033,7 +977,7 @@ async def test_a_failed_older_page_is_asked_again_after_a_reconnect(
             raise RuntimeError("odd")
         return [_m("1", _at(1))]
 
-    monkeypatch.setattr(W, "fetch_history", flaky)
+    monkeypatch.setattr(CV, "fetch_history", flaky)
     page = await chat.open(_chat(b))
     await page.wait_for_function("window.__frames.some(f => f.error === 'odd')")
     since = await _frames(page)
@@ -1047,20 +991,21 @@ async def test_an_empty_page_that_says_older_is_asked_once(
     chat: Pages, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """011-AC15: a short page whose older page comes back empty (yet `older`) does not ask it again."""
-    real = W.read_page
+    real = CV.read_page
     befores: list[str] = []
 
     def lying(*args: Any, **kwargs: Any) -> Any:
         if kwargs.get("before"):
             befores.append(kwargs["before"])
-            return [], True, False
-        messages, _, newer = real(*args, **kwargs)
-        return messages, True, newer
+            return archive_store.Page([], True, False)
+        messages, _, newer, _ = real(*args, **kwargs)
+        return archive_store.Page(messages, True, newer)
 
-    monkeypatch.setattr(W, "read_page", lying)
+    monkeypatch.setattr(CV, "read_page", lying)
     page = await chat.open(_chat(T))
     await page.wait_for_function("window.__frames.filter(f => 'history' in f).length === 2")
-    await asyncio.sleep(0.5)
+    await rendered(page)  # a third ask would go out while the second answer is handled, or on a scroll
+    assert len(await page.evaluate("window.__out.filter(v => 'history' in v)")) == 2
     assert befores == [_at(1)]
 
 
@@ -1070,14 +1015,14 @@ async def test_a_failed_reconnect_page_falls_back_to_the_latest(
     """Deferred to phase 5: when the page around the reader's message fails, the latest page loads."""
     page = await _open_long(chat)
     await _scroll(page, "l.scrollHeight / 2")
-    real = W.read_page
+    real = CV.read_page
 
     def no_around(*args: Any, **kwargs: Any) -> Any:
         if kwargs.get("around"):
             raise ValueError("boom")
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(W, "read_page", no_around)
+    monkeypatch.setattr(CV, "read_page", no_around)
     since = await _frames(page)
     await _drop(board)
     await page.wait_for_function(
@@ -1104,22 +1049,19 @@ async def test_a_search_answer_after_escape_stays_closed(
     chat: Pages, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """011-AC18: closing the results before the answer drops that search."""
-    from miniteams import mcp
+    real = CV.search_chat
 
-    real = mcp.Archive.search_messages
-
-    def slow(self: mcp.Archive, *args: Any) -> Any:
+    def slow(*args: Any, **kwargs: Any) -> Any:
         threading.Event().wait(1.0)  # Escape must land first, even on a loaded host
-        return real(self, *args)
+        return real(*args, **kwargs)
 
-    monkeypatch.setattr(mcp.Archive, "search_messages", slow)
+    monkeypatch.setattr(CV, "search_chat", slow)
     page = await _open_long(chat)
     since = await _frames(page)
     await page.fill("#find", "x02")
     await page.press("#find", "Enter")
     await page.press("#find", "Escape")
-    await _handled(page, "search", since)
-    await asyncio.sleep(0.1)
+    await _handled(page, "search", since)  # recorded once the page's handler ran
     assert await page.locator("#hits").is_hidden()
 
 
@@ -1210,11 +1152,7 @@ class Widget:
         await click()
         await self.page.evaluate("window.__ws.send(JSON.stringify({open: 'barrier'}))")
 
-        async def barrier() -> None:
-            while _BARRIER not in self.verbs:
-                await asyncio.sleep(0.01)
-
-        await asyncio.wait_for(barrier(), 5)
+        await wait(lambda: _BARRIER in self.verbs, "barrier")
         assert self.verbs[-1] == _BARRIER
         tabs = []
         for tab in self.ctx.pages[1:]:
@@ -1239,34 +1177,26 @@ class Widget:
 
 @pytest.fixture
 async def widget(settings: Settings, pages: Pages, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Widget]:
-    row = {
-        "id": T,
-        "label": "Fictional chat",
-        "last_activity": _at(1),
-        "last_id": "1789466400000",
-        "typing": [],
-    }
-    board = W.Board({T: row}, None)
+    board = W.Board({T: row(T, "Fictional chat", _at(1), last_id="1789466400000")}, None)
     board.opener = ["xdg-open"]
     verbs: list[Verb] = []
 
     async def spy(
         thread_id: str,
-        web: bool = False,
+        target: str = "app",
         ws: Any = None,
         msg_id: str = "",
-        chat: bool = False,
-        split: bool = False,
     ) -> bool:
-        verbs.append((thread_id, "chat" if chat else web))
+        verbs.append((thread_id, "chat" if target in ("chat", "split") else target == "web"))
         return True
 
     monkeypatch.setattr(board, "open_row", spy)
     async with _served(board, settings) as host:
-        pages.host = host
+        pages.serve(host, board)
         # The row's Teams link becomes a 404 of our own server: an anchor's default tab stays local.
         monkeypatch.setattr(W, "deep_link", lambda thread_id, msg_id="", scheme="https": f"/teams/{msg_id}")
         yield Widget(board, pages, verbs)
+        await pages.close()
     assert pages.external == []
 
 
@@ -1474,20 +1404,7 @@ async def test_editing_my_message_leaves_its_card_out(chat: Pages) -> None:
 
 
 def _row(thread_id: str, label: str, i: int) -> dict[str, Any]:
-    return {
-        "id": thread_id,
-        "label": label,
-        "last_activity": _at(i),
-        "last_id": str(i),
-        "read_id": str(i),
-        "unread": False,
-        "mention": None,
-        "sender": "Ann Lee",
-        "text": f"snippet {label}",
-        "seen_at": None,
-        "muted": False,
-        "typing": [],
-    }
+    return row(thread_id, label, _at(i), last_id=str(i), read_id=str(i))
 
 
 @pytest.fixture
@@ -1737,13 +1654,11 @@ async def test_split_middle_click_opens_a_new_tab(
 
     async def spy(
         thread_id: str,
-        web: bool = False,
+        target: str = "app",
         ws: Any = None,
         msg_id: str = "",
-        chat: bool = False,
-        split: bool = False,
     ) -> bool:
-        opened.append((thread_id, "split" if split else chat))
+        opened.append((thread_id, "split" if target == "split" else target == "chat"))
         return True
 
     monkeypatch.setattr(board, "open_row", spy)
@@ -1771,3 +1686,75 @@ async def test_list_mode_has_no_side_pane(split: Pages) -> None:
     assert not await page.locator("#side").is_visible()
     assert not await page.locator("#menu").is_visible()
     assert await page.evaluate("window.__frames.some(f => 'rows' in f)") is False
+
+
+# --- review fixes ---
+
+
+async def test_reply_is_offered_where_the_server_takes_a_quote(
+    chat: Pages, calls: list[tuple[Any, ...]]
+) -> None:
+    """011 Message actions: no ↩ on a card post (`send` cannot quote a Media_Card); a text message
+    carrying a card has one, and quoting it posts."""
+    page = await chat.open(_chat(K))
+    await _handled(page, "history")
+    offered = await page.locator("#msgs .msg").evaluate_all(
+        "ns => ns.map(n => [n.dataset.id, !!n.querySelector('[data-act=reply]')])"
+    )
+    assert offered == [["1", False], ["2", False], ["3", True]]
+    await page.locator('[data-id="3"]').hover()
+    await _act(page, "3", "reply").click()
+    await page.locator("#reply").fill("answer")
+    await page.locator("#reply").press("Enter")
+    await page.wait_for_function("document.getElementById('quotes').hidden")
+    assert [c[:2] for c in calls] == [("send", K)]
+    assert 'itemid="3"' in calls[0][2]
+
+
+async def test_open_in_teams_after_a_jump_opens_the_chat(
+    launched: list[tuple[str, ...]], board: W.Board, chat: Pages
+) -> None:
+    """011-AC19: detached by a jump, the header's Open in Teams opens the chat, not the last message shown."""
+    board.opener = ["xdg-open"]
+    page = await _open_long(chat)
+    await _jump_to(page, "20")
+    await page.click("#teams")
+    await _until(launched, 1)
+    assert launched == [("xdg-open", W.deep_link(X, "", board.open_scheme))]
+
+
+async def test_pages_redial_a_restarted_server_with_their_cookie(
+    board: W.Board, settings: Settings, pages: Pages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M2: after a restart, open pages reconnect on their `mt` cookie alone: no reload, nothing fetched."""
+    port = test_web_chat._free_port()
+    monkeypatch.setattr(test_web_chat, "_free_port", lambda: port)  # the restart binds the same port
+    live = "document.getElementById('status').title === 'live'"
+    async with _served(board, settings) as host:
+        pages.serve(host, board)
+        opened = [await pages.open("/"), await pages.open(_chat(T))]
+        requests: list[str] = []
+        for page in opened:
+            await until(page, live)
+            await page.evaluate("window.__same = 1")
+            page.on("request", lambda r: requests.append(r.url))
+    for page in opened:
+        await until(page, "document.getElementById('status').title === 'disconnected'")
+    async with _served(board, settings):
+        for page in opened:
+            await until(page, live, tries=1500)  # backoff 1 s, then 2 s if the first dial was early
+            assert await page.evaluate("window.__same") == 1
+        await pages.close()
+    assert [u for u in requests if not u.startswith("ws")] == []
+    assert pages.external == []
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+async def test_both_settings_menus_share_one_style(chat: Pages, theme: str) -> None:
+    """H6: one ⚙ menu style (ui.css) in both pages: the same layer, headings at 4.5:1 or more."""
+    for path in (f"/?theme={theme}", f"{_chat(T)}?theme={theme}"):
+        page = await chat.open(path)
+        await page.locator("#gear").click()
+        assert await page.locator(".menu").evaluate("m => getComputedStyle(m).zIndex") == "6", path
+        ratios = await page.locator(".menu h3").evaluate_all(f"hs => hs.map({CONTRAST})")
+        assert ratios and min(ratios) >= 4.5, (path, ratios)

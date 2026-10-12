@@ -1,8 +1,9 @@
-"""Inbound delivery routing, body decode, and chat-message printing.
+"""Chat messages: inbound delivery decode and printing, and the pure readers every view shares.
 
 Trouter delivers each event as a pseudo-HTTP request whose `body` is a stringified (and often
 gzip+base64-wrapped) JSON. Chat messages arrive on the `/messaging` endpoint as `EventMessage`
-notifications; everything else (presence, calls) is ignored for the MVP dump.
+notifications; everything else (presence, calls) is ignored for the MVP dump. The readers (text,
+snippet, deleted/edited, mentions, `fold`) serve the stream, the web views, the archive and MCP.
 """
 
 import base64
@@ -10,6 +11,7 @@ import gzip
 import html
 import json
 import re
+import unicodedata
 from typing import Any
 
 import structlog
@@ -20,8 +22,8 @@ from .directory import Directory
 
 log = structlog.get_logger()
 
-# messagetypes worth printing — skip Control/* (typing indicators, read receipts, …).
-_TEXT_TYPES = {"RichText/Html", "Text"}
+# What a person writes: quotable, editable, worth printing — not Control/*, calls or roster changes.
+TEXT_TYPES = frozenset({"RichText/Html", "Text"})
 _MEDIA_TYPES = {
     "RichText/Media_GenericFile",
     "RichText/UriObject",
@@ -29,8 +31,26 @@ _MEDIA_TYPES = {
     "RichText/Media_CallRecording",
     "RichText/Media_LocalRecording",
 }
-_PRINTABLE = _TEXT_TYPES | _MEDIA_TYPES
-_TAG_RE = re.compile(r"<[^>]+>")
+_PRINTABLE = TEXT_TYPES | _MEDIA_TYPES
+TAG_RE = re.compile(r"<[^>]+>")
+_EMOJI_ALT_RE = re.compile(r'<emoji\b[^>]*\balt="([^"]*)"[^>]*>')
+# A forward is a blockquote too, but its content IS the message — only a reply quotes another.
+# Repeated: a reply quoting two messages carries two Reply blocks.
+_REPLY_QUOTE_RE = re.compile(r"\A(?:\s*<blockquote\b(?![^>]*Forward)[^>]*>.*?</blockquote>)+", re.DOTALL)
+SNIPPET_LEN = 1000  # the row tooltip shows it whole; CSS truncates the visible line
+# Non-text last messages: a short marker instead of the raw HTML/card payload.
+_TYPE_MARKERS = {
+    "RichText/Media_GenericFile": "📎 file",
+    "RichText/UriObject": "🖼 image",
+    "RichText/Media_Card": "🃏 card",
+    "RichText/Media_CallRecording": "🎥 recording",
+    "RichText/Media_LocalRecording": "🎥 recording",
+    "ThreadActivity/AddMember": "👥 member added",
+    "ThreadActivity/DeleteMember": "👥 member removed",
+    "ThreadActivity/TopicUpdate": "✎ renamed",
+    "ThreadActivity/MemberConsumptionHorizonUpdate": "👁 read marker",
+    "Event/Call": "📞 call started",
+}
 _THREAD_RE = re.compile(r"/conversations/([^/]+)")
 
 # Teams reaction keys → emoji; unknown keys fall back to ":key:".
@@ -68,7 +88,110 @@ def _decode_body(req: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def strip_html(content: str) -> str:
-    return html.unescape(_TAG_RE.sub("", content)).strip()
+    return html.unescape(TAG_RE.sub("", content)).strip()
+
+
+def json_list(value: Any) -> list[Any]:
+    """`properties.files` / `.cards` arrive as JSON *strings* (`'[]'` is truthy) or as lists."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return []
+    return value if isinstance(value, list) else []
+
+
+def plain_text(content: str) -> str:
+    """HTML body as one line of text.
+
+    Emoji are tags whose `alt` holds the character; tags then become spaces, not nothing:
+    `<at>Bob</at>dis` would otherwise read "Bobdis".
+    """
+    return " ".join(html.unescape(TAG_RE.sub(" ", _EMOJI_ALT_RE.sub(r"\1", content))).split())
+
+
+def message_text(message: dict[str, Any]) -> str:
+    """Plain text of a message as search and the MCP tools show it; `[Type]` for anything else."""
+    msgtype = str(message.get("messagetype") or "")
+    content = str(message.get("content") or "")
+    text = plain_text(content) if msgtype in TEXT_TYPES else f"[{msgtype.rsplit('/', 1)[-1]}]"
+    return text[:SNIPPET_LEN]
+
+
+def snippet(msgtype: str, content: str, props: dict[str, Any] | None = None) -> str:
+    """One-line preview of a message body, marker for non-text types, capped at SNIPPET_LEN."""
+    props = props or {}
+    if msgtype in TEXT_TYPES:
+        text = content
+        if msgtype == "RichText/Html":
+            # A reply repeats the quoted message before its own body; preview what was written,
+            # unless the reply is nothing but the quote.
+            body = _REPLY_QUOTE_RE.sub("", content)
+            text = plain_text(body) or plain_text(content)
+        text = " ".join(text.split())
+        if not text:
+            # A file/card post has an empty body and its payload in properties; the list stub of
+            # a deleted message has neither; a body that strips to nothing is an image tag.
+            names = [
+                str(f.get("fileName") or "file") for f in json_list(props.get("files")) if isinstance(f, dict)
+            ]
+            if names:
+                text = "📎 " + ", ".join(names)
+            elif json_list(props.get("cards")):
+                text = "🃏 card"
+            elif not content.strip():
+                text = "🗑 deleted"
+            else:
+                text = "🖼 image" if "<img" in content else "📎 attachment"
+    elif msgtype == "Event/Call" and "<ended/>" in content:
+        text = "📞 call ended"
+    else:
+        text = (_TYPE_MARKERS.get(msgtype) or f"[{msgtype.rsplit('/', 1)[-1]}]") if msgtype else ""
+    text = " ".join(text.split())
+    return text if len(text) <= SNIPPET_LEN else text[: SNIPPET_LEN - 1] + "…"
+
+
+def is_deleted(props: dict[str, Any]) -> bool:
+    return bool(props.get("deletetime") or props.get("hardDeleteTime"))
+
+
+def is_edited(resource: dict[str, Any]) -> bool:
+    props = resource.get("properties")
+    return bool(resource.get("skypeeditedid") or (isinstance(props, dict) and props.get("edittime")))
+
+
+def fold(text: str) -> str:
+    """Case and accents dropped, so "zoe" finds "ZOÉ" and "elodie" finds "Élodie"."""
+    return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)).casefold()
+
+
+def is_activity(msgtype: str) -> bool:
+    """Thread activity (member changes, read markers…) is emitted by the thread, not a person."""
+    return msgtype.startswith("ThreadActivity/")
+
+
+def is_me(mri: str, me: str) -> bool:
+    """`from` is a contact URL ending in the MRI; a call event names the bare MRI."""
+    return bool(me) and mri.rsplit("/", 1)[-1] == me
+
+
+def mention_kind(resource: dict[str, Any], me: str) -> str | None:
+    """`"me"` when the message @mentions `me` by name, `"all"` for an @everyone, else None.
+
+    `properties.mentions` is a JSON string (or list) of entries; `bot` and `share-contact`
+    entries are not mentions of a person. A message from `me` never counts."""
+    if not me or str(resource.get("from") or "").endswith(me):
+        return None
+    kind = None
+    for entry in json_list((resource.get("properties") or {}).get("mentions")):
+        if not isinstance(entry, dict):
+            continue
+        mtype = str(entry.get("mentionType") or "")
+        if mtype == "person" and entry.get("mri") == me:
+            return "me"
+        if mtype == "everyone":
+            kind = "all"  # the entry's mri is the thread itself; a `me` entry still wins
+    return kind
 
 
 def thread_of(resource: dict[str, Any]) -> str:
@@ -269,9 +392,9 @@ async def handle_delivery(
         props = resource.get("properties") or {}
         if props.get("emotions") is not None:
             await _print_reactions(resource, props["emotions"], directory)
-        elif props.get("deletetime"):
+        elif is_deleted(props):
             await _print_deleted(resource, directory)
-        elif resource.get("skypeeditedid") or props.get("edittime"):
+        elif is_edited(resource):
             await _print_message(resource, directory, tag="✏ ")
         else:
             log.debug("message_update", id=resource.get("id"))

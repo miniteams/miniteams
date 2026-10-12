@@ -19,6 +19,15 @@ _MAX_RETRIES = 5
 _MAX_BACKOFF = 30.0  # ceiling for the exponential fallback when no Retry-After is given
 
 
+def failure(exc: Exception) -> str:
+    """Reason a failed Teams call shows on the page or in a log: never a body or a URL."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"Teams answered {exc.response.status_code}"
+    if isinstance(exc, httpx.TransportError):
+        return "network error"
+    return str(exc)[:200]
+
+
 def _retry_delay(resp: httpx.Response, attempt: int) -> float:
     header = resp.headers.get("Retry-After", "")
     return float(header) if header.isdigit() else min(2.0**attempt, _MAX_BACKOFF)

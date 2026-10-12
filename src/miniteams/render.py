@@ -8,13 +8,14 @@ import binascii
 import html
 import json
 import re
+from collections import Counter
 from collections.abc import Callable
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
 
-from .attachments import _existing, _object_id
+from .attachments import existing, object_id
 
 _KEPT = frozenset(
     (
@@ -23,6 +24,7 @@ _KEPT = frozenset(
 )
 _VOID = frozenset({"br", "hr", "img"})
 _DROP_CONTENT = frozenset({"script", "style", "iframe"})
+_HTML_MAX = 128 * 1024  # chars, well past a real Teams message body
 _IMG_ATTRS = ("alt", "title")
 _STEM_RE = re.compile(r"[\w-][\w.-]*")  # no glob characters, no leading dot
 _NOT_ARCHIVED = "[image not archived]"
@@ -40,10 +42,10 @@ def _web_url(value: str) -> str | None:
 
 def media_url(thread_id: str, media_dir: Path | None, src: str) -> str | None:
     """`/media/<thread>/<file>` when the archive holds the object `src` points to, else None."""
-    stem = _object_id(src)
+    stem = object_id(src)
     if media_dir is None or "/objects/" not in src or not _STEM_RE.fullmatch(stem):
         return None
-    found = _existing(media_dir, stem)
+    found = existing(media_dir, stem)
     if found is None:
         return None
     return f"/media/{quote(thread_id, safe='')}/{quote(Path(found).name, safe='')}"
@@ -54,12 +56,22 @@ def _attr(name: str, value: str) -> str:
 
 
 class _Sanitizer(HTMLParser):
-    def __init__(self, thread_id: str, media_dir: Path | None, me: str, mentions: dict[str, str]) -> None:
+    def __init__(
+        self,
+        thread_id: str,
+        media_dir: Path | None,
+        me: str,
+        mentions: dict[str, str],
+        custom: frozenset[str] = frozenset(),
+    ) -> None:
         super().__init__(convert_charrefs=True)
         self.thread_id, self.media_dir, self.me, self.mentions = thread_id, media_dir, me, mentions
+        self.custom = custom
         self.out: list[str] = []
         # (tag, emitted): dropped spans/links stay on the stack so their end tag closes nothing else.
         self.open: list[tuple[str, bool]] = []
+        # Lets an unmatched end tag return in O(1) instead of scanning the stack (CWE-407).
+        self.counts: Counter[str] = Counter()
         self.hidden = 0  # depth inside script/style/iframe
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -72,7 +84,7 @@ class _Sanitizer(HTMLParser):
         itemtype = a.get("itemtype", "")
         if tag == "emoji" or itemtype.endswith("/Emoji"):
             if tag == "span":
-                self.open.append((tag, False))  # its text is the character
+                self._push(tag, False)  # its text is the character
             elif tag in ("img", "emoji"):
                 self.out.append(html.escape(a.get("alt", "")))
             return
@@ -99,13 +111,15 @@ class _Sanitizer(HTMLParser):
                 extra = _attr("class", cls) + (_attr("data-mri", mri) if mri else "")
         elif tag == "blockquote" and itemtype.endswith("/Reply"):
             extra = ' class="reply"'
-        self.open.append((tag, emitted))
+        self._push(tag, emitted)
         if emitted:
             self.out.append(f"<{tag}{extra}>")
 
     def _img(self, a: dict[str, str], emoji: bool) -> None:
         src = a.get("src", "")
         local = media_url(self.thread_id, self.media_dir, src)
+        if local is None and emoji and (oid := object_id(src)) in self.custom:
+            local = f"/emoji/{oid}"  # sent before the archiver fetched it: served from the emoji cache
         if local is None:
             if emoji:
                 self.out.append(html.escape(a.get("alt", "")))
@@ -132,7 +146,7 @@ class _Sanitizer(HTMLParser):
         if tag in _DROP_CONTENT:
             self.hidden = max(0, self.hidden - 1)
             return
-        if self.hidden:
+        if self.hidden or not self.counts[tag]:
             return
         for i in range(len(self.open) - 1, -1, -1):
             if self.open[i][0] == tag:
@@ -140,8 +154,13 @@ class _Sanitizer(HTMLParser):
                     self._close()
                 return
 
+    def _push(self, tag: str, emitted: bool) -> None:
+        self.open.append((tag, emitted))
+        self.counts[tag] += 1
+
     def _close(self) -> None:
         tag, emitted = self.open.pop()
+        self.counts[tag] -= 1
         if emitted:
             self.out.append(f"</{tag}>")
 
@@ -162,10 +181,14 @@ def sanitize(
     media_dir: Path | None = None,
     me: str = "",
     mentions: dict[str, str] | None = None,
+    custom: frozenset[str] = frozenset(),
 ) -> str:
-    """Teams HTML → allowlisted HTML; `mentions` maps a Mention span's `itemid` to its MRI."""
-    parser = _Sanitizer(thread_id, media_dir, me, mentions or {})
-    parser.feed(content)
+    """Teams HTML → allowlisted HTML; `mentions` maps a Mention span's `itemid` to its MRI, `custom`
+    holds the custom emoji object ids `/emoji/<id>` serves.
+
+    Input past `_HTML_MAX` chars is cut off: the parser's cost must stay bounded per message."""
+    parser = _Sanitizer(thread_id, media_dir, me, mentions or {}, custom)
+    parser.feed(content[:_HTML_MAX])
     return parser.result()
 
 
@@ -218,7 +241,7 @@ def _md_inline(text: str) -> str:
     return "".join(out)
 
 
-def markdown_html(text: str) -> str:
+def card_markdown_html(text: str) -> str:
     """The Teams card markdown subset: **bold**, _italic_, [text](url), `- ` and `1. ` lists."""
     out: list[str] = []
     lines: list[str] = []  # pending plain lines, joined by <br>
@@ -255,7 +278,7 @@ class _CardRenderer:
     def md(self, text: str) -> str:
         text = text[: min(_MD_MAX, self.md_left)]
         self.md_left -= len(text)
-        return markdown_html(text)
+        return card_markdown_html(text)
 
     def tb(self, cls: str, text: str) -> str:
         """A text block, or nothing once the markdown budget is spent: an empty div would still

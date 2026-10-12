@@ -4,87 +4,85 @@ fake chat socket speaking the 012 wire contract. Synthetic data, no network, no 
 Run: `uv run --with playwright pytest tests/test_browser_chat_compose.py`.
 """
 
-import asyncio
 import json
 import re
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from importlib.resources import files
 from typing import Any
 from urllib.parse import quote
 
+import browser_helpers
 import pytest
-import test_browser
-from test_browser import PNG, Page, Pages, Route  # its import skips without playwright
+from browser_helpers import (  # skips without playwright
+    ANN,
+    ANN2,
+    BOB,
+    EMOJIS,
+    EVERYONE,
+    MALFORMED,
+    ORIGIN,
+    POP_ASK_MS,
+    Page,
+    Pages,
+    T,
+    closed,
+    open_fake,
+    past,
+    pick_namesakes,
+    pick_out_of_order,
+    pick_then_glue,
+    row,
+    shows,
+    until,
+    wait,
+)
 
 from miniteams import web as W
 from miniteams.compose import compose_html
 
 pytestmark = pytest.mark.browser
-pages = test_browser.pages
+pages = browser_helpers.pages
 
-ORIGIN = "http://127.0.0.1:9"  # never dialled: every request on it is answered by a route
-T = "19:fake@thread.v2"
 L = "19:other@thread.v2"
-ANN = {"name": "Ann Lee", "mri": "8:orgid:ann"}
-BOB = {"name": "Bob Roe", "mri": "8:orgid:bob"}
-EVERYONE = {"name": "everyone", "mri": T, "everyone": True}
-EMOJIS = [
-    {"name": "fire", "char": "🔥"},
-    {"name": "fish", "char": "🐟"},
-    {"name": "partyparrot", "custom": "0-abc", "src": "/emoji/0-abc"},
-    {"name": "pacman", "custom": "0-far", "src": "https://evil.example/x.png"},
-    {"name": "pa<img src=x onerror=alert(1)>", "char": "x"},
-    {"name": "trok", "custom": "0-ok", "src": "/emoji/0-ok"},
-    *({"name": f"tr{i}", "custom": i, "src": f"/emoji/{i}"} for i in ("..", "%2e%2e", "a\nb", "a/b")),
-]
-MALFORMED: list[Any] = [None, {"name": 5}, "x", {"name": "nuke", "char": "☢"}]
 MINE = {"id": "1", "at": "2026-10-09T10:00:00.000Z", "from": "8:orgid:me", "name": "Me", "me": True}
-_BARRIER = {"barrier": 1}
 # A module global read by `_open`: a mutation run swaps it for an altered copy.
-PAGE = files("miniteams").joinpath("chat.html").read_text(encoding="utf-8")
-
-
-def _row(thread_id: str, label: str) -> dict[str, Any]:
-    return {"id": thread_id, "label": label, "last_activity": "2026-10-09T10:00:00.000Z", "typing": []}
+PAGE = W._page("chat.html")  # as served: ui.css and ui.js inlined
 
 
 @dataclass
-class Fake:
+class Fake(browser_helpers.Fake):
     """The server side of the chat socket: follow, history, board, complete, preview, send."""
 
-    page: Page | None = None
-    verbs: list[dict[str, Any]] = field(default_factory=list)
-    held: list[dict[str, Any]] = field(default_factory=list)
-    hold: bool = False  # queue `complete` and `preview` answers instead of sending them
     fail: bool = False
     read_only: bool = False
+    opener: bool = False
     version: str = "1"
-    ws: Any = None
+    members: list[dict[str, Any]] = field(default_factory=lambda: [EVERYONE, ANN, BOB])
+    history: list[dict[str, Any]] = field(
+        default_factory=lambda: [{**MINE, "html": "<p>mine</p>", "editable": True}]
+    )
+    busy: bool = False  # answer `history` and `search` with `busy`
+    follow_error: str = ""  # answer `follow` with this error
 
-    def attach(self, ws: Any) -> None:
-        self.ws = ws
-        ws.on_message(self._on_message)
-
-    def _answer(self, answer: dict[str, Any]) -> None:
-        if self.hold:
-            self.held.append(answer)
-        else:
-            self.ws.send(json.dumps(answer))
-
-    def _on_message(self, raw: str | bytes) -> None:
-        msg = json.loads(raw)
-        self.verbs.append(msg)
-        if "follow" in msg:
+    def on_verb(self, msg: dict[str, Any]) -> None:
+        if "follow" in msg and self.follow_error:
+            self.send({"follow": msg["follow"], "error": self.follow_error})
+        elif "follow" in msg:
             label = "Fictional T · 3p" if msg["follow"] == T else "Fictional L · 3p"
-            follow = {"follow": msg["follow"], "label": label, "page": self.version, "opener": False}
-            self.ws.send(json.dumps({**follow, "read_only": self.read_only}))
+            follow = {"follow": msg["follow"], "label": label, "page": self.version, "opener": self.opener}
+            self.send({**follow, "read_only": self.read_only})
         elif "history" in msg:
-            messages = [{**MINE, "html": "<p>mine</p>", "editable": True}] if msg["history"] == T else []
-            self.ws.send(json.dumps({"history": msg["history"], "messages": messages, "source": "archive"}))
+            if self.busy:
+                self.send({"history": msg["history"], "before": msg.get("before"), "error": "busy"})
+                return
+            messages = self.history if msg["history"] == T else []
+            self.send({"history": msg["history"], "messages": messages, "source": "archive"})
+        elif "search" in msg:
+            self.send(
+                {"search": msg["search"], "q": msg["q"], **({"error": "busy"} if self.busy else {"hits": []})}
+            )
         elif msg.get("board") is True:
-            rows = [_row(T, "Fictional T"), _row(L, "Fictional L")]
-            self.ws.send(json.dumps({"rows": rows, "browser": False, "me": "Me"}))
+            self.send({"rows": [row(T, "Fictional T"), row(L, "Fictional L")], "browser": False, "me": "Me"})
         elif "complete" in msg:
             q = msg["q"].lower()
             if q == "nu":
@@ -92,81 +90,40 @@ class Fake:
             elif msg["complete"] == "emoji":
                 items = [e for e in EMOJIS if e["name"].startswith(q)]
             else:
-                people = (EVERYONE, ANN, BOB)
                 items = [
                     m
-                    for m in people
+                    for m in self.members
                     if any(n.startswith(q) for n in [m["name"].lower(), *m["name"].lower().split()])
                 ]
-            self._answer({"complete": msg["complete"], "q": msg["q"], "items": items[:12]})
+            self.answer({"complete": msg["complete"], "q": msg["q"], "items": items[:12]})
         elif "preview" in msg:
             if msg["preview"] == "bad":
-                self._answer({"preview": "", "error": "<b>nope</b>"})
+                self.answer({"preview": "", "error": "<b>nope</b>"})
             else:
                 html, _ = compose_html(msg["preview"], [], {}, full=True)  # the server's own renderer
-                self._answer({"preview": f'<div class="pv">{html}</div>'})
+                self.answer({"preview": f'<div class="pv">{html}</div>'})
         elif "send" in msg:
-            self.ws.send(
-                json.dumps({"sent": msg["send"], "ok": not self.fail, "error": "boom" if self.fail else None})
-            )
-
-    def release(self, i: int) -> None:
-        self.ws.send(json.dumps(self.held[i]))
-
-    def of(self, verb: str) -> list[dict[str, Any]]:
-        return [v for v in self.verbs if verb in v]
-
-    async def settled(self) -> None:
-        """Every verb the page sent so far reached us: the socket is ordered, a barrier closes it."""
-        assert self.page is not None
-        await self.page.evaluate(f"window.__ws.send({json.dumps(json.dumps(_BARRIER))})")
-        await _wait(lambda: _BARRIER in self.verbs)
-        self.verbs.remove(_BARRIER)
+            self.send({"sent": msg["send"], "ok": not self.fail, "error": "boom" if self.fail else None})
 
 
-async def _wait(cond: Callable[[], bool]) -> None:
-    for _ in range(500):
-        if cond():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("condition not met in 5 s")
-
-
-async def _until(page: Page, js: str) -> None:
-    """wait_for_function evaluates a string the page's CSP refuses: poll through evaluate instead."""
-    for _ in range(500):
-        if await page.evaluate(js):
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError(f"{js} not true in 5 s")
-
-
-async def _open(pages: Pages, fake: Fake, query: str = "") -> Page:
-    ctx = await pages.browser.new_context()
-    await ctx.route_web_socket(re.compile(r"^ws://127\.0\.0\.1:9/ws\?chat$"), fake.attach)
-    await ctx.add_init_script(test_browser._FRAMES)  # after the socket route, as in test_browser_compose
-
-    async def other(route: Route) -> None:
-        if not route.request.url.startswith(ORIGIN + "/"):
-            pages.external.append(route.request.url)
-        await route.abort()
-
-    async def emoji(route: Route) -> None:
-        await route.fulfill(body=PNG, content_type="image/png")
-
-    async def page_html(route: Route) -> None:
-        # The real policy: the popup images and the preview must work under it.
-        headers = {"Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": W._chat_csp(PAGE)}
-        await route.fulfill(body=PAGE, headers=headers)
-
-    await ctx.route("**/*", other)  # last registered wins: the catch-all goes first
-    await ctx.route(ORIGIN + "/emoji/*", emoji)
-    await ctx.route(re.compile(r"^http://127\.0\.0\.1:9/chat/[^/]+$"), page_html)
-    page = fake.page = await ctx.new_page()
-    page.on("pageerror", lambda exc: pages.errors.append(str(exc)))
-    await page.goto(f"{ORIGIN}/chat/{quote(T, safe='')}{query}")
-    await _wait(lambda: bool(fake.of("history")))
-    await page.wait_for_selector('[data-id="1"]')
+async def _open(
+    pages: Pages, fake: Fake, query: str = "", wait_for: str = '[data-id="1"]', init: str = ""
+) -> Page:
+    # The real policy: the popup images and the preview must work under it.
+    headers = {"Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": W._page_csp(PAGE)}
+    page = await open_fake(
+        pages,
+        fake,
+        f"{ORIGIN}/chat/{quote(T, safe='')}{query}",
+        PAGE,
+        page_route=re.compile(r"^http://127\.0\.0\.1:9/chat/[^/]+$"),
+        ws_route=re.compile(r"^ws://127\.0\.0\.1:9/ws\?chat$"),
+        headers=headers,
+        init=init,
+    )
+    await wait(lambda: bool(fake.of("history")))
+    if wait_for:
+        await page.wait_for_selector(wait_for)
     return page
 
 
@@ -176,24 +133,8 @@ async def fake(pages: Pages) -> AsyncIterator[Fake]:
     page = await _open(pages, board)
     await page.locator("#reply").focus()
     yield board
-    await page.context.close()
+    await pages.close()
     assert pages.external == []
-
-
-async def _shows(page: Page, expected: list[str]) -> None:
-    """The open list reads `expected`: an answer to an earlier prefix may show first."""
-    seen: list[str] = []
-    for _ in range(500):
-        if not await page.locator("#pop").is_hidden():
-            seen = await page.locator("#pop [role=option]").all_text_contents()
-            if seen == expected:
-                return
-        await asyncio.sleep(0.01)
-    raise AssertionError(f"list shows {seen}, expected {expected}")
-
-
-async def _closed(page: Page) -> bool:
-    return await page.locator("#pop").is_hidden()
 
 
 def _parts(fake: Fake) -> tuple[Page, Any]:
@@ -210,7 +151,7 @@ async def test_colon_lists_emoji_enter_inserts_and_does_not_send(fake: Fake) -> 
     page, box = _parts(fake)
     assert await box.get_attribute("aria-expanded") == "false"
     await box.press_sequentially("hot :fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     assert fake.of("complete") == [{"complete": "emoji", "q": "fi", "thread": T}]
     assert await box.get_attribute("role") == "combobox"
     assert await box.get_attribute("aria-expanded") == "true"
@@ -222,7 +163,7 @@ async def test_colon_lists_emoji_enter_inserts_and_does_not_send(fake: Fake) -> 
     await box.press("ArrowUp")
     await box.press("Enter")
     assert await box.input_value() == "hot 🔥"
-    assert await _closed(page)
+    assert await closed(page)
     assert await box.get_attribute("aria-expanded") == "false"
     await fake.settled()
     assert fake.of("send") == []
@@ -233,18 +174,18 @@ async def test_at_lists_everyone_first_and_send_carries_mentions_in_full_format(
     `format: full` (the chat view's set)."""
     page, box = _parts(fake)
     await box.press_sequentially("@")
-    await _shows(page, ["everyone", "Ann Lee", "Bob Roe"])
+    await shows(page, ["everyone", "Ann Lee", "Bob Roe"])
     assert await page.locator("#pop").get_attribute("aria-label") == "members"
     await box.press("ArrowDown")
     await box.press("Enter")
     assert await box.input_value() == "@Ann Lee "
     await box.press_sequentially("hi @ev")
-    await _shows(page, ["everyone"])
+    await shows(page, ["everyone"])
     await box.press("Tab")
     assert await box.input_value() == "@Ann Lee hi @everyone "
     assert await page.evaluate("document.activeElement.id") == "reply"
     await box.press("Enter")
-    await _wait(lambda: len(fake.of("send")) == 1)
+    await wait(lambda: len(fake.of("send")) == 1)
     assert fake.of("send") == [
         {"send": T, "text": "@Ann Lee hi @everyone ", "mentions": [ANN, EVERYONE], "format": "full"}
     ]
@@ -255,10 +196,10 @@ async def test_a_quote_and_a_mention_travel_together(fake: Fake) -> None:
     page, box = _parts(fake)
     await page.locator('[data-id="1"] [data-act=reply]').dispatch_event("click")
     await box.press_sequentially("@ann")
-    await _shows(page, ["Ann Lee"])
+    await shows(page, ["Ann Lee"])
     await box.press("Enter")
     await box.press("Enter")
-    await _wait(lambda: len(fake.of("send")) == 1)
+    await wait(lambda: len(fake.of("send")) == 1)
     assert fake.of("send") == [
         {"send": T, "text": "@Ann Lee ", "mentions": [ANN], "format": "full", "quote": ["1"]}
     ]
@@ -269,30 +210,29 @@ async def test_a_stale_answer_is_ignored(fake: Fake) -> None:
     page, box = _parts(fake)
     fake.hold = True
     await box.press_sequentially(":fi")
-    await _wait(lambda: len(fake.held) == 1)
+    await wait(lambda: len(fake.held) == 1)
     await box.press_sequentially("s")
-    await _wait(lambda: len(fake.held) == 2)
+    await wait(lambda: len(fake.held) == 2)
     fake.release(0)
-    await asyncio.sleep(0.2)
-    assert await _closed(page)
+    await fake.handled()
+    assert await closed(page)
     fake.release(1)
-    await _shows(page, ["🐟:fish:"])
+    await shows(page, ["🐟:fish:"])
 
 
 async def test_escape_dismisses_the_word_keeps_the_text_then_enter_sends(fake: Fake) -> None:
     """012-AC8: Escape closes the list only, the same word does not reopen it, Enter then sends."""
     page, box = _parts(fake)
     await box.press_sequentially(":fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     await box.press("Escape")
-    assert await _closed(page)
+    assert await closed(page)
     assert await box.input_value() == ":fi"
     await box.press_sequentially("s")
-    await asyncio.sleep(0.3)  # past the debounce
-    await fake.settled()
+    await fake.settled(past_ms=POP_ASK_MS)
     assert [v["q"] for v in fake.of("complete")] == ["fi"]
     await box.press("Enter")
-    await _wait(lambda: len(fake.of("send")) == 1)
+    await wait(lambda: len(fake.of("send")) == 1)
     assert fake.of("send") == [{"send": T, "text": ":fis", "mentions": [], "format": "full"}]
 
 
@@ -301,17 +241,17 @@ async def test_a_shorter_prefix_list_is_locked_until_answered_or_two_seconds(fak
     goes after the wait and Enter sends again."""
     page, box = _parts(fake)
     await box.press_sequentially(":fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     fake.hold = True
     await box.press_sequentially("s")
-    await _wait(lambda: len(fake.held) == 1)
+    await wait(lambda: len(fake.held) == 1)
     await box.press("Enter")
     assert await box.input_value() == ":fis"
     await fake.settled()
     assert fake.of("send") == []
     await page.locator("#pop").wait_for(state="hidden", timeout=3000)
     await box.press("Enter")
-    await _wait(lambda: len(fake.of("send")) == 1)
+    await wait(lambda: len(fake.of("send")) == 1)
     assert fake.of("send")[0]["text"] == ":fis"
 
 
@@ -320,9 +260,9 @@ async def test_a_prefix_typed_offline_releases_enter_at_once(fake: Fake) -> None
     the send path and says offline instead of waiting."""
     page, box = _parts(fake)
     await box.press_sequentially(":fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     await fake.ws.close()
-    await _until(page, "window.__ws.readyState === 3")
+    await until(page, "window.__ws.readyState === 3")
     await box.press_sequentially("s")
     await page.locator("#pop").wait_for(state="hidden", timeout=500)  # before the 2 s release
     await box.press("Enter")
@@ -334,15 +274,15 @@ async def test_only_plain_emoji_paths_load_an_image_and_names_are_text(fake: Fak
     foreign host); a name carrying markup is text; a custom pick inserts `:name:`."""
     page, box = _parts(fake)
     await box.press_sequentially(":tr")
-    await _shows(page, [":trok:", ":tr..:", ":tr%2e%2e:", ":tra\nb:", ":tra/b:"])
+    await shows(page, [":trok:", ":tr..:", ":tr%2e%2e:", ":tra\nb:", ":tra/b:"])
     srcs = await page.locator("#pop img").evaluate_all("imgs => imgs.map(i => i.getAttribute('src'))")
     assert srcs == ["/emoji/0-ok"]
     await box.fill(":pa")
-    await _shows(page, [":partyparrot:", ":pacman:", "x:pa<img src=x onerror=alert(1)>:"])
+    await shows(page, [":partyparrot:", ":pacman:", "x:pa<img src=x onerror=alert(1)>:"])
     assert await page.locator("#pop img").evaluate_all("imgs => imgs.map(i => i.getAttribute('src'))") == [
         "/emoji/0-abc"
     ]
-    await _until(page, "document.querySelector('#pop img').naturalWidth > 0")  # loads under the CSP
+    await until(page, "document.querySelector('#pop img').naturalWidth > 0")  # loads under the CSP
     await box.press("Enter")
     assert await box.input_value() == ":partyparrot:"
 
@@ -351,7 +291,7 @@ async def test_malformed_items_are_skipped(fake: Fake) -> None:
     """012-AC8: null, nameless or non-object items are dropped; the rest still lists and picks."""
     page, box = _parts(fake)
     await box.press_sequentially(":nu")
-    await _shows(page, ["☢:nuke:"])
+    await shows(page, ["☢:nuke:"])
     await box.press("Enter")
     assert await box.input_value() == "☢"
 
@@ -362,22 +302,21 @@ async def test_mid_word_triggers_ask_nothing_and_an_inserted_mention_is_not_aske
     page, box = _parts(fake)
     for part in ("at 10:30", " to me@ann"):
         await box.press_sequentially(part)
-        await asyncio.sleep(0.3)  # past the debounce
+        await past(page, POP_ASK_MS)
     await fake.settled()
     assert fake.of("complete") == []
     await box.fill("")
     await box.press_sequentially("@ann l")
-    await _shows(page, ["Ann Lee"])
+    await shows(page, ["Ann Lee"])
     assert fake.of("complete")[-1]["q"] == "ann l"
     await box.press("Enter")
     await box.press_sequentially("hi @every")
-    await _shows(page, ["everyone"])
+    await shows(page, ["everyone"])
     await box.press("Enter")
     asked = len(fake.of("complete"))
-    await asyncio.sleep(0.3)  # past the debounce: the insert itself asks nothing either
+    await past(page, POP_ASK_MS)  # the insert itself asks nothing either
     await box.press_sequentially("thanks")  # `everyone thanks` would still fit the one-space pattern
-    await asyncio.sleep(0.3)
-    await fake.settled()
+    await fake.settled(past_ms=POP_ASK_MS)
     assert len(fake.of("complete")) == asked
     assert await box.input_value() == "@Ann Lee hi @everyone thanks"
 
@@ -386,7 +325,7 @@ async def test_an_emoji_word_after_a_member_word_asks_for_emoji(fake: Fake) -> N
     """012-AC8: `@ann :fi` reads as the emoji word, not a two-word member query."""
     page, box = _parts(fake)
     await box.press_sequentially("@ann :fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     assert fake.of("complete")[-1] == {"complete": "emoji", "q": "fi", "thread": T}
 
 
@@ -395,12 +334,12 @@ async def test_quick_typing_asks_once_and_a_typed_shortcode_goes_out_as_typed(fa
     closes the list at its second colon and is sent as text."""
     page, box = _parts(fake)
     await box.press_sequentially("a :fire", delay=20)
-    await _shows(page, ["🔥:fire:"])
+    await shows(page, ["🔥:fire:"])
     assert [v["q"] for v in fake.of("complete")] == ["fire"]
     await box.press_sequentially(": b")
-    assert await _closed(page)
+    assert await closed(page)
     await box.press("Enter")
-    await _wait(lambda: len(fake.of("send")) == 1)
+    await wait(lambda: len(fake.of("send")) == 1)
     assert fake.of("send")[0]["text"] == "a :fire: b"
 
 
@@ -408,10 +347,10 @@ async def test_caret_leaving_the_word_lets_enter_send(fake: Fake) -> None:
     """012-AC8: `ab :fi` listed, Home moves the caret out of the word: Enter sends the text as is."""
     page, box = _parts(fake)
     await box.press_sequentially("ab :fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     await box.press("Home")
     await box.press("Enter")
-    await _wait(lambda: len(fake.of("send")) == 1)
+    await wait(lambda: len(fake.of("send")) == 1)
     assert fake.of("send")[0]["text"] == "ab :fi"
 
 
@@ -419,14 +358,14 @@ async def test_click_picks_a_press_keeps_focus_and_blur_closes(fake: Fake) -> No
     """012-AC8: a click on an item inserts it without blurring the composer; focus leaving closes."""
     page, box = _parts(fake)
     await box.press_sequentially(":fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     await page.locator("#pop-1").click()
     assert await box.input_value() == "🐟"
     assert await page.evaluate("document.activeElement.id") == "reply"
     await box.press_sequentially(" :fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     await box.blur()
-    assert await _closed(page)
+    assert await closed(page)
 
 
 async def test_the_popup_opens_inside_the_window(fake: Fake) -> None:
@@ -434,7 +373,7 @@ async def test_the_popup_opens_inside_the_window(fake: Fake) -> None:
     lies within the textarea padding), on screen."""
     page, box = _parts(fake)
     await box.press_sequentially(":fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     pop, reply = await page.locator("#pop").bounding_box(), await box.bounding_box()
     assert pop is not None and reply is not None
     height = await page.evaluate("innerHeight")
@@ -451,10 +390,9 @@ async def test_the_edit_in_place_editor_stays_plain(fake: Fake) -> None:
     await page.locator('[data-id="1"] [data-act=edit]').dispatch_event("click")
     editor = page.locator(".editor")
     await editor.press_sequentially(" :fi @a")
-    await asyncio.sleep(0.3)
-    await fake.settled()
+    await fake.settled(past_ms=POP_ASK_MS)
     assert fake.of("complete") == []
-    assert await _closed(page)
+    assert await closed(page)
 
 
 # --- picked set per chat ---
@@ -468,31 +406,31 @@ async def test_picks_stay_with_their_chat_across_a_split_switch_and_clear_only_o
     box = page.locator("#reply")
     await page.wait_for_selector('#rows li[data-id="19:other@thread.v2"]')
     await box.press_sequentially("@ann")
-    await _shows(page, ["Ann Lee"])
+    await shows(page, ["Ann Lee"])
     await box.press("Enter")
     await page.locator("#show").click()
     await page.locator("#view .pv").wait_for()
     await page.locator(f'#rows li[data-id="{L}"] a.name').click()
-    await _wait(lambda: fake.of("history")[-1]["history"] == L)
+    await wait(lambda: fake.of("history")[-1]["history"] == L)
     assert await box.input_value() == ""
     assert await page.locator("#view").is_hidden()  # T's preview does not follow to L
     await box.fill("@Ann Lee by hand")
     await box.press("Enter")
-    await _wait(lambda: len(fake.of("send")) == 1)
+    await wait(lambda: len(fake.of("send")) == 1)
     await page.locator(f'#rows li[data-id="{T}"] a.name').click()
-    await _wait(lambda: fake.of("history")[-1]["history"] == T)
+    await wait(lambda: fake.of("history")[-1]["history"] == T)
     assert await box.input_value() == "@Ann Lee "
     fake.fail = True
     await box.press("Enter")
-    await _wait(lambda: len(fake.of("send")) == 2)
-    await _until(page, "!document.getElementById('reply').disabled")
+    await wait(lambda: len(fake.of("send")) == 2)
+    await until(page, "!document.getElementById('reply').disabled")
     fake.fail = False
     await box.press("Enter")
-    await _wait(lambda: len(fake.of("send")) == 3)
-    await _until(page, "document.getElementById('reply').value === ''")
+    await wait(lambda: len(fake.of("send")) == 3)
+    await until(page, "document.getElementById('reply').value === ''")
     await box.fill("@Ann Lee again")
     await box.press("Enter")
-    await _wait(lambda: len(fake.of("send")) == 4)
+    await wait(lambda: len(fake.of("send")) == 4)
     assert [(v["send"], v["mentions"]) for v in fake.of("send")] == [(L, []), (T, [ANN]), (T, [ANN]), (T, [])]
     await page.context.close()
     assert pages.external == []
@@ -504,7 +442,7 @@ async def test_picks_survive_the_reload_a_newer_page_triggers(pages: Pages) -> N
     page = await _open(pages, fake)
     box = page.locator("#reply")
     await box.press_sequentially("@ann")
-    await _shows(page, ["Ann Lee"])
+    await shows(page, ["Ann Lee"])
     await box.press("Enter")
     await page.evaluate("window.__same = 1")
     fake.version = "2"
@@ -515,18 +453,19 @@ async def test_picks_survive_the_reload_a_newer_page_triggers(pages: Pages) -> N
     assert await box.input_value() == "@Ann Lee "
     await box.focus()
     await box.press("Enter")
-    await _wait(lambda: len(fake.of("send")) == 1)
+    await wait(lambda: len(fake.of("send")) == 1)
     assert fake.of("send")[0]["mentions"] == [ANN]
     await page.context.close()
     assert pages.external == []
 
 
 async def test_invalid_saved_picks_are_left_out(pages: Pages) -> None:
-    """012-AC8: a saved draft whose picks were tampered with sends only the well-formed ones."""
+    """012-AC8: a saved draft whose picks were tampered with sends only the well-formed ones, two
+    people sharing a name included."""
     fake = Fake()
     page = await _open(pages, fake)
-    bad = [None, {"name": "Bob Roe", "mri": 5}, {"name": "everyone", "mri": T, "everyone": "yes"}, ANN]
-    draft = {"text": "@Ann Lee @Bob Roe @everyone", "quotes": [], "picked": bad}
+    bad = [None, {"name": "Bob Roe", "mri": 5}, {"name": "everyone", "mri": T, "everyone": "yes"}, ANN, ANN2]
+    draft = {"text": "@Ann Lee @Ann Lee @Bob Roe @everyone", "quotes": [], "picked": bad}
     await page.evaluate(
         f"sessionStorage.setItem({json.dumps('draft:' + T)}, {json.dumps(json.dumps(draft))})"
     )
@@ -536,8 +475,8 @@ async def test_invalid_saved_picks_are_left_out(pages: Pages) -> None:
     assert await box.input_value() == draft["text"]
     await box.focus()
     await box.press("Enter")
-    await _wait(lambda: len(fake.of("send")) == 1)
-    assert fake.of("send")[0]["mentions"] == [ANN]
+    await wait(lambda: len(fake.of("send")) == 1)
+    assert fake.of("send")[0]["mentions"] == [ANN, ANN2]
     await page.context.close()
     assert pages.external == []
 
@@ -548,18 +487,18 @@ async def test_an_answer_for_the_chat_left_opens_nothing(pages: Pages) -> None:
     page = await _open(pages, fake, "?chatnav=split")
     box = page.locator("#reply")
     await page.locator(f'#rows li[data-id="{L}"] a.name').click()
-    await _wait(lambda: fake.of("history")[-1]["history"] == L)
+    await wait(lambda: fake.of("history")[-1]["history"] == L)
     await page.locator(f'#rows li[data-id="{T}"] a.name').click()
-    await _wait(lambda: fake.of("history")[-1]["history"] == T)
+    await wait(lambda: fake.of("history")[-1]["history"] == T)
     await box.focus()
     fake.hold = True
     await box.press_sequentially(":fi")
-    await _wait(lambda: len(fake.held) == 1)
+    await wait(lambda: len(fake.held) == 1)
     await page.go_back()  # a switch that leaves the focus in the composer
-    await _wait(lambda: fake.of("history")[-1]["history"] == L)
+    await wait(lambda: fake.of("history")[-1]["history"] == L)
     fake.release(0)
-    await asyncio.sleep(0.2)
-    assert await _closed(page)
+    await fake.handled()
+    assert await closed(page)
     await page.context.close()
     assert pages.external == []
 
@@ -693,7 +632,7 @@ async def test_preview_hides_when_the_text_changes_and_on_send(fake: Fake) -> No
     await page.locator("#view .pv").wait_for()
     await box.press("Enter")
     assert await page.locator("#view").is_hidden()
-    await _wait(lambda: len(fake.of("send")) == 1)
+    await wait(lambda: len(fake.of("send")) == 1)
 
 
 async def test_a_stale_preview_is_dropped(fake: Fake) -> None:
@@ -703,22 +642,22 @@ async def test_a_stale_preview_is_dropped(fake: Fake) -> None:
     fake.hold = True
     await box.fill("one")
     await page.locator("#show").click()
-    await _wait(lambda: len(fake.held) == 1)
+    await wait(lambda: len(fake.held) == 1)
     await box.press_sequentially("two")  # hides; asked again below, the first answer still on its way
     await page.locator("#show").click()
-    await _wait(lambda: len(fake.held) == 2)
+    await wait(lambda: len(fake.held) == 2)
     fake.release(0)
-    await asyncio.sleep(0.2)
+    await fake.handled()
     assert await page.locator("#view").is_hidden()
     fake.release(1)
     await page.locator("#view .pv").wait_for()
     assert await page.locator("#view").inner_text() == "onetwo"
     await page.locator("#show").click()  # off before its answer: nothing shows
     await page.locator("#show").click()
-    await _wait(lambda: len(fake.held) == 3)
+    await wait(lambda: len(fake.held) == 3)
     await page.locator("#show").click()
     fake.release(2)
-    await asyncio.sleep(0.2)
+    await fake.handled()
     assert await page.locator("#view").is_hidden()
 
 
@@ -729,10 +668,10 @@ async def test_preview_after_reconnect_shows_again(fake: Fake) -> None:
     fake.hold = True
     await box.fill("a")
     await page.locator("#show").click()
-    await _wait(lambda: len(fake.held) == 1)
+    await wait(lambda: len(fake.held) == 1)
     await fake.ws.close()
-    await _until(page, "document.getElementById('show').getAttribute('aria-pressed') === 'false'")
-    await _wait(lambda: len(fake.of("follow")) == 2)  # reconnected
+    await until(page, "document.getElementById('show').getAttribute('aria-pressed') === 'false'")
+    await wait(lambda: len(fake.of("follow")) == 2)  # reconnected
     fake.hold = False
     await page.locator("#show").click()
     await page.locator("#view .pv").wait_for()
@@ -793,7 +732,7 @@ async def test_ctrl_z_undoes_a_toolbar_edit_and_a_pick(fake: Fake) -> None:
     assert await box.input_value() == "say hi"
     await box.fill("")
     await box.press_sequentially(":fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     await box.press("Enter")
     assert await box.input_value() == "🔥"
     await box.press("Control+z")
@@ -804,15 +743,16 @@ async def test_bold_with_the_list_open_closes_it(fake: Fake) -> None:
     """012-AC8, 012-AC14: B clicked or Ctrl+B pressed while the list is open closes the list."""
     page, box = _parts(fake)
     await box.press_sequentially(":fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     await page.locator('#tools [data-fmt="bold"]').click()
-    assert await _closed(page)
+    assert await closed(page)
     await box.fill(":fi")
-    await _shows(page, ["🔥:fire:", "🐟:fish:"])
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
     await box.press("Control+b")
-    assert await _closed(page)
-    await asyncio.sleep(0.3)  # past the debounce: nothing reopens it
-    assert await _closed(page)
+    assert await closed(page)
+    await fake.settled(past_ms=POP_ASK_MS)  # nothing reopens it: no ask, so no answer either
+    await fake.handled()
+    assert await closed(page)
 
 
 async def test_a_preview_error_is_text(fake: Fake) -> None:
@@ -829,8 +769,226 @@ async def test_a_read_only_channel_has_no_toolbar(pages: Pages) -> None:
     """012-AC14, 011 Composer bullet: a team channel page shows no toolbar and no preview toggle."""
     fake = Fake(read_only=True)
     page = await _open(pages, fake)
-    await _until(page, "document.body.classList.contains('readonly')")
+    await until(page, "document.body.classList.contains('readonly')")
     assert await page.locator("#tools").is_hidden()
     assert await page.locator("#show").is_hidden()
     await page.context.close()
     assert pages.external == []
+
+
+# --- review fixes: quote offer, IME, busy cap, partial updates, direction, same-name mentions ---
+
+
+async def test_reply_needs_a_sender(pages: Pages) -> None:
+    """011 Message actions: ↩ only where `send` takes a quote; a text message without a sender has none."""
+    anon = {"id": "2", "at": "2026-10-09T10:01:00.000Z", "from": "", "name": "", "me": False, "type": "text"}
+    fake = Fake(
+        history=[
+            {**MINE, "html": "<p>mine</p>", "editable": True},
+            {**anon, "html": "<p>x</p>", "editable": True},
+        ]
+    )
+    page = await _open(pages, fake, wait_for='[data-id="2"]')
+    assert await page.locator('[data-id="1"] [data-act=reply]').count() == 1
+    assert await page.locator('[data-id="2"] [data-act=reply]').count() == 0
+
+
+@pytest.mark.parametrize(
+    "event",
+    ["{key: 'Enter', isComposing: true}", "{key: 'Enter', keyCode: 229}"],
+    ids=["isComposing", "keyCode-229"],
+)
+async def test_enter_during_an_ime_composition_neither_sends_nor_saves(fake: Fake, event: str) -> None:
+    """011 Composer bullet (spec 006 keys): an Enter the IME still owns confirms the composition only,
+    in the composer and in the edit-in-place editor; a plain Enter then sends and saves."""
+    page, box = _parts(fake)
+    press = (
+        f"b => b.dispatchEvent(new KeyboardEvent('keydown', {{...{event}, bubbles: true, cancelable: true}}))"
+    )
+    await box.fill("にほん")
+    await box.evaluate(press)
+    await page.locator('[data-id="1"] [data-act=edit]').dispatch_event("click")
+    editor = page.locator(".editor")
+    await editor.fill("にほんご")
+    await editor.evaluate(press)
+    await fake.settled()
+    assert fake.of("send") == [] and fake.of("edit") == []
+    assert await box.input_value() == "にほん"
+    await editor.press("Enter")
+    await box.press("Enter")
+    await fake.settled()
+    assert [v["text"] for v in fake.of("edit")] == ["にほんご"]
+    assert [v["text"] for v in fake.of("send")] == ["にほん"]
+
+
+async def test_busy_answers_are_retried_ten_times_then_say_unavailable(pages: Pages) -> None:
+    """011 History bullet: `busy` is asked again, at most ten times, then the page says the history
+    (or the search) is unavailable and asks nothing more."""
+    fake = Fake(busy=True)
+    page = await _open(pages, fake, wait_for="")
+    await page.locator("#find").fill("x")
+    await page.locator("#find").press("Enter")
+    await until(page, "document.getElementById('note').textContent === 'history: history unavailable'", 1000)
+    await until(page, "document.querySelector('#hits .err')?.textContent === 'search unavailable'", 1000)
+    await fake.settled(past_ms=1000)  # past two retry delays: an eleventh retry would be in
+    assert (len(fake.of("history")), len(fake.of("search"))) == (11, 11)
+
+
+async def test_a_reaction_update_keeps_the_rest_of_the_message(pages: Pages) -> None:
+    """011-AC7: an update without a body (a reaction) changes the reactions and nothing else: the
+    name, the edited marker and the edit action stay."""
+    fake = Fake(history=[{**MINE, "html": "<p>mine</p>", "editable": True, "edited": True, "type": "text"}])
+    page = await _open(pages, fake)
+    like = {"key": "like", "emoji": "👍", "count": 1, "mine": False}
+    blank = {
+        "name": "",
+        "type": "other",
+        "editable": False,
+        "edited": False,
+        "deleted": False,
+        "mentions": None,
+    }
+    fake.send({"edit": {**MINE, **blank, "reactions": [like]}, "thread": T})
+    await fake.handled()
+    msg = page.locator('[data-id="1"]')
+    assert await msg.locator(".reacts").inner_text() == "👍 1"
+    assert await msg.locator(".head b").inner_text() == "Me"
+    assert await msg.locator(".edited").count() == 1
+    assert await msg.locator("[data-act=edit]").count() == 1
+    assert await msg.locator(".html").inner_text() == "mine"
+
+
+async def test_names_and_bodies_take_their_own_direction(pages: Pages) -> None:
+    """A right-to-left message reads right to left: bodies, sender names, row names and snippets
+    carry dir=auto."""
+    rtl = {"id": "2", "at": "2026-10-09T10:01:00.000Z", "from": "8:orgid:x", "name": "שרה לוי", "me": False}
+    fake = Fake(history=[{**rtl, "type": "text", "html": "<p>שלום לכולם</p>", "editable": True}])
+    page = await _open(pages, fake, "?chatnav=split", wait_for='[data-id="2"]')
+    await page.wait_for_selector("#rows li")
+    dirs = await page.evaluate(
+        """[...['[data-id="2"] .html', '[data-id="2"] .head b', '#rows .name', '#rows .prev']]
+        .map((s) => document.querySelector(s).getAttribute('dir'))"""
+    )
+    assert dirs == ["auto"] * 4
+
+
+async def test_two_people_with_one_name_are_both_mentioned(fake: Fake) -> None:
+    """012-AC8: two members sharing a display name are two picks; the send carries both mentions."""
+    fake.members = [ANN, ANN2]
+    page, box = _parts(fake)
+    await box.press_sequentially("@ann")
+    await shows(page, ["Ann Lee", "Ann Lee"])
+    await box.press("Enter")
+    await box.press_sequentially("and @ann")
+    await shows(page, ["Ann Lee", "Ann Lee"])
+    await box.press("ArrowDown")
+    await box.press("Enter")
+    await box.press("Enter")
+    await wait(lambda: len(fake.of("send")) == 1)
+    assert fake.of("send")[0]["mentions"] == [ANN, ANN2]
+
+
+@pytest.mark.parametrize(
+    ("picks", "sent"), [([0, 1], [ANN2]), ([0, 1, 0], [ANN])], ids=["other", "re-picked"]
+)
+async def test_a_deleted_pick_does_not_mention_its_namesake(fake: Fake, picks: list[int], sent: Any) -> None:
+    """M1: a namesake picked then deleted from the text is not mentioned; the one picked last is."""
+    fake.members = [ANN, ANN2]
+    assert await pick_namesakes(fake, picks) == sent
+
+
+async def test_picks_out_of_text_order_mention_both(fake: Fake) -> None:
+    """M1: a mention inserted before an earlier pick still counts, and so does the earlier one."""
+    assert await pick_out_of_order(fake) == [BOB, ANN]
+
+
+async def test_a_longer_word_is_no_mention(fake: Fake) -> None:
+    """L4: `@Ann Leeds` is no mention of Ann Lee, as the server reads it (a raw substring would count it)."""
+    assert await pick_then_glue(fake) == []
+
+
+# Delays of 1 s and more (the reconnect backoff) are recorded and run at once: the test reads the
+# backoff without waiting it out.
+DELAYS = """(() => { const real = window.setTimeout; window.__delays = [];
+  window.setTimeout = (f, ms, ...a) => {
+    if (ms >= 1000) { window.__delays.push(ms); ms = 0; }
+    return real(f, ms, ...a);
+  };
+})();"""
+
+
+async def test_a_follow_that_keeps_failing_keeps_backing_off(pages: Pages) -> None:
+    """L2: the backoff resets on a followed chat, not on an open socket: a follow refused every time
+    must not redial once a second."""
+    fake = Fake(follow_error="unknown chat")
+    page = await _open(pages, fake, wait_for="", init=DELAYS)
+    for n in (1, 2, 3, 4):
+        await wait(lambda n=n: len(fake.of("follow")) == n, f"follow {n}")
+        await fake.handled()
+        if n == 3:
+            fake.follow_error = ""  # the 4th follow succeeds: the next drop starts over
+        await fake.ws.close()
+    await wait(lambda: len(fake.of("follow")) == 5, "follow 5")
+    assert await page.evaluate("window.__delays") == [1000, 2000, 4000, 1000]
+    await pages.close()
+
+
+async def test_a_gap_frame_reloads_the_latest_page_and_keeps_the_draft(fake: Fake) -> None:
+    """Server dropped relayed frames (`gap`): the page asks the latest page again and shows what it
+    missed, the draft untouched; a gap for another chat asks nothing."""
+    page, box = _parts(fake)
+    await box.fill("draft")
+    asked = len(fake.of("history"))
+    fake.send({"gap": L})
+    await fake.handled()
+    await fake.settled()
+    assert len(fake.of("history")) == asked
+    fake.history = [
+        *fake.history,
+        {**MINE, "id": "2", "at": "2026-10-09T10:01:00.000Z", "html": "<p>missed</p>"},
+    ]
+    fake.send({"gap": T})
+    await page.wait_for_selector('[data-id="2"]')
+    assert fake.of("history")[asked:] == [{"history": T, "before": None}]
+    assert await box.input_value() == "draft"
+
+
+GAP = "2026-10-01T00:00:00.000Z"  # where the server stopped reading past unreadable rows
+OLD = {
+    "id": "0",
+    "at": "2026-09-30T10:00:00.000Z",
+    "from": ANN["mri"],
+    "name": "Ann Lee",
+    "html": "<p>old</p>",
+}
+
+
+@dataclass
+class Gapped(Fake):
+    """An archive whose page before the latest one is all unreadable rows: empty, with a `cursor`."""
+
+    def on_verb(self, msg: dict[str, Any]) -> None:
+        before = msg.get("before")
+        if "history" not in msg or "after" in msg or "around" in msg:
+            super().on_verb(msg)
+        elif not before:
+            self.send(
+                {"history": T, "before": None, "messages": self.history, "older": True, "source": "archive"}
+            )
+        elif before == MINE["at"]:
+            head = {"history": T, "before": before, "older": True, "source": "archive"}
+            self.send({**head, "messages": [], "cursor": GAP})
+        else:
+            self.send(
+                {"history": T, "before": before, "messages": [OLD], "older": False, "source": "archive"}
+            )
+
+
+async def test_an_empty_page_with_a_cursor_asks_on_from_the_cursor(pages: Pages) -> None:
+    """L4: past unreadable rows the server answers an empty page and a `cursor`: the next page is
+    asked from that cursor, not from the edge message again."""
+    fake = Gapped()
+    page = await _open(pages, fake)
+    await page.wait_for_selector('[data-id="0"]')
+    assert [v["before"] for v in fake.of("history")] == [None, MINE["at"], GAP]
+    await pages.close()

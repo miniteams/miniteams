@@ -3,10 +3,14 @@
 import asyncio
 import base64
 import contextlib
+import functools
 import hashlib
+import html
 import json
+import re
 import socket
 import sqlite3
+import stat
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -16,10 +20,15 @@ from urllib.parse import quote
 
 import httpx
 import pytest
+import structlog
+import structlog.testing
 import websockets
+from conftest import board_socket, cookie_header, wait
 
+from miniteams import chat_verbs as CV
+from miniteams import compose
 from miniteams import web as W
-from miniteams.archive_store import ChatStore, Index, find_chat_dir
+from miniteams.archive_store import ChatStore, Index, Page, find_chat_dir
 from miniteams.config import Settings
 from miniteams.directory import Directory
 
@@ -61,6 +70,57 @@ def _archive(data_dir: Path, thread_id: str, messages: list[dict[str, Any]] | No
     return data_dir
 
 
+async def _history(
+    board: W.Board,
+    thread: Any,
+    before: Any = None,
+    limit: Any = None,
+    *,
+    after: Any = None,
+    around: Any = None,
+) -> dict[str, Any]:
+    """The `history` verb as the socket answers it."""
+    verb = {"history": thread, "before": before, "limit": limit, "after": after, "around": around}
+    return await board.chat.history_answer({k: v for k, v in verb.items() if v is not None})
+
+
+async def _send(
+    board: W.Board,
+    thread: Any,
+    text: Any,
+    ws: Any = None,
+    quote: Any = None,
+    mentions: Any = None,
+    fmt: Any = None,
+) -> str | None:
+    """The `send` verb; its refusal or failure reason, None once sent."""
+    verb = {"send": thread, "text": text, "quote": quote, "mentions": mentions, "format": fmt}
+    error: str | None = (await board.chat.send_answer(ws, verb)).get("error")
+    return error
+
+
+async def _search(board: W.Board, thread: Any, q: Any) -> dict[str, Any]:
+    return await board.chat.search_answer({"search": thread, "q": q})
+
+
+class _Recorder:
+    """A socket that keeps what it is sent."""
+
+    def __init__(self) -> None:
+        self.frames: list[dict[str, Any]] = []
+
+    async def send(self, data: str) -> None:
+        self.frames.append(json.loads(data))
+
+
+async def _answered(head: dict[str, Any], work: Any) -> dict[str, Any]:
+    """What the page receives for `work`, through `answer` as the socket handlers run it."""
+    ws = _Recorder()
+    await CV.answer(ws, head, work)  # type: ignore[arg-type]
+    [frame] = ws.frames
+    return frame
+
+
 @pytest.fixture
 def quiet_directory(directory: Directory, monkeypatch: pytest.MonkeyPatch) -> Directory:
     async def fake_display(self: Directory, mri: str) -> str:
@@ -93,8 +153,8 @@ def board(quiet_directory: Directory, data_dir: Path) -> W.Board:
 
 @pytest.fixture
 def no_api(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(W, "fetch_history", lambda *a: pytest.fail("no API call expected"))
-    monkeypatch.setattr(W, "send_message", lambda *a: pytest.fail("no API call expected"))
+    monkeypatch.setattr(CV, "fetch_history", lambda *a: pytest.fail("no API call expected"))
+    monkeypatch.setattr(CV, "send_message", lambda *a: pytest.fail("no API call expected"))
 
 
 def _ids(answer: dict[str, Any]) -> list[str]:
@@ -106,7 +166,7 @@ def _ids(answer: dict[str, Any]) -> list[str]:
 
 async def test_history_latest_page_oldest_first(board: W.Board, no_api: None) -> None:
     """011-AC4: the last `limit` messages, oldest first, `older` while earlier ones exist."""
-    answer = await board.history(T, limit=2)
+    answer = await _history(board, T, limit=2)
     assert answer["history"] == T
     assert (_ids(answer), answer["older"], answer["newer"], answer["source"]) == (
         ["4", "5"],
@@ -116,9 +176,9 @@ async def test_history_latest_page_oldest_first(board: W.Board, no_api: None) ->
     )
     assert set(answer) == {"history", "before", "messages", "older", "newer", "source"}
     assert answer["before"] is None
-    before = await board.history(T, before=answer["messages"][0]["at"], limit=2)
+    before = await _history(board, T, before=answer["messages"][0]["at"], limit=2)
     assert (_ids(before), before["older"]) == (["2", "3"], True)
-    first = await board.history(T, before=before["messages"][0]["at"], limit=2)
+    first = await _history(board, T, before=before["messages"][0]["at"], limit=2)
     assert (_ids(first), first["older"]) == (["1"], False)
 
 
@@ -132,25 +192,25 @@ async def test_history_before_pages_back_without_overlap_or_gap(
     data = _archive(tmp_path / "d", T, [_m(str(i), t) for i, t in enumerate(times, 1)])
     board = W.Board({}, quiet_directory, me=ME, data_dir=data)
     pages: list[list[str]] = []
-    answer = await board.history(T, limit=3)
+    answer = await _history(board, T, limit=3)
     while True:
         pages.insert(0, _ids(answer))
         if not answer["older"]:
             break
-        answer = await board.history(T, before=answer["messages"][0]["at"], limit=3)
+        answer = await _history(board, T, before=answer["messages"][0]["at"], limit=3)
     # 5, 6, 7 fill the page; 3 and 4 share 5's time, so they join it rather than be skipped.
     assert pages == [["1", "2"], ["3", "4", "5", "6", "7"]]
-    assert (await board.history(T, before=_at(1)))["messages"] == []
+    assert (await _history(board, T, before=_at(1)))["messages"] == []
 
 
 async def test_history_limit_default_and_cap(tmp_path: Path, quiet_directory: Directory) -> None:
     """011-AC4: default page 100, capped at 200, junk limits fall back to the default."""
     data = _archive(tmp_path / "d", T, [_m(str(i), _at(i)) for i in range(250)])
     board = W.Board({}, quiet_directory, data_dir=data)
-    assert len((await board.history(T))["messages"]) == 100
-    assert len((await board.history(T, limit=500))["messages"]) == 200
+    assert len((await _history(board, T))["messages"]) == 100
+    assert len((await _history(board, T, limit=500))["messages"]) == 200
     for junk in (0, -3, "50", True, 2.5, None):
-        assert len((await board.history(T, limit=junk))["messages"]) == 100
+        assert len((await _history(board, T, limit=junk))["messages"]) == 100
 
 
 async def test_history_of_an_empty_archived_chat(
@@ -158,7 +218,7 @@ async def test_history_of_an_empty_archived_chat(
 ) -> None:
     """011-AC4: an archived chat without messages is an empty page, not an error."""
     board = W.Board({}, quiet_directory, data_dir=_archive(tmp_path / "d", T, []))
-    assert await board.history(T) == {
+    assert await _history(board, T) == {
         "history": T,
         "before": None,
         "messages": [],
@@ -170,7 +230,7 @@ async def test_history_of_an_empty_archived_chat(
 
 async def test_history_refuses_a_non_text_cursor(board: W.Board, no_api: None) -> None:
     """011-AC4"""
-    assert await board.history(T, before=123) == {"history": T, "before": None, "error": "invalid before"}
+    assert await _history(board, T, before=123) == {"history": T, "before": None, "error": "invalid before"}
 
 
 async def test_history_rewrites_archived_images(board: W.Board, data_dir: Path) -> None:
@@ -182,7 +242,7 @@ async def test_history_rewrites_archived_images(board: W.Board, data_dir: Path) 
     )
     (store.media_dir / f"{OBJ}.jpg").write_bytes(b"jpg")
     store.close()
-    answer = await board.history(T, limit=1)
+    answer = await _history(board, T, limit=1)
     assert answer["messages"][0]["html"] == f'<p><img src="/media/19%3Aaaaa%40thread.v2/{OBJ}.jpg"></p>'
 
 
@@ -205,13 +265,13 @@ def api_calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, int, int, int 
         calls.append((thread_id, page_size, max_pages, end_before))
         return page
 
-    monkeypatch.setattr(W, "fetch_history", fake_history)
+    monkeypatch.setattr(CV, "fetch_history", fake_history)
     return calls
 
 
 async def test_history_without_archive_reads_one_api_page(board: W.Board, api_calls: list[Any]) -> None:
     """011-AC5: a board chat without messages.db gets one API page, `source: "api"`."""
-    answer = await board.history(B, limit=50)
+    answer = await _history(board, B, limit=50)
     assert (_ids(answer), answer["older"], answer["newer"], answer["source"]) == (
         ["1", "2", "3"],
         True,
@@ -223,11 +283,11 @@ async def test_history_without_archive_reads_one_api_page(board: W.Board, api_ca
 
 async def test_history_api_before_cuts_at_the_exact_time(board: W.Board, api_calls: list[Any]) -> None:
     """011-AC5: the API window is second-granular, the cut is not."""
-    answer = await board.history(B, before="2026-09-15T10:00:00.500Z")
+    answer = await _history(board, B, before="2026-09-15T10:00:00.500Z")
     assert _ids(answer) == ["1"]
     epoch = 1789466400  # 2026-09-15T10:00:00Z
     assert api_calls[-1][3] == epoch + 1
-    assert (await board.history(B, before="2026-09-15T10:00:00.000Z"))["older"] is False  # nothing left
+    assert (await _history(board, B, before="2026-09-15T10:00:00.000Z"))["older"] is False  # nothing left
 
 
 async def test_history_indexed_chat_without_messages_db_uses_the_api(
@@ -235,7 +295,7 @@ async def test_history_indexed_chat_without_messages_db_uses_the_api(
 ) -> None:
     """011-AC5: indexed but never backfilled is "no messages.db"."""
     board = W.Board({}, quiet_directory, data_dir=_archive(tmp_path / "d", T, None))
-    assert (await board.history(T))["source"] == "api"
+    assert (await _history(board, T))["source"] == "api"
 
 
 async def test_history_unreadable_archive_falls_back_to_the_api(
@@ -246,7 +306,7 @@ async def test_history_unreadable_archive_falls_back_to_the_api(
     (chat / "messages.db").write_bytes(b"not a database" * 100)
     for leftover in chat.glob("messages.db-*"):
         leftover.unlink()
-    assert (await board.history(C))["source"] == "api"
+    assert (await _history(board, C))["source"] == "api"
 
 
 async def test_history_with_the_archive_gone_uses_the_api(
@@ -254,8 +314,8 @@ async def test_history_with_the_archive_gone_uses_the_api(
 ) -> None:
     """011-AC5: no index at all: the board's chats still get their API page."""
     board = W.Board({B: {"id": B, "last_activity": _at(1)}}, quiet_directory, data_dir=tmp_path / "missing")
-    assert (await board.history(B))["source"] == "api"
-    assert (await board.history(T))["error"] == "unknown chat"
+    assert (await _history(board, B))["source"] == "api"
+    assert (await _history(board, T))["error"] == "unknown chat"
 
 
 @pytest.mark.parametrize(
@@ -279,14 +339,14 @@ async def test_history_api_failure_answers_an_error(
     def failing(*args: Any) -> list[Any]:
         raise exc
 
-    monkeypatch.setattr(W, "fetch_history", failing)
-    assert await board.history(B) == {"history": B, "before": None, "error": reason}
+    monkeypatch.setattr(CV, "fetch_history", failing)
+    assert await _history(board, B) == {"history": B, "before": None, "error": reason}
 
 
 async def test_history_without_a_connection(tmp_path: Path) -> None:
     """011-AC5: nothing archived and no API session: an error, not a crash."""
     board = W.Board({B: {"id": B, "last_activity": _at(1)}})
-    assert await board.history(B) == {"history": B, "before": None, "error": "not connected"}
+    assert await _history(board, B) == {"history": B, "before": None, "error": "not connected"}
 
 
 # --- unknown thread (011-AC9) ---
@@ -294,16 +354,16 @@ async def test_history_without_a_connection(tmp_path: Path) -> None:
 
 async def test_unknown_thread_is_refused_without_an_api_call(board: W.Board, no_api: None) -> None:
     """011-AC9: neither on the board nor in the archive: history, follow and send are refused."""
-    assert await board.history(NOPE) == {"history": NOPE, "before": None, "error": "unknown chat"}
+    assert await _history(board, NOPE) == {"history": NOPE, "before": None, "error": "unknown chat"}
     assert await board.follow(None, NOPE) == {"follow": NOPE, "error": "unknown chat"}  # type: ignore[arg-type]
-    assert await board.send(NOPE, "hi") == "unknown chat"
+    assert await _send(board, NOPE, "hi") == "unknown chat"
     assert board._follows == {}
 
 
 async def test_unknown_thread_without_any_archive(quiet_directory: Directory, no_api: None) -> None:
     """011-AC9: no --data-dir at all."""
     board = W.Board({}, quiet_directory)
-    assert await board.history(T) == {"history": T, "before": None, "error": "unknown chat"}
+    assert await _history(board, T) == {"history": T, "before": None, "error": "unknown chat"}
 
 
 # --- message records ---
@@ -312,7 +372,7 @@ async def test_unknown_thread_without_any_archive(quiet_directory: Directory, no
 def test_record_fields() -> None:
     """011-AC4: the record shape the page relies on."""
     message = _m("7", _at(7), "<p>hi <b>you</b></p>", properties={"edittime": "1789466500000"})
-    assert W.chat_record(message, T, ME) == {
+    assert CV.chat_record(message, T, ME) == {
         "id": "7",
         "at": _at(7),
         "from": ANN,
@@ -331,9 +391,9 @@ def test_record_fields() -> None:
 def test_record_deleted_message_has_no_body() -> None:
     """011-AC7: a deleted message keeps its place and loses its body."""
     for props in ({"deletetime": "1789466500000"}, {"hardDeleteTime": "1789466500000"}):
-        record = W.chat_record(_m("7", _at(7), "<p>secret</p>", properties=props), T, ME)
+        record = CV.chat_record(_m("7", _at(7), "<p>secret</p>", properties=props), T, ME)
         assert (record["deleted"], record["html"]) == (True, "")
-    assert W.chat_record(_m("8", _at(8), skypeeditedid="8"), T)["edited"] is True
+    assert CV.chat_record(_m("8", _at(8), skypeeditedid="8"), T)["edited"] is True
 
 
 def test_record_reactions_count_and_mine() -> None:
@@ -351,9 +411,9 @@ def test_record_reactions_count_and_mine() -> None:
         {"key": "party_custom", "emoji": ":party_custom:", "count": 1, "mine": False},
     ]
     for value in (emotions, json.dumps(emotions)):
-        assert W.chat_record(_m("7", _at(7), properties={"emotions": value}), T, ME)["reactions"] == expected
+        assert CV.chat_record(_m("7", _at(7), properties={"emotions": value}), T, ME)["reactions"] == expected
     assert (
-        W.chat_record(_m("7", _at(7), properties={"emotions": emotions}), T)["reactions"][0]["mine"] is False
+        CV.chat_record(_m("7", _at(7), properties={"emotions": emotions}), T)["reactions"][0]["mine"] is False
     )
 
 
@@ -361,10 +421,10 @@ def test_record_mentions_and_me() -> None:
     """011-AC6: mention kind (spec 003) and the mention span for my MRI."""
     content = '<p><span itemtype="http://schema.skype.com/Mention" itemscope itemid="0">Me</span> look</p>'
     props = {"mentions": json.dumps([{"mentionType": "person", "itemid": 0, "mri": ME}])}
-    record = W.chat_record(_m("7", _at(7), content, properties=props), T, ME)
+    record = CV.chat_record(_m("7", _at(7), content, properties=props), T, ME)
     assert record["mentions"] == "me"
     assert record["html"] == f'<p><span class="mention mention-me" data-mri="{ME}">Me</span> look</p>'
-    mine = W.chat_record(_m("8", _at(8), **{"from": f"https://h/v1/users/ME/contacts/{ME}"}), T, ME)
+    mine = CV.chat_record(_m("8", _at(8), **{"from": f"https://h/v1/users/ME/contacts/{ME}"}), T, ME)
     assert (mine["me"], mine["from"], mine["mentions"]) == (True, ME, None)
 
 
@@ -382,7 +442,7 @@ def test_record_types_and_markers(
     msgtype: str, content: str, props: dict[str, Any], kind: str, body: str
 ) -> None:
     """011-AC4: non-text messages get the widget's marker, escaped."""
-    record = W.chat_record(
+    record = CV.chat_record(
         {"id": "1", "composetime": _at(1), "messagetype": msgtype, "content": content, "properties": props}, T
     )
     assert (record["type"], record["html"]) == (kind, body)
@@ -411,7 +471,7 @@ def test_record_renders_a_media_card(tmp_path: Path) -> None:
     """011-AC24: a Swift card renders as card HTML, typed text; images only from the archive."""
     (tmp_path / f"{OBJ}.png").write_bytes(b"png")
     attachment = {"contentType": "application/vnd.microsoft.card.adaptive", "content": _BUILD_CARD}
-    record = W.chat_record(_swift_message({"attachments": [attachment]}), T, ME, tmp_path)
+    record = CV.chat_record(_swift_message({"attachments": [attachment]}), T, ME, tmp_path)
     assert record["type"] == "text"
     out = record["html"]
     assert (
@@ -427,7 +487,7 @@ def test_record_appends_properties_cards_after_the_sanitised_body() -> None:
     """011-AC24: `properties.cards` (a JSON string) follows the body, its classes intact."""
     cards = [{"appName": "CI", "content": _BUILD_CARD}]
     message = _m("7", _at(7), '<p onclick="x()">see below</p>', properties={"cards": json.dumps(cards)})
-    record = W.chat_record(message, T, ME)
+    record = CV.chat_record(message, T, ME)
     assert record["type"] == "text"
     assert record["html"].startswith('<p>see below</p><div class="card"><div class="card-app">CI</div>')
     assert '<table class="facts">' in record["html"] and "onclick" not in record["html"]
@@ -438,10 +498,10 @@ def test_record_card_type_only_upgrades_other() -> None:
     cards = {"cards": [{"content": _BUILD_CARD}]}
     mine = {"from": f"https://h/v1/users/ME/contacts/{ME}"}
     attachment = {"contentType": "application/vnd.microsoft.card.adaptive", "content": _BUILD_CARD}
-    record = W.chat_record({**_swift_message({"attachments": [attachment]}), **mine}, T, ME)
+    record = CV.chat_record({**_swift_message({"attachments": [attachment]}), **mine}, T, ME)
     assert (record["type"], record["editable"], record["me"]) == ("text", False, True)
     added = {**_m("8", _at(8)), "messagetype": "ThreadActivity/AddMember", "properties": cards}
-    record = W.chat_record(added, T, ME)
+    record = CV.chat_record(added, T, ME)
     assert (record["type"], record["editable"]) == ("system", False)
     assert '<div class="card">' in record["html"]
 
@@ -455,7 +515,7 @@ def test_record_card_type_only_upgrades_other() -> None:
 )
 def test_record_with_nothing_to_render_keeps_the_marker(message: dict[str, Any]) -> None:
     """011-AC24: an empty body and cards that render nothing fall back to the card marker."""
-    record = W.chat_record(message, T, ME)
+    record = CV.chat_record(message, T, ME)
     assert record["html"] == "🃏 card"
 
 
@@ -482,7 +542,8 @@ async def _served(board: W.Board, settings: Settings) -> AsyncIterator[str]:
                 await asyncio.sleep(0.01)
                 continue
             # A real request, not a bare connect: the server logs an aborted handshake as an error.
-            writer.write(f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n".encode())
+            cookie = f"Cookie: mt={board.secret}\r\n"
+            writer.write(f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{cookie}\r\n".encode())
             status = b""
             with contextlib.suppress(OSError, TimeoutError):
                 status = await asyncio.wait_for(reader.readline(), 1)
@@ -502,8 +563,16 @@ async def _served(board: W.Board, settings: Settings) -> AsyncIterator[str]:
             await task
 
 
-def _connect(host: str) -> Any:
-    return websockets.connect(f"ws://{host}/ws", origin=websockets.Origin(f"http://{host}"))
+def _host(board: W.Board) -> str:
+    return board.base_url.removeprefix("http://")
+
+
+def _cookie(board: W.Board) -> dict[str, str]:
+    return cookie_header(board.secret)
+
+
+def _connect(board: W.Board) -> Any:
+    return board_socket(_host(board), board.secret)
 
 
 async def _frame(ws: Any) -> dict[str, Any]:
@@ -527,7 +596,7 @@ async def test_follow_relays_messages_edits_deletes_reactions_and_typing(
     board: W.Board, settings: Settings
 ) -> None:
     """011-AC7: a followed thread's live events reach the follower as msg / edit / typing frames."""
-    async with _served(board, settings) as host, _connect(host) as ws:
+    async with _served(board, settings), _connect(board) as ws:
         await ws.recv()
         await ws.send(json.dumps({"follow": T}))
         assert (await _frame(ws)).items() >= {"follow": T, "ok": True}.items()
@@ -561,7 +630,7 @@ async def test_follow_relays_messages_edits_deletes_reactions_and_typing(
 
 async def test_follow_relays_only_its_thread_and_skips_noise(board: W.Board, settings: Settings) -> None:
     """011-AC7: other threads, my own typing, read markers and conversation updates are not relayed."""
-    async with _served(board, settings) as host, _connect(host) as ws:
+    async with _served(board, settings), _connect(board) as ws:
         await ws.recv()
         await ws.send(json.dumps({"follow": C}))  # an archived channel, outside the board's scope
         assert (await _frame(ws)).items() >= {"follow": C, "ok": True}.items()
@@ -582,19 +651,15 @@ async def test_follow_relays_only_its_thread_and_skips_noise(board: W.Board, set
 
 async def test_follow_replaces_and_closing_cleans_up(board: W.Board, settings: Settings) -> None:
     """011-AC7: one followed thread per socket; a closed socket leaves no bookkeeping."""
-    async with _served(board, settings) as host:
-        async with _connect(host) as ws:
+    async with _served(board, settings):
+        async with _connect(board) as ws:
             await ws.recv()
             await ws.send(json.dumps({"follow": T}))
             await _frame(ws)
             await ws.send(json.dumps({"follow": B}))
             await _frame(ws)
             assert [tid for tid, _ in board._follows.values()] == [B]
-        for _ in range(50):
-            if not board._follows:
-                break
-            await asyncio.sleep(0.02)
-        assert board._follows == {}
+        await wait(lambda: not board._follows, "the follow dropped")
 
 
 async def test_history_and_errors_go_to_the_asking_socket_only(
@@ -605,8 +670,8 @@ async def test_history_and_errors_go_to_the_asking_socket_only(
     def failing(*args: Any) -> list[Any]:
         raise httpx.ConnectError("boom", request=httpx.Request("GET", "https://x"))
 
-    monkeypatch.setattr(W, "fetch_history", failing)
-    async with _served(board, settings) as host, _connect(host) as asker, _connect(host) as other:
+    monkeypatch.setattr(CV, "fetch_history", failing)
+    async with _served(board, settings), _connect(board) as asker, _connect(board) as other:
         await asker.recv()
         await other.recv()
         await asker.send(json.dumps({"history": B}))
@@ -632,7 +697,7 @@ async def _silent(ws: Any, wait: float = 0.3) -> None:
 
 async def test_relay_skips_a_socket_that_does_not_follow(board: W.Board, settings: Settings) -> None:
     """011-AC7: only followers get relayed frames; another open page gets none."""
-    async with _served(board, settings) as host, _connect(host) as ws, _connect(host) as idle:
+    async with _served(board, settings), _connect(board) as ws, _connect(board) as idle:
         await ws.recv()
         await idle.recv()
         await ws.send(json.dumps({"follow": T}))
@@ -659,7 +724,7 @@ async def test_unreadable_archive_rows_are_skipped(
         )
     db.close()
     board = W.Board({}, quiet_directory, me=ME, data_dir=data)
-    answer = await board.history(T)
+    answer = await _history(board, T)
     assert (_ids(answer), answer["older"]) == (["1", "4", "5"], False)
 
 
@@ -669,17 +734,23 @@ async def test_any_history_failure_still_answers(board: W.Board, monkeypatch: py
     def broken(*args: Any, **kwargs: Any) -> Any:
         raise ValueError("boom")
 
-    monkeypatch.setattr(W, "read_page", broken)
-    assert await board.history(T) == {"history": T, "before": None, "error": "history unavailable"}
-    monkeypatch.setattr(W, "chat_record", broken)
-    monkeypatch.setattr(W, "read_page", lambda *a, **k: ([_m("1", _at(1))], False, False))
-    assert (await board.history(T))["messages"] == []  # the bad record is skipped, the page answers
+    monkeypatch.setattr(CV, "read_page", broken)
+    verb = {"history": T}
+    with structlog.testing.capture_logs() as logs:
+        got = await _answered(CV._head_history(verb), board.chat.history_answer(verb))
+    assert got == {"history": T, "before": None, "error": "failed"}
+    assert [(e["event"], e["verb"], e["error_type"]) for e in logs] == [
+        ("verb_failed", "history", "ValueError")
+    ]
+    monkeypatch.setattr(CV, "chat_record", broken)
+    monkeypatch.setattr(CV, "read_page", lambda *a, **k: Page([_m("1", _at(1))], False, False))
+    assert (await _history(board, T))["messages"] == []  # the bad record is skipped, the page answers
 
 
 def test_record_survives_malformed_properties() -> None:
     """011-AC7: odd shapes from the stream or the archive never raise."""
     for props in ("oops", ["x"], {"emotions": [{"key": "like", "users": 5}], "mentions": 3}):
-        record = W.chat_record(_m("1", _at(1), properties=props), T, ME)
+        record = CV.chat_record(_m("1", _at(1), properties=props), T, ME)
         assert (record["reactions"], record["html"]) == ([], "<p>m1</p>")
 
 
@@ -689,16 +760,17 @@ async def test_records_are_built_off_the_event_loop(
     """011-AC4 + 011-AC7: sanitising globs the (NFS) media folder: never on the loop thread."""
     loop_thread = threading.get_ident()
     threads: list[int] = []
-    real = W.chat_record
+    real = CV.chat_record
 
     def spy(*args: Any) -> dict[str, Any]:
         threads.append(threading.get_ident())
         return real(*args)
 
-    monkeypatch.setattr(W, "chat_record", spy)
-    await board.history(T)
-    await board.history(B)  # API path
-    async with _served(board, settings) as host, _connect(host) as ws:
+    monkeypatch.setattr(CV, "chat_record", spy)  # pages
+    monkeypatch.setattr(W, "chat_record", spy)  # live relay
+    await _history(board, T)
+    await _history(board, B)  # API path
+    async with _served(board, settings), _connect(board) as ws:
         await ws.recv()
         await ws.send(json.dumps({"follow": T}))
         await _frame(ws)
@@ -719,7 +791,7 @@ async def test_relay_failure_does_not_cost_the_board_its_update(
         raise TypeError("odd event")
 
     monkeypatch.setattr(W, "chat_record", broken)
-    async with _served(board, settings) as host, _connect(host) as ws:
+    async with _served(board, settings), _connect(board) as ws:
         await ws.recv()
         await ws.send(json.dumps({"follow": B}))
         await _frame(ws)
@@ -737,7 +809,7 @@ async def test_typing_relay_names_who_stopped_and_expires(
     """011-AC7: clear frames name the typer (groups), expire without ClearTyping, end on their message."""
     board = W.Board({}, quiet_directory, me=ME, data_dir=data_dir, typing_ttl=0.2)
     bob = {"from": "https://h/v1/users/ME/contacts/8:orgid:bob", "imdisplayname": "Bob Day"}
-    async with _served(board, settings) as host, _connect(host) as ws:
+    async with _served(board, settings), _connect(board) as ws:
         await ws.recv()
         await ws.send(json.dumps({"follow": C}))  # not on the board: the relay owns the timer
         await _frame(ws)
@@ -766,7 +838,7 @@ async def test_typing_relay_names_who_stopped_and_expires(
 async def test_history_refuses_a_malformed_cursor(board: W.Board, no_api: None, before: str) -> None:
     """011-AC4 + 011-AC5: a cursor that is not a time is refused before any read or API call."""
     for thread in (T, B):
-        assert await board.history(thread, before=before) == {
+        assert await _history(board, thread, before=before) == {
             "history": thread,
             "before": before,
             "error": "invalid before",
@@ -775,23 +847,23 @@ async def test_history_refuses_a_malformed_cursor(board: W.Board, no_api: None, 
 
 async def test_history_echoes_its_cursor(board: W.Board, api_calls: list[Any]) -> None:
     """011-AC4 + 011-AC5: the page matches each answer to its request by `before`."""
-    assert (await board.history(T, before=_at(3)))["before"] == _at(3)
-    assert (await board.history(B, before=_at(3)))["before"] == _at(3)
-    assert (await board.history(T))["before"] is None
+    assert (await _history(board, T, before=_at(3)))["before"] == _at(3)
+    assert (await _history(board, B, before=_at(3)))["before"] == _at(3)
+    assert (await _history(board, T))["before"] is None
 
 
 async def test_one_history_in_flight_per_socket(
     board: W.Board, settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """011-AC4: a second request while one is pending is refused `busy`; other sockets are not held up."""
-    real = W.read_page
+    real = CV.read_page
 
     def slow(*args: Any, **kwargs: Any) -> Any:
         time.sleep(0.4)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(W, "read_page", slow)
-    async with _served(board, settings) as host, _connect(host) as one, _connect(host) as two:
+    monkeypatch.setattr(CV, "read_page", slow)
+    async with _served(board, settings), _connect(board) as one, _connect(board) as two:
         await one.recv()
         await two.recv()
         await one.send(json.dumps({"history": T, "limit": 1}))
@@ -806,14 +878,14 @@ async def test_one_history_in_flight_per_socket(
 
 async def test_empty_before_means_the_latest_page(board: W.Board, no_api: None) -> None:
     """011-AC4: `before: ""` is the latest page, like a missing or null cursor."""
-    answer = await board.history(T, before="", limit=2)
+    answer = await _history(board, T, before="", limit=2)
     assert (_ids(answer), answer["before"]) == (["4", "5"], None)
 
 
 async def test_own_typing_is_never_relayed(board: W.Board, settings: Settings) -> None:
     """011-AC7: my typing on another device, started or cleared, is not shown to the page."""
     mine = {"from": f"https://h/v1/users/ME/contacts/{ME}", "imdisplayname": "Me Myself"}
-    async with _served(board, settings) as host, _connect(host) as ws:
+    async with _served(board, settings), _connect(board) as ws:
         await ws.recv()
         await ws.send(json.dumps({"follow": B}))
         await _frame(ws)
@@ -854,7 +926,7 @@ async def test_chat_route_serves_the_page_for_board_and_archived_chats(
     board: W.Board, settings: Settings
 ) -> None:
     """011-AC3: `/chat/<id>` is the chat page for a thread on the board or in the archive, 404 else."""
-    async with _served(board, settings) as host, httpx.AsyncClient() as client:
+    async with _served(board, settings) as host, httpx.AsyncClient(headers=_cookie(board)) as client:
         for thread_id in (T, B, C):
             page = await client.get(_chat_url(host, thread_id))
             assert page.status_code == 200, thread_id
@@ -874,7 +946,7 @@ async def test_media_route_serves_an_archived_file(
 ) -> None:
     """011-AC3: an archived asset is served with its type, sandboxed; a missing one is a 404."""
     _media(data_dir)
-    async with _served(board, settings) as host, httpx.AsyncClient() as client:
+    async with _served(board, settings) as host, httpx.AsyncClient(headers=_cookie(board)) as client:
         base = f"http://{host}/media/{quote(T, safe='')}"
         got = await client.get(f"{base}/{OBJ}.png")
         assert got.status_code == 200 and got.content == b"\x89PNG-fake"
@@ -896,7 +968,7 @@ def test_media_file_stays_inside_the_media_folder(board: W.Board, data_dir: Path
     (media / "to-part.png").symlink_to(media / "half.png.part")
     (media / "sub").mkdir()
     thread = quote(T, safe="")
-    assert board.media_file(f"/media/{thread}/{OBJ}.png") == (b"\x89PNG-fake", "image/png")
+    assert board.chat.media_file(f"/media/{thread}/{OBJ}.png") == (b"\x89PNG-fake", "image/png")
     refused = [
         "..",
         "%2e%2e",
@@ -913,11 +985,11 @@ def test_media_file_stays_inside_the_media_folder(board: W.Board, data_dir: Path
         f"{OBJ}.png%00.txt",
     ]
     for name in refused:
-        assert board.media_file(f"/media/{thread}/{name}") is None, name
-    assert board.media_file(f"/media/{thread}//etc/passwd") is None  # absolute: extra segment
-    assert board.media_file(f"/media/{thread}/sub/x.png") is None
-    assert board.media_file(f"/media/{quote(NOPE, safe='')}/{OBJ}.png") is None
-    assert board.media_file(f"/media/{quote(B, safe='')}/{OBJ}.png") is None  # on the board, no archive
+        assert board.chat.media_file(f"/media/{thread}/{name}") is None, name
+    assert board.chat.media_file(f"/media/{thread}//etc/passwd") is None  # absolute: extra segment
+    assert board.chat.media_file(f"/media/{thread}/sub/x.png") is None
+    assert board.chat.media_file(f"/media/{quote(NOPE, safe='')}/{OBJ}.png") is None
+    assert board.chat.media_file(f"/media/{quote(B, safe='')}/{OBJ}.png") is None  # on the board, no archive
 
 
 def test_media_file_refuses_oversized_files(
@@ -925,23 +997,23 @@ def test_media_file_refuses_oversized_files(
 ) -> None:
     """011-AC3: the whole-body response is capped."""
     _media(data_dir)
-    monkeypatch.setattr(W, "_MEDIA_MAX", 4)
-    assert board.media_file(f"/media/{quote(T, safe='')}/{OBJ}.png") is None
+    monkeypatch.setattr(CV, "_MEDIA_MAX", 4)
+    assert board.chat.media_file(f"/media/{quote(T, safe='')}/{OBJ}.png") is None
 
 
-def _chat_socket(host: str) -> Any:
-    return websockets.connect(f"ws://{host}/ws?chat", origin=websockets.Origin(f"http://{host}"))
+def _chat_socket(board: W.Board) -> Any:
+    return board_socket(_host(board), board.secret, chat=True)
 
 
 async def test_chat_socket_never_receives_the_board(board: W.Board, settings: Settings) -> None:
     """011-AC10: a chat page's socket gets its chat's frames, never the board's rows; the widget does."""
-    async with _served(board, settings) as host, _chat_socket(host) as chat, _connect(host) as widget:
+    async with _served(board, settings), _chat_socket(board) as chat, _connect(board) as widget:
         assert "rows" in json.loads(await widget.recv())
         await chat.send(json.dumps({"follow": T}))
         assert json.loads(await asyncio.wait_for(chat.recv(), 2)) == {
             "follow": T,
             "ok": True,
-            "label": T,  # archived, not seeded: no better name known
+            "label": "Chat",  # archived, not seeded: the index names it
             "opener": False,
             "page": W.page_version("chat.html"),
             "read_only": False,
@@ -960,7 +1032,7 @@ async def test_chat_socket_never_receives_the_board(board: W.Board, settings: Se
 async def test_a_split_chat_socket_subscribes_to_the_board(board: W.Board, settings: Settings) -> None:
     """011-AC23: `board` gives a chat socket the widget's payload and every later broadcast; seen and
     mute work from it; a chat socket that did not ask still gets no rows."""
-    async with _served(board, settings) as host, _chat_socket(host) as split, _chat_socket(host) as plain:
+    async with _served(board, settings), _chat_socket(board) as split, _chat_socket(board) as plain:
         await split.send(json.dumps({"follow": T}))
         assert (await _frame(split))["follow"] == T
         await split.send(json.dumps({"board": True}))
@@ -988,16 +1060,12 @@ async def test_a_split_chat_socket_subscribes_to_the_board(board: W.Board, setti
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(plain.recv(), 0.3)
         assert len(board.clients) == 1
-    for _ in range(50):
-        if not board.clients:
-            break
-        await asyncio.sleep(0.02)
-    assert board.clients == set()
+    await wait(lambda: not board.clients, "the clients gone")
 
 
 async def test_switching_the_followed_chat_stops_the_old_relay(board: W.Board, settings: Settings) -> None:
     """011-AC22: after `follow` on another chat, the previous one's live events no longer reach the socket."""
-    async with _served(board, settings) as host, _chat_socket(host) as ws:
+    async with _served(board, settings), _chat_socket(board) as ws:
         await ws.send(json.dumps({"follow": T}))
         assert (await _frame(ws))["follow"] == T
         await ws.send(json.dumps({"follow": B}))
@@ -1014,7 +1082,7 @@ async def test_switching_the_followed_chat_stops_the_old_relay(board: W.Board, s
 
 async def test_relayed_frames_name_their_chat(board: W.Board, settings: Settings) -> None:
     """011-AC22: message, edit and typing frames carry `thread`: a page that switched drops the left one's."""
-    async with _served(board, settings) as host, _chat_socket(host) as ws:
+    async with _served(board, settings), _chat_socket(board) as ws:
         await ws.send(json.dumps({"follow": T}))
         assert (await _frame(ws))["follow"] == T
         new = {"id": "9", "composetime": _at(9), "messagetype": "Text", "content": "x"}
@@ -1050,7 +1118,7 @@ def sent(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
         calls.append((thread_id, text))
         return {"status": 201}
 
-    monkeypatch.setattr(W, "send_message", fake_send)
+    monkeypatch.setattr(CV, "send_message", fake_send)
     return calls
 
 
@@ -1058,7 +1126,7 @@ async def test_send_reaches_a_followed_chat_off_the_board(
     board: W.Board, settings: Settings, sent: list[tuple[str, str]]
 ) -> None:
     """011-AC8: the composer's send posts once to a followed archived chat; anything else is refused."""
-    async with _served(board, settings) as host, _chat_socket(host) as chat, _chat_socket(host) as other:
+    async with _served(board, settings), _chat_socket(board) as chat, _chat_socket(board) as other:
         await other.send(json.dumps({"send": T, "text": "not following"}))
         assert json.loads(await asyncio.wait_for(other.recv(), 2)) == {"sent": T, "error": "unknown chat"}
         await chat.send(json.dumps({"follow": T}))
@@ -1080,8 +1148,8 @@ async def test_send_failure_keeps_the_reason(
     def failing(*args: Any) -> None:
         raise httpx.ConnectError("boom", request=httpx.Request("POST", "https://x"))
 
-    monkeypatch.setattr(W, "send_message", failing)
-    async with _served(board, settings) as host, _chat_socket(host) as chat:
+    monkeypatch.setattr(CV, "send_message", failing)
+    async with _served(board, settings), _chat_socket(board) as chat:
         await chat.send(json.dumps({"follow": T}))
         await chat.recv()
         await chat.send(json.dumps({"send": T, "text": "hi"}))
@@ -1112,10 +1180,7 @@ def launched(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
 
 
 async def _until(calls: list[Any], n: int) -> None:
-    for _ in range(100):
-        if len(calls) >= n:
-            return
-        await asyncio.sleep(0.01)
+    await wait(lambda: len(calls) >= n, f"{n} calls")
 
 
 async def test_open_reaches_a_followed_chat_and_lands_on_a_message(
@@ -1124,7 +1189,7 @@ async def test_open_reaches_a_followed_chat_and_lands_on_a_message(
     """011-AC19: `open` runs the opener for a followed off-board chat, on a message id when it is digits."""
     rows = {B: {"id": B, "label": "B", "last_activity": _at(1), "last_id": "1", "typing": []}}
     board = W.Board(rows, quiet_directory, me=ME, data_dir=data_dir, opener=["xdg-open"])
-    async with _served(board, settings) as host, _chat_socket(host) as chat:
+    async with _served(board, settings), _chat_socket(board) as chat:
         await chat.send(json.dumps({"open": T}))  # not followed yet: refused
         await chat.send(json.dumps({"follow": T}))
         await chat.recv()
@@ -1141,6 +1206,7 @@ async def test_open_reaches_a_followed_chat_and_lands_on_a_message(
         ("xdg-open", W.deep_link(T, "", "msteams")),
         ("xdg-open", W.deep_link(B, "1", "msteams")),
     ]
+    assert board.secret and not any(board.secret in arg for argv in launched for arg in argv)  # Teams never
 
 
 async def test_open_without_opener_is_left_to_the_page(
@@ -1156,7 +1222,7 @@ async def test_chat_and_media_refuse_a_foreign_host(
 ) -> None:
     """011-AC10: DNS rebinding: a name other than the bound address reads neither a chat nor its files."""
     _media(data_dir)
-    async with _served(board, settings) as host, httpx.AsyncClient() as client:
+    async with _served(board, settings) as host, httpx.AsyncClient(headers=_cookie(board)) as client:
         thread = quote(T, safe="")
         for path in (f"/chat/{thread}", f"/media/{thread}/{OBJ}.png"):
             assert (await client.get(f"http://{host}{path}")).status_code == 200, path
@@ -1168,10 +1234,12 @@ async def test_chat_and_media_refuse_a_foreign_host(
 async def test_chat_socket_checks_the_origin(board: W.Board, settings: Settings) -> None:
     """011-AC10: `/ws?chat` has the board's Origin rule: a foreign or missing Origin gets 403."""
     async with _served(board, settings) as host:
-        for origin in ("http://evil.example", "null", None):
+        for origin in ("http://evil.example", "null", None):  # the cookie right: only the Origin is wrong
             with pytest.raises(websockets.InvalidStatus) as exc:
                 await websockets.connect(
-                    f"ws://{host}/ws?chat", origin=websockets.Origin(origin) if origin else None
+                    f"ws://{host}/ws?chat",
+                    origin=websockets.Origin(origin) if origin else None,
+                    additional_headers=_cookie(board),
                 )
             assert exc.value.response.status_code == 403, origin
 
@@ -1180,7 +1248,7 @@ async def test_send_never_reaches_a_followed_channel(
     board: W.Board, settings: Settings, sent: list[tuple[str, str]]
 ) -> None:
     """011-AC8 + 011-AC9: a followed archived channel is read-only: send is refused, no API call."""
-    async with _served(board, settings) as host, _chat_socket(host) as chat:
+    async with _served(board, settings), _chat_socket(board) as chat:
         await chat.send(json.dumps({"follow": C}))
         answer = json.loads(await asyncio.wait_for(chat.recv(), 2))
         assert (answer["ok"], answer["read_only"]) == (True, True)
@@ -1209,10 +1277,10 @@ async def test_open_chat_runs_the_browser_on_our_own_chat_page(
 
     monkeypatch.setattr(W.asyncio, "create_subprocess_exec", fake_exec)
     board.browser = ["firefox"]
-    assert await board.open_row(B, chat=True) is False  # not bound yet: no URL to point at
+    assert await board.open_row(B, "chat") is False  # not bound yet: no URL to point at
     board.browser = None
     async with _served(board, settings) as host:
-        async with _connect(host) as ws:
+        async with _connect(board) as ws:
             await ws.recv()
             # Verbs run in order: a follow answer means every verb sent before it ran.
             await ws.send(json.dumps({"open": B, "chat": True}))  # no --browser yet
@@ -1224,7 +1292,9 @@ async def test_open_chat_runs_the_browser_on_our_own_chat_page(
             await ws.send(json.dumps({"open": NOPE, "chat": True}))
             await ws.send(json.dumps({"follow": B}))
             await _frame(ws)
-    assert launched == [("firefox", "--new-tab", f"http://{host}/chat/19%3Abbbb%40thread.v2")]
+            opened = _nonceless(launched)  # the files go with the server
+    assert opened == [("firefox", "--new-tab", f"http://{host}/chat/19%3Abbbb%40thread.v2?n=N")]
+    assert board.secret not in repr(launched) and "n=" not in repr(launched)
 
 
 async def test_open_chat_carries_the_split_setting(
@@ -1245,15 +1315,101 @@ async def test_open_chat_carries_the_split_setting(
     monkeypatch.setattr(W.asyncio, "create_subprocess_exec", fake_exec)
     board.browser = ["firefox"]
     async with _served(board, settings) as host:
-        async with _connect(host) as ws:
+        async with _connect(board) as ws:
             await ws.recv()
             for chatnav in ("split", "split&x=1", '"><', ["split"], True, "list"):
                 await ws.send(json.dumps({"open": B, "chat": True, "chatnav": chatnav}))
             await ws.send(json.dumps({"open": B, "chat": "split", "chatnav": "split"}))
             await ws.send(json.dumps({"follow": B}))
             await _frame(ws)
-    page = f"http://{host}/chat/19%3Abbbb%40thread.v2"
-    assert launched == [("firefox", page + "?chatnav=split")] + [("firefox", page)] * 5
+            opened = _nonceless(launched)  # the files go with the server
+            nonces = [re.search(r"n=([\w-]+)", _target(argv[-1]))[1] for argv in launched]  # type: ignore[index]
+    page = f"http://{host}/chat/19%3Abbbb%40thread.v2?n=N"
+    assert opened == [("firefox", page + "&chatnav=split")] + [("firefox", page)] * 5
+    assert board.secret not in repr(launched)
+    assert len(set(nonces)) == 6  # one per open
+
+
+def _target(arg: str) -> str:
+    """The URL a launch file passed as `file://…` redirects to; any other argument as it is."""
+    if not arg.startswith("file://"):
+        return arg
+    path = Path(arg.removeprefix("file://"))
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600 and stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    found = re.search(r'content="0;url=([^"]+)"', path.read_text())
+    assert found, arg
+    return html.unescape(found[1])
+
+
+def _nonceless(launched: list[tuple[str, ...]]) -> list[tuple[str, ...]]:
+    return [tuple(re.sub(r"n=[\w-]{32}", "n=N", _target(arg)) for arg in argv) for argv in launched]
+
+
+async def test_a_chat_open_sets_the_cookie_once(
+    board: W.Board, settings: Settings, launched: list[tuple[str, ...]]
+) -> None:
+    """H1: `--browser` gets the path of an owner-only file holding a single-use nonce, never the secret
+    nor the nonce (argv is readable by other users): the first use sets the cookie and lands without
+    `n`, deleting the file; a reused, expired or unknown nonce is a 403."""
+    board.browser = ["firefox"]
+    async with _served(board, settings) as host, httpx.AsyncClient() as client:
+        assert await board.open_row(B, "split")
+        [(_, arg)] = launched
+        file = Path(arg.removeprefix("file://"))
+        assert arg.startswith(f"file://{board.run_dir}/chat-") and file.exists()
+        url = _target(arg)
+        assert board.secret not in url + file.read_text() and url.startswith(f"http://{host}/chat/")
+        cookie = f"mt={board.secret}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000"
+        got = await client.get(url)
+        assert got.status_code == 200 and got.headers["set-cookie"] == cookie
+        assert f'content="0;url=/chat/{quote(B, safe="")}?chatnav=split"' in got.text
+        assert not file.exists()  # spent: its file goes
+        client.cookies.clear()
+        again = await client.get(url)  # spent
+        assert again.status_code == 403 and "set-cookie" not in again.headers
+        for bad in ("x" * 32, ""):  # unknown
+            got = await client.get(f"http://{host}/?n={bad}")
+            assert got.status_code == 403 and "set-cookie" not in got.headers, bad
+        assert await board.open_row(B, "chat")
+        stale = _target(launched[-1][1])
+        [nonce] = [n for n, (_, f) in board._nonces.items() if f.name != "open.html"]
+        board._nonces[nonce] = (time.monotonic() - 1, board._nonces[nonce][1])  # its _NONCE_TTL is over
+        got = await client.get(stale)  # expired
+        assert got.status_code == 403 and "set-cookie" not in got.headers
+        assert [f.name for _, f in board._nonces.values()] == ["open.html"]  # consumed even when expired
+
+
+async def test_a_chat_file_goes_when_its_nonce_expires_or_the_server_stops(
+    board: W.Board, settings: Settings, launched: list[tuple[str, ...]]
+) -> None:
+    """H1: an expired chat file is purged when the next one is written; all go at shutdown."""
+    board.browser = ["firefox"]
+    async with _served(board, settings):
+        assert await board.open_row(B, "chat")
+        expiring = Path(launched[-1][1].removeprefix("file://"))
+        [nonce] = [n for n, (_, f) in board._nonces.items() if f == expiring]
+        board._nonces[nonce] = (time.monotonic() - 1, expiring)
+        assert await board.open_row(B, "chat")
+        kept = Path(launched[-1][1].removeprefix("file://"))
+        assert not expiring.exists() and kept.exists()
+        assert board.run_dir is not None and (board.run_dir / "open.html").exists()
+    assert not kept.exists() and not (board.run_dir / "open.html").exists()
+
+
+def test_the_nonce_store_is_bounded(board: W.Board, tmp_path: Path) -> None:
+    """Past _NONCE_MAX the oldest nonce goes, and its file with it."""
+
+    async def run() -> None:
+        board.run_dir, board.base_url = tmp_path, "http://127.0.0.9:1"
+        files = [board._issue(f"chat-{i}.html", "/chat/x", 60.0) for i in range(W._NONCE_MAX + 5)]
+        assert len(board._nonces) == W._NONCE_MAX
+        assert [f.exists() for f in files] == [False] * 5 + [True] * W._NONCE_MAX
+        nonce = next(reversed(board._nonces))
+        assert board.take_nonce(nonce) and not board.take_nonce(nonce)
+        board.drop_launch_files()
+        assert not any(f.exists() for f in files) and board._nonces == {}
+
+    asyncio.run(run())
 
 
 # --- message actions: quote, react, edit, delete (011 phase 4) ---
@@ -1309,7 +1465,9 @@ def calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
         made.append(("delete", thread_id, msg))
         return {"status": 200}
 
-    def fake_history(s: Any, token: str, thread_id: str, size: int, pages: int) -> list[dict[str, Any]]:
+    def fake_history(
+        s: Any, token: str, thread_id: str, size: int, pages: int, end: int | None = None
+    ) -> list[dict[str, Any]]:
         made.append(("history", thread_id))
         return []
 
@@ -1320,7 +1478,7 @@ def calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
         ("delete_message", fake_delete),
         ("fetch_history", fake_history),
     ):
-        monkeypatch.setattr(W, name, fake)
+        monkeypatch.setattr(CV, name, fake)
     return made
 
 
@@ -1348,7 +1506,7 @@ async def test_quote_prepends_reply_blocks_in_order_from_the_servers_copy(
 ) -> None:
     """011-AC11: one Reply block per id, in the order given, author and preview from the archive, escaped."""
     ws = await _following(act_board, T)
-    assert await act_board.send(T, "ok <then>\nbye", ws, ["3", "1"]) is None
+    assert await _send(act_board, T, "ok <then>\nbye", ws, ["3", "1"]) is None
     assert calls == [
         (
             "send",
@@ -1374,10 +1532,10 @@ async def test_quote_refusals_make_no_write(act_board: W.Board, calls: list[tupl
         ("1", "invalid quote"),
         ([{"id": "1"}], "invalid quote"),
     ):
-        assert await act_board.send(T, "hi", ws, ids) == error, ids
+        assert await _send(act_board, T, "hi", ws, ids) == error, ids
     assert _writes(calls) == []
-    # A message the archive lacks is looked for in the latest API page, read only.
-    assert calls == [("history", T)]
+    # A message the archive lacks is looked for in the latest API page, then the one ending at it.
+    assert calls == [("history", T)] * 2
 
 
 async def test_quote_found_in_the_api_page_when_the_archive_lacks_it(
@@ -1385,10 +1543,10 @@ async def test_quote_found_in_the_api_page_when_the_archive_lacks_it(
 ) -> None:
     """011-AC11: a chat without archive (and a message newer than it) quotes from one API page."""
     fresh = _m("7", _at(7), "<p>fresh</p>")
-    monkeypatch.setattr(W, "fetch_history", lambda *a: [fresh])
-    assert await act_board.send(B, "re", None, ["7"]) is None
+    monkeypatch.setattr(CV, "fetch_history", lambda *a: [fresh])
+    assert await _send(act_board, B, "re", None, ["7"]) is None
     ws = await _following(act_board, T)
-    assert await act_board.send(T, "re", ws, ["1", "7"]) is None
+    assert await _send(act_board, T, "re", ws, ["1", "7"]) is None
     fresh_block = _block("7", ANN, "Ann Lee", "fresh")
     assert [c[2] for c in calls] == [
         fresh_block + "re",
@@ -1399,9 +1557,9 @@ async def test_quote_found_in_the_api_page_when_the_archive_lacks_it(
 async def test_quote_counts_toward_the_size_cap(act_board: W.Board, calls: list[tuple[Any, ...]]) -> None:
     """011-AC11 + 011-AC13: the 28 KB cap applies to the body with its quotes."""
     ws = await _following(act_board, T)
-    text = "y" * (W._SEND_MAX_BYTES - 100)
-    assert await act_board.send(T, text, ws) is None
-    assert await act_board.send(T, text, ws, ["1"]) == "message too long"
+    text = "y" * (compose.MAX_TEXT - 100)
+    assert await _send(act_board, T, text, ws) is None
+    assert await _send(act_board, T, text, ws, ["1"]) == "message too long"
     assert [c[0] for c in calls] == ["send"]
 
 
@@ -1410,22 +1568,25 @@ async def test_react_adds_and_removes_one_of_the_eight_keys(
 ) -> None:
     """011-AC12: one react() per verb with the key and `remove`; other keys and bad flags refused."""
     ws = await _following(act_board, T)
-    assert await act_board.act(ws, "react", {"react": T, "msg": "1", "key": "like", "remove": False}) == {
+    assert await act_board.chat.act_answer(
+        ws, "react", {"react": T, "msg": "1", "key": "like", "remove": False}
+    ) == {
         "react": T,
         "msg": "1",
         "ok": True,
     }
-    assert (await act_board.act(ws, "react", {"react": T, "msg": "2", "key": "heart", "remove": True}))["ok"]
+    assert (
+        await act_board.chat.act_answer(ws, "react", {"react": T, "msg": "2", "key": "heart", "remove": True})
+    )["ok"]
     for request, error in (
         ({"key": "1f525_fire"}, "invalid reaction"),
         ({"key": "Like"}, "invalid reaction"),
         ({"key": ["like"]}, "invalid reaction"),
         ({"key": "like", "remove": "yes"}, "invalid reaction"),
-        ({"key": "like", "msg": "99"}, "unknown message"),
         ({"key": "like", "msg": "../1"}, "invalid message"),
         ({"key": "like", "msg": None}, "invalid message"),
     ):
-        answer = await act_board.act(ws, "react", {"react": T, "msg": "1", **request})
+        answer = await act_board.chat.act_answer(ws, "react", {"react": T, "msg": "1", **request})
         assert answer.get("error") == error, request
     assert _writes(calls) == [("react", T, "1", "like", False), ("react", T, "2", "heart", True)]
 
@@ -1435,7 +1596,7 @@ async def test_edit_only_my_own_message_with_valid_text(
 ) -> None:
     """011-AC13: edit() once on my message; another's, empty or over 28 KB: refused, no API write."""
     ws = await _following(act_board, T)
-    assert await act_board.act(ws, "edit", {"edit": T, "msg": "2", "text": "fixed <b>"}) == {
+    assert await act_board.chat.act_answer(ws, "edit", {"edit": T, "msg": "2", "text": "fixed <b>"}) == {
         "edit": T,
         "msg": "2",
         "ok": True,
@@ -1445,9 +1606,9 @@ async def test_edit_only_my_own_message_with_valid_text(
         ("3", "hijack", "not your message"),
         ("2", "  ", "empty message"),
         ("2", None, "empty message"),
-        ("2", "<" * (W._SEND_MAX_BYTES // 4 + 1), "message too long"),
+        ("2", "<" * (compose.MAX_TEXT // 4 + 1), "message too long"),
     ):
-        answer = await act_board.act(ws, "edit", {"edit": T, "msg": msg, "text": text})
+        answer = await act_board.chat.act_answer(ws, "edit", {"edit": T, "msg": msg, "text": text})
         assert answer.get("error") == error, (msg, error)
     assert _writes(calls) == [("edit", T, "2", "fixed <b>")]
 
@@ -1455,12 +1616,12 @@ async def test_edit_only_my_own_message_with_valid_text(
 async def test_delete_only_my_own_message(act_board: W.Board, calls: list[tuple[Any, ...]]) -> None:
     """011-AC14: delete() once on my message; on another's it is refused without an API write."""
     ws = await _following(act_board, T)
-    assert await act_board.act(ws, "delete", {"delete": T, "msg": "1"}) == {
+    assert await act_board.chat.act_answer(ws, "delete", {"delete": T, "msg": "1"}) == {
         "delete": T,
         "msg": "1",
         "error": "not your message",
     }
-    assert await act_board.act(ws, "delete", {"delete": T, "msg": "2"}) == {
+    assert await act_board.chat.act_answer(ws, "delete", {"delete": T, "msg": "2"}) == {
         "delete": T,
         "msg": "2",
         "ok": True,
@@ -1472,10 +1633,10 @@ async def test_own_message_is_decided_without_a_known_me(
     act_board: W.Board, calls: list[tuple[Any, ...]]
 ) -> None:
     """011-AC13 + 011-AC14: with my MRI unknown, no message is mine: edit and delete refused."""
-    act_board.me = ""
+    act_board.chat.me = ""
     ws = await _following(act_board, T)
     for verb, extra in (("edit", {"text": "x"}), ("delete", {})):
-        answer = await act_board.act(ws, verb, {verb: T, "msg": "2", **extra})
+        answer = await act_board.chat.act_answer(ws, verb, {verb: T, "msg": "2", **extra})
         assert answer["error"] == "not your message"
     assert _writes(calls) == []
 
@@ -1488,9 +1649,9 @@ async def test_actions_refused_on_channels_and_chats_not_followed(
     stranger = object()
     for ws, thread_id in ((channel, C), (stranger, T), (channel, NOPE)):
         for verb, extra in (("react", {"key": "like"}), ("edit", {"text": "x"}), ("delete", {})):
-            answer = await act_board.act(ws, verb, {verb: thread_id, "msg": "1", **extra})
+            answer = await act_board.chat.act_answer(ws, verb, {verb: thread_id, "msg": "1", **extra})
             assert answer["error"] == "unknown chat", (thread_id, verb)
-        assert await act_board.send(thread_id, "x", ws, ["1"]) == "unknown chat"
+        assert await _send(act_board, thread_id, "x", ws, ["1"]) == "unknown chat"
     assert calls == []
 
 
@@ -1503,9 +1664,9 @@ async def test_action_failure_answers_the_reason(
         request = httpx.Request("PUT", "https://x")
         raise httpx.HTTPStatusError("no", request=request, response=httpx.Response(403, request=request))
 
-    monkeypatch.setattr(W, "edit_message", refused)
+    monkeypatch.setattr(CV, "edit_message", refused)
     ws = await _following(act_board, T)
-    answer = await act_board.act(ws, "edit", {"edit": T, "msg": "2", "text": "x"})
+    answer = await act_board.chat.act_answer(ws, "edit", {"edit": T, "msg": "2", "text": "x"})
     assert answer == {"edit": T, "msg": "2", "error": "Teams answered 403"}
 
 
@@ -1513,7 +1674,11 @@ async def test_action_verbs_over_the_socket(
     act_board: W.Board, settings: Settings, calls: list[tuple[Any, ...]]
 ) -> None:
     """011-AC11..AC14: each verb answers the asking socket only, in `{verb: thread, msg, ok|error}` shape."""
-    async with _served(act_board, settings) as host, _chat_socket(host) as chat, _chat_socket(host) as other:
+    async with (
+        _served(act_board, settings),
+        _chat_socket(act_board) as chat,
+        _chat_socket(act_board) as other,
+    ):
         await other.send(json.dumps({"follow": T}))
         await other.recv()
         await chat.send(json.dumps({"follow": T}))
@@ -1546,21 +1711,23 @@ async def test_server_copy_survives_a_broken_archive(
         db.execute("INSERT INTO messages (id, composetime, raw) VALUES ('8', ?, '{bad')", (_at(8),))
     db.close()
     ws = await _following(act_board, T)
-    assert await act_board.send(T, "x", ws, ["8"]) == "unknown quoted message"
+    assert await _send(act_board, T, "x", ws, ["8"]) == "unknown quoted message"
     (chat_dir / "messages.db").write_bytes(b"not a database" * 100)
     for leftover in chat_dir.glob("messages.db-*"):
         leftover.unlink()
-    monkeypatch.setattr(W, "fetch_history", lambda *a: [_m("2", _at(2))])
-    assert await act_board.send(T, "x", ws, ["2"]) is None
-    assert [c[0] for c in calls] == ["history", "send"]
+    monkeypatch.setattr(CV, "fetch_history", lambda *a: [_m("2", _at(2))])
+    assert await _send(act_board, T, "x", ws, ["2"]) is None
+    assert [c[0] for c in calls] == ["history", "history", "send"]
 
 
 async def test_actions_without_a_connection(act_board: W.Board, calls: list[tuple[Any, ...]]) -> None:
     """011-AC12..AC14: no Teams session: refused, nothing called."""
-    act_board.directory = None
+    act_board.chat.directory = None
     ws = await _following(act_board, T)
-    assert (await act_board.act(ws, "delete", {"delete": T, "msg": "2"}))["error"] == "not connected"
-    assert await act_board.send(T, "x", ws, ["2"]) == "not connected"
+    assert (await act_board.chat.act_answer(ws, "delete", {"delete": T, "msg": "2"}))[
+        "error"
+    ] == "not connected"
+    assert await _send(act_board, T, "x", ws, ["2"]) == "not connected"
     assert calls == []
 
 
@@ -1574,9 +1741,11 @@ async def test_edit_and_delete_refuse_my_deleted_or_non_text_messages(
         ("delete", "4", "message deleted"),
         ("edit", "5", "cannot edit this message"),
     ):
-        answer = await act_board.act(ws, verb, {verb: T, "msg": msg, "text": "x"})
+        answer = await act_board.chat.act_answer(ws, verb, {verb: T, "msg": msg, "text": "x"})
         assert answer.get("error") == error, (verb, msg)
-    assert (await act_board.act(ws, "delete", {"delete": T, "msg": "5"}))["ok"]  # a file post of mine goes
+    assert (await act_board.chat.act_answer(ws, "delete", {"delete": T, "msg": "5"}))[
+        "ok"
+    ]  # a file post of mine goes
     assert _writes(calls) == [("delete", T, "5")]
 
 
@@ -1586,7 +1755,7 @@ async def test_quote_refuses_non_text_or_sender_less_messages(
     """011-AC11: a file post or a system event cannot be quoted; nothing is posted."""
     ws = await _following(act_board, T)
     for ids in (["5"], ["6"], ["1", "6"]):
-        assert await act_board.send(T, "x", ws, ids) == "cannot quote this message", ids
+        assert await _send(act_board, T, "x", ws, ids) == "cannot quote this message", ids
     assert calls == []
 
 
@@ -1596,15 +1765,19 @@ async def test_one_message_action_in_flight_per_socket(
     """011-AC12..AC14: while one action runs, another action or a quoted send on that socket answers
     `busy`; a plain send and another socket are not held."""
     entered, release = threading.Event(), threading.Event()
-    real = W.react
+    real = CV.react
 
     def held(*args: Any, **kw: Any) -> Any:
         entered.set()
         release.wait(5)
         return real(*args, **kw)
 
-    monkeypatch.setattr(W, "react", held)
-    async with _served(act_board, settings) as host, _chat_socket(host) as chat, _chat_socket(host) as other:
+    monkeypatch.setattr(CV, "react", held)
+    async with (
+        _served(act_board, settings),
+        _chat_socket(act_board) as chat,
+        _chat_socket(act_board) as other,
+    ):
         for ws in (chat, other):
             await ws.send(json.dumps({"follow": T}))
             await ws.recv()
@@ -1651,15 +1824,15 @@ async def test_history_after_pages_forward_without_overlap_or_gap(tied: W.Board,
     """011-AC17: walking `after` from the start returns every message once, `newer` false at the end;
     the page boundary falls inside the tied time and the tie joins the page."""
     pages: list[tuple[list[str], bool, bool]] = []
-    answer = await tied.history(T, after=_at(0), limit=3)
+    answer = await _history(tied, T, after=_at(0), limit=3)
     while True:
         pages.append((_ids(answer), answer["older"], answer["newer"]))
         if not answer["newer"]:
             break
-        answer = await tied.history(T, after=answer["messages"][-1]["at"], limit=3)
+        answer = await _history(tied, T, after=answer["messages"][-1]["at"], limit=3)
     assert pages == [(["1", "2", "3", "4", "5"], False, True), (["6", "7"], True, False)]
     assert answer["after"] == _at(3) and "before" not in answer
-    assert (await tied.history(T, after=_at(5)))["messages"] == []
+    assert (await _history(tied, T, after=_at(5)))["messages"] == []
 
 
 async def test_history_around_returns_both_sides_of_the_anchor(board: W.Board, no_api: None) -> None:
@@ -1675,7 +1848,7 @@ async def test_history_around_returns_both_sides_of_the_anchor(board: W.Board, n
         (_at(3), 100, ["1", "2", "3", "4", "5"], False, False),
     ]
     for anchor, limit, ids, older, newer in cases:
-        answer = await board.history(T, around=anchor, limit=limit)
+        answer = await _history(board, T, around=anchor, limit=limit)
         assert (_ids(answer), answer["older"], answer["newer"]) == (ids, older, newer), anchor
         assert (answer["around"], answer["source"]) == (anchor, "archive")
         assert "before" not in answer
@@ -1684,18 +1857,18 @@ async def test_history_around_returns_both_sides_of_the_anchor(board: W.Board, n
 async def test_history_around_keeps_a_tied_time_whole(tied: W.Board, no_api: None) -> None:
     """011-AC17: messages sharing the anchor's time all come back, then paging either way neither
     repeats nor skips one."""
-    answer = await tied.history(T, around=_at(3), limit=2)
+    answer = await _history(tied, T, around=_at(3), limit=2)
     assert (_ids(answer), answer["older"], answer["newer"]) == (["2", "3", "4", "5"], True, True)
-    back = await tied.history(T, before=answer["messages"][0]["at"], limit=2)
-    forth = await tied.history(T, after=answer["messages"][-1]["at"], limit=2)
+    back = await _history(tied, T, before=answer["messages"][0]["at"], limit=2)
+    forth = await _history(tied, T, after=answer["messages"][-1]["at"], limit=2)
     assert (_ids(back), back["older"], _ids(forth), forth["newer"]) == (["1"], False, ["6", "7"], False)
 
 
 async def test_history_flags_at_both_ends_of_the_latest_page(board: W.Board, no_api: None) -> None:
     """011-AC17: the latest page is never `newer`; an old `before` page is."""
-    latest = await board.history(T, limit=2)
+    latest = await _history(board, T, limit=2)
     assert (latest["older"], latest["newer"]) == (True, False)
-    first = await board.history(T, before=_at(2), limit=2)
+    first = await _history(board, T, before=_at(2), limit=2)
     assert (_ids(first), first["older"], first["newer"]) == (["1"], False, True)
 
 
@@ -1706,7 +1879,7 @@ async def test_history_refuses_a_malformed_after_or_around(
 ) -> None:
     """011-AC17: `after` and `around` are checked like `before`, before any read or API call."""
     for thread in (T, B):
-        assert await board.history(thread, **{key: value}) == {
+        assert await _history(board, thread, **{key: value}) == {
             "history": thread,
             key: value if isinstance(value, str) else None,
             "error": f"invalid {key}",
@@ -1715,7 +1888,7 @@ async def test_history_refuses_a_malformed_after_or_around(
 
 async def test_history_refuses_two_cursors(board: W.Board, no_api: None) -> None:
     """011-AC17: one cursor per request; the answer echoes the first one."""
-    assert await board.history(T, before=_at(3), after=_at(1)) == {
+    assert await _history(board, T, before=_at(3), after=_at(1)) == {
         "history": T,
         "before": _at(3),
         "error": "one cursor at most",
@@ -1725,7 +1898,7 @@ async def test_history_refuses_two_cursors(board: W.Board, no_api: None) -> None
 @pytest.mark.parametrize("key", ["after", "around"])
 async def test_after_and_around_need_the_archive(board: W.Board, no_api: None, key: str) -> None:
     """011-AC17: the API source only serves the latest page and `before`: no API call for the others."""
-    assert await board.history(B, **{key: _at(3)}) == {
+    assert await _history(board, B, **{key: _at(3)}) == {
         "history": B,
         key: _at(3),
         "error": "not available without archive",
@@ -1736,14 +1909,14 @@ async def test_history_cursor_echo_and_busy_over_the_socket(
     board: W.Board, settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """011-AC17: answers and `busy` refusals echo the cursor they were asked with."""
-    real = W.read_page
+    real = CV.read_page
 
     def slow(*args: Any, **kwargs: Any) -> Any:
         time.sleep(0.3)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(W, "read_page", slow)
-    async with _served(board, settings) as host, _connect(host) as ws:
+    monkeypatch.setattr(CV, "read_page", slow)
+    async with _served(board, settings), _connect(board) as ws:
         await ws.recv()
         await ws.send(json.dumps({"history": T, "around": _at(3), "limit": 2}))
         await ws.send(json.dumps({"history": T, "after": _at(1)}))
@@ -1763,26 +1936,26 @@ def searchable(tmp_path: Path, quiet_directory: Directory) -> W.Board:
 
 async def test_search_folds_case_and_accents_newest_first(searchable: W.Board, no_api: None) -> None:
     """011-AC18: case and accents ignored, newest first, hits as {id, at, name, text}."""
-    answer = await searchable.search(T, " reunion ")
+    answer = await _search(searchable, T, " reunion ")
     assert answer["search"] == T
     assert [h["id"] for h in answer["hits"]] == ["4", "3", "1"]
     assert answer["hits"][0] == {"id": "4", "at": _at(4), "name": "Ann Lee", "text": "réunion finie"}
-    assert [h["id"] for h in (await searchable.search(T, "ANNULÉE"))["hits"]] == ["3"]
-    assert (await searchable.search(T, "absent"))["hits"] == []
+    assert [h["id"] for h in (await _search(searchable, T, "ANNULÉE"))["hits"]] == ["3"]
+    assert (await _search(searchable, T, "absent"))["hits"] == []
 
 
 async def test_search_caps_at_fifty_newest(tmp_path: Path, quiet_directory: Directory, no_api: None) -> None:
     """011-AC18: at most 50 hits, the newest ones, over the whole history."""
     data = _archive(tmp_path / "d", T, [_m(str(i), _at(i), f"<p>hit {i}</p>") for i in range(120)])
     board = W.Board({}, quiet_directory, me=ME, data_dir=data)
-    hits = (await board.search(T, "HIT"))["hits"]
+    hits = (await _search(board, T, "HIT"))["hits"]
     assert [h["id"] for h in hits] == [str(i) for i in range(119, 69, -1)]
 
 
 @pytest.mark.parametrize("thread", [B, C, NOPE])
 async def test_search_without_archive_is_an_error(searchable: W.Board, no_api: None, thread: str) -> None:
     """011-AC18: on the board only, indexed without messages, or unknown: no archive, no API call."""
-    assert await searchable.search(thread, "x") == {
+    assert await _search(searchable, thread, "x") == {
         "search": thread,
         "q": "x",
         "error": "no archive for this chat",
@@ -1792,41 +1965,40 @@ async def test_search_without_archive_is_an_error(searchable: W.Board, no_api: N
 async def test_search_with_no_data_dir(quiet_directory: Directory, no_api: None) -> None:
     """011-AC18"""
     board = W.Board({B: {"id": B, "last_activity": _at(1)}}, quiet_directory)
-    assert (await board.search(B, "x"))["error"] == "no archive for this chat"
+    assert (await _search(board, B, "x"))["error"] == "no archive for this chat"
 
 
 @pytest.mark.parametrize("query", ["", "   ", None, 3])
 async def test_search_refuses_an_empty_query(searchable: W.Board, query: Any) -> None:
     """011-AC18: nothing to look for is refused before any read."""
-    assert (await searchable.search(T, query))["error"] == "empty query"
+    assert (await _search(searchable, T, query))["error"] == "empty query"
 
 
 async def test_search_runs_off_the_event_loop_and_failures_answer(
     searchable: W.Board, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """011-AC18: the whole-history scan never blocks the loop; an unexpected failure is an answer."""
-    from miniteams import mcp
-
     loop_thread = threading.get_ident()
     threads: list[int] = []
-    real = mcp.Archive.search_messages
+    real = CV.search_chat
 
-    def spy(self: mcp.Archive, *args: Any) -> dict[str, Any]:
+    def spy(*args: Any, **kwargs: Any) -> tuple[list[dict[str, Any]], bool]:
         threads.append(threading.get_ident())
-        return real(self, *args)
+        return real(*args, **kwargs)
 
-    monkeypatch.setattr(mcp.Archive, "search_messages", spy)
-    assert len((await searchable.search(T, "reunion"))["hits"]) == 3
+    monkeypatch.setattr(CV, "search_chat", spy)
+    assert len((await _search(searchable, T, "reunion"))["hits"]) == 3
     assert threads and loop_thread not in threads
 
-    def broken(self: mcp.Archive, *args: Any) -> Any:
+    def broken(*args: Any, **kwargs: Any) -> Any:
         raise sqlite3.DatabaseError("disk image is malformed")
 
-    monkeypatch.setattr(mcp.Archive, "search_messages", broken)
-    assert await searchable.search(T, "reunion") == {
+    monkeypatch.setattr(CV, "search_chat", broken)
+    verb = {"search": T, "q": "reunion"}
+    assert await _answered(CV._head_search(verb), searchable.chat.search_answer(verb)) == {
         "search": T,
         "q": "reunion",
-        "error": "search unavailable",
+        "error": "failed",
     }
 
 
@@ -1834,16 +2006,14 @@ async def test_search_over_the_socket_one_at_a_time(
     searchable: W.Board, settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """011-AC18: the verb answers the asker; a second search while one runs is refused `busy`."""
-    from miniteams import mcp
+    real = CV.search_chat
 
-    real = mcp.Archive.search_messages
-
-    def slow(self: mcp.Archive, *args: Any) -> dict[str, Any]:
+    def slow(*args: Any, **kwargs: Any) -> tuple[list[dict[str, Any]], bool]:
         time.sleep(0.3)
-        return real(self, *args)
+        return real(*args, **kwargs)
 
-    monkeypatch.setattr(mcp.Archive, "search_messages", slow)
-    async with _served(searchable, settings) as host, _connect(host) as ws:
+    monkeypatch.setattr(CV, "search_chat", slow)
+    async with _served(searchable, settings), _connect(searchable) as ws:
         await ws.recv()
         await ws.send(json.dumps({"search": T, "q": "reunion"}))
         await ws.send(json.dumps({"search": T, "q": "demain"}))
@@ -1860,9 +2030,9 @@ async def test_a_burst_at_one_time_keeps_the_page_bounded(
     data = _archive(tmp_path / "d", T, [_m("1", _at(1)), *burst, _m("9", _at(9))])
     board = W.Board({}, quiet_directory, me=ME, data_dir=data)
     for answer in (
-        await board.history(T, limit=10),
-        await board.history(T, after=_at(1), limit=10),
-        await board.history(T, around=_at(5), limit=10),
+        await _history(board, T, limit=10),
+        await _history(board, T, after=_at(1), limit=10),
+        await _history(board, T, around=_at(5), limit=10),
     ):
         assert 10 <= len(answer["messages"]) <= 10 + 200
 
@@ -1879,7 +2049,7 @@ async def test_a_burst_at_one_time_keeps_the_page_bounded(
 async def test_history_refuses_trailing_junk_after_a_time(board: W.Board, no_api: None, cursor: str) -> None:
     """011-AC17: a cursor is a whole composetime, not one that merely starts like it."""
     for key in ("before", "after", "around"):
-        assert (await board.history(T, **{key: cursor}))["error"] == f"invalid {key}"
+        assert (await _history(board, T, **{key: cursor}))["error"] == f"invalid {key}"
 
 
 @pytest.mark.parametrize(
@@ -1888,7 +2058,7 @@ async def test_history_refuses_trailing_junk_after_a_time(board: W.Board, no_api
 async def test_history_accepts_every_composetime_shape(board: W.Board, no_api: None, cursor: str) -> None:
     """011-AC17: with or without fraction and Z, as the archive and the page's dates write them."""
     for key in ("before", "after", "around"):
-        assert "error" not in await board.history(T, **{key: cursor}), key
+        assert "error" not in await _history(board, T, **{key: cursor}), key
 
 
 def _with_bad_rows(data: Path, times: list[str]) -> None:
@@ -1925,7 +2095,7 @@ async def test_a_window_of_unreadable_rows_is_read_past(
     data = _archive(tmp_path / "d", T, [_m(str(i), _at(i)) for i in good])
     _with_bad_rows(data, [_at(i) for i in bad])
     board = W.Board({}, quiet_directory, me=ME, data_dir=data)
-    answer = await board.history(T, limit=5, **cursor)
+    answer = await _history(board, T, limit=5, **cursor)
     assert (_ids(answer), answer["older"], answer["newer"]) == (ids, older, newer)
 
 
@@ -1936,12 +2106,619 @@ async def test_reading_past_unreadable_rows_is_bounded(
     data = _archive(tmp_path / "d", T, [_m(str(i), _at(i)) for i in range(31, 36)])
     _with_bad_rows(data, [_at(i) for i in range(1, 31)])
     board = W.Board({}, quiet_directory, me=ME, data_dir=data)
-    answer = await board.history(T, before=_at(31), limit=5)
+    answer = await _history(board, T, before=_at(31), limit=5)
     assert (answer["messages"], answer["older"]) == ([], True)  # windows 26-30 down to 6-10
-    assert _ids(await board.history(T, before=_at(6), limit=5)) == []
+    assert _ids(await _history(board, T, before=_at(6), limit=5)) == []
 
 
 @pytest.mark.parametrize("cursor", ["２０２６-09-15T10:00:00Z", "2026-09-15T10:00:0٣Z"])
 async def test_history_refuses_non_ascii_digits(board: W.Board, no_api: None, cursor: str) -> None:
     """011-AC17: `\\d` would take any Unicode digit; a cursor is ASCII."""
-    assert (await board.history(T, after=cursor))["error"] == "invalid after"
+    assert (await _history(board, T, after=cursor))["error"] == "invalid after"
+
+
+# --- wire parsers (pure) ---
+
+
+def test_parse_send_types_a_valid_verb_and_names_the_first_refusal() -> None:
+    verb = {
+        "send": T,
+        "text": "hi",
+        "quote": ["1", "2"],
+        "mentions": [{"name": "A", "mri": ANN}],
+        "format": "full",
+    }
+    assert CV.parse_send(verb) == CV.SendRequest(T, "hi", ("1", "2"), ({"name": "A", "mri": ANN},), True)
+    assert CV.parse_send({"send": T, "text": "hi"}) == CV.SendRequest(T, "hi")
+    for extra, reason in (
+        ({"text": " "}, "empty message"),
+        ({"text": "<" * (compose.MAX_TEXT // 4 + 1)}, "message too long"),
+        ({"quote": "1"}, "invalid quote"),
+        ({"quote": ["1", "1"]}, "invalid quote"),
+        ({"quote": ["x"]}, "invalid quote"),
+        ({"quote": [str(n) for n in range(11)]}, "too many quotes"),
+        ({"mentions": {"name": "A"}}, "invalid mention"),
+        ({"mentions": [{"name": "A", "mri": ANN, "everyone": "yes"}]}, "invalid mention"),
+        ({"format": "md"}, "invalid format"),
+        ({"send": 3}, "unknown chat"),
+    ):
+        assert CV.parse_send({"send": T, "text": "hi", **extra}) == reason, extra
+
+
+def test_parse_act_checks_what_each_action_needs() -> None:
+    assert CV.parse_act("react", {"react": T, "msg": "1", "key": "like"}) == CV.ActRequest(
+        "react", T, "1", "like"
+    )
+    assert CV.parse_act("edit", {"edit": T, "msg": "1", "text": "x"}) == CV.ActRequest(
+        "edit", T, "1", text="x"
+    )
+    assert CV.parse_act("delete", {"delete": T, "msg": "1", "text": 5}) == CV.ActRequest("delete", T, "1")
+    for action, extra, reason in (
+        ("delete", {"msg": "1a"}, "invalid message"),
+        ("delete", {"msg": 1}, "invalid message"),
+        ("react", {"key": "nope"}, "invalid reaction"),
+        ("react", {"key": "like", "remove": "yes"}, "invalid reaction"),
+        ("edit", {"text": ""}, "empty message"),
+    ):
+        assert CV.parse_act(action, {action: T, "msg": "1", **extra}) == reason, extra
+
+
+def test_parse_history_picks_one_cursor_and_bounds_the_size() -> None:
+    assert CV.parse_history({"history": T}) == CV.HistoryRequest(T, "before", "", 100)
+    assert CV.parse_history({"history": T, "before": "", "limit": 500}) == CV.HistoryRequest(
+        T, "before", "", 200
+    )
+    assert CV.parse_history({"history": T, "around": _at(3), "limit": True}) == CV.HistoryRequest(
+        T, "around", _at(3), 100
+    )
+    assert CV.parse_history({"history": T, "after": f"{_at(3)}x"}) == "invalid after"
+    assert CV.parse_history({"history": T, "before": _at(3), "after": _at(1)}) == "one cursor at most"
+
+
+def test_parse_search_complete_preview() -> None:
+    assert CV.parse_search({"search": T, "q": " x "}) == CV.SearchRequest(T, "x")
+    assert CV.parse_search({"search": T, "q": " "}) == "empty query"
+    assert CV.parse_complete({"complete": "emoji", "q": "fi"}) == CV.CompleteRequest("emoji", "fi")
+    assert CV.parse_complete({"complete": "member", "q": "", "thread": T}) == CV.CompleteRequest(
+        "member", "", T
+    )
+    assert CV.parse_complete({"complete": "emoji", "q": ""}) == "invalid query"
+    assert CV.parse_complete({"complete": "member", "q": "a" * 65, "thread": T}) == "invalid query"
+    assert CV.parse_complete({"complete": "room", "q": "a"}) == "invalid kind"
+    assert CV.parse_complete({"complete": "member", "q": "a"}) == "unknown chat"
+    assert CV.parse_preview({"preview": "x"}) == CV.PreviewRequest("x", False)
+    assert CV.parse_preview({"preview": "x", "format": "full"}) == CV.PreviewRequest("x", True)
+    assert CV.parse_preview({"preview": None}) == "invalid preview"
+    # L2: the composer's character cap, before any rendering work.
+    assert CV.parse_preview({"preview": "x" * compose.MAX_TEXT}) == CV.PreviewRequest(
+        "x" * compose.MAX_TEXT, False
+    )
+    assert CV.parse_preview({"preview": "x" * (compose.MAX_TEXT + 1)}) == "message too long"
+
+
+def test_parse_open_maps_the_flags_to_one_target() -> None:
+    assert W.parse_open({"open": T}) == ("app", "")
+    assert W.parse_open({"open": T, "web": True, "msg": "7"}) == ("web", "7")
+    assert W.parse_open({"open": T, "msg": "7x"}) == ("app", "")
+    assert W.parse_open({"open": T, "chat": True, "web": True, "msg": "7"}) == ("chat", "")
+    assert W.parse_open({"open": T, "chat": True, "chatnav": "split"}) == ("split", "")
+    assert W.parse_open({"open": T, "chatnav": "split"}) == ("app", "")
+
+
+# --- wave 2 review fixes ---
+
+
+def _relayed(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Frames the board relays to followers, decoded; row broadcasts left out."""
+    frames: list[dict[str, Any]] = []
+
+    def capture(sockets: Any, frame: str) -> None:
+        if "thread" in (decoded := json.loads(frame)):
+            frames.append(decoded)
+
+    monkeypatch.setattr(W, "broadcast", capture)
+    return frames
+
+
+async def _settled(frames: list[Any], n: int) -> None:
+    await wait(lambda: len(frames) >= n, f"{n} frames")
+
+
+async def test_a_slow_media_folder_never_holds_the_stream(
+    board: W.Board, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H1: on_event only queues the relay: a 3 s glob per record leaves the stream free, order kept."""
+    frames = _relayed(monkeypatch)
+    release = threading.Event()
+    real = W.chat_record
+
+    def slow(*args: Any) -> dict[str, Any]:
+        release.wait(3)  # the NFS media glob the review measured
+        return real(*args)
+
+    monkeypatch.setattr(W, "chat_record", slow)
+    await _following(board, C)  # off the board: every frame is the relay's
+    started = time.monotonic()
+    await board.on_event(_event("NewMessage", C, id="9", composetime=_at(9), messagetype="Text", content="x"))
+    await board.on_event(_event("NewMessage", C, messagetype="Control/Typing"))
+    await board.on_event(
+        _event("NewMessage", C, id="10", composetime=_at(10), messagetype="Text", content="y")
+    )
+    assert time.monotonic() - started < 0.5
+    release.set()
+    await _settled(frames, 4)
+    kinds = [(next(k for k in ("msg", "typing") if k in f), f.get("on")) for f in frames]
+    assert kinds == [("msg", None), ("typing", True), ("typing", False), ("msg", None)]
+    assert [f["msg"]["id"] for f in frames if "msg" in f] == ["9", "10"]
+    board.close()
+
+
+async def test_the_relay_queue_is_bounded_and_says_once_what_it_drops(
+    quiet_directory: Directory, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H1 + L5: past the bound a relay is dropped, never awaited: the followers get one `gap` frame, the
+    log one line per stall, and the count once the queue drains. The next stall says so again."""
+    monkeypatch.setattr(W, "_RELAY_QUEUE", 2)
+    rows = {B: {"id": B, "label": "B", "last_activity": _at(1), "last_id": "1", "typing": []}}
+    board = W.Board(rows, quiet_directory, me=ME, data_dir=data_dir)
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(W, "broadcast", lambda sockets, frame: sent.append(json.loads(frame)))
+    await _following(board, T)
+    await _following(board, B)
+
+    def burst(ids: range, thread: str = T) -> None:
+        for i in ids:  # no await between them: the consumer cannot run
+            resource = _event(
+                "NewMessage", thread, id=str(i), composetime=_at(i), messagetype="Text", content="x"
+            )
+            forward = functools.partial(board._forward, thread, "NewMessage", resource["resource"], "Text")
+            board._enqueue_relay(thread, "NewMessage", forward)
+
+    def relayed() -> list[str]:
+        return [f["msg"]["id"] for f in sent if "msg" in f]
+
+    with structlog.testing.capture_logs() as logs:
+        burst(range(1, 6))
+        burst(range(20, 21), B)
+        assert sent == [{"gap": T}, {"gap": B}]
+        await wait(lambda: any(e["event"] == "follow_relay_resumed" for e in logs), "the stall's end")
+        # M5: once drained, every chat that lost a relay hears it again: its page resyncs past the hole.
+        assert [("gap", f["gap"]) if "gap" in f else ("msg", f["msg"]["id"]) for f in sent] == [
+            ("gap", T),
+            ("gap", B),
+            ("msg", "1"),
+            ("msg", "2"),
+            ("gap", T),
+            ("gap", B),
+        ]
+        burst(range(6, 10))
+        await wait(lambda: sum(e["event"] == "follow_relay_resumed" for e in logs) == 2, "the second end")
+    assert relayed() == ["1", "2", "6", "7"]
+    assert [f["gap"] for f in sent if "gap" in f] == [T, B, T, B, T, T]
+    events = [(e["event"], e.get("dropped")) for e in logs if e["event"].startswith("follow_relay")]
+    assert events == [
+        ("follow_relay_stalled", None),
+        ("follow_relay_resumed", 4),
+        ("follow_relay_stalled", None),
+        ("follow_relay_resumed", 2),
+    ]
+    board.close()
+    assert board._relay_task is None
+
+
+async def test_a_hung_media_folder_relays_without_media(
+    board: W.Board, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H1: a record whose media read outlives the relay deadline is built without the folder, and the
+    following records skip it for _MEDIA_BACKOFF: the queue keeps moving."""
+    frames = _relayed(monkeypatch)
+    release = threading.Event()
+    seen: list[Any] = []
+    real = W.chat_record
+
+    def record(message: dict[str, Any], thread_id: str, me: str, media: Any, custom: Any) -> dict[str, Any]:
+        seen.append(media)
+        if media is not None:
+            release.wait(5)
+        return real(message, thread_id, me, media, custom)
+
+    monkeypatch.setattr(W, "chat_record", record)
+    monkeypatch.setitem(CV._DEADLINES, "relay", 0.05)
+    await _following(board, T)  # archived: a media folder
+    try:
+        for i in (9, 10):
+            await board.on_event(_event("NewMessage", T, id=str(i), composetime=_at(i), messagetype="Text"))
+        await _settled(frames, 2)
+    finally:
+        release.set()
+    assert [f["msg"]["id"] for f in frames] == ["9", "10"]
+    assert seen[0] is not None and seen[1:] == [None, None]  # the timed-out read, its fallback, then none
+    board.close()
+
+
+async def test_a_relay_that_hangs_is_cut_and_the_next_one_goes(
+    board: W.Board, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H1: a relay stuck past _RELAY_MAX (a name lookup) is abandoned, logged, and the queue moves on."""
+    frames = _relayed(monkeypatch)
+    monkeypatch.setattr(W, "_RELAY_MAX", 0.05)
+    await _following(board, C)
+
+    async def stuck() -> None:
+        await asyncio.sleep(5)
+
+    with structlog.testing.capture_logs() as logs:
+        board._enqueue_relay(C, "NewMessage", stuck)
+        await board.on_event(
+            _event("NewMessage", C, id="9", composetime=_at(9), messagetype="Text", content="x")
+        )
+        await _settled(frames, 1)
+    assert [f["msg"]["id"] for f in frames] == ["9"]
+    assert [e["error_type"] for e in logs if e["event"] == "follow_relay_failed"] == ["TimeoutError"]
+    board.close()
+
+
+async def test_archive_reads_have_their_own_bounded_pool(
+    board: W.Board, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H2 + M11: 40 media reads hung on NFS take exactly _ARCHIVE_WORKERS archive threads; a Teams
+    call's to_thread is not held; closing the pool does not wait and cancels the queued reads."""
+    release = threading.Event()
+    names: list[str] = []
+    monkeypatch.setattr(CV, "_MEDIA_READS", 40)  # the pool's own bound is what this measures
+
+    def hung(path: str) -> None:
+        names.append(threading.current_thread().name)
+        release.wait(5)
+
+    monkeypatch.setattr(board.chat, "media_file", hung)
+    reads = [asyncio.ensure_future(board.chat.media(f"/media/{T}/{i}")) for i in range(40)]
+    try:
+        await wait(lambda: len(names) == CV._ARCHIVE_WORKERS, "the pool's threads busy")
+        await asyncio.wait_for(asyncio.to_thread(lambda: None), 1)
+        started = time.monotonic()
+        CV.close_archive_pool()
+        assert time.monotonic() - started < 0.5
+        with pytest.raises(CV.ArchiveUnavailable, match="archive pool closed"):  # L5: a 503, not a 500
+            CV.archive_pool()
+        # The cancelled reads never ran: their slots come back; the running ones keep theirs.
+        await wait(lambda: board.chat._media_reads == CV._ARCHIVE_WORKERS, "the cancelled reads' slots")
+        with pytest.raises(CV.ArchiveUnavailable, match="archive pool closed"):
+            await board.chat.media(f"/media/{T}/late")
+    finally:
+        release.set()
+        outcomes = await asyncio.gather(*reads, return_exceptions=True)
+    assert len(names) == CV._ARCHIVE_WORKERS and len(set(names)) == CV._ARCHIVE_WORKERS
+    assert all(name.startswith("archive") for name in names)
+    cancelled = [o for o in outcomes if isinstance(o, asyncio.CancelledError)]
+    assert len(cancelled) == 40 - CV._ARCHIVE_WORKERS
+
+
+async def test_media_reads_hold_two_threads_until_they_really_end(
+    board: W.Board, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H2 + H3: a media read keeps its slot until its thread ends, past the deadline too; with both slots
+    taken the next read is refused at once instead of queueing behind them. 6 hung reads, in a burst
+    or one after another, never take more than _MEDIA_READS pool threads, and none waits long."""
+    release = threading.Event()
+    running: set[str] = set()
+    most = 0
+
+    def hung(path: str) -> None:
+        nonlocal most
+        running.add(path)
+        most = max(most, len(running))
+        release.wait(5)
+        running.discard(path)
+
+    monkeypatch.setattr(board.chat, "media_file", hung)
+    monkeypatch.setitem(CV._DEADLINES, "media", 0.1)
+    started = time.monotonic()
+    try:
+        burst = await asyncio.gather(
+            *(board.chat.media(f"/media/{T}/{i}") for i in range(3)), return_exceptions=True
+        )
+        assert all(isinstance(o, CV.ArchiveUnavailable) for o in burst)
+        for i in range(3, 6):  # past the deadline: the two hung threads still hold their slots
+            refused = time.monotonic()
+            with pytest.raises(CV.ArchiveUnavailable, match="media busy"):
+                await board.chat.media(f"/media/{T}/{i}")
+            assert time.monotonic() - refused < 0.05
+        assert await CV.io("dir", lambda: "free") == "free"  # the pool's other threads stay free
+        assert most == CV._MEDIA_READS == len(running)
+        assert time.monotonic() - started < 1
+    finally:
+        release.set()
+    await wait(lambda: board.chat._media_reads == 0, "the slots released when the threads end")
+    monkeypatch.setattr(board.chat, "media_file", lambda path: (b"x", "image/png"))
+    assert await board.chat.media(f"/media/{T}/again") == (b"x", "image/png")
+    assert board.chat._media_reads == 0
+
+
+async def test_a_third_media_request_answers_503_at_once(
+    board: W.Board, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H2: over HTTP, with both media slots on hung reads, the next image is a 503 without waiting."""
+    release = threading.Event()
+    monkeypatch.setattr(board.chat, "media_file", lambda path: None if release.wait(5) else None)
+    try:
+        async with _served(board, settings) as host, httpx.AsyncClient(headers=_cookie(board)) as client:
+            hung = [
+                asyncio.ensure_future(client.get(f"http://{host}/media/{quote(T, safe='')}/{i}.png"))
+                for i in (1, 2)
+            ]
+            await wait(lambda: board.chat._media_reads == 2, "two reads running")
+            started = time.monotonic()
+            got = await client.get(f"http://{host}/media/{quote(T, safe='')}/3.png")
+            assert (got.status_code, time.monotonic() - started < 0.5) == (503, True)
+            release.set()
+            assert [r.status_code for r in await asyncio.gather(*hung)] == [404, 404]  # None: not found
+    finally:
+        release.set()
+
+
+async def test_io_rethrows_a_timeout_of_its_own_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """L8: a TimeoutError raised by the work itself is not the deadline: it stays a TimeoutError."""
+
+    def times_out() -> None:
+        raise TimeoutError("socket")
+
+    with pytest.raises(TimeoutError, match="socket") as exc:
+        await CV.io("dir", times_out)
+    assert not isinstance(exc.value, CV.ArchiveUnavailable)
+
+
+async def test_archive_unavailable_is_logged_once_per_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """M8: a dead mount fails every read; one `archive_unavailable` warning per 30 s says so, with the
+    kind and how many archive threads are busy."""
+    release = threading.Event()
+    monkeypatch.setitem(CV._DEADLINES, "dir", 0.02)
+    monkeypatch.setattr(CV, "_unavailable_warned", -CV._UNAVAILABLE_EVERY)
+    try:
+        with structlog.testing.capture_logs() as logs:
+            for _ in range(3):
+                with pytest.raises(CV.ArchiveUnavailable):
+                    await CV.io("dir", release.wait, 5)
+            monkeypatch.setattr(CV, "_unavailable_warned", CV._unavailable_warned - CV._UNAVAILABLE_EVERY)
+            with pytest.raises(CV.ArchiveUnavailable):
+                await CV.io("dir", release.wait, 5)
+    finally:
+        release.set()
+    warned = [(e["kind"], e["busy_workers"]) for e in logs if e["event"] == "archive_unavailable"]
+    assert warned == [("dir", 1), ("dir", 4)]
+
+
+async def test_board_close_leaves_the_pool_to_the_process(board: W.Board) -> None:
+    """M6: closing a board stops its relays only; the archive pool is closed once, by run()."""
+    await _following(board, T)
+    board._enqueue_relay(T, "frame", lambda: asyncio.sleep(0))
+    task = board._relay_task
+    board.close()
+    assert board._relay_task is None and task is not None
+    assert await CV.io("dir", lambda: 1) == 1
+
+
+async def test_a_hung_archive_answers_archive_unavailable(
+    board: W.Board, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H2: history, search and follow past their deadline answer `archive unavailable`; the stuck
+    threads stay, the callers do not wait."""
+    release = threading.Event()
+
+    def hung(*args: Any, **kwargs: Any) -> None:
+        release.wait(5)
+
+    for kind in ("dir", "history", "search"):
+        monkeypatch.setitem(CV._DEADLINES, kind, 0.05)
+    try:
+        monkeypatch.setattr(CV, "read_page", hung)
+        assert (await _history(board, T))["error"] == "archive unavailable"
+        monkeypatch.setattr(CV, "search_chat", hung)
+        assert await _search(board, T, "x") == {"search": T, "q": "x", "error": "archive unavailable"}
+        monkeypatch.setattr(CV, "find_chat_dir", hung)
+        monkeypatch.setattr(W, "archive_dir", hung)
+        assert (await _history(board, T))["error"] == "archive unavailable"
+        ws: Any = object()
+        assert await board.follow(ws, T) == {"follow": T, "error": "archive unavailable"}
+    finally:
+        release.set()
+
+
+def test_index_label_survives_a_broken_or_missing_index(data_dir: Path, tmp_path: Path) -> None:
+    """L10: the index names an archived chat; no data dir, no index or an unreadable one is ""."""
+    assert CV.index_label(data_dir, T) == "Chat"
+    assert CV.index_label(None, T) == ""
+    assert CV.index_label(tmp_path / "nowhere", T) == ""
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / "index.db").write_bytes(b"not a database" * 100)
+    assert CV.index_label(broken, T) == ""
+    assert CV.archive_dir(None, T) is None and CV.archive_dir(broken, T) is None
+
+
+async def test_a_failing_verb_answers_failed_and_keeps_the_socket(
+    board: W.Board, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M11: a background verb that raises is logged once and answered `failed` with its head; a
+    synchronous one is logged; the socket stays either way."""
+
+    async def broken(*args: Any) -> None:
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(board.chat, "history_answer", broken)
+    monkeypatch.setitem(board._handlers, "board", broken)
+    with structlog.testing.capture_logs() as logs:
+        async with _served(board, settings), _chat_socket(board) as ws:
+            await ws.send(json.dumps({"history": T, "after": _at(1)}))
+            assert await _frame(ws) == {"history": T, "after": _at(1), "error": "failed"}
+            await ws.send(json.dumps({"board": True}))
+            await ws.send(json.dumps({"follow": T}))
+            assert (await _frame(ws)).items() >= {"follow": T, "ok": True}.items()
+    failed = [e for e in logs if e["event"] == "verb_failed"]
+    assert [(e["verb"], e["error_type"]) for e in failed] == [
+        ("history", "RuntimeError"),
+        ("board", "RuntimeError"),
+    ]
+    assert all(e["exc_info"] is True for e in failed)  # L5: the traceback, one JSON field
+
+
+async def test_the_read_verb_marks_the_chat_read(
+    board: W.Board, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L8: `read` tells Teams the row is read up to its last message; an unknown chat calls nothing."""
+    marked: list[tuple[str, str]] = []
+    monkeypatch.setattr(W, "mark_read", lambda s, token, thread, msg: marked.append((thread, msg)))
+    async with _served(board, settings), _connect(board) as ws:
+        await ws.recv()
+        await ws.send(json.dumps({"read": NOPE}))
+        await ws.send(json.dumps({"read": B}))
+        await wait(lambda: bool(marked), "mark_read called")
+    assert marked == [(B, "1")]
+
+
+OLD = "1789466000000"  # far older than the latest API page
+
+
+@pytest.fixture
+def old_page(monkeypatch: pytest.MonkeyPatch, calls: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
+    """The API holds my message OLD only in the page ending at it; the latest page lacks it."""
+    mine = {"from": f"https://h/v1/users/ME/contacts/{ME}", "imdisplayname": "Me Self"}
+    old = _m(OLD, _at(1), "<p>old</p>", **mine)
+
+    def fake_history(
+        s: Any, token: str, thread_id: str, size: int, pages: int, end: int | None = None
+    ) -> list[dict[str, Any]]:
+        calls.append(("history", thread_id, end))
+        return [old] if end == int(OLD) // 1000 + 1 else [_m("1789467000000", _at(9))]
+
+    monkeypatch.setattr(CV, "fetch_history", fake_history)
+    return calls
+
+
+async def test_old_messages_of_an_api_only_chat_stay_actionable(
+    act_board: W.Board, old_page: list[tuple[Any, ...]]
+) -> None:
+    """M5: past the latest page, quote/edit/delete look up the page ending at the message; react needs
+    no copy at all."""
+    assert (await act_board.chat.act_answer(None, "react", {"react": B, "msg": OLD, "key": "like"}))["ok"]
+    assert old_page == [("react", B, OLD, "like", False)]
+    assert (await act_board.chat.act_answer(None, "edit", {"edit": B, "msg": OLD, "text": "x"}))["ok"]
+    assert (await act_board.chat.act_answer(None, "delete", {"delete": B, "msg": OLD}))["ok"]
+    assert await _send(act_board, B, "re", None, [OLD]) is None
+    lookups = [c for c in old_page if c[0] == "history"]
+    assert lookups == [("history", B, None), ("history", B, int(OLD) // 1000 + 1)] * 3
+    assert old_page[-1][2] == _block(OLD, ME, "Me Self", "old") + "re"
+    assert (await act_board.chat.act_answer(None, "edit", {"edit": B, "msg": "1789465000000", "text": "x"}))[
+        "error"
+    ] == "unknown message"
+
+
+async def test_follow_names_an_archived_channel_from_the_index(board: W.Board) -> None:
+    """M6: a chat outside the seed (a channel) takes the index's label, not its raw id."""
+    assert (await board.follow(object(), C))["label"] == "Chat"  # type: ignore[arg-type]
+
+
+async def test_unreadable_windows_hand_the_page_a_cursor_to_go_on(
+    tmp_path: Path, quiet_directory: Directory, no_api: None
+) -> None:
+    """L4: past the bounded read-ahead the answer carries where it stopped; following it reaches the
+    messages beyond, both ways."""
+    data = _archive(tmp_path / "d", T, [_m(str(i), _at(i)) for i in (1, 32)])
+    _with_bad_rows(data, [_at(i) for i in range(2, 32)])
+    board = W.Board({}, quiet_directory, me=ME, data_dir=data)
+    answer = await _history(board, T, before=_at(32), limit=5)
+    assert (answer["messages"], answer["older"], answer["cursor"]) == ([], True, _at(7))
+    assert _ids(await _history(board, T, before=answer["cursor"], limit=5)) == ["1"]
+    answer = await _history(board, T, after=_at(1), limit=5)
+    assert (answer["messages"], answer["newer"], answer["cursor"]) == ([], True, _at(26))
+    answer = await _history(board, T, after=answer["cursor"], limit=5)
+    assert (_ids(answer), "cursor" in answer) == (["32"], False)
+
+
+class _Sink:
+    """A socket that keeps what it is sent."""
+
+    def __init__(self) -> None:
+        self.frames: list[dict[str, Any]] = []
+
+    async def send(self, data: str) -> None:
+        self.frames.append(json.loads(data))
+
+
+async def test_busy_answers_echo_their_verb_like_the_real_answers(board: W.Board) -> None:
+    """M7: one head per verb, busy or not: `q` only when it is a string, the history cursor as asked."""
+    ws: Any = _Sink()
+    chat = board.chat
+    chat._search_busy.add(ws)
+    chat._history_busy.add(ws)
+    await chat._on_search(ws, {"search": T, "q": 5})
+    await chat._on_search(ws, {"search": T, "q": "x"})
+    await chat._on_history(ws, {"history": T, "around": _at(3)})
+    await wait(lambda: len(ws.frames) == 3, "three busy answers")
+    assert ws.frames == [
+        {"search": T, "q": None, "error": "busy"},
+        {"search": T, "q": "x", "error": "busy"},
+        {"history": T, "around": _at(3), "error": "busy"},
+    ]
+    assert await chat.search_answer({"search": T, "q": 5}) == {"search": T, "q": None, "error": "empty query"}
+    chat._history_busy.clear()
+    await chat._on_history(ws, {"history": T, "around": _at(3), "limit": 1})
+    await wait(lambda: len(ws.frames) == 4, "the history answer")
+    assert ws.frames[3]["around"] == _at(3) and "messages" in ws.frames[3]
+    assert chat._history_busy == set()  # the slot is freed once answered
+
+
+def test_verb_keys_match_their_declared_value_shapes(board: W.Board) -> None:
+    """L7: a thread id string by default; `board` only with true; ANY_VALUE keys on presence alone."""
+    assert CV.ANY_VALUE == {"preview"}
+
+    def key(verb: dict[str, Any]) -> str | None:
+        return W._verb_key(board._handlers, board._accepts, verb)
+
+    assert key({"preview": None}) == "preview" and key({"preview": 3}) == "preview"
+    assert key({"board": True}) == "board"
+    assert key({"board": "x"}) is None and key({"board": 1}) is None
+    assert key({"send": 3}) is None and key({"send": T}) == "send"
+    assert key({"seen": T, "preview": "x"}) == "seen"  # dispatch order: the first listed wins
+    assert key({}) is None
+
+
+async def test_a_hung_archive_falls_back_to_the_api_for_server_copies(
+    board: W.Board, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M13: the server's copy of a quoted or acted-on message comes from the API when the archive read
+    outlives its deadline."""
+    release = threading.Event()
+    monkeypatch.setitem(CV._DEADLINES, "history", 0.05)
+    monkeypatch.setattr(board.chat, "_archived_copies", lambda *a: release.wait(5) and {})
+    asked: list[list[str]] = []
+
+    def api(thread_id: str, ids: list[str]) -> dict[str, dict[str, Any]]:
+        asked.append(ids)
+        return {i: {"id": i, "from": "api"} for i in ids}
+
+    monkeypatch.setattr(board.chat, "_api_copies", api)
+    try:
+        assert await board.chat._server_copies(T, ["1", "2"]) == {
+            "1": {"id": "1", "from": "api"},
+            "2": {"id": "2", "from": "api"},
+        }
+    finally:
+        release.set()
+    assert asked == [["1", "2"]]
+
+
+def test_the_board_takes_every_chat_verb_from_chat_verbs(board: W.Board) -> None:
+    """M12: one source for the chat verbs; the board's own come first and last, in dispatch order."""
+    chat = list(board.chat.handlers())
+    assert list(board._handlers) == [
+        "seen",
+        "unseen",
+        "read",
+        "mute",
+        "unmute",
+        *chat,
+        "board",
+        "follow",
+        "open",
+    ]

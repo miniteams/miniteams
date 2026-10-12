@@ -5,29 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>miniteams chat</title>
 <style>
-  :root {
-    color-scheme: light;
-    --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f0f2f5; --text: #1b1f24; --dim: #5f6775; --faint: #9aa1ab;
-    --line: #e3e6ea; --accent: #4f5bd5; --accent-soft: #4f5bd51a; --hot: #e5484d; --ok: #2f9e6e; --typing: #b7791f;
-    --mention: #0284c7; --mention-soft: #0ea5e91a; --on-mention: #fff;
-    --shadow: 0 1px 2px #0000000d, 0 4px 14px #0000000a;
-  }
-  :root[data-theme="dark"] {
-    color-scheme: dark;
-    --bg: #0f1115; --panel: #171a21; --panel-2: #1e222b; --text: #e6e8ec; --dim: #8b93a1; --faint: #5d6472;
-    --line: #262b35; --accent: #8b96ff; --accent-soft: #8b96ff22; --hot: #ff6b6f; --ok: #4cc38a; --typing: #f0b45a;
-    --mention: #7dd3fc; --mention-soft: #7dd3fc1f; --on-mention: #062a3d;
-    --shadow: 0 1px 2px #00000066, 0 6px 20px #00000055;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      color-scheme: dark;
-      --bg: #0f1115; --panel: #171a21; --panel-2: #1e222b; --text: #e6e8ec; --dim: #8b93a1; --faint: #5d6472;
-      --line: #262b35; --accent: #8b96ff; --accent-soft: #8b96ff22; --hot: #ff6b6f; --ok: #4cc38a; --typing: #f0b45a;
-      --mention: #7dd3fc; --mention-soft: #7dd3fc1f; --on-mention: #062a3d;
-      --shadow: 0 1px 2px #00000066, 0 6px 20px #00000055;
-    }
-  }
+  /* ui.css */
   * { box-sizing: border-box; }
   html, body { height: 100%; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -89,20 +67,6 @@
   #more button { border: 0; background: transparent; text-align: left; padding: 3px 8px; border-radius: 6px; cursor: pointer; font-size: 12.5px; }
   #more button:hover, #more button.on { background: var(--accent-soft); color: var(--accent); }
   .seg button.on { background: var(--panel); color: var(--text); box-shadow: var(--shadow); font-weight: 550; }
-  /* ⚙ as in widget.html. */
-  .cog { position: relative; flex: none; }
-  .cog > button { border: 0; background: transparent; color: var(--dim); font-size: 16px; width: 28px; height: 28px; border-radius: 8px; cursor: pointer; }
-  .cog > button:hover, .cog.open > button { background: var(--panel-2); color: var(--text); }
-  .cog > button:focus-visible, .menu .seg button:focus-visible, .switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-  .menu { position: absolute; right: 0; top: 34px; width: 220px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
-    box-shadow: var(--shadow); padding: 10px; display: grid; gap: 10px; z-index: 6; }
-  .menu h3 { margin: 0 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); font-weight: 600; }
-  .menu .seg button { flex: 1; }
-  .menu label { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; cursor: pointer; }
-  .switch { appearance: none; width: 32px; height: 18px; border-radius: 99px; background: var(--line); position: relative; cursor: pointer; transition: background .15s; margin: 0; }
-  .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: left .15s; box-shadow: 0 1px 2px #0003; }
-  .switch:checked { background: var(--accent); }
-  .switch:checked::after { left: 16px; }
   .seg b { font-weight: 600; margin-left: 3px; font-size: 10.5px; padding: 0 4px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); }
   .seg button.mention b { background: var(--mention-soft); color: var(--mention); }
   #filter { flex: 1; min-width: 0; font: inherit; font-size: 12.5px; color: inherit; background: var(--panel-2); border: 0; border-radius: 10px;
@@ -282,12 +246,6 @@
     border: 1px dashed var(--line); border-radius: 10px; }
   #view[hidden] { display: none; }
   #view.err { color: var(--hot); }
-  #pop { position: absolute; z-index: 4; min-width: 180px; max-width: 280px; max-height: 240px; overflow-y: auto; padding: 4px;
-    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); }
-  #pop[hidden] { display: none; }
-  #pop [role=option] { display: flex; align-items: center; gap: 8px; padding: 3px 8px; border-radius: 6px; cursor: pointer; }
-  #pop [aria-selected=true] { background: var(--accent-soft); color: var(--accent); }
-  #pop img, #pop .ch { width: 20px; height: 20px; flex: none; text-align: center; }
   #reply { display: block; width: 100%; resize: none; max-height: calc(8lh + 14px); overflow-y: auto; font: inherit; color: inherit;
     background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
   #reply:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
@@ -339,14 +297,15 @@
     <button id="show" title="preview the formatted message" aria-label="preview" aria-pressed="false">preview</button>
   </div>
   <div id="quotes" hidden></div>
-  <textarea id="reply" rows="1" placeholder="message · Enter sends, Shift+Enter new line" aria-label="message"
-    role="combobox" aria-autocomplete="list" aria-controls="pop" aria-expanded="false"></textarea>
-  <div id="pop" role="listbox" hidden></div>
+  <textarea id="reply" rows="1" placeholder="message · Enter sends, Shift+Enter new line" aria-label="message"></textarea>
+  <div id="pop" hidden></div>
   <small id="err"></small>
 </footer>
 </div>
 <script>
 (() => {
+  // ui.js defines store keep q pref el hue initials wsUrl backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview completion
+  /* ui.js */
   let thread = null;
   try { thread = decodeURIComponent(location.pathname.slice("/chat/".length)); } catch (e) {}
   const $list = document.getElementById("list"), $msgs = document.getElementById("msgs"), $note = document.getElementById("note"),
@@ -355,27 +314,47 @@
         $typing = document.getElementById("typing"), $reply = document.getElementById("reply"), $err = document.getElementById("err"),
         $quotes = document.getElementById("quotes"), $latest = document.getElementById("latest"),
         $find = document.getElementById("find"), $hits = document.getElementById("hits");
-  const store = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
-  const keep = (k, v) => { try { if (v == null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch (e) {} };
-  const q = new URLSearchParams(location.search), pref = (k) => q.get(k) ?? store(k);
-  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
-  // Same colour and initials rules as the widget's rows.
-  const hue = (s) => [...s].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7);
-  const initials = (name) => { const w = name.split(/[ ,]+/).filter((x) => /\p{L}/u.test(x));
-    return ((w[0] || "?")[0] + ((w[1] || "")[0] || "")).toUpperCase(); };
 
-  let ws = null, opener = false, retry = 1000, loaded = false, followFailed = false, pageVersion = null;
+  const BUSY_RETRY_MS = 500, BUSY_TRIES = 10;  // the server answers `busy` while it runs this socket's last ask
+  const CLOCK_TICK_MS = 30000;  // relative row times
+  const GROUP_MS = 300000;
+  let ws = null, opener = false, pageVersion = null;
+  const retry = backoff();
+  // What the screen shows of the chat's history and where a navigation (jump, reconnect) is heading.
+  const newHist = () => ({
+    loaded: false, followFailed: false,
+    records: new Map(),  // id → record, for the messages on screen
+    pending: new Set(),  // history requests asked and not answered: "<side>:<cursor>", "" = latest page
+    // Relayed frames the screen cannot take yet: while a page that replaces it is read, or while
+    // detached (`newer`), where they wait for the page to reach the latest message.
+    live: [], liveEdits: [],
+    older: false, newer: false,  // more history above / below what is shown; `newer` = detached by a jump
+    // Where the next page above / below starts when the server read past rows it could not show (its
+    // `cursor`), else "" and the edge message is the cursor.
+    olderAt: "", newerAt: "",
+    unseen: 0,  // live messages received while the latest one was out of view
+    source: "archive", target: null, restore: null,  // target: a jump's {at, id}; restore: a reconnect's anchor
+    aroundAt: "",  // the one `around` page still wanted: an answer for another is stale
+    stick: true,
+    // The edge `fill` last asked: asked again, it would bring nothing again. A new screen clears it, so
+    // it only stops two identical asks in a row.
+    filled: "",
+    unfolded: new Set(),  // members of the runs the reader opened: a run grows at either end
+    busy: 0,  // `busy` answers in a row to history asks
+  });
+  let hist = newHist();
+  // The one place a navigation in progress is dropped or redirected, per entry point.
+  const resetNav = (entry, to = null) => {
+    switch (entry) {
+      case "switch": hist = newHist(); break;
+      case "open": hist.pending.clear(); Object.assign(hist, { restore: to, target: null, aroundAt: "" }); break;  // asks died with the old socket, or a gap superseded them
+      case "jump": Object.assign(hist, { target: to, aroundAt: to.at }); break;
+      case "latest": Object.assign(hist, { restore: null, target: null, aroundAt: "" }); break;
+      case "fallback": hist.restore = null; break;  // a reconnect's anchor failed: the latest page instead
+    }
+  };
   const sending = new Set();  // chats whose send awaits its ack (split: one per chat)
   const split = pref("chatnav") === "split";
-  const records = new Map();  // id → record, for the messages on screen
-  const pending = new Set();  // history requests asked and not answered: "<kind>:<cursor>", "" = latest page
-  // Relayed frames the screen cannot take yet: while a page that replaces it is read, or while
-  // detached (`newer`), where they wait for the page to reach the latest message.
-  let live = [], liveEdits = [];
-  let older = false, newer = false;  // more history above / below what is shown; `newer` = detached by a jump
-  let unseen = 0;  // live messages received while the latest one was out of view
-  let source = "archive", target = null, restore = null;  // target: a jump's {at, id}; restore: a reconnect's anchor
-  let aroundAt = "";  // the one `around` page still wanted: an answer for another is stale
   const LIVE_MAX = 600;  // messages kept on screen at the bottom (and buffered while detached)
   const EDGE = 150;  // px from the top or bottom that loads the next page
   const typing = new Set();
@@ -403,35 +382,38 @@
     window.open(teamsLink(msgId), "_blank", "noopener");
   };
   const lastId = () => $msgs.lastElementChild?.dataset.id || "";
-  $teams.onclick = () => openTeams(lastId());
+  // Detached by a jump, the last message shown is not the chat's last: open the chat itself.
+  $teams.onclick = () => openTeams(hist.newer ? "" : lastId());
 
   const near = (px = 40) => $list.scrollHeight - $list.scrollTop - $list.clientHeight < px;
-  let stick = true;
   const showLatest = () => {
-    $latest.hidden = !newer && near();
-    $latest.textContent = unseen ? `↓ latest (${unseen})` : "↓ latest";
+    $latest.hidden = !hist.newer && near();
+    $latest.textContent = hist.unseen ? `↓ latest (${hist.unseen})` : "↓ latest";
   };
   const firstAt = () => $msgs.firstElementChild?.dataset.at || "", lastAt = () => $msgs.lastElementChild?.dataset.at || "";
+  const olderEdge = () => hist.olderAt || firstAt(), newerEdge = () => hist.newerAt || lastAt();
+  // The next page when the reader is at an edge: on scroll, and after a page past unreadable rows,
+  // which may bring nothing to scroll.
+  const more = () => {
+    if (!hist.loaded || hist.pending.size) return;  // one page at a time: the server answers `busy` to a second
+    if (hist.older && $list.scrollTop < EDGE) requestHistory("before", olderEdge());
+    else if (hist.newer && near(EDGE)) requestHistory("after", newerEdge());
+  };
   $list.addEventListener("scroll", () => {
-    stick = !newer && near();
-    if (stick) unseen = 0;
+    hist.stick = !hist.newer && near();
+    if (hist.stick) hist.unseen = 0;
     showLatest();
-    if (!loaded || pending.size) return;  // one page at a time: the server answers `busy` to a second
-    if (older && $list.scrollTop < EDGE) requestHistory("before", firstAt());
-    else if (newer && near(EDGE)) requestHistory("after", lastAt());
+    more();
   });
   // A page shorter than the list never scrolls: ask the next one without waiting for a scroll.
-  // The edge `fill` last asked: asked again, it would bring nothing again. A new screen clears it, so
-  // it only stops two identical asks in a row.
-  let filled = "";
   const fill = () => {
-    if (pending.size || $list.scrollHeight > $list.clientHeight) return;
-    const [kind, at] = older ? ["before", firstAt()] : newer ? ["after", lastAt()] : ["", ""];
-    if (!at || kind + at === filled) return;
-    filled = kind + at;
-    requestHistory(kind, at);
+    if (hist.pending.size || $list.scrollHeight > $list.clientHeight) return;
+    const [side, at] = hist.older ? ["before", olderEdge()] : hist.newer ? ["after", newerEdge()] : ["", ""];
+    if (!at || side + at === hist.filled) return;
+    hist.filled = side + at;
+    requestHistory(side, at);
   };
-  const toBottom = () => { $list.scrollTop = $list.scrollHeight; stick = !newer; if (stick) unseen = 0; showLatest(); };
+  const toBottom = () => { $list.scrollTop = $list.scrollHeight; hist.stick = !hist.newer; if (hist.stick) hist.unseen = 0; showLatest(); };
   const byId = (id) => $msgs.querySelector(`[data-id="${CSS.escape(id)}"]`);
   // The reader's place as a message and its offset, not pixels: pages above it change the pixels.
   const anchor = () => {
@@ -456,7 +438,7 @@
     n.scrollIntoView({ block: t.id ? "center" : "start" });
   };
   // Images grow the list after it was laid out: keep the bottom in view when it was.
-  $list.addEventListener("load", () => { if (stick) toBottom(); }, true);
+  $list.addEventListener("load", () => { if (hist.stick) toBottom(); }, true);
 
   const fmtTime = (iso) => {
     const d = new Date(iso);
@@ -472,24 +454,24 @@
     node.dataset.id = r.id; node.dataset.from = r.from || ""; node.dataset.at = r.at || "";
     const body = el("div", "body");
     if (r.deleted) body.append(el("div", "html", "message deleted"));
-    else { const h = el("div", "html"); h.innerHTML = r.html || ""; body.append(h); }
+    else { const h = el("div", "html"); h.dir = "auto"; h.innerHTML = r.html || ""; body.append(h); }
     if (sys) { node.append(body); node.title = r.at; return node; }
     node.tabIndex = 0;  // keyboard users reach the actions through focus-visible
     const name = r.name || (r.me ? "You" : "?");
     const av = el("div", "av", initials(name));
     av.style.background = `linear-gradient(135deg, hsl(${hue(r.from || name)} 62% 58%), hsl(${(hue(r.from || name) + 40) % 360} 62% 48%))`;
     const head = el("div", "head");
-    head.append(el("b", null, name), Object.assign(el("span", "when", fmtTime(r.at)), { title: r.at }));
+    head.append(Object.assign(el("b", null, name), { dir: "auto" }), Object.assign(el("span", "when", fmtTime(r.at)), { title: r.at }));
     if (r.edited && !r.deleted) head.append(el("span", "edited", "edited"));
     body.prepend(head);
     if (!r.deleted && r.reactions && r.reactions.length) {
       const line = el("div", "reacts");
       for (const x of r.reactions) {
         // `react` refuses keys outside Teams' 8: those chips only show the count.
-        const live = !readOnly && Object.hasOwn(EMOJI, x.key);
-        const chip = el(live ? "button" : "span", x.mine ? "mine" : null, `${x.emoji} ${x.count}`);
+        const active = !readOnly && Object.hasOwn(EMOJI, x.key);
+        const chip = el(active ? "button" : "span", x.mine ? "mine" : null, `${x.emoji} ${x.count}`);
         chip.title = x.key;
-        if (live) {
+        if (active) {
           chip.setAttribute("aria-label", `${x.emoji} ${x.count}, ${x.mine ? "remove" : "add"}`);
           chip.onclick = () => readOnly || send({ react: thread, msg: r.id, key: x.key, remove: x.mine }) || ($err.textContent = "offline, not sent");
         }
@@ -501,7 +483,8 @@
     actions.onmousedown = (e) => e.preventDefault();  // a mouse click must not leave focus on the button and pin the bar
     const button = (act, text, title, onclick) => { const b = el("button", null, text); b.dataset.act = act; b.title = title; b.setAttribute("aria-label", title); b.onclick = onclick; actions.append(b); return b; };
     if (!r.deleted) {
-      button("reply", "↩", "reply with quote", () => addQuote(r, node));
+      // Where `send` takes a quote: a text-type message (`editable`, whoever wrote it) with a sender.
+      if (r.editable && r.from) button("reply", "↩", "reply with quote", () => addQuote(r, node));
       const picker = el("span", "picker");
       picker.hidden = true;
       for (const [key, emoji] of Object.entries(EMOJI)) {
@@ -536,18 +519,18 @@
   };
 
   const renderQuotes = () => {
-    $quotes.replaceChildren(...quotes.map((q, i) => {
+    $quotes.replaceChildren(...quotes.map((qt, i) => {
       const chip = el("div", "quote"), drop = el("button", null, "✕");
-      chip.dataset.quote = q.id;
+      chip.dataset.quote = qt.id;
       drop.title = "drop this quote"; drop.setAttribute("aria-label", drop.title);
       drop.onclick = () => { quotes.splice(i, 1); renderQuotes(); };
-      chip.append(el("b", null, q.name), el("span", "truncate", q.line), drop);
+      chip.append(Object.assign(el("b", null, qt.name), { dir: "auto" }), Object.assign(el("span", "truncate", qt.line), { dir: "auto" }), drop);
       return chip;
     }));
     $quotes.hidden = !quotes.length;
   };
   const addQuote = (r, node) => {
-    if (quotes.some((q) => q.id === r.id)) return;
+    if (quotes.some((qt) => qt.id === r.id)) return;
     if (quotes.length >= QUOTE_MAX) { $err.textContent = `${QUOTE_MAX} quotes at most`; return; }
     quotes.push({ id: r.id, name: r.name || (r.me ? "You" : "?"), line: plainOf(node).split("\n")[0] });
     renderQuotes();
@@ -560,7 +543,7 @@
 
   // Edit in place: the body becomes a textarea; only the ack, a delete echo or Escape puts a message back.
   const rerender = (id) => {
-    const node = $msgs.querySelector(`[data-id="${CSS.escape(id)}"]`), r = records.get(id);
+    const node = $msgs.querySelector(`[data-id="${CSS.escape(id)}"]`), r = hist.records.get(id);
     if (node && r) { node.replaceWith(renderMessage(r)); regroup(); }
   };
   const startEdit = (node, r, text = null, focus = true, note = "") => {
@@ -601,13 +584,12 @@
   };
 
   // Bots delete their old notifications in bulk: ≥2 consecutive deleted messages fold behind one line.
-  const unfolded = new Set();  // members of the runs the reader opened: a run grows at either end
   const fold = () => {
     for (const b of $msgs.querySelectorAll(":scope > .msg > .run")) b.remove();
     let run = [];
     const close = () => {
       const members = run, many = members.length > 1, head = members[0];
-      const open = many && members.some((n) => unfolded.has(n.dataset.id));
+      const open = many && members.some((n) => hist.unfolded.has(n.dataset.id));
       run = [];
       members.forEach((n, i) => {
         n.classList.toggle("in-run", many); n.classList.toggle("run-head", many && !i);
@@ -617,7 +599,7 @@
       const b = el("button", "run", `${members.length} messages deleted`);
       b.setAttribute("aria-expanded", String(open));
       b.onclick = () => {
-        for (const n of members) if (open) unfolded.delete(n.dataset.id); else unfolded.add(n.dataset.id);
+        for (const n of members) if (open) hist.unfolded.delete(n.dataset.id); else hist.unfolded.add(n.dataset.id);
         fold();
         head.querySelector(":scope > .run")?.focus();
       };
@@ -634,7 +616,7 @@
     for (const n of $msgs.children) {
       const cont = !!prev && !n.classList.contains("system") && !prev.classList.contains("system")
         && prev.classList.contains("in-run") === n.classList.contains("in-run")
-        && prev.dataset.from === n.dataset.from && Date.parse(n.dataset.at) - Date.parse(prev.dataset.at) < 300000;
+        && prev.dataset.from === n.dataset.from && Date.parse(n.dataset.at) - Date.parse(prev.dataset.at) < GROUP_MS;
       n.classList.toggle("cont", cont);
       prev = n;
     }
@@ -645,52 +627,52 @@
     // Restored editors start idle: a save in flight lost its answer with the old socket (see onclose).
     const editing = carry || editorsOf();
     carry = null;
-    older = !!more.older; newer = !!more.newer;
-    filled = "";
-    records.clear();
-    for (const r of messages) records.set(r.id, r);
-    if (!newer) {  // landed while the page was read, or while detached
-      for (const r of live) if (!records.has(r.id)) records.set(r.id, r);
-      live = [];
+    hist.older = !!more.older; hist.newer = !!more.newer;
+    hist.filled = "";
+    hist.records.clear();
+    for (const r of messages) hist.records.set(r.id, r);
+    if (!hist.newer) {  // landed while the page was read, or while detached
+      for (const r of hist.live) if (!hist.records.has(r.id)) hist.records.set(r.id, r);
+      hist.live = [];
     }
-    $msgs.replaceChildren(...[...records.values()].map(renderMessage));
+    $msgs.replaceChildren(...[...hist.records.values()].map(renderMessage));
     regroup();
-    const edits = liveEdits;
-    liveEdits = [];
+    const edits = hist.liveEdits;
+    hist.liveEdits = [];
     for (const r of edits) replace(r);
     for (const e of editing) {
-      const node = $msgs.querySelector(`[data-id="${CSS.escape(e.id)}"]`), r = records.get(e.id);
+      const node = $msgs.querySelector(`[data-id="${CSS.escape(e.id)}"]`), r = hist.records.get(e.id);
       if (node && r && !r.deleted) startEdit(node, r, e.text, e.focused, e.note);
       else $err.textContent = "edit lost: the message is no longer shown";
     }
-    $note.hidden = records.size > 0;
+    $note.hidden = hist.records.size > 0;
     $note.className = ""; $note.textContent = "no message yet";
-    loaded = true;
-    const t = jumped ? target : null, back = restore;
-    if (jumped) target = null;
-    restore = null;
+    hist.loaded = true;
+    const t = jumped ? hist.target : null, back = hist.restore;
+    if (jumped) hist.target = null;
+    hist.restore = null;
     if (t) land(t);
     else if (!toAnchor(back)) toBottom();
-    stick = !newer && near();
+    hist.stick = !hist.newer && near();
     showLatest();
     fill();
   };
   // A page next to the screen: older above with the visible message kept in place, newer below.
   const addPage = (messages, above) => {
     const a = above && anchor();
-    const nodes = messages.filter((r) => !records.has(r.id)).map((r) => { records.set(r.id, r); return renderMessage(r); });
+    const nodes = messages.filter((r) => !hist.records.has(r.id)).map((r) => { hist.records.set(r.id, r); return renderMessage(r); });
     if (above) $msgs.prepend(...nodes); else $msgs.append(...nodes);
-    if (!above && !newer) {  // reached the latest message: what arrived while detached follows it
-      for (const r of live) if (!records.has(r.id)) { records.set(r.id, r); $msgs.append(renderMessage(r)); }
-      live = [];
+    if (!above && !hist.newer) {  // reached the latest message: what arrived while detached follows it
+      for (const r of hist.live) if (!hist.records.has(r.id)) { hist.records.set(r.id, r); $msgs.append(renderMessage(r)); }
+      hist.live = [];
     }
     regroup();
     if (a) toAnchor(a);
-    $note.hidden = records.size > 0;
+    $note.hidden = hist.records.size > 0;
     showLatest();
     if (nodes.length) fill();
   };
-  const replacing = () => [...pending].some((k) => !k || k.startsWith("around:"));
+  const replacing = () => [...hist.pending].some((k) => !k || k.startsWith("around:"));
 
   // A long-open busy chat: the reader at the bottom keeps the newest LIVE_MAX, scrolling up reloads the rest.
   const trim = () => {
@@ -698,86 +680,116 @@
     const editor = cut.findIndex((n) => n.querySelector(".editor"));
     if (editor >= 0) cut.length = editor;  // an unsaved edit outlives the trim
     if (!cut.length) return;
-    for (const n of cut) { records.delete(n.dataset.id); n.remove(); }
-    older = true;
+    for (const n of cut) { hist.records.delete(n.dataset.id); n.remove(); }
+    hist.older = true; hist.olderAt = "";  // the edge moved down past the cursor
     regroup();
   };
 
   const append = (r) => {
-    if (newer || replacing()) {
-      if (!live.some((x) => x.id === r.id)) live.push(r);
-      if (live.length > LIVE_MAX) live.shift();
+    if (hist.newer || replacing()) {
+      if (!hist.live.some((x) => x.id === r.id)) hist.live.push(r);
+      if (hist.live.length > LIVE_MAX) hist.live.shift();
     }
-    if (newer) { unseen++; showLatest(); return; }  // not after what is shown: it waits for the latest page
-    if (records.has(r.id)) return;
-    const was = stick;
-    records.set(r.id, r);
+    if (hist.newer) { hist.unseen++; showLatest(); return; }  // not after what is shown: it waits for the latest page
+    if (hist.records.has(r.id)) return;
+    const was = hist.stick;
+    hist.records.set(r.id, r);
     $msgs.append(renderMessage(r));
     regroup();
     $note.hidden = true;
-    if (was) { trim(); toBottom(); } else { unseen++; showLatest(); }
+    if (was) { trim(); toBottom(); } else { hist.unseen++; showLatest(); }
   };
 
+  // No `html`: a partial update (a reaction), whose other fields are blank, not news.
+  const patch = (old, r) => "html" in r ? r : { ...old, reactions: r.reactions, deleted: r.deleted };
   const replace = (r) => {
-    if (replacing()) liveEdits.push(r);
-    const held = live.findIndex((x) => x.id === r.id);  // detached: it is shown once the latest page is
-    if (held >= 0) live[held] = "html" in r ? r : { ...live[held], ...r, html: live[held].html };
-    const old = records.get(r.id), node = $msgs.querySelector(`[data-id="${CSS.escape(r.id)}"]`);
+    if (replacing()) hist.liveEdits.push(r);
+    const held = hist.live.findIndex((x) => x.id === r.id);  // detached: it is shown once the latest page is
+    if (held >= 0) hist.live[held] = patch(hist.live[held], r);
+    const old = hist.records.get(r.id), node = $msgs.querySelector(`[data-id="${CSS.escape(r.id)}"]`);
     if (!old || !node) return;  // not on screen: the next page read carries it
-    const merged = "html" in r ? r : { ...old, ...r, html: old.html };  // a partial update keeps the body
-    records.set(r.id, merged);
+    const merged = patch(old, r);
+    hist.records.set(r.id, merged);
     if (node.querySelector(".editor") && !merged.deleted) return;  // an edit in progress: shown once it ends
     node.replaceWith(renderMessage(merged));
     regroup();
   };
 
   // History is keyed on its cursor, which the answer echoes: one request per cursor in flight.
-  const requestHistory = (kind = "before", at = "") => {
-    const key = at ? kind + ":" + at : "";
-    if (pending.has(key)) return;
-    if (!send({ history: thread, [kind]: at || null })) return;
-    pending.add(key);
-    if (!at && !newer) { live = []; liveEdits = []; }  // attached: what came before is on screen
+  const requestHistory = (side = "before", at = "") => {
+    const key = at ? side + ":" + at : "";
+    if (hist.pending.has(key)) return;
+    if (!send({ history: thread, [side]: at || null })) return;
+    hist.pending.add(key);
+    if (!at && !hist.newer) { hist.live = []; hist.liveEdits = []; }  // attached: what came before is on screen
   };
-  const jump = (at, id = "") => { target = { at, id }; aroundAt = at; requestHistory("around", at); };
+  const jump = (at, id = "") => { resetNav("jump", { at, id }); requestHistory("around", at); };
   const onHistory = (m) => {
     if (m.history !== thread) return;  // asked before a switch
-    const kind = ["after", "around"].find((k) => k in m) || "before", at = m[kind] || "";
-    pending.delete(at ? kind + ":" + at : "");
-    if (kind === "around" && at !== aroundAt) return;  // a later jump (or the latest page) replaced it
-    if (m.error === "busy") { const t = thread; setTimeout(() => t === thread && requestHistory(kind, at), 500); return; }
-    if (kind === "around") aroundAt = "";
+    const side = ["after", "around"].find((k) => k in m) || "before", at = m[side] || "";
+    hist.pending.delete(at ? side + ":" + at : "");
+    if (side === "around" && at !== hist.aroundAt) return;  // a later jump (or the latest page) replaced it
+    if (m.error === "busy" && hist.busy < BUSY_TRIES) {
+      hist.busy++;
+      const t = thread;
+      setTimeout(() => t === thread && requestHistory(side, at), BUSY_RETRY_MS);
+      return;
+    }
+    hist.busy = 0;
+    if (m.error === "busy") m = { ...m, error: "history unavailable" };  // the server's word for any failure
+    if (side === "around") hist.aroundAt = "";
     if (m.error) {
-      if (kind === "around" && restore) { restore = null; requestHistory(); return; }  // a reconnect: the latest page then
-      if (kind !== "before" && at) { $err.textContent = (kind === "around" ? "jump: " : "history: ") + m.error; target = null; return; }
-      if (followFailed) return;  // its error says more than this one
+      if (side === "around" && hist.restore) { resetNav("fallback"); requestHistory(); return; }
+      if (side !== "before" && at) { $err.textContent = (side === "around" ? "jump: " : "history: ") + m.error; hist.target = null; return; }
+      if (hist.followFailed) return;  // its error says more than this one
       $note.hidden = false; $note.className = "err";
       $note.textContent = "history: " + m.error;
       return;
     }
-    source = m.source;
+    hist.source = m.source;
     const messages = m.messages || [];
-    if (!at || kind === "around") showPage(messages, m, kind === "around");
+    const cursor = typeof m.cursor === "string" ? m.cursor : "";
+    if (!at || side === "around") {
+      // An `around` cursor would not say which side it continues: both edges are messages again.
+      Object.assign(hist, { olderAt: !at && m.older ? cursor : "", newerAt: "" });
+      showPage(messages, m, side === "around");
+    }
     // A page asked for an edge that has moved since (a jump, a trim) is stale: the next scroll asks again.
-    else if (kind === "before" && at === firstAt()) { older = !!m.older; addPage(messages, true); }
-    else if (kind === "after" && at === lastAt()) { newer = !!m.newer; addPage(messages, false); }
+    else if (side === "before" && at === olderEdge()) {
+      Object.assign(hist, { older: !!m.older, olderAt: m.older ? cursor : "" });
+      addPage(messages, true);
+      if (cursor) more();
+    }
+    else if (side === "after" && at === newerEdge()) {
+      Object.assign(hist, { newer: !!m.newer, newerAt: m.newer ? cursor : "" });
+      addPage(messages, false);
+      if (cursor) more();
+    }
   };
   $latest.onclick = () => {
-    if (!newer) { toBottom(); return; }
-    target = restore = null; aroundAt = "";
+    if (!hist.newer) { toBottom(); return; }
+    resetNav("latest");
     requestHistory();  // showPage ends at the bottom
   };
 
+  let searchBusy = 0;  // `busy` answers in a row to the current search
   const onSearch = (m) => {
     if (m.search !== thread || m.q !== $find.dataset.q) return;  // an answer to a search since replaced
-    if (m.error === "busy") { setTimeout(() => m.search === thread && send({ search: thread, q: m.q }), 500); return; }
+    if (m.error === "busy" && searchBusy < BUSY_TRIES) {
+      searchBusy++;
+      setTimeout(() => m.search === thread && send({ search: thread, q: m.q }), BUSY_RETRY_MS);
+      return;
+    }
+    searchBusy = 0;
+    if (m.error === "busy") m = { ...m, error: "search unavailable" };
     $hits.replaceChildren();
     if (m.error) $hits.append(el("div", "none err", m.error));
     else if (!(m.hits || []).length) $hits.append(el("div", "none", "no match"));
     for (const h of m.hits || []) {
       const b = el("button");
       b.dataset.id = h.id;
-      b.append(el("b", null, h.name || "?"), el("span", "when", fmtTime(h.at)), el("div", "truncate", h.text));
+      b.append(Object.assign(el("b", null, h.name || "?"), { dir: "auto" }), el("span", "when", fmtTime(h.at)),
+        Object.assign(el("div", "truncate", h.text), { dir: "auto" }));
       b.onclick = () => { $hits.hidden = true; jump(h.at, h.id); };
       $hits.append(b);
     }
@@ -789,10 +801,11 @@
     if (e.key === "Escape") { closeHits(); return; }
     if (e.key !== "Enter" || e.isComposing) return;
     e.preventDefault();
-    const q = $find.value.trim();
-    if (!q) return;
-    $find.dataset.q = q;
-    if (!send({ search: thread, q })) { $hits.replaceChildren(el("div", "none err", "offline")); $hits.hidden = false; }
+    const needle = $find.value.trim();
+    if (!needle) return;
+    $find.dataset.q = needle;
+    searchBusy = 0;
+    if (!send({ search: thread, q: needle })) { $hits.replaceChildren(el("div", "none err", "offline")); $hits.hidden = false; }
   };
   document.addEventListener("click", (e) => { if (!$hits.contains(e.target) && e.target !== $find) closeHits(); });
 
@@ -800,13 +813,14 @@
 
   const onFollow = (m) => {
     if (m.follow !== thread) return;  // a chat left since
-    if (m.error) { followFailed = true; $note.hidden = false; $note.className = "err"; $note.textContent = m.error; return; }
+    if (m.error) { hist.followFailed = true; $note.hidden = false; $note.className = "err"; $note.textContent = m.error; return; }
     // A newer chat.html on the server (restart, edit): this page is stale, reload it.
     if (m.page) { if (pageVersion && m.page !== pageVersion) { saveDraft(); location.reload(); return; } pageVersion = m.page; }
-    followFailed = false;
+    hist.followFailed = false;
+    retry.reset();  // not on open: a socket whose follow fails must keep backing off
     readOnly = !!m.read_only;
     $reply.disabled = readOnly || sending.has(thread);
-    $reply.placeholder = readOnly ? "read-only: team channel" : PLACEHOLDER;
+    $reply.placeholder = readOnly ? "read-only chat" : PLACEHOLDER;
     document.body.classList.toggle("readonly", readOnly);
     opener = !!m.opener;
     $teams.disabled = false;
@@ -840,8 +854,7 @@
     stash();
     for (const [t, d] of drafts) {
       if (t !== thread && !d.text && !d.quotes.length) continue;
-      const p = [...(picked.get(t)?.values() || [])];
-      try { sessionStorage.setItem("draft:" + t, JSON.stringify({ text: d.text, quotes: d.quotes, picked: p })); } catch (e) {}
+      try { sessionStorage.setItem("draft:" + t, JSON.stringify({ text: d.text, quotes: d.quotes, picked: complete.mentions(d.text, t) })); } catch (e) {}
     }
   };
   const takeDraft = (t) => {
@@ -856,14 +869,11 @@
     const d = drafts.get(thread) || takeDraft(thread) || { text: "", quotes: [] };
     drafts.delete(thread);
     $reply.value = d.text; grow();
-    quotes = (Array.isArray(d.quotes) ? d.quotes : []).filter((q) => q && typeof q.id === "string").slice(0, QUOTE_MAX)
-      .map((q) => ({ id: q.id, name: String(q.name ?? ""), line: String(q.line ?? "") }));
+    quotes = (Array.isArray(d.quotes) ? d.quotes : []).filter((qt) => qt && typeof qt.id === "string").slice(0, QUOTE_MAX)
+      .map((qt) => ({ id: qt.id, name: String(qt.name ?? ""), line: String(qt.line ?? "") }));
     renderQuotes();
-    // Only a draft from sessionStorage carries its picks: in memory they never left `picked`.
-    if (Array.isArray(d.picked)) {
-      const ok = d.picked.filter((m) => m && typeof m.name === "string" && typeof m.mri === "string" && [undefined, true].includes(m.everyone));
-      picked.set(thread, new Map(ok.map((m) => [m.name, { name: m.name, mri: m.mri, ...(m.everyone === true ? { everyone: true } : {}) }])));
-    }
+    // Only a draft from sessionStorage carries its picks: in memory they never left the completion.
+    if (Array.isArray(d.picked)) complete.restore(d.picked);
     carry = d.editing?.length ? d.editing : null;
     $err.textContent = d.err || "";
   };
@@ -875,144 +885,50 @@
   const submit = () => {
     const text = $reply.value;
     if (!text.trim() || sending.has(thread)) return;
-    // Names, not offsets: a picked mention counts only while its `@Name` is still in the text.
-    const mentions = [...(picked.get(thread)?.values() || [])].filter((m) => text.includes("@" + m.name));
-    const verb = { send: thread, text, mentions, format: "full", ...(quotes.length ? { quote: quotes.map((q) => q.id) } : {}) };
+    const verb = { send: thread, text, mentions: complete.mentions(text), format: "full", ...(quotes.length ? { quote: quotes.map((qt) => qt.id) } : {}) };
     if (!send(verb)) { $err.textContent = "offline, not sent"; return; }
     $err.textContent = "";
     hideView();
     setSending(thread, true);
   };
 
-  // `:` / `@` completion (spec 012), ported from widget.html: the server answers {complete, q, items};
-  // only the answer to the latest question counts, an older one arriving late would list the wrong names.
   const $pop = document.getElementById("pop");
-  $pop.onmousedown = (e) => e.preventDefault();  // its scrollbar too: a press there must not blur the textarea
-  let comp = null, want = null, timer = 0, dismissed = -1;
-  const picked = new Map();  // chat id → Map(name → {name, mri, everyone?}): the mentions picked in its draft
-  const token = () => {
-    const at = $reply.selectionStart;
-    if (at !== $reply.selectionEnd) return null;
-    // Word start only: `10:30` and `me@host` must not ask anything. One inner space reaches a last name
-    // (`@ann l`); an inserted `@Ann Lee ` ends in a second one, so it never asks again.
-    // Emoji first: the member pattern's inner space would let `@ann :fi` read as one name.
-    const before = $reply.value.slice(0, at), e = /(?:^|\s):([a-z0-9_+-]{2,})$/i.exec(before);
-    const m = e || /(?:^|\s)@([^\s@]*(?: [^\s@]*)?)$/.exec(before);
-    return m && { kind: e ? "emoji" : "member", q: m[1], start: at - m[1].length - 1 };
-  };
-  // A textarea exposes no caret coordinates: lay the text before the caret out in a hidden copy.
-  const caret = () => {
-    const cs = getComputedStyle($reply), copy = el("div", null, $reply.value.slice(0, $reply.selectionStart)), mark = el("span", null, "\u200b");
-    for (const k of ["font", "padding", "border", "boxSizing", "lineHeight", "letterSpacing", "tabSize", "width"]) copy.style[k] = cs[k];
-    Object.assign(copy.style, { position: "absolute", visibility: "hidden", whiteSpace: "pre-wrap", overflowWrap: "break-word", top: 0, left: 0 });
-    copy.append(mark); document.body.append(copy);
-    const xy = [mark.offsetLeft, mark.offsetTop];
-    copy.remove();
-    return xy;
-  };
-  const renderPop = () => {
-    $pop.hidden = !comp;
-    $reply.setAttribute("aria-expanded", String(!!comp));
-    if (!comp) { $pop.replaceChildren(); $reply.removeAttribute("aria-activedescendant"); return; }
-    $pop.setAttribute("aria-label", comp.kind === "emoji" ? "emoji" : "members");
-    $pop.replaceChildren(...comp.items.map((it, i) => {
-      const o = el("div");
-      o.id = "pop-" + i; o.setAttribute("role", "option"); o.setAttribute("aria-selected", String(i === comp.active));
-      if (comp.kind === "emoji") {
-        // Images only from our own /emoji/ route: the item comes over the socket, the page trusts no URL.
-        const own = it.custom && /^\/emoji\/[\w-]+$/.test(it.src || "");
-        o.append(own ? Object.assign(el("img"), { src: it.src, alt: "" }) : el("span", "ch", it.custom ? "" : it.char));
-      }
-      o.append(el("span", "truncate", comp.kind === "emoji" ? `:${it.name}:` : it.name));
-      o.onclick = () => { const t = word(); if (t && t.q === comp.q) { comp.active = i; insert(t); } };
-      return o;
-    }));
-    $reply.setAttribute("aria-activedescendant", "pop-" + comp.active);
-    // Above the caret line: the composer sits at the bottom of the window.
-    const [x, y] = caret();
-    $pop.style.top = $reply.offsetTop + y - $reply.scrollTop - $pop.offsetHeight + "px";
-    $pop.style.left = $reply.offsetLeft + Math.max(0, Math.min(x, $reply.offsetWidth - $pop.offsetWidth)) + "px";
-    document.getElementById("pop-" + comp.active).scrollIntoView({ block: "nearest" });
-  };
-  const closePop = () => { clearTimeout(timer); want = null; comp = null; renderPop(); };
-  const lookup = () => {
-    clearTimeout(timer); want = null;
-    const t = token();
-    if (!t || t.start === dismissed) { if (!t) dismissed = -1; comp = null; renderPop(); return; }
-    timer = setTimeout(() => {
-      // No socket or no answer: drop the list, or Enter would wait forever on a prefix nobody answers.
-      if (!send({ complete: t.kind, q: t.q, thread })) { closePop(); return; }
-      want = t;
-      timer = setTimeout(closePop, 2000);
-    }, 120);
-  };
-  const answered = (msg) => {
-    if (!want || msg.complete !== want.kind || msg.q !== want.q) return;
-    clearTimeout(timer);
-    // A malformed item would throw mid-render and leave the list stuck open.
-    const items = Array.isArray(msg.items) && !msg.error ? msg.items.filter((it) => it && typeof it.name === "string").slice(0, 12) : [];
-    comp = items.length ? { ...want, items, active: 0 } : null;
-    renderPop();
-  };
-  // The word the open list answers, or null once the caret left it.
-  const word = () => { const t = token(); return t && t.start === comp.start && t.kind === comp.kind ? t : null; };
   // execCommand keeps the edit in the textarea's undo history (Ctrl+Z); setRangeText would not.
-  // Its `input` event runs lookup(): callers settle `dismissed` before calling.
+  // Its `input` event runs the completion's lookup: an insert settles what it dismisses before calling.
   const put = (text, a, b, selA, selB) => {
     $reply.focus();
     $reply.setSelectionRange(a, b);
     if (!document.execCommand("insertText", false, text)) $reply.setRangeText(text, a, b);
     $reply.setSelectionRange(selA, selB);
   };
-  const insert = (t) => {
-    const it = comp.items[comp.active], kind = comp.kind, text = kind === "member" ? `@${it.name} ` : it.custom ? `:${it.name}:` : it.char;
-    if (kind === "member") {
-      if (!picked.has(thread)) picked.set(thread, new Map());
-      picked.get(thread).set(it.name, { name: it.name, mri: it.mri, ...(it.everyone ? { everyone: true } : {}) });
-    }
-    closePop();
-    if (kind === "member") dismissed = t.start;  // `@everyone ` + the next word must not ask `everyone t`…
-    put(text, t.start, $reply.selectionStart, t.start + text.length, t.start + text.length);
-    edited();
-  };
-  // Enter with the list open picks, never sends; true when the key was the list's. While a longer
-  // prefix is still being asked, the list on screen answers a shorter one: Enter/Tab wait for it.
-  const popKey = (e) => {
-    const n = comp.items.length;
-    if (e.key === "ArrowDown" || e.key === "ArrowUp") { comp.active = (comp.active + (e.key === "ArrowDown" ? 1 : n - 1)) % n; renderPop(); }
-    else if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
-      const t = word();
-      if (!t) { closePop(); return false; }  // caret left the word: the key is the textarea's again
-      if (t.q === comp.q) insert(t);
-    }
-    else if (e.key === "Escape") { dismissed = comp.start; closePop(); }
-    else return false;
-    return true;
-  };
+  const complete = completion({
+    input: $reply, pop: $pop, send: (o) => send(o), chat: () => thread, edited: () => edited(), above: true,
+    put: (text, from, to) => put(text, from, to, from + text.length, from + text.length),
+  });
 
   // Toolbar (spec 012, full format): markers around the selection, or around the caret to type into.
   const MARK = { bold: "**", italic: "*", strike: "~~", code: "`" };
-  const format = (kind) => {
+  const format = (fmt) => {
     if ($reply.disabled) return;
     const v = $reply.value, a = $reply.selectionStart, b = $reply.selectionEnd, sel = v.slice(a, b);
-    if (kind === "list" || kind === "quote") {
+    if (fmt === "list" || fmt === "quote") {
       // Whole lines: from the start of the first one to the end of the last (a trailing newline ends it).
       const from = v.lastIndexOf("\n", a - 1) + 1, end = b > a && v[b - 1] === "\n" ? b - 1 : b;
       const nl = v.indexOf("\n", end), to = nl < 0 ? v.length : nl;
-      const lines = v.slice(from, to).split("\n").map((l) => (kind === "list" ? "- " : "> ") + l).join("\n");
+      const lines = v.slice(from, to).split("\n").map((l) => (fmt === "list" ? "- " : "> ") + l).join("\n");
       put(lines, from, to, from, from + lines.length);
-    } else if (kind === "code" && sel.includes("\n")) {
+    } else if (fmt === "code" && sel.includes("\n")) {
       // A fence only opens and closes on a line of its own.
       const pre = a && v[a - 1] !== "\n" ? "\n" : "", post = b < v.length && v[b] !== "\n" ? "\n" : "";
       const text = pre + "```\n" + sel + "\n```" + post;
       put(text, a, b, a, a + text.length);
     } else if (!sel) {
-      const m = MARK[kind];
+      const m = MARK[fmt];
       put(m + m, a, b, a + m.length, a + m.length);
     } else {
       // The server never closes a marker across lines, nor one with a space inside it: each line gets
       // its own pair, inside its list or quote prefix, around its text without the surrounding spaces.
-      const m = MARK[kind], atLineStart = !a || v[a - 1] === "\n";
+      const m = MARK[fmt], atLineStart = !a || v[a - 1] === "\n";
       let inner = null;
       const text = sel.split("\n").map((l, i) => {
         const p = i || atLineStart ? /^\s*(?:(?:[-*]|\d+\.|>) +)*/.exec(l)[0] : "";
@@ -1024,7 +940,7 @@
       const one = inner && !sel.includes("\n");  // one line: its text stays selected, inside the markers
       put(text, a, b, one ? a + inner[0] : a, one ? a + inner[0] + inner[1] : a + text.length);
     }
-    closePop();
+    complete.close();
     edited();
   };
   const $tools = document.getElementById("tools");
@@ -1056,11 +972,9 @@
   };
   const edited = () => { grow(); if (showing) hideView(); };
 
-  $reply.oninput = (e) => { edited(); if (!e.isComposing) lookup(); };
-  $reply.addEventListener("compositionend", lookup);
-  $reply.onblur = closePop;
+  $reply.oninput = edited;
   $reply.onkeydown = (e) => {
-    if (comp && !e.isComposing && e.keyCode !== 229 && popKey(e)) { e.preventDefault(); return; }
+    if (complete.key(e)) { e.preventDefault(); return; }
     const k = e.key.toLowerCase();
     if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && !e.isComposing && e.keyCode !== 229 && (k === "b" || k === "i")) { e.preventDefault(); format(k === "b" ? "bold" : "italic"); return; }
     if (e.key !== "Enter" || e.shiftKey || e.isComposing || e.keyCode === 229) return;
@@ -1069,7 +983,7 @@
   };
   const onSent = (m) => {
     if (!sending.has(m.sent)) return;
-    if (m.ok) picked.delete(m.sent);
+    if (m.ok) complete.forget(m.sent);
     if (m.sent !== thread) {
       const d = drafts.get(m.sent);
       if (!m.ok) noteFor(m.sent, why(m.error) || "not sent");
@@ -1079,7 +993,7 @@
     setSending(m.sent, false);
   };
 
-  // --- chatnav=split: the board's list beside the chat (row rules as in widget.html) ---
+  // --- chatnav=split: the board's list beside the chat (row rules in ui.js) ---
   const $side = document.getElementById("side"), $rows = document.getElementById("rows"), $tabs = document.getElementById("tabs"),
         $filter = document.getElementById("filter"), $nochat = document.getElementById("nochat"), $menu = document.getElementById("menu"),
         $more = document.getElementById("more"), $clear = document.getElementById("clear"), $grip = document.getElementById("grip");
@@ -1092,68 +1006,9 @@
   const EMPTY = { all: "Inbox zero", mention: "No mentions", unread: "No unread chats", seen: "Nothing seen yet", muted: "Nothing muted" };
   // Read once, never written: the widget owns the stored tab.
   let tab = Object.hasOwn(TABS, pref("tab") || "") ? pref("tab") : "all";
-  const isSeen = (r) => !!r.seen_at && Date.parse(r.seen_at) >= Date.parse(r.last_activity);
-  const mentioned = (r) => !!r.mention;
-  const rowTitle = (r) => r.label.replace(/ · \d+p$/, "");
-  const ago = (iso) => {
-    const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
-    if (isNaN(s)) return "";
-    return s < 60 ? "now" : s < 3600 ? Math.floor(s / 60) + "m" : s < 86400 ? Math.floor(s / 3600) + "h" : Math.floor(s / 86400) + "d";
-  };
-  // Case- and accent-blind, with a folded→original index map so the highlight keeps the original spelling.
-  const foldText = (str) => {
-    let out = "";
-    const map = [];
-    for (let i = 0; i < str.length; i++) {
-      const c = str[i].normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
-      out += c;
-      for (let k = 0; k < c.length; k++) map.push(i);
-    }
-    map.push(str.length);
-    return [out, map];
-  };
-  const filters = {
-    all: (r) => mentioned(r) || (!r.muted && !isSeen(r)),
-    mention: mentioned,
-    unread: (r) => r.unread && !r.muted,
-    seen: (r) => isSeen(r) && !r.muted,
-    muted: (r) => r.muted,
-  };
-  const named = (r) => !query || foldText(rowTitle(r))[0].includes(query);
-  const marked = (node, text) => {
-    const [hay, map] = foldText(text);
-    let at = 0, cut = 0, i;
-    while (query && (i = hay.indexOf(query, at)) >= 0) {
-      node.append(text.slice(cut, map[i]), el("mark", null, text.slice(map[i], map[i + query.length])));
-      at = i + query.length;
-      cut = map[at];
-    }
-    node.append(text.slice(cut));
-    return node;
-  };
-  const mentionLine = (r, into) => {
-    const m = r.mention;
-    if (m.by) into.append(el("b", null, m.by + ": "));
-    const text = m.text || "", full = (meName || "").trim(), [hay, map] = foldText(text);
-    let from = -1, to = -1;
-    for (const cand of m.kind === "me" && full ? [full, full.split(" ")[0]] : []) {
-      const [needle] = foldText(cand), j = hay.indexOf(needle);
-      if (j >= 0) { from = map[j]; to = map[j + needle.length]; break; }
-    }
-    if (from < 0) { into.append(el("span", "at", m.kind === "all" ? "@everyone" : "@you"), " " + text); return into; }
-    into.append(text.slice(0, from), el("span", "at", "@" + text.slice(from, to)), text.slice(to));
-    return into;
-  };
-  const preview = (r, into) => {
-    if (r.typing && r.typing.length) { into.classList.add("typing"); into.textContent = "✍ " + r.typing.join(", "); return into; }
-    if (mentioned(r)) return mentionLine(r, into);
-    if (r.sender) into.append(el("b", null, r.sender + ": "));
-    into.append(r.text || "");
-    return into;
-  };
   const chatPath = (id) => "/chat/" + encodeURIComponent(id);
   const rowOf = (r) => {
-    const m = mentioned(r), dm = r.id.includes("@unq.gbl");
+    const m = mentioned(r), dm = kind(r.id) === "dm";
     const li = el("li", (r.unread ? "unread " : "") + ((isSeen(r) || r.muted) && !m ? "seen " : "") + (r.id === thread ? "cur " : "")
       + (r.id === sel ? "sel " : "") + (m ? "mention " + r.mention.kind : ""));
     li.dataset.id = r.id;
@@ -1164,7 +1019,7 @@
       av.style.background = `linear-gradient(135deg, hsl(${hue(r.id)} 62% 58%), hsl(${(hue(r.id) + 40) % 360} 62% 48%))`;
       li.append(av);
     }
-    const name = Object.assign(marked(el("a", "name truncate"), rowTitle(r)), { href: r.link || "#", target: "_blank", rel: "noopener", title: r.label });
+    const name = Object.assign(marked(el("a", "name truncate"), rowTitle(r), query), { href: r.link || "#", target: "_blank", rel: "noopener", title: r.label, dir: "auto" });
     name.dataset.k = "name";
     name.tabIndex = -1;  // renderRows gives one row the Tab stop
     // Plain click switches in place; Ctrl click opens Teams as on the board; middle click is onauxclick's.
@@ -1196,7 +1051,7 @@
     const ind = el("span", "ind");
     if (m) ind.append(el("span", "tag " + r.mention.kind, r.mention.kind === "all" ? "@ all" : "@ you"));
     else if (r.unread) ind.append(el("span", "dot"));
-    li.append(name, meta, preview(r, el("span", "prev truncate")), ind);
+    li.append(name, meta, preview(r, el("span", "prev truncate"), meName), ind);
     return li;
   };
   const renderRows = () => {
@@ -1205,7 +1060,7 @@
     const f = $side.contains(document.activeElement) ? document.activeElement : null;
     const fk = f?.dataset.k, fid = f?.closest("#rows > li")?.dataset.id;
     rows.sort((a, b) => (a.last_activity < b.last_activity) - (a.last_activity > b.last_activity));
-    const counts = Object.fromEntries(Object.entries(filters).map(([k, f]) => [k, rows.filter((r) => f(r) && named(r)).length]));
+    const counts = Object.fromEntries(Object.entries(filters).map(([k, f]) => [k, rows.filter((r) => f(r) && named(r, query)).length]));
     const tabs = Object.entries(TABS).map(([k, lbl]) => {
       const b = el("button", (tab === k ? "on " : "") + (k === "mention" ? "mention " : "") + (EXTRA.includes(k) ? "x" : ""), lbl);
       b.append(el("b", null, counts[k]));
@@ -1233,7 +1088,7 @@
       return b;
     }));
     $more.hidden = !moreOpen;
-    const shown = rows.filter((r) => filters[tab](r) && named(r));
+    const shown = rows.filter((r) => filters[tab](r) && named(r, query));
     $rows.replaceChildren(...shown.map(rowOf));
     const stop = $rows.querySelector("li.sel") || $rows.querySelector("li.cur") || $rows.firstElementChild;
     if (stop) stop.querySelector(".name").tabIndex = 0;
@@ -1311,9 +1166,8 @@
   };
   // A chat's whole screen state goes; its draft, quotes and open editors wait in `drafts`.
   const reset = () => {
-    records.clear(); pending.clear(); live = []; liveEdits = []; older = newer = false; unseen = 0;
-    source = "archive"; target = restore = null; aroundAt = ""; loaded = false; followFailed = false;
-    stick = true; filled = ""; unfolded.clear(); typing.clear(); renderTyping();
+    resetNav("switch");
+    typing.clear(); renderTyping();
     $msgs.replaceChildren(); $note.hidden = false; $note.className = ""; $note.textContent = "loading…";
     closeHits(); $find.value = "";
     $teams.disabled = true; $members.textContent = "";
@@ -1327,7 +1181,7 @@
     if (push) history.pushState(null, "", chatPath(id) + location.search);
     thread = id;
     reset();
-    dismissed = -1; closePop(); hideView();
+    complete.reset(); hideView();
     unstash();
     $reply.disabled = readOnly || sending.has(thread);
     const row = rows.find((r) => r.id === id);
@@ -1431,31 +1285,34 @@
       reveal = id !== thread;
       switchTo(id, false);
     });
-    setInterval(renderRows, 30000);  // keep the relative times honest
+    setInterval(renderRows, CLOCK_TICK_MS);
   };
 
+  // After a drop, or frames the server dropped (`gap`): the reader scrolled up gets the page around
+  // their message back, else the latest page, which holds whatever landed meanwhile.
+  const resync = () => {
+    const back = hist.loaded && !hist.stick ? anchor() : null, at = back && byId(back.id).dataset.at;
+    resetNav("open", back);  // a jump asked before is superseded
+    if (at && hist.source === "archive") { hist.aroundAt = at; requestHistory("around", at); } else requestHistory();
+  };
   const connect = () => {
-    ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws?chat");
+    ws = new WebSocket(wsUrl("/ws?chat"));
     ws.onopen = () => {
-      retry = 1000; $status.title = "live"; $status.classList.remove("off");
-      pending.clear();
+      $status.title = "live"; $status.classList.remove("off");
       send({ follow: thread });
       if (split) send({ board: true });
-      // After a drop: the reader scrolled up gets the page around their message back, else the latest
-      // page, which holds whatever landed meanwhile.
-      const back = loaded && !stick ? anchor() : null, at = back && byId(back.id).dataset.at;
-      restore = back; target = null; aroundAt = "";  // a jump asked on the dead socket is lost with it
-      if (at && source === "archive") { aroundAt = at; requestHistory("around", at); } else requestHistory();
+      resync();
     };
     ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
       if (m.rows) { onBoard(m); return; }
       // Relayed frames name their chat: those of a chat left since (split) are dropped.
       if ("thread" in m && m.thread !== thread) return;
-      if ("follow" in m) onFollow(m);
+      if ("gap" in m) { if (m.gap === thread) resync(); }  // no `thread` key: a gap of a chat left is ignored here
+      else if ("follow" in m) onFollow(m);
       else if ("history" in m) onHistory(m);
       else if ("search" in m) onSearch(m);
-      else if ("complete" in m) answered(m);
+      else if ("complete" in m) complete.answered(m);
       else if ("preview" in m) onPreview(m);
       // Acks name the thread; a relayed `edit` frame carries a record.
       else if (typeof m.edit === "string" || "react" in m || "delete" in m) onAction(m);
@@ -1478,11 +1335,11 @@
         delete box.dataset.saving;
         box.nextElementSibling.textContent = "connection lost: check the message before saving again";
       }
-      setTimeout(connect, retry); retry = Math.min(retry * 2, 30000);
+      setTimeout(connect, retry.next());
     };
   };
   // ⚙: the settings this page reads, on the widget's keys: a tab opened in another browser through
-  // --browser has a storage of its own, set here. A URL parameter would outrank the stored choice: it goes.
+  // --browser has a storage of its own, set here. A choice drops its URL parameter: the URL outranks storage.
   const $cog = document.getElementById("cog"), $gear = document.getElementById("gear");
   let cogOpen = false;
   const here = () => location.pathname + (q.size ? "?" + q : "");

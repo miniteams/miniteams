@@ -11,7 +11,16 @@ from typing import Any
 
 import pytest
 
-from miniteams.render import card_from_message, card_html, cards_html, markdown_html, media_url, sanitize
+from miniteams.render import (
+    _HTML_MAX,
+    _MD_MAX,
+    card_from_message,
+    card_html,
+    card_markdown_html,
+    cards_html,
+    media_url,
+    sanitize,
+)
 
 T = "19:aaaa@thread.v2"
 ME = "8:orgid:00000000-0000-0000-0000-00000000000a"
@@ -83,6 +92,44 @@ def test_th_br_hr_and_plain_blockquote() -> None:
 def test_dropped_content_and_unknown_tags(raw: str, out: str) -> None:
     """011-AC6: script/style/iframe vanish with their content; other tags lose the tag only."""
     assert sanitize(raw, T) == out
+
+
+def test_self_closing_script_hides_what_follows_like_a_browser() -> None:
+    """011-AC6: `<script/>` skips CDATA mode in the parser, so tags reach the hidden-depth guards."""
+    assert sanitize("<script/><b>x</b></script>y", T) == "y"
+    assert sanitize("<b><script/></b>x</script>y</b>", T) == "<b>y</b>"
+    assert sanitize("<style/><img src='https://x/i.png'>", T) == ""
+
+
+def test_self_closing_non_void_tag_renders_empty() -> None:
+    """A browser would ignore the `/` and wrap the rest; closing at once keeps the output balanced."""
+    assert sanitize("<b/>x", T) == "<b></b>x"
+    assert sanitize("<p/>x</p>y", T) == "<p></p>xy"
+
+
+def _best_s(fn: Any) -> float:
+    gc.disable()  # a collection inside the window would blur a bound meant for the parser
+    try:
+        best = float("inf")
+        for _ in range(3):
+            start = time.perf_counter()
+            fn()
+            best = min(best, time.perf_counter() - start)
+        return best
+    finally:
+        gc.enable()
+
+
+@pytest.mark.parametrize("unit", ["<b></i>", "<span></i>", "<b><a href='x'></u>"])
+def test_unmatched_end_tags_stay_linear(unit: str) -> None:
+    """CWE-407: each stray end tag used to rescan the whole open stack."""
+    assert _best_s(lambda: sanitize(unit * (280_000 // len(unit)), T)) < 0.5
+    small = _best_s(lambda: sanitize(unit * (25_000 // len(unit)), T))
+    assert _best_s(lambda: sanitize(unit * (100_000 // len(unit)), T)) / small < 8
+
+
+def test_input_is_capped() -> None:
+    assert sanitize("x" * _HTML_MAX + "<b>y</b>", T) == "x" * _HTML_MAX
 
 
 @pytest.mark.parametrize(
@@ -180,6 +227,16 @@ def test_custom_emoji_points_at_the_archived_file(media: Path) -> None:
     )
     # Not archived: the page cannot fetch it, so its name stands in.
     assert sanitize(tag, T, None) == ":party:"
+    # Not archived yet but a known custom emoji (L7): the emoji cache serves it.
+    assert sanitize(tag, T, None, custom=frozenset({OBJ})) == (
+        f'<img src="/emoji/{OBJ}" class="emoji" alt=":party:">'
+    )
+    assert sanitize(tag, T, None, custom=frozenset({"other"})) == ":party:"
+    # The archived file still wins, and a plain image is never routed to /emoji.
+    assert sanitize(tag, T, media, custom=frozenset({OBJ})).startswith('<img src="/media/')
+    assert "/emoji/" not in sanitize(
+        f'<img src="{SRC.replace(OBJ, "x1")}">', T, None, custom=frozenset({"x1"})
+    )
 
 
 def test_mentions_become_mention_spans() -> None:
@@ -373,20 +430,21 @@ def _assert_inert(out: str) -> None:
 )
 def test_markdown_subset(text: str, out: str) -> None:
     """011-AC24: the card markdown subset, every text escaped."""
-    assert markdown_html(text) == out
+    assert card_markdown_html(text) == out
 
 
-def test_markdown_is_bounded_on_hostile_text() -> None:
-    """011-AC24: unclosed markers and huge input stay linear and capped."""
-    gc.disable()  # a collection inside the window would blur a bound meant for the regex
-    try:
-        for bomb in ("**" * 50_000, "[" * 50_000, "_a" * 50_000, "[a](" + "h" * 50_000, "[a](" * 5_000):
-            start = time.perf_counter()
-            assert len(markdown_html(bomb)) <= 10_000 * 6
-            # ~0.3 ms when linear; the old unbounded-label pattern took ~30 ms here.
-            assert time.perf_counter() - start < 0.025, bomb[:8]
-    finally:
-        gc.enable()
+@pytest.mark.parametrize("unit", ["**", "[", "_a", "[a](", "h"])
+def test_markdown_is_bounded_on_hostile_text(unit: str) -> None:
+    """011-AC24: unclosed markers stay linear (4× the input, not ~16× the time) and huge input is capped."""
+    head = "[a](" if unit == "h" else ""  # one unclosed link whose url never ends
+
+    def bomb(size: int) -> str:
+        return head + unit * (size // len(unit))
+
+    assert len(card_markdown_html(bomb(50_000))) <= _MD_MAX * 6
+    small = _best_s(lambda: card_markdown_html(bomb(_MD_MAX // 4)))
+    # The floor keeps a sub-50 µs run from turning timer noise into a ratio.
+    assert _best_s(lambda: card_markdown_html(bomb(_MD_MAX))) / max(small, 50e-6) < 8
 
 
 def test_text_block_weight_size_subtle() -> None:
@@ -778,7 +836,7 @@ def test_spent_budget_leaves_no_empty_blocks_and_keeps_the_fallback() -> None:
 def test_link_label_with_a_bracket_pair_and_toggle_actions() -> None:
     """011-AC24: a label such as "[repo [!12]](url)" is still a link, as GitLab cards write it; a
     ToggleVisibility action has no place on a read-only card."""
-    html = markdown_html(
+    html = card_markdown_html(
         "[repo [!12]](https://x.org/mr/12) and [[a]](https://x.org/a) [[[b]]](https://x.org/b)"
     )
     assert '<a href="https://x.org/mr/12" rel="noopener" target="_blank">repo [!12]</a>' in html

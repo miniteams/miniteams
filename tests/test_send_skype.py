@@ -299,3 +299,12 @@ def test_exchange_skype_token_keeps_an_explicit_csa(monkeypatch) -> None:
     )
     skype.exchange_skype_token(pinned, "aad")
     assert pinned.csa_url == "https://pinned.example/api/csa/x"
+
+
+def test_too_long_caps_the_posted_html_bytes() -> None:
+    """M10: the cap is on the HTML Teams receives: escaping and multi-byte characters count."""
+    cap = send.MAX_HTML_BYTES
+    assert not send.too_long("x" * cap) and send.too_long("x" * (cap + 1))
+    assert send.too_long("<" * (cap // 4 + 1))  # &lt; is four bytes
+    assert not send.too_long("<b>" * (cap // 3), is_html=True)
+    assert send.too_long("é" * (cap // 2 + 1))

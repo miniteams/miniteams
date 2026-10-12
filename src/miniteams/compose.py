@@ -1,6 +1,6 @@
 """Composer text → Teams message HTML: a markdown subset, `:shortcode:` emojis, `@Name` mentions.
 
-Pure, stdlib only (spec 012). No backtracking regex: closers are found with `str.find`.
+Pure (spec 012). No backtracking regex: closers are found with `str.find`.
 """
 
 import html
@@ -9,11 +9,13 @@ import re
 from collections.abc import Callable
 from typing import Any
 
+from .config import Settings
 from .emoji_table import SHORTCODES
+from .messages import snippet
 
-MAX_TEXT = 28 * 1024  # Teams refuses messages past 28 KB anyway
-# Tenant region host, as on every CustomEmoji in the archive; other regions pass `asyncgw_host`.
-ASYNCGW_HOST = "fr-prod.asyncgw.teams.microsoft.com"
+MAX_TEXT = 28 * 1024  # composer characters; send.too_long caps the posted HTML bytes
+_ASYNCGW_HOST: str = Settings.model_fields["asyncgw_host"].default
+EMOJI_NAME_RE = re.compile(r"[A-Za-z0-9_+-]{1,64}")  # what `:name:` expands
 
 _MENTION = "http://schema.skype.com/Mention"
 _CUSTOM_EMOJI = "http://schema.skype.com/CustomEmoji"
@@ -22,7 +24,8 @@ _RUN_RE = re.compile(r"\*+|_+|~+")
 _URL_RE = re.compile(r"https?://[^\s<>\"'`]+")
 _ORDERED_RE = re.compile(r"\d{1,9}\. ")
 # The trailing `:` is a lookahead so an unknown name gives it back: `10:30:fire:` still finds `:fire:`.
-_EMOJI = r":(?P<emoji>[A-Za-z0-9_+-]{1,64})(?=:)"
+_EMOJI = rf":(?P<emoji>{EMOJI_NAME_RE.pattern})(?=:)"
+_PREVIEW_LEN = 100  # characters of the quoted message a Reply block carries
 _SPANS = (("**", "b"), ("~~", "s"), ("*", "i"), ("_", "i"))
 MAX_MENTIONS = 50
 MAX_NAME = 200
@@ -89,6 +92,9 @@ def _inline(line: str, on_text: OnText) -> str:
         else:
             for marker, tag in _SPANS:
                 if line.startswith(marker, i) and (end := closer(i, marker)) >= 0:
+                    # Flushed before the span's content: mentions are numbered and paired in text order.
+                    out.append(on_text(line[flushed:i]))
+                    flushed = i
                     inner = _inline(line[i + len(marker) : end], on_text)
                     hit = f"<{tag}>{inner}</{tag}>", end + len(marker)
                     break
@@ -152,23 +158,19 @@ def _render(text: str, full: bool, on_text: OnText) -> str:
     return "<br>".join(_inline(line, on_text) for line in text.split("\n"))
 
 
-def markdown_html(text: str, full: bool) -> str:
-    """Markdown subset → Teams HTML; with no markup it equals `send.message_html(text, False)`."""
-    return _render(text, full, html.escape)
-
-
 def compose_html(
     text: str,
     mentions: list[dict[str, Any]],
     emojis: dict[str, str],
     *,
     full: bool = False,
-    asyncgw_host: str = ASYNCGW_HOST,
+    asyncgw_host: str = _ASYNCGW_HOST,
 ) -> tuple[str, dict[str, Any] | None]:
     """Composer text → (content HTML, message `properties` or None).
 
     `mentions`: picked `{name, mri, label?, everyone?}`, `name` as typed and `label` as shown (default
-    `name`); `emojis`: custom name → AMS object id. `@Name` matches when `@` starts a word and
+    `name`), in the order picked: the n-th `@Name` goes to the n-th pick of that name, any further one
+    to its last; `emojis`: custom name → AMS object id. `@Name` matches when `@` starts a word and
     the name is followed by the end or a non-word character; names are tried longest first,
     case-sensitive, so `@Ann Lee` wins over `@Ann`. Code, link labels and URLs are never expanded.
 
@@ -177,12 +179,13 @@ def compose_html(
     """
     if len(mentions) > MAX_MENTIONS:
         raise ValueError(f"too many mentions ({len(mentions)} > {MAX_MENTIONS})")
-    by_name: dict[str, dict[str, Any]] = {}
+    by_name: dict[str, list[dict[str, Any]]] = {}
     for mention in mentions:
         if name := str(mention.get("name") or ""):
             if max(len(name), len(str(mention.get("label") or ""))) > MAX_NAME:
                 raise ValueError(f"mention name too long (> {MAX_NAME} characters)")
-            by_name.setdefault(name, mention)
+            by_name.setdefault(name, []).append(mention)
+    seen: dict[str, int] = {}  # name → occurrences so far
     alternatives = "|".join(re.escape(n) for n in sorted(by_name, key=len, reverse=True))
     mention_re = rf"(?<!\w)@(?P<name>{alternatives})(?!\w)|" if alternatives else ""
     # Bare URLs go first so Teams still links them whole: no emoji or mention inside a URL.
@@ -193,7 +196,9 @@ def compose_html(
         if m.group("url") is not None:
             return html.escape(m.group())
         if (name := m.group("name") if alternatives else None) is not None:
-            picked = by_name[name]
+            picks = by_name[name]
+            picked = picks[min(seen.get(name, 0), len(picks) - 1)]
+            seen[name] = seen.get(name, 0) + 1
             everyone = bool(picked.get("everyone"))
             label = "Everyone" if everyone else str(picked.get("label") or name)
             entries.append(
@@ -236,3 +241,18 @@ def compose_html(
 
     content = _render(text, full, on_text)
     return content, ({"mentions": json.dumps(entries, ensure_ascii=False)} if entries else None)
+
+
+def reply_quote(message: dict[str, Any], name: str) -> str:
+    """Teams' Reply block quoting `message`, in the shape the archive holds (spec 011)."""
+    msg_id = html.escape(str(message.get("id") or ""))
+    mri = html.escape(str(message.get("from") or "").rsplit("/", 1)[-1])
+    props = message.get("properties")
+    msgtype, content = str(message.get("messagetype") or ""), str(message.get("content") or "")
+    preview = snippet(msgtype, content, props if isinstance(props, dict) else None)[:_PREVIEW_LEN]
+    return (
+        f'<blockquote itemscope itemtype="http://schema.skype.com/Reply" itemid="{msg_id}">'
+        f'<strong itemprop="mri" itemid="{mri}">{html.escape(name)}</strong>'
+        f'<span itemprop="time" itemid="{msg_id}"></span>'
+        f'<p itemprop="preview">{html.escape(preview)}</p></blockquote>'
+    )

@@ -17,19 +17,16 @@ from typing import Any
 import structlog
 
 from ._io import emit, force_blocking_stdout
-from .auth import AuthExpired, token_source
+from .auth import AuthExpired, self_mri, token_source
 from .config import Settings
 from .directory import Directory
 from .dump import iter_history_pages
-from .messages import thread_of
+from .messages import SNIPPET_LEN, TEXT_TYPES, is_me, plain_text, thread_of
 from .skype import exchange_skype_token
 from .stream import run_forever
-from .web import _is_me, self_mri
-from .web import _plain as plain_text
 
 log = structlog.get_logger()
 
-_TEXT_MAX = 1000
 _RATE_MAX = 10  # matches per minute before the rest is held back (Monitor cuts a noisy source)
 _RATE_WINDOW = 60.0
 _SEEN_MAX = 10_000  # message ids already printed, so a live repeat of a caught-up one stays silent
@@ -37,7 +34,6 @@ _SENT_FILE = "mcp-sent.json"  # client ids the MCP server sent; see `note_sent`
 _SENT_MAX = 1000
 _PAGE_SIZE = 100
 _CATCHUP_PAGES = 50  # history pages a catch-up walks when `--after` is not found
-_MESSAGE_TYPES = ("RichText/Html", "Text")  # what a person writes; calls, typing, roster: not news
 
 
 @dataclass(frozen=True)
@@ -72,7 +68,7 @@ def _newer(message_id: str, after: str) -> bool:
 
 
 def _wanted_sender(watch: Watch, mri: str, me: str) -> bool:
-    mine = _is_me(mri, me)
+    mine = is_me(mri, me)
     return watch.sender == "anyone" or (watch.sender == "me") == mine
 
 
@@ -90,7 +86,7 @@ def match(
     if watch.after and not _newer(message_id, watch.after):
         return None
     if watch.event == "message":
-        if kind != "NewMessage" or str(resource.get("messagetype") or "") not in _MESSAGE_TYPES:
+        if kind != "NewMessage" or str(resource.get("messagetype") or "") not in TEXT_TYPES:
             return None  # edits and deletes are MessageUpdate; typing and calls are not messages
         if str(resource.get("clientmessageid") or "") in sent_ids:
             return None  # what the MCP server sent must not wake its own agent
@@ -167,7 +163,7 @@ class Watcher:
             "sender": sender,
             "message_id": str(resource.get("id") or ""),
             "time": str(resource.get("composetime") or resource.get("originalarrivaltime") or ""),
-            "text": plain_text(str(resource.get("content") or ""))[:_TEXT_MAX],
+            "text": plain_text(str(resource.get("content") or ""))[:SNIPPET_LEN],
             "reaction": hit["reaction"],
             "note": self.watch.note,
         }

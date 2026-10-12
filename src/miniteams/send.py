@@ -27,6 +27,8 @@ log = structlog.get_logger()
 # Kept open: a fresh TLS handshake per send doubles its latency. httpx clients are thread-safe.
 _CLIENT = httpx.Client(timeout=30.0)
 
+MAX_HTML_BYTES = 28 * 1024  # Teams' per-message limit, on the posted HTML
+
 # "Notes to self" — the write-safe default target.
 NOTES_THREAD = "48:notes"
 
@@ -45,6 +47,11 @@ def parse_message_link(value: str) -> tuple[str, str] | None:
 def message_html(text: str, is_html: bool) -> str:
     # messagetype is RichText/Html; plain text is escaped (newlines → <br>), --html sent verbatim.
     return text if is_html else html.escape(text).replace("\n", "<br>")
+
+
+def too_long(text: str, *, is_html: bool = False) -> bool:
+    """Over Teams' limit once posted: the cap is on the HTML bytes, so escaping counts."""
+    return len(message_html(text, is_html).encode()) > MAX_HTML_BYTES
 
 
 def _headers(skype_token: str, settings: Settings) -> dict[str, str]:

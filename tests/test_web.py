@@ -9,10 +9,14 @@ from typing import Any
 import httpx
 import pytest
 import websockets
+from conftest import board_socket, cookie_header, wait
+from test_web_chat import _send
 
+from miniteams import chat_verbs as CV
 from miniteams import web as W
 from miniteams.config import Settings
 from miniteams.directory import Directory
+from miniteams.messages import SNIPPET_LEN
 
 
 @pytest.fixture
@@ -84,10 +88,10 @@ def test_snippet_keeps_a_forwarded_body() -> None:
 
 def test_snippet_truncates_with_ellipsis() -> None:
     assert W.snippet("Text", "y" * 900) == "y" * 900  # a long message reaches the tooltip whole
-    out = W.snippet("Text", "x" * (W._SNIPPET_LEN * 2))
-    assert len(out) == W._SNIPPET_LEN
+    out = W.snippet("Text", "x" * (SNIPPET_LEN * 2))
+    assert len(out) == SNIPPET_LEN
     assert out.endswith("…")
-    assert W.snippet("Text", "x" * W._SNIPPET_LEN) == "x" * W._SNIPPET_LEN  # boundary: untouched
+    assert W.snippet("Text", "x" * SNIPPET_LEN) == "x" * SNIPPET_LEN  # boundary: untouched
 
 
 def test_snippet_html_with_only_media_gets_a_marker() -> None:
@@ -362,7 +366,7 @@ async def test_open_row_launches_opener_or_browser_without_marking_seen(
     assert await board.open_row("t") is True
     assert launched == [("xdg-open", W.deep_link("t", "42", "msteams"))]
     assert rows["t"]["seen_at"] is None  # opening is not reading
-    assert await board.open_row("t", web=True) is True
+    assert await board.open_row("t", "web") is True
     assert launched[-1] == ("firefox", W.deep_link("t", "42", "https"))
     assert await board.open_row("nope") is False and len(launched) == 2
     assert json.loads(board.payload())["opener"] is True and json.loads(board.payload())["browser"] is True
@@ -370,7 +374,7 @@ async def test_open_row_launches_opener_or_browser_without_marking_seen(
     # No opener configured: the verb is a no-op and the page is told to follow its own link.
     plain = W.Board(dict(rows), opener=None)
     assert await plain.open_row("t") is False and json.loads(plain.payload())["opener"] is False
-    assert await plain.open_row("t", web=True) is False and json.loads(plain.payload())["browser"] is False
+    assert await plain.open_row("t", "web") is False and json.loads(plain.payload())["browser"] is False
 
 
 async def test_open_row_survives_missing_opener_binary(settings: Settings) -> None:
@@ -444,7 +448,7 @@ async def test_serve_page_and_initial_rows(settings: Settings) -> None:
     port = _free_port()
     task = asyncio.create_task(W.serve_board(board, settings, f"127.0.0.1:{port}"))
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(headers=cookie_header(W.load_secret(settings))) as client:
             for _ in range(50):  # server task needs a few loop turns to bind
                 await asyncio.sleep(0.02)
                 try:
@@ -460,8 +464,7 @@ async def test_serve_page_and_initial_rows(settings: Settings) -> None:
             assert view.status_code == 200 and "<title>miniteams</title>" in view.text
             assert (await client.get(f"http://127.0.0.1:{port}/nope")).status_code == 404
             assert (await client.get(f"http://127.0.0.1:{port}/nope?theme=dark")).status_code == 404
-        own = f"http://127.0.0.1:{port}"  # what the served page sends; the server accepts only this
-        async with websockets.connect(f"ws://127.0.0.1:{port}/ws", origin=own) as ws:
+        async with board_socket(f"127.0.0.1:{port}", board.secret) as ws:
             first = json.loads(await ws.recv())
             assert first["rows"][0]["id"] == "t"
             assert len(board.clients) == 1
@@ -472,9 +475,12 @@ async def test_serve_page_and_initial_rows(settings: Settings) -> None:
         assert board.clients == set()
         # Another site's page — or no page at all — must not read the list (cross-site websocket
         # hijacking). Both shapes: foreign Origin and missing Origin.
+        cookie = cookie_header(board.secret)  # the cookie right: only the Origin is wrong
         for origin in ("http://evil.example", None):
             with pytest.raises(websockets.InvalidStatus) as exc:
-                await websockets.connect(f"ws://127.0.0.1:{port}/ws", origin=origin)
+                await websockets.connect(
+                    f"ws://127.0.0.1:{port}/ws", origin=origin, additional_headers=cookie
+                )
             assert exc.value.response.status_code == 403
     finally:
         task.cancel()
@@ -483,21 +489,25 @@ async def test_serve_page_and_initial_rows(settings: Settings) -> None:
 
 
 async def test_serve_redraws_when_persisted_port_is_taken(settings: Settings, monkeypatch) -> None:
+    """L3: only the port is redrawn: the cookie is scoped to the host, a new one would sign pages out."""
+    host = "127.0.0.33"
     taken = socket.socket()
-    taken.bind(("127.0.0.1", 0))
+    taken.bind((host, 0))
     taken.listen()
     busy = int(taken.getsockname()[1])
-    W.save_bind(settings, "127.0.0.1", busy)
-    free = _free_port()
-    monkeypatch.setattr(W, "_draw_bind", lambda: ("127.0.0.1", free))
-    task = asyncio.create_task(W.serve_board(W.Board({}), settings, None))
+    W.save_bind(settings, host, busy)
+    with socket.socket() as probe:
+        probe.bind((host, 0))
+        free = int(probe.getsockname()[1])
+    monkeypatch.setattr(W, "_draw_port", lambda: free)
+    monkeypatch.setattr(W, "_draw_bind", lambda: pytest.fail("the host was redrawn"))
+    board = W.Board({})
+    task = asyncio.create_task(W.serve_board(board, settings, None))
     try:
-        await asyncio.sleep(0.2)
-        assert json.loads((settings.config_dir / "web.json").read_text()) == {
-            "host": "127.0.0.1",
-            "port": free,
-        }
-        async with websockets.connect(f"ws://127.0.0.1:{free}/ws", origin=f"http://127.0.0.1:{free}") as ws:
+        await wait(lambda: board.launch_url != "", "bound")
+        assert json.loads((settings.config_dir / "web.json").read_text()) == {"host": host, "port": free}
+        assert board.base_url == f"http://{host}:{free}"
+        async with board_socket(f"{host}:{free}", board.secret) as ws:
             assert json.loads(await ws.recv())["rows"] == []
     finally:
         taken.close()
@@ -803,7 +813,7 @@ async def test_seen_verb_over_websocket(settings: Settings) -> None:
     task = asyncio.create_task(W.serve_board(board, settings, f"127.0.0.1:{port}"))
     try:
         await asyncio.sleep(0.2)
-        async with websockets.connect(f"ws://127.0.0.1:{port}/ws", origin=f"http://127.0.0.1:{port}") as ws:
+        async with board_socket(f"127.0.0.1:{port}", board.secret) as ws:
             await ws.recv()
             await ws.send("not json")  # ignored, socket stays up
             await ws.send(json.dumps({"seen": 42}))  # wrong shape, ignored
@@ -903,18 +913,6 @@ def test_ms_and_read_at_parse_teams_shapes() -> None:
     assert W._ms(None) == 0 and W._ms("") == 0 and W._ms("garbage") == 0
     assert W.read_at_ms({"consumptionhorizon": "1789308085736;1789370244184;175117"}) == 1789370244184
     assert W.read_at_ms({"consumptionhorizon": "1789308085736"}) == 0 and W.read_at_ms(None) == 0
-
-
-def test_self_mri_from_access_token() -> None:
-    import base64
-
-    def jwt(claims: dict[str, Any]) -> str:
-        body = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
-        return f"eyJhbGciOiJub25lIn0.{body}.sig"
-
-    assert W.self_mri(jwt({"oid": "abc-123", "upn": "x"})) == "8:orgid:abc-123"
-    assert W.self_mri(jwt({"upn": "x"})) == ""
-    assert W.self_mri("not.a-jwt") == "" and W.self_mri("") == ""
 
 
 async def test_live_mention_sets_row_and_everyone_is_outranked(mboard: W.Board) -> None:
@@ -1030,7 +1028,9 @@ async def test_edit_of_an_older_read_message_adds_a_mention(mboard: W.Board) -> 
     assert row["mention"] is None
 
 
-async def test_deleting_the_mentioning_message_clears_it(mboard: W.Board) -> None:
+@pytest.mark.parametrize("deleted", [{"deletetime": "1"}, {"hardDeleteTime": "1"}])
+async def test_deleting_the_mentioning_message_clears_it(mboard: W.Board, deleted: dict[str, str]) -> None:
+    """M9: a soft or a hard delete, as messages.is_deleted reads them."""
     t = "19:a@thread.v2"
     await mboard.on_event(
         _msg(
@@ -1049,7 +1049,7 @@ async def test_deleting_the_mentioning_message_clears_it(mboard: W.Board) -> Non
             id="1789473600000",
             messagetype="Text",
             content="",
-            properties={"deletetime": "1"},
+            properties=deleted,
         )
     )
     assert mboard.rows[t]["mention"] is None and mboard.rows[t]["text"] == "🗑 deleted"
@@ -1465,20 +1465,20 @@ async def test_send_verb_posts_as_me_and_reports_failures(board: W.Board, monkey
             raise failure.pop()
         return {"status": 201}
 
-    monkeypatch.setattr(W, "send_message", fake_send)
-    board.me_name = "Me"
+    monkeypatch.setattr(CV, "send_message", fake_send)
+    board.chat.me_name = "Me"
     before = json.dumps(board.rows, sort_keys=True)
-    assert await board.send("19:a@thread.v2", "ok\nje regarde") is None
+    assert await _send(board, "19:a@thread.v2", "ok\nje regarde") is None
     assert calls == [("19:a@thread.v2", "ok\nje regarde", "Me")]
     assert json.dumps(board.rows, sort_keys=True) == before  # the Trouter echo updates the row
 
     request = httpx.Request("POST", "https://x")
     failure.append(httpx.HTTPStatusError("403", request=request, response=httpx.Response(403)))
-    assert await board.send("19:a@thread.v2", "x") == "Teams answered 403"
+    assert await _send(board, "19:a@thread.v2", "x") == "Teams answered 403"
     failure.append(httpx.ConnectError("boom", request=request))
-    assert await board.send("19:a@thread.v2", "x") == "network error"
+    assert await _send(board, "19:a@thread.v2", "x") == "network error"
     failure.append(RuntimeError("send rejected: Forbidden: nope"))
-    assert await board.send("19:a@thread.v2", "x") == "send rejected: Forbidden: nope"
+    assert await _send(board, "19:a@thread.v2", "x") == "send rejected: Forbidden: nope"
     assert len(calls) == 4
 
 
@@ -1498,36 +1498,35 @@ async def test_send_verb_posts_as_me_and_reports_failures(board: W.Board, monkey
 async def test_send_verb_refuses_without_calling_teams(
     board: W.Board, monkeypatch, thread: str, text: Any, reason: str
 ) -> None:
-    monkeypatch.setattr(W, "send_message", lambda *a: pytest.fail("no API call expected"))
-    assert await board.send(thread, text) == reason
+    monkeypatch.setattr(CV, "send_message", lambda *a: pytest.fail("no API call expected"))
+    assert await _send(board, thread, text) == reason
 
 
 async def test_send_verb_at_the_size_limit_goes_through(board: W.Board, monkeypatch) -> None:
-    monkeypatch.setattr(W, "send_message", lambda *a: {"status": 201})
-    assert await board.send("19:a@thread.v2", "x" * (28 * 1024)) is None
+    monkeypatch.setattr(CV, "send_message", lambda *a: {"status": 201})
+    assert await _send(board, "19:a@thread.v2", "x" * (28 * 1024)) is None
 
 
 async def test_send_verb_without_directory_is_refused() -> None:
     board = W.Board({"t": {"id": "t", "last_activity": "2026-09-15T10:00:00Z", "seen_at": None}})
-    assert await board.send("t", "hi") == "not connected"
+    assert await _send(board, "t", "hi") == "not connected"
 
 
 async def test_send_ack_goes_to_the_sender_only(
     settings: Settings, quiet_directory: Directory, monkeypatch
 ) -> None:
-    monkeypatch.setattr(W, "send_message", lambda *a: {"status": 201})
+    monkeypatch.setattr(CV, "send_message", lambda *a: {"status": 201})
     board = W.Board(
         {"t": {"id": "t", "last_activity": "2026-09-15T10:00:00Z", "label": "L", "seen_at": None}},
         quiet_directory,
     )
     port = _free_port()
-    own = f"http://127.0.0.1:{port}"
     task = asyncio.create_task(W.serve_board(board, settings, f"127.0.0.1:{port}"))
     try:
         await asyncio.sleep(0.2)
         async with (
-            websockets.connect(f"ws://127.0.0.1:{port}/ws", origin=own) as sender,
-            websockets.connect(f"ws://127.0.0.1:{port}/ws", origin=own) as other,
+            board_socket(f"127.0.0.1:{port}", board.secret) as sender,
+            board_socket(f"127.0.0.1:{port}", board.secret) as other,
         ):
             await sender.recv()
             await other.recv()
@@ -1553,7 +1552,7 @@ async def test_slow_send_does_not_hold_the_page_other_verbs(
         time.sleep(1.0)
         return {"status": 201}
 
-    monkeypatch.setattr(W, "send_message", slow_send)
+    monkeypatch.setattr(CV, "send_message", slow_send)
     board = W.Board(
         {"t": {"id": "t", "last_activity": "2026-09-15T10:00:00Z", "label": "L", "seen_at": None}},
         quiet_directory,
@@ -1562,7 +1561,7 @@ async def test_slow_send_does_not_hold_the_page_other_verbs(
     task = asyncio.create_task(W.serve_board(board, settings, f"127.0.0.1:{port}"))
     try:
         await asyncio.sleep(0.2)
-        async with websockets.connect(f"ws://127.0.0.1:{port}/ws", origin=f"http://127.0.0.1:{port}") as ws:
+        async with board_socket(f"127.0.0.1:{port}", board.secret) as ws:
             await ws.recv()
             await ws.send(json.dumps({"send": "t", "text": "hi"}))
             await ws.send(json.dumps({"seen": "t"}))

@@ -4,28 +4,34 @@ current row, empty states, contrast. A fake chat socket serves synthetic rows; n
 Run: `uv run --with playwright pytest tests/test_browser_split_ux.py`.
 """
 
-import json
 import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from importlib.resources import files
 from typing import Any
 from urllib.parse import quote
 
+import browser_helpers
 import pytest
-import test_browser
-from test_browser import Page, Pages, Route  # its import skips without playwright
-from test_browser_chat_compose import _until, _wait
+from browser_helpers import (
+    CONTRAST,
+    ORIGIN,
+    Page,
+    Pages,
+    open_fake,
+    past,
+    row,
+    until,
+    wait,
+)  # skips without playwright
 
 from miniteams import web as W
 
 pytestmark = pytest.mark.browser
-pages = test_browser.pages
+pages = browser_helpers.pages
 
-ORIGIN = "http://127.0.0.1:9"  # never dialled: every request on it is answered by a route
 # A module global read by `_open`: a mutation run swaps it for an altered copy.
-PAGE = files("miniteams").joinpath("chat.html").read_text(encoding="utf-8")
+PAGE = W._page("chat.html")  # as served: ui.css and ui.js inlined
 _NOW = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
 
 
@@ -36,19 +42,7 @@ def _id(i: int) -> str:
 def _row(i: int, **over: Any) -> dict[str, Any]:
     """Row `i` of the board, newest first: index order is list order."""
     at = (_NOW - timedelta(minutes=i)).isoformat().replace("+00:00", "Z")
-    return {
-        "id": _id(i),
-        "label": f"Fictional chat {i:03d}",
-        "last_activity": at,
-        "unread": False,
-        "mention": None,
-        "sender": "Ann Lee",
-        "text": f"snippet {i}",
-        "seen_at": None,
-        "muted": False,
-        "typing": [],
-        **over,
-    }
+    return row(_id(i), f"Fictional chat {i:03d}", at, text=f"snippet {i}", **over)
 
 
 def _board(n: int) -> list[dict[str, Any]]:
@@ -65,30 +59,22 @@ def _counts(rows: list[dict[str, Any]]) -> dict[str, int]:
 
 
 @dataclass
-class Fake:
+class Fake(browser_helpers.Fake):
     """The server side of the chat socket: follow, history and the board's rows."""
 
-    rows: list[dict[str, Any]]
-    verbs: list[dict[str, Any]] = field(default_factory=list)
-    ws: Any = None
-
-    def attach(self, ws: Any) -> None:
-        self.ws = ws
-        ws.on_message(self._on_message)
+    rows: list[dict[str, Any]] = field(default_factory=list)
 
     def broadcast(self) -> None:
-        self.ws.send(json.dumps({"rows": self.rows, "browser": False, "me": "Me"}))
+        self.send({"rows": self.rows, "browser": False, "me": "Me"})
 
-    def _on_message(self, raw: str | bytes) -> None:
-        msg = json.loads(raw)
-        self.verbs.append(msg)
+    def on_verb(self, msg: dict[str, Any]) -> None:
         if "follow" in msg:
             label = next((r["label"] for r in self.rows if r["id"] == msg["follow"]), "?") + " · 3p"
-            self.ws.send(json.dumps({"follow": msg["follow"], "label": label, "page": "1", "opener": False}))
+            self.send({"follow": msg["follow"], "label": label, "page": "1", "opener": False})
         elif "history" in msg:
             hello = {"id": "1", "at": "2026-10-09T10:00:00.000Z", "from": "8:orgid:ann", "name": "Ann Lee"}
             messages = [{**hello, "me": False, "type": "text", "html": "<p>hello</p>", "reactions": []}]
-            self.ws.send(json.dumps({"history": msg["history"], "messages": messages, "source": "archive"}))
+            self.send({"history": msg["history"], "messages": messages, "source": "archive"})
         elif msg.get("board") is True:
             self.broadcast()
 
@@ -103,32 +89,22 @@ class Split:
 
     async def open(self, at: int = 2, query: str = "?chatnav=split", **ctx: Any) -> Page:
         """The chat page of row `at`, its list loaded. A narrow window keeps the list folded, attached."""
-        context = await self.pages.browser.new_context(**ctx)
-        await context.route_web_socket(re.compile(r"^ws://127\.0\.0\.1:9/ws\?chat$"), self.fake.attach)
-        await context.add_init_script(test_browser._FRAMES)
-
-        async def other(route: Route) -> None:
-            if not route.request.url.startswith(ORIGIN + "/"):
-                self.pages.external.append(route.request.url)
-            await route.abort()
-
-        async def page_html(route: Route) -> None:
-            headers = {
-                "Content-Type": "text/html; charset=utf-8",
-                "Content-Security-Policy": W._chat_csp(PAGE),
-            }
-            await route.fulfill(body=PAGE, headers=headers)
-
-        await context.route("**/*", other)  # last registered wins: the catch-all goes first
-        await context.route(re.compile(r"^http://127\.0\.0\.1:9/chat/[^/]+$"), page_html)
-        page = await context.new_page()
-        page.on("pageerror", lambda exc: self.pages.errors.append(str(exc)))
-        await page.goto(f"{ORIGIN}/chat/{quote(_id(at), safe='')}{query}")
+        headers = {"Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": W._page_csp(PAGE)}
+        page = await open_fake(
+            self.pages,
+            self.fake,
+            f"{ORIGIN}/chat/{quote(_id(at), safe='')}{query}",
+            PAGE,
+            page_route=re.compile(r"^http://127\.0\.0\.1:9/chat/[^/]+$"),
+            ws_route=re.compile(r"^ws://127\.0\.0\.1:9/ws\?chat$"),
+            headers=headers,
+            **ctx,
+        )
         await self.ready(page)
         return page
 
     async def ready(self, page: Page) -> None:
-        await _until(page, "window.__frames.some(f => 'history' in f)")
+        await until(page, "window.__frames.some(f => 'history' in f)")
         if await page.evaluate("document.body.classList.contains('split')"):
             await page.wait_for_selector("#rows li", state="attached")
 
@@ -140,8 +116,9 @@ class Split:
 
 @pytest.fixture
 async def split(pages: Pages) -> AsyncIterator[Split]:
-    found = Split(pages, Fake(_board(12)))
+    found = Split(pages, Fake(rows=_board(12)))
     yield found
+    await pages.close()
     assert pages.external == []
 
 
@@ -240,7 +217,7 @@ async def test_a_stored_width_out_of_range_is_clamped(split: Split, stored: str,
     await split.reload(page)
     assert await _width(page) == width
     await page.set_viewport_size({"width": 800, "height": 700})
-    await _until(page, f"document.getElementById('side').getBoundingClientRect().width === {min(width, 380)}")
+    await until(page, f"document.getElementById('side').getBoundingClientRect().width === {min(width, 380)}")
     assert await _stored(page, "chatnav_w") == stored
 
 
@@ -365,12 +342,12 @@ async def test_filter_arrows_highlight_and_enter_switches(split: Split) -> None:
     assert await page.locator("#rows li.sel").get_attribute("data-id") == _id(11)
     assert await _focused(page) == "#filter"
     await flt.press("Enter")
-    await _wait(lambda: split.fake.follows()[-1:] == [_id(11)])
+    await wait(lambda: split.fake.follows()[-1:] == [_id(11)])
     assert page.url.endswith(quote(_id(11), safe="") + "?chatnav=split")
     assert await _focused(page) == "#reply"
     await flt.fill("chat 00")
     await flt.press("Enter")
-    await _wait(lambda: split.fake.follows()[-1:] == [_id(0)])
+    await wait(lambda: split.fake.follows()[-1:] == [_id(0)])
 
 
 @pytest.mark.parametrize("how", ["docked", "folded", "drawer"])
@@ -452,11 +429,11 @@ async def test_row_keys_move_the_tab_stop_and_enter_switches(split: Split) -> No
     await page.keyboard.press("ArrowUp")  # stays on the first
     assert await page.evaluate(stops) == [_id(0)]
     split.fake.broadcast()  # a re-render keeps the stop and the focus
-    await _until(page, "window.__frames.filter(f => 'rows' in f).length >= 2")
+    await until(page, "window.__frames.filter(f => 'rows' in f).length >= 2")
     assert await page.evaluate(stops) == [_id(0)]
     assert await page.evaluate("document.activeElement.closest('li')?.dataset.id") == _id(0)
     await page.keyboard.press("Enter")
-    await _wait(lambda: split.fake.follows()[-1:] == [_id(0)])
+    await wait(lambda: split.fake.follows()[-1:] == [_id(0)])
     assert await _focused(page) == "#reply"
 
 
@@ -573,12 +550,12 @@ async def test_current_row_is_marked_and_shown_on_load_and_back_not_on_updates(s
     assert style[2] == "none"
     await page.locator("#rows").evaluate("l => { l.scrollTop = 0; }")
     split.fake.broadcast()
-    await _until(page, "window.__frames.filter(f => 'rows' in f).length >= 2")
+    await until(page, "window.__frames.filter(f => 'rows' in f).length >= 2")
     assert await page.locator("#rows").evaluate("l => l.scrollTop") == 0
     await page.locator(f'#rows li[data-id="{_id(1)}"] .name').click()
-    await _wait(lambda: split.fake.follows()[-1:] == [_id(1)])
+    await wait(lambda: split.fake.follows()[-1:] == [_id(1)])
     await page.go_back()
-    await _wait(lambda: split.fake.follows()[-1:] == [_id(200)])
+    await wait(lambda: split.fake.follows()[-1:] == [_id(200)])
     assert await page.evaluate(_IN_VIEW)
 
 
@@ -597,12 +574,12 @@ async def test_empty_tabs_and_filters_say_so_under_the_bar(split: Split) -> None
     split.fake.rows = [r for r in split.fake.rows if r["muted"] or r["seen_at"]]
     split.fake.broadcast()
     await page.get_by_role("button", name="Inbox").click()
-    await _until(page, "document.getElementById('nochat').textContent === 'Inbox zero'")
+    await until(page, "document.getElementById('nochat').textContent === 'Inbox zero'")
     split.fake.rows = []
     split.fake.broadcast()
     await page.locator("#tabs .more").click()
     await page.get_by_role("menuitemradio", name="Seen").click()
-    await _until(page, "document.getElementById('nochat').textContent === 'Nothing seen yet'")
+    await until(page, "document.getElementById('nochat').textContent === 'Nothing seen yet'")
     await page.locator("#tabs .more").click()
     await page.get_by_role("menuitemradio", name="Muted").click()
     assert await nochat.inner_text() == "Nothing muted"
@@ -629,25 +606,6 @@ async def test_focus_rings_use_the_accent_colour(split: Split) -> None:
 
 # An element's text against what is really under it: every ancestor's fill composited (alpha
 # included) over white, the text faded by every ancestor's opacity.
-_CONTRAST = """e => {
-  const rgba = (c) => { const n = c.match(/[\\d.]+/g).map(Number), s = c.startsWith('color(') ? 255 : 1;
-    return [n[0] * s, n[1] * s, n[2] * s, n.length > 3 ? n[3] : 1]; };
-  const chain = [];
-  for (let n = e; n; n = n.parentElement) chain.unshift(n);
-  let bg = [255, 255, 255], op = 1;
-  for (const n of chain) {
-    const [r, g, b, a] = rgba(getComputedStyle(n).backgroundColor);
-    bg = [r, g, b].map((v, i) => v * a + bg[i] * (1 - a));
-    op *= Number(getComputedStyle(n).opacity);
-  }
-  const [r, g, b, a] = rgba(getComputedStyle(e).color), k = a * op;
-  const fg = [r, g, b].map((v, i) => v * k + bg[i] * (1 - k));
-  const lin = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; };
-  const lum = (c) => c.map(lin)
-    .reduce((s, v, i) => s + v * [0.2126, 0.7152, 0.0722][i], 0);
-  const [hi, lo] = [lum(fg), lum(bg)].sort((x, y) => y - x);
-  return (hi + 0.05) / (lo + 0.05);
-}"""
 
 
 @pytest.mark.parametrize("theme", ["light", "dark"])
@@ -660,18 +618,18 @@ async def test_row_text_and_tab_labels_reach_4_5_to_1(split: Split, theme: str) 
     seen = f'#rows li.seen[data-id="{_id(5)}"]'
     measured = {}
     for part in ("name", "ago", "prev"):
-        measured[f"seen {part}"] = await page.locator(f"{seen} .{part}").evaluate(_CONTRAST)
+        measured[f"seen {part}"] = await page.locator(f"{seen} .{part}").evaluate(CONTRAST)
     await page.get_by_role("button", name="Inbox").click()
     plain = page.locator(f'#rows li[data-id="{_id(4)}"]')
     assert await plain.get_attribute("class") in (None, "")
-    measured["plain ago"] = await plain.locator(".ago").evaluate(_CONTRAST)
-    measured["plain prev"] = await plain.locator(".prev").evaluate(_CONTRAST)
-    measured["current ago"] = await page.locator("#rows li.cur .ago").evaluate(_CONTRAST)
+    measured["plain ago"] = await plain.locator(".ago").evaluate(CONTRAST)
+    measured["plain prev"] = await plain.locator(".prev").evaluate(CONTRAST)
+    measured["current ago"] = await page.locator("#rows li.cur .ago").evaluate(CONTRAST)
     measured["mention ago"] = await page.locator(f'#rows li.mention[data-id="{_id(1)}"] .ago').evaluate(
-        _CONTRAST
+        CONTRAST
     )
     tabs = await page.locator("#tabs button:not(.on)").evaluate_all(
-        f"bs => bs.filter(b => b.getClientRects().length).map(b => [b.textContent, ({_CONTRAST})(b)])"
+        f"bs => bs.filter(b => b.getClientRects().length).map(b => [b.textContent, ({CONTRAST})(b)])"
     )
     assert len(tabs) == 3  # @, Unread, ⋯
     measured |= {f"tab {name}": ratio for name, ratio in tabs}
@@ -691,7 +649,7 @@ async def test_switching_chats_keeps_the_list_scroll(split: Split) -> None:
           return [...document.querySelectorAll('#rows li')].find(below).dataset.id; })()"""
     )
     await page.locator(f'#rows li[data-id="{target}"] .name').click()
-    await _wait(lambda: split.fake.follows()[-1:] == [target])
+    await wait(lambda: split.fake.follows()[-1:] == [target])
     assert await rows.evaluate("l => l.scrollTop") == 1500
     assert await page.locator("#rows li.cur").get_attribute("data-id") == target
     assert page.url.endswith(quote(target, safe="") + "?chatnav=split")
@@ -711,7 +669,7 @@ async def test_the_current_row_shows_when_a_hidden_list_opens(split: Split) -> N
     other = await split.open(at=200, viewport={"width": 700, "height": 700})
     await other.set_viewport_size({"width": 1300, "height": 700})
     split.fake.broadcast()
-    await _until(other, "window.__frames.filter(f => 'rows' in f).length >= 2")
+    await until(other, "window.__frames.filter(f => 'rows' in f).length >= 2")
     assert await other.evaluate(_IN_VIEW)
 
 
@@ -751,7 +709,7 @@ async def test_the_more_menu_is_one_tab_stop_and_closes_when_left(split: Split) 
         await page.keyboard.press(key)
         assert await _focused(page) == f"k:menu:{want}", key
     await page.keyboard.press("Tab")
-    await _until(page, "document.getElementById('more').hidden")
+    await until(page, "document.getElementById('more').hidden")
     assert await _focused(page) == "k:name"
     assert await more.get_attribute("aria-expanded") == "false"
     await more.click()
@@ -760,7 +718,7 @@ async def test_the_more_menu_is_one_tab_stop_and_closes_when_left(split: Split) 
     assert box is not None
     await page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
     await page.mouse.down()
-    await page.wait_for_timeout(100)  # a human press: the focusout check runs before the click
+    await past(page, 1)  # a human press: the focusout check (a 0 ms timer) runs before the click
     await page.mouse.up()
     assert await page.locator("#more").is_hidden()
 
@@ -866,10 +824,10 @@ async def test_settings_menu_keyboard_escape_and_outside_click(split: Split) -> 
     await page.keyboard.press("Enter")
     for _ in range(6):  # Light, Dark, the switch, List, Split, then out
         await page.keyboard.press("Tab")
-    await _until(page, "!document.querySelector('#cog .menu')")
+    await until(page, "!document.querySelector('#cog .menu')")
     await _settings(page)
     await page.locator("#label").click()  # outside: the focus leaves the menu
-    await _until(page, "!document.querySelector('#cog .menu')")
+    await until(page, "!document.querySelector('#cog .menu')")
 
 
 async def test_avatars_changed_in_another_tab_reach_the_rows(split: Split) -> None:
@@ -880,5 +838,5 @@ async def test_avatars_changed_in_another_tab_reach_the_rows(split: Split) -> No
     other = await page.context.new_page()
     await other.goto(page.url.split("?")[0] + "?chatnav=list")
     await other.evaluate("localStorage.setItem('avatars', '0')")
-    await _until(page, "document.body.classList.contains('compact')")
+    await until(page, "document.body.classList.contains('compact')")
     assert await page.locator("#rows .rav").count() == 0

@@ -58,6 +58,18 @@ def is_system(thread_id: str) -> bool:
     return thread_id.startswith("48:")
 
 
+def chat_kind(thread_id: str) -> str:
+    if is_system(thread_id):
+        return "system"
+    if is_meeting(thread_id):
+        return "meeting"
+    if "@unq.gbl.spaces" in thread_id:
+        return "private"
+    if is_private(thread_id):
+        return "group"
+    return "channel"
+
+
 def in_archive_scope(thread_id: str, include_all: bool = False) -> bool:
     """What `archive` keeps: private, meeting and `48:` conversations; `--all` adds the rest."""
     return bool(thread_id) and (

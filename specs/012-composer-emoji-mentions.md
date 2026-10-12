@@ -20,7 +20,7 @@ the person (or everyone) is notified and the name shows highlighted in Teams, as
 ## Scope
 
 - **Emoji table.** `emoji_table.py`: a built-in `shortcode → character` dict (the common set,
-  ~300 entries, GitHub/Slack names: `smile`, `thumbsup`, `fire`, `eyes`, `tada`, `+1` alias…).
+  ~450 entries, GitHub/Slack names: `smile`, `thumbsup`, `fire`, `eyes`, `tada`, `+1` alias…).
   Custom emojis come from `emojis.rows()` (spec: `emojis.py`), fetched once at `web` start and
   refreshed every 6 h; failure to fetch leaves only the built-in set and logs a warning.
 - **Lookup verb.** `{"complete": "emoji"|"member", "q": "<prefix>", "thread": "<id>"}` answers
@@ -163,10 +163,13 @@ None.
   MRI outside the chat.
 - Custom emojis sent as `:name:` text and expanded on the server: the textarea stays plain text,
   the page needs no contenteditable.
-- Built-in shortcode table shipped in the repo rather than a dependency: ~300 names cover what
+- Built-in shortcode table shipped in the repo rather than a dependency: ~450 names cover what
   gets typed; the full Unicode set is not worth a package.
 - Unknown `:name:` left as typed: `:)` and times like `10:30:` must not vanish.
 - Custom emoji image served through `/emoji/<id>` from the local cache, not the asyncgw URL: that
   URL needs the skype token, which stays off the page (same rule as spec 011 media).
 - Completion for members comes from the server roster, not from the page's row data: rows only
   carry a label, and the roster is already cached by `Directory`.
+- Known limits: namesake mentions (two members sharing a name) are paired with the `@Name` occurrences by
+  count, best effort: of the picks under one name the last k count, k being its `@Name`s in the text; the
+  page does not track positions. The server matches `@Name` on word boundaries only.

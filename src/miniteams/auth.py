@@ -15,7 +15,8 @@ refresh token the moment one of them redeems it, so the file is re-read whenever
 """
 
 import atexit
-import os
+import base64
+import json
 import sys
 import threading
 from pathlib import Path
@@ -24,7 +25,7 @@ from typing import Any, TypeGuard
 import msal
 import structlog
 
-from .config import Settings
+from .config import Settings, write_private
 
 log = structlog.get_logger()
 
@@ -38,16 +39,9 @@ def _load_cache(path: Path) -> msal.SerializableTokenCache:
 
 def _persist_cache(cache: msal.SerializableTokenCache, path: Path) -> None:
     if cache.has_state_changed:
-        # Security: the cache holds refresh tokens — created owner-only, before any byte is written.
-        # Per-writer temp + os.replace: the refresher thread and the session loop may persist at once.
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-        try:
-            with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as fh:
-                fh.write(cache.serialize())
-            os.replace(tmp, path)
-        except BaseException:
-            tmp.unlink(missing_ok=True)  # may hold a partial refresh-token payload
-            raise
+        # Security: the cache holds refresh tokens. The refresher thread and the session loop may
+        # persist at once: write_private gives each writer its own temp.
+        write_private(path, cache.serialize())
 
 
 _NO_FILE = (0, 0, 0)
@@ -99,6 +93,21 @@ def _device_code_flow(app: msal.PublicClientApplication, scopes: list[str]) -> d
 
 def _has_token(result: dict[str, Any] | None) -> TypeGuard[dict[str, Any]]:
     return result is not None and "access_token" in result
+
+
+def self_mri(access_token: str) -> str:
+    """`8:orgid:<oid>` from the AAD access token's claims; "" when they cannot be read.
+
+    Our own token, already trusted for the API calls it authorises — the payload is decoded
+    without signature verification only to learn who we are (the silent refresh returns no
+    id_token)."""
+    try:
+        payload = access_token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        oid = str(claims.get("oid") or "")
+    except IndexError, ValueError, AttributeError:
+        return ""
+    return f"8:orgid:{oid}" if oid else ""
 
 
 class AuthExpired(RuntimeError):

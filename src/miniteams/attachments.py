@@ -64,7 +64,7 @@ def _downloadable(url: str) -> bool:
     return bool(_OBJECT_HOST_RE.match(host))
 
 
-def _object_id(url: str) -> str:
+def object_id(url: str) -> str:
     match = re.search(r"/objects/([^/]+)", url)
     return match.group(1) if match else "object"
 
@@ -102,9 +102,9 @@ def recording_files(content: str, media_dir: Path) -> dict[str, Any]:
             stem = f"sp-{hashlib.sha1(uri.split('?')[0].encode()).hexdigest()[:16]}.transcript"
             transcripts += _present(f"{stem}.*")
         elif typ == "amsTranscript":
-            transcripts += _present(f"{_object_id(uri)}.transcript.*")
+            transcripts += _present(f"{object_id(uri)}.transcript.*")
         elif typ == "amsVideo":
-            videos += _present(f"{_object_id(uri)}.video.*")
+            videos += _present(f"{object_id(uri)}.video.*")
     orig = _ORIGNAME_RE.search(content)
     if orig:
         name = _safe_name(orig.group(1))
@@ -197,7 +197,7 @@ async def _stream_to(client: httpx.AsyncClient, url: str, token: str, dest: Path
         raise
 
 
-def _existing(media_dir: Path, stem: str) -> str | None:
+def existing(media_dir: Path, stem: str) -> str | None:
     """First already-downloaded file for this object id (any extension), else None."""
     for match in media_dir.glob(f"{stem}.*"):
         if not match.name.endswith(".part"):
@@ -232,9 +232,9 @@ async def _serialized(key: str) -> AsyncGenerator[None]:
 
 
 async def fetch_image(client: httpx.AsyncClient, token: str, url: str, media_dir: Path, suffix: str) -> str:
-    stem = f"{_object_id(url)}{suffix}"
+    stem = f"{object_id(url)}{suffix}"
     async with _serialized(str(media_dir / stem)):
-        cached = _existing(media_dir, stem)
+        cached = existing(media_dir, stem)
         if cached:
             return cached  # skip re-download (archive re-runs, same object across messages)
         # Content-type is in the response headers (available before the body), so name the file
@@ -242,7 +242,7 @@ async def fetch_image(client: httpx.AsyncClient, token: str, url: str, media_dir
         tmp = media_dir / f"{stem}.part"
         headers = await _stream_to(client, url, token, tmp)
         ext = _CTYPE_EXT.get((headers.get("content-type") or "").split(";")[0], ".img")
-        dest = media_dir / f"{_object_id(url)}{suffix}{ext}"
+        dest = media_dir / f"{object_id(url)}{suffix}{ext}"
         tmp.rename(dest)
         if suffix == ".video":
             # info, not debug — videos are rare and huge; one line per FRESH download only
@@ -416,7 +416,7 @@ async def _download_file(
     meta = await client.get(status_url, headers={"Accept": "*/*"}, cookies=cookies)
     meta.raise_for_status()
     info = meta.json()
-    name = _safe_name(str(info.get("original_filename") or _object_id(uri)))
+    name = _safe_name(str(info.get("original_filename") or object_id(uri)))
     size = info.get("content_full_length")
     view = info.get("view_location")
     if info.get("content_state") != "ready" or not view:

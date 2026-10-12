@@ -7,7 +7,11 @@ object (`documentId`), fetched like a chat image.
 """
 
 import asyncio
+import functools
 import json
+import mimetypes
+import re
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -18,12 +22,22 @@ import structlog
 
 from ._io import emit, force_blocking_stdout
 from .attachments import fetch_image
+from .auth import token_source
+from .compose import EMOJI_NAME_RE
 from .config import Settings
 from .directory import Directory
+from .http import failure
 
 log = structlog.get_logger()
 
 _IMAGE_URL = "https://api.asm.skype.com/v1/objects/{}/views/imgpsh_fullsize"
+_REFRESH = 6 * 3600.0
+_RETRY = 120.0  # first retry after a failed set fetch, doubled up to _RETRY_MAX
+_RETRY_MAX = 3600.0
+_FAILED_TTL = 900.0  # seconds a failed image download is not retried: the page asks per keystroke
+_FAILED_MAX = 512
+_IMAGE_MAX = 50 * 1024 * 1024
+_ID_RE = re.compile(r"[\w-]{1,128}", re.ASCII)
 
 
 def fetch_metadata(settings: Settings, skype_token: str, csa_token: str) -> dict[str, Any]:
@@ -128,3 +142,93 @@ async def _image(client: httpx.AsyncClient, skype_token: str, document_id: str, 
     except Exception as exc:  # noqa: BLE001 — one missing image must not end the listing
         log.warning("emoji_image_failed", document_id=document_id, error=str(exc))
         return ""
+
+
+class EmojiCache:
+    """The organisation's custom emojis for the composer: {name: AMS object id}, refreshed in the
+    background, and their images served from the local cache."""
+
+    def __init__(self, directory: Directory | None) -> None:
+        self.directory = directory
+        self.names: dict[str, str] = {}  # empty until fetched
+        self._failed: dict[str, float] = {}  # image id → when its download failed
+        self._downloads: dict[str, asyncio.Task[Path | None]] = {}  # image id → download in flight
+
+    def custom(self) -> frozenset[str]:
+        """Object ids of the custom emojis `/emoji/<id>` serves."""
+        return frozenset(self.names.values())
+
+    async def refresh(
+        self, interval: float = _REFRESH, retry: float = _RETRY, retry_max: float = _RETRY_MAX
+    ) -> None:
+        """Fetch the set now and every `interval`; a failure keeps the last set and is retried after
+        `retry`, doubled per failure up to `retry_max`."""
+        wait = retry
+        while True:
+            pause = interval
+            if self.directory is not None:
+                try:
+                    settings, token = self.directory.settings, self.directory.skype_token
+                    self.names = await asyncio.to_thread(_custom_names, settings, token)
+                    log.info("custom_emojis_loaded", count=len(self.names))
+                    wait = retry
+                except Exception as exc:  # noqa: BLE001 — the built-in set still completes
+                    log.warning(
+                        "custom_emojis_unavailable",
+                        error=failure(exc),
+                        error_type=type(exc).__name__,
+                        retry_in=wait,
+                    )
+                    pause, wait = wait, min(wait * 2, retry_max)
+            await asyncio.sleep(pause)
+
+    async def image(self, oid: str) -> tuple[bytes, str] | None:
+        """(body, content type) of a known custom emoji's image, None for anything else."""
+        if not _ID_RE.fullmatch(oid) or oid not in self.custom() or self.directory is None:
+            return None
+        now = time.monotonic()
+        failed_at = self._failed.get(oid)
+        if failed_at is not None and now - failed_at < _FAILED_TTL:
+            return None
+        settings = self.directory.settings
+        task = self._downloads.get(oid)
+        if task is None:
+            task = asyncio.create_task(cached_image(settings, self.directory.skype_token, oid))
+            self._downloads[oid] = task
+            task.add_done_callback(functools.partial(self._downloaded, oid))
+        # Shielded: the HTTP handler runs under the socket's open timeout, the download and its memo don't.
+        path = await asyncio.shield(task)
+        if path is None:
+            return None
+        return await asyncio.to_thread(_cached_body, settings.cache_dir / "emojis", path)
+
+    def _downloaded(self, oid: str, task: asyncio.Task[Path | None]) -> None:
+        self._downloads.pop(oid, None)
+        if not task.cancelled() and task.exception() is None and task.result() is not None:
+            return
+        now = time.monotonic()
+        self._failed = {k: at for k, at in self._failed.items() if now - at < _FAILED_TTL and k != oid}
+        self._failed[oid] = now
+        while len(self._failed) > _FAILED_MAX:
+            del self._failed[next(iter(self._failed))]  # oldest first
+
+
+def _custom_names(settings: Settings, skype_token: str) -> dict[str, str]:
+    """{name: AMS object id} of the names the composer expands. Blocking: worker thread."""
+    csa_token = token_source(settings).csa_token()
+    if not csa_token:
+        raise RuntimeError("no chat-service token (run `miniteams login`)")
+    found = ids_by_name(rows(fetch_metadata(settings, skype_token, csa_token)))
+    return {name: oid for name, oid in found.items() if EMOJI_NAME_RE.fullmatch(name)}
+
+
+def _cached_body(cache: Path, path: Path) -> tuple[bytes, str] | None:
+    try:
+        target = path.resolve(strict=True)
+        if target.parent != cache.resolve(strict=True) or target.name.endswith(".part"):
+            return None
+        if target.stat().st_size > _IMAGE_MAX:
+            return None
+        return target.read_bytes(), mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    except OSError:
+        return None

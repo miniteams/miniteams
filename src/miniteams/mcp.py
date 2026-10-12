@@ -4,14 +4,12 @@ stdout carries protocol lines only; logs go to stderr (see `logging`). One reque
 """
 
 import asyncio
-import contextlib
 import json
 import re
 import sqlite3
 import sys
 import threading
 import time
-import unicodedata
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -23,9 +21,9 @@ import structlog
 
 from . import __version__
 from .archive import RefreshingToken
-from .archive_store import chat_dir_name, find_chat_dir, read_chats, read_meta
-from .auth import AuthExpired, AuthUnavailable, TokenSource, token_source
-from .chats import is_meeting, is_private, is_system, last_activity, parse_when
+from .archive_store import chat_dir_name, find_chat_dir, read_chats, read_meta, search_chat
+from .auth import AuthExpired, AuthUnavailable, TokenSource, self_mri, token_source
+from .chats import chat_kind, is_system, last_activity, parse_when
 from .config import Settings
 from .drafts import (
     SCHEDULE_MAX_AHEAD,
@@ -37,17 +35,16 @@ from .drafts import (
     notes_thread_id,
     unused_client_id,
 )
+from .http import failure
 from .mcp_api import ApiReader
-from .send import NOTES_THREAD, edit_message, message_html, send_message
+from .messages import SNIPPET_LEN, fold, is_deleted, is_edited, json_list, message_text, plain_text
+from .send import MAX_HTML_BYTES, NOTES_THREAD, edit_message, message_html, send_message, too_long
 from .watch import note_sent
-from .web import _SEND_MAX_BYTES, self_mri
-from .web import _plain as plain_text
 
 log = structlog.get_logger()
 
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 _PARSE_ERROR, _INVALID_REQUEST, _METHOD_NOT_FOUND, _INVALID_PARAMS = -32700, -32600, -32601, -32602
-_TEXT_MAX = 1000  # characters of plain text per message, as the widget's tooltip
 _SEARCH_DAYS = 7  # default window of search_messages, and of read_messages on the API
 _PROBE_DEADLINE = 3.0  # seconds an archive gets to answer before the API takes over
 _PROBE_HOLD = 60.0  # seconds the archive counts as unavailable after a failed probe
@@ -128,23 +125,6 @@ def _validate(tool: Tool, args: Any) -> dict[str, Any]:
 # --- archive reads ---
 
 
-def _fold(text: str) -> str:
-    """Case and accents dropped, so "zoe" finds "ZOÉ" and "elodie" finds "Élodie"."""
-    return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)).casefold()
-
-
-def chat_kind(thread_id: str) -> str:
-    if is_system(thread_id):
-        return "system"
-    if is_meeting(thread_id):
-        return "meeting"
-    if "@unq.gbl.spaces" in thread_id:
-        return "private"
-    if is_private(thread_id):
-        return "group"
-    return "channel"
-
-
 _COMPOSETIME_RE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z$")
 
 
@@ -163,23 +143,16 @@ def _utc(value: str, *, end: bool = False) -> str:
 
 def message_record(message: dict[str, Any]) -> dict[str, Any]:
     props = message.get("properties") or {}
-    msgtype = str(message.get("messagetype") or "")
-    content = str(message.get("content") or "")
-    # `_plain` keeps emoji alt text and turns tags into spaces, so `<br>` never glues two lines.
-    text = plain_text(content) if msgtype in ("RichText/Html", "Text") else f"[{msgtype.rsplit('/', 1)[-1]}]"
-    files = props.get("files") or "[]"
-    with contextlib.suppress(ValueError, TypeError):
-        files = json.loads(files) if isinstance(files, str) else files
     ams = message.get("amsreferences") or []
     record = {
         "id": str(message.get("id") or ""),
         "time": str(message.get("composetime") or ""),
         "sender": str(message.get("imdisplayname") or ""),
         "from": str(message.get("from") or "").rsplit("/", 1)[-1],
-        "text": text[:_TEXT_MAX],
-        "edited": "edittime" in props,
-        "deleted": "deletetime" in props or "hardDeleteTime" in props,
-        "attachments": len(files if isinstance(files, list) else []) + len(ams),
+        "text": message_text(message),
+        "edited": is_edited(message),
+        "deleted": is_deleted(props),
+        "attachments": len(json_list(props.get("files"))) + len(ams),
     }
     return record
 
@@ -257,7 +230,7 @@ class Archive:
     def find_chats(
         self, query: str, participant: str, kind: str, since: str, limit: int
     ) -> list[dict[str, Any]]:
-        q, who = _fold(query), _fold(participant)
+        q, who = fold(query), fold(participant)
         found: list[dict[str, Any]] = []
         for chat in self.chats():
             thread_id = str(chat["id"])
@@ -265,10 +238,10 @@ class Archive:
             names = [str(m.get("name") or "") for m in members]
             if kind and chat_kind(thread_id) != kind:
                 continue
-            if q and q not in _fold(" ".join([chat["label"], chat["topic"], *names])):
+            if q and q not in fold(" ".join([chat["label"], chat["topic"], *names])):
                 continue
             roster = list(zip(names, members, strict=True))
-            if who and not any(who in _fold(n) or participant == m.get("mri") for n, m in roster):
+            if who and not any(who in fold(n) or participant == m.get("mri") for n, m in roster):
                 continue
             activity = last_activity(chat["raw"])
             if since and activity < since:
@@ -320,7 +293,6 @@ class Archive:
         self, query: str, since: str, until: str, thread_id: str, limit: int
     ) -> dict[str, Any]:
         """Case- and accent-insensitive substring match on plain text, newest first."""
-        needle = _fold(query)
         if thread_id:
             targets = [(thread_id, "", self.chat_dir(thread_id))]
         else:
@@ -335,32 +307,12 @@ class Archive:
         hits: list[dict[str, Any]] = []
         more = False
         for chat_id, label, folder in targets:
-            path = folder / "messages.db"
-            if not path.is_file():
-                continue
-            found = 0
             try:
-                db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+                found, extra = search_chat(folder, query, limit, since=since, until=until)
             except sqlite3.Error as exc:
                 raise self._unavailable(exc) from exc
-            try:
-                rows = db.execute(
-                    "SELECT raw FROM messages WHERE composetime >= ? AND composetime < ?"
-                    " ORDER BY composetime DESC",
-                    (since, until or "\uffff"),
-                )
-                for (raw,) in rows:
-                    record = message_record(json.loads(raw))
-                    if needle in _fold(record["text"]):
-                        found += 1
-                        if found > limit:
-                            more = True
-                            break
-                        hits.append({**record, "thread_id": chat_id, "chat": label})
-            except sqlite3.Error as exc:
-                raise self._unavailable(exc) from exc
-            finally:
-                db.close()
+            more = more or extra
+            hits += [{**message_record(m), "thread_id": chat_id, "chat": label} for m in found]
         hits.sort(key=lambda h: h["time"], reverse=True)
         more = more or len(hits) > limit
         return {"chats_scanned": len(targets), "more": more, "messages": hits[:limit]}
@@ -586,8 +538,8 @@ def _outgoing_text(args: dict[str, Any]) -> str:
     text = args.get("text")
     if not isinstance(text, str) or not text.strip():
         raise ToolError("text must be a non-empty string")
-    if len(message_html(text, False).encode()) > _SEND_MAX_BYTES:
-        raise ToolError(f"text is over Teams' limit of {_SEND_MAX_BYTES // 1024} KB once escaped")
+    if too_long(text):
+        raise ToolError(f"text is over Teams' limit of {MAX_HTML_BYTES // 1024} KB once escaped")
     return text
 
 
@@ -606,10 +558,8 @@ def _known_thread(server: Server, thread_id: str) -> None:
 def _write[T](call: Callable[[], T], action: str) -> T:
     try:
         return call()
-    except httpx.HTTPStatusError as exc:
-        raise ToolError(f"Teams answered {exc.response.status_code} to the {action}: {exc}") from exc
-    except httpx.TransportError as exc:
-        raise ToolError(f"{action} failed on the network: {exc}") from exc
+    except (httpx.HTTPStatusError, httpx.TransportError) as exc:
+        raise ToolError(f"{action} failed: {failure(exc)}") from exc  # failure(): never a URL
     except RuntimeError as exc:  # send._check: a 2xx with an error envelope
         raise ToolError(str(exc)) from exc
 
@@ -679,7 +629,7 @@ def _scheduled_record(draft: dict[str, Any], labels: dict[str, str]) -> dict[str
         "thread_id": thread_id,
         "chat": labels.get(thread_id, ""),
         "send_at": _iso_ms(int((draft.get("draftDetails") or {}).get("sendAt") or 0)),
-        "text": plain_text(str(draft.get("content") or ""))[:_TEXT_MAX],
+        "text": plain_text(str(draft.get("content") or ""))[:SNIPPET_LEN],
     }
 
 
@@ -904,9 +854,7 @@ class Server:
     def api(self) -> ApiReader:
         """A reader on the chat service with fresh tokens; raises the login ToolError when signed out."""
         skype_token, bearer = self.session.tokens()
-        return ApiReader(
-            self.settings, skype_token, bearer, record=message_record, kind=chat_kind, fold=_fold
-        )
+        return ApiReader(self.settings, skype_token, bearer, record=message_record)
 
     def drafts(self) -> DraftsStore:
         ic3, region = self.session.proxy()

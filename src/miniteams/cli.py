@@ -213,7 +213,8 @@ def cmd_web(settings: Settings, args: argparse.Namespace) -> int:
     import asyncio
     from pathlib import Path
 
-    from .web import run, self_mri
+    from .auth import self_mri
+    from .web import run
 
     aad, skype_token = _ensure_skype_token(settings)
     bearer = str(aad.get("id_token") or aad["access_token"])
@@ -584,7 +585,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="max conversations to load (0 = no limit; default 400 with an archive, 250 without)",
     )
-    p_web.add_argument("--data-dir", default="data", help="archive root to seed rows from (default: ./data)")
+    p_web.add_argument(
+        "--data-dir",
+        default="data",
+        help="archive root: seeds rows, serves chat history, search and media (default: ./data)",
+    )
     p_web.add_argument("--bind", help="ADDR:PORT to listen on (default: persisted random 127.0.0.X:PORT)")
     p_web.add_argument(
         "--reactions", action="store_true", help="a reaction becomes the row's last event and bumps it"
@@ -604,8 +609,8 @@ def main(argv: list[str] | None = None) -> int:
     p_web.add_argument(
         "--browser",
         default="",
-        help="command run with the https link on Ctrl/middle click (e.g. firefox); default: the page's "
-        "own browser follows the link",
+        help="command run with Teams web links (Ctrl/middle click) and with chat pages opened from the "
+        "widget (e.g. firefox); default: the page's own browser",
     )
     p_web.set_defaults(func=cmd_web)
 

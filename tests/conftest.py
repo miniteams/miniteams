@@ -1,14 +1,17 @@
 """Shared fixtures for the test suite."""
 
+import asyncio
+import contextlib
 import ipaddress
 import logging
 import socket
 import sys
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
 
 import pytest
 import structlog
+import websockets
 
 from miniteams.config import Settings
 from miniteams.directory import Directory
@@ -115,6 +118,22 @@ def _fresh_token_sources() -> Any:
     auth._SOURCES.clear()
 
 
+@pytest.fixture(autouse=True)
+def _fresh_archive_pool() -> Iterator[None]:
+    """Each test gets an open archive pool: the process closes it once, a test run many times."""
+    from miniteams import chat_verbs
+
+    yield
+    chat_verbs.close_archive_pool()
+    chat_verbs._closed = False
+
+
+@pytest.fixture(autouse=True)
+def _private_run_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Launch files go under each test's config dir: the real runtime dir holds the live server's."""
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+
+
 @pytest.fixture
 def settings(tmp_path: Any) -> Settings:
     s = Settings(tenant_id="tenant-123")
@@ -128,3 +147,38 @@ def directory(settings: Settings) -> Directory:
     d = Directory(settings)
     d.set_token("sk")
     return d
+
+
+def auth_cookie(board: Any) -> dict[str, str]:
+    """The `mt` cookie of a served board, in Playwright's `context.add_cookies` shape."""
+    return {"name": "mt", "value": board.secret, "url": board.base_url}
+
+
+def launch_url(board: Any) -> str:
+    """The `http://…/?n=<nonce>` the served board's `open.html` points at now (single use)."""
+    return str(board.launch_url)
+
+
+def cookie_header(secret: str) -> dict[str, str]:
+    """The `mt` cookie as a request header."""
+    return {"Cookie": f"mt={secret}"}
+
+
+@contextlib.asynccontextmanager
+async def board_socket(host: str, secret: str, *, chat: bool = False) -> AsyncIterator[Any]:
+    """A socket on the board at `host` as its served page opens one: own Origin, the `mt` cookie."""
+    url = f"ws://{host}/ws{'?chat' if chat else ''}"
+    headers = cookie_header(secret)
+    async with websockets.connect(
+        url, origin=websockets.Origin(f"http://{host}"), additional_headers=headers
+    ) as ws:
+        yield ws
+
+
+async def wait(cond: Callable[[], bool], what: str = "condition", tries: int = 500) -> None:
+    """Poll `cond` every 10 ms; AssertionError after `tries` polls."""
+    for _ in range(tries):
+        if cond():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"{what} not met in {tries / 100:g} s")

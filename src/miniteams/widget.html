@@ -5,29 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>miniteams</title>
 <style>
-  :root {
-    color-scheme: light;
-    --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f0f2f5; --text: #1b1f24; --dim: #6b7380; --faint: #9aa1ab;
-    --line: #e3e6ea; --accent: #4f5bd5; --accent-soft: #4f5bd51a; --hot: #e5484d; --ok: #2f9e6e; --typing: #b7791f;
-    --mention: #0284c7; --mention-soft: #0ea5e91a; --on-mention: #fff;
-    --shadow: 0 1px 2px #0000000d, 0 4px 14px #0000000a;
-  }
-  :root[data-theme="dark"] {
-    color-scheme: dark;
-    --bg: #0f1115; --panel: #171a21; --panel-2: #1e222b; --text: #e6e8ec; --dim: #8b93a1; --faint: #5d6472;
-    --line: #262b35; --accent: #8b96ff; --accent-soft: #8b96ff22; --hot: #ff6b6f; --ok: #4cc38a; --typing: #f0b45a;
-    --mention: #7dd3fc; --mention-soft: #7dd3fc1f; --on-mention: #062a3d;
-    --shadow: 0 1px 2px #00000066, 0 6px 20px #00000055;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      color-scheme: dark;
-      --bg: #0f1115; --panel: #171a21; --panel-2: #1e222b; --text: #e6e8ec; --dim: #8b93a1; --faint: #5d6472;
-      --line: #262b35; --accent: #8b96ff; --accent-soft: #8b96ff22; --hot: #ff6b6f; --ok: #4cc38a; --typing: #f0b45a;
-      --mention: #7dd3fc; --mention-soft: #7dd3fc1f; --on-mention: #062a3d;
-      --shadow: 0 1px 2px #00000066, 0 6px 20px #00000055;
-    }
-  }
+  /* ui.css */
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
   button { font: inherit; color: inherit; }
@@ -59,18 +37,6 @@
   li { scroll-margin-top: var(--hdr, 90px); }
   #status { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); flex: none; }
   #status.off { background: var(--hot); box-shadow: 0 0 0 3px color-mix(in srgb, var(--hot) 25%, transparent); }
-  .cog { position: relative; }
-  .cog > button { border: 0; background: transparent; color: var(--dim); font-size: 16px; width: 28px; height: 28px; border-radius: 8px; cursor: pointer; }
-  .cog > button:hover, .cog.open > button { background: var(--panel-2); color: var(--text); }
-  .menu { position: absolute; right: 0; top: 34px; width: 220px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); padding: 10px; display: grid; gap: 10px; z-index: 5; }
-  .menu h3 { margin: 0 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); font-weight: 600; }
-  .menu .seg { display: flex; }
-  .menu .seg button { flex: 1; }
-  .menu label { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; cursor: pointer; }
-  .switch { appearance: none; width: 32px; height: 18px; border-radius: 99px; background: var(--line); position: relative; cursor: pointer; transition: background .15s; margin: 0; }
-  .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: left .15s; box-shadow: 0 1px 2px #0003; }
-  .switch:checked { background: var(--accent); }
-  .switch:checked::after { left: 16px; }
 
   ul { list-style: none; margin: 8px; padding: 0; display: grid; gap: 2px; }
   li { display: grid; grid-template-columns: 40px minmax(0,1fr) auto; gap: 2px 10px; padding: 9px 10px; border-radius: 12px; align-items: center; position: relative; }
@@ -121,11 +87,6 @@
   #reply:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
   #reply:disabled { opacity: .6; }
   .composer small { display: block; color: var(--hot); font-size: 12px; margin-top: 2px; }
-  #pop { position: absolute; z-index: 4; min-width: 180px; max-width: 280px; max-height: 240px; overflow-y: auto; padding: 4px;
-    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); }
-  #pop [role=option] { display: flex; align-items: center; gap: 8px; padding: 3px 8px; border-radius: 6px; cursor: pointer; }
-  #pop [aria-selected=true] { background: var(--accent-soft); color: var(--accent); }
-  #pop img, #pop .ch { width: 20px; height: 20px; flex: none; text-align: center; }
   #empty { padding: 2em; text-align: center; color: var(--dim); }
   /* Still filling in from the live listing: the rows on screen come from the local archive. */
   .spin { position: fixed; right: 14px; bottom: 14px; width: 16px; height: 16px; border-radius: 50%;
@@ -149,6 +110,8 @@
 <div id="spin" class="spin" hidden title="loading the live list…"></div>
 <script>
 (() => {
+  // ui.js defines store keep q pref el hue initials wsUrl backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview completion
+  /* ui.js */
   const $rows = document.getElementById("rows"), $empty = document.getElementById("empty"),
         $status = document.getElementById("status"), $tabs = document.getElementById("tabs"),
         $cog = document.getElementById("cog"), $gear = document.getElementById("gear"),
@@ -156,10 +119,8 @@
         $spin = document.getElementById("spin"),
         $header = document.querySelector("header");
   let rows = [], ws = null, pageVersion = null, opener = false, browser = false, meName = "", menuOpen = false, query = "", sel = "";
-  const store = (k, v) => { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) {} return v; };
+  const CLOCK_TICK_MS = 30000;  // relative row times
   const TABS = { all: "Inbox", mention: "@", unread: "Unread", seen: "Seen", muted: "Muted" }, THEMES = ["auto", "light", "dark"];
-  // URL params override the stored choices without replacing them (bookmarks, screenshots).
-  const q = new URLSearchParams(location.search), pref = (k) => q.get(k) ?? store(k);
   let tab = TABS[pref("tab")] ? pref("tab") : "all";
   let theme = THEMES.includes(pref("theme")) ? pref("theme") : "auto";
   let avatars = pref("avatars") !== "0";
@@ -173,94 +134,17 @@
   let replyTo = "";
   const drafts = new Map(), sending = new Set(), errors = new Map();
 
-  // Parse, don't compare strings: Teams stamps 7 fraction digits, the server's mention time 3.
-  const isSeen = (r) => !!r.seen_at && Date.parse(r.seen_at) >= Date.parse(r.last_activity);
-  const mentioned = (r) => !!r.mention;  // the server clears it on seen / Teams read
-  const kind = (id) => id.includes("@unq.gbl") ? "dm" : id.includes("meeting_") ? "meeting" : "group";
   const glyph = { group: "👥", meeting: "📅" };
-  const title = (r) => r.label.replace(/ · \d+p$/, "");
-  const initials = (r) => { const w = title(r).split(/[ ,]+/).filter((x) => /\p{L}/u.test(x));
-    return ((w[0] || "?")[0] + ((w[1] || "")[0] || "")).toUpperCase(); };
-  const hue = (s) => [...s].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7);
-  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
-
-  const ago = (iso) => {
-    const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
-    if (isNaN(s)) return "";
-    if (s < 60) return "now";
-    if (s < 3600) return Math.floor(s / 60) + "m";
-    if (s < 86400) return Math.floor(s / 3600) + "h";
-    return Math.floor(s / 86400) + "d";
-  };
-
-  // Case- and accent-blind text, with a folded→original index map: "seb" must reach "Sébastien",
-  // and what gets highlighted is still the original spelling.
-  const fold = (str) => {
-    let out = "";
-    const map = [];
-    for (let i = 0; i < str.length; i++) {
-      const c = str[i].normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
-      out += c;
-      for (let k = 0; k < c.length; k++) map.push(i);
-    }
-    map.push(str.length);
-    return [out, map];
-  };
-
-  // The mentioning text carries my name inline (Teams strips the <at> tag): highlight it once.
-  // Either form is mentioned in practice, so the full name is tried before the first name alone.
-  const mentionLine = (r, into) => {
-    const m = r.mention;
-    if (m.by) into.append(el("b", null, m.by + ": "));
-    const text = m.text || "", full = (meName || "").trim(), [hay, map] = fold(text);
-    let from = -1, to = -1;
-    for (const cand of m.kind === "me" && full ? [full, full.split(" ")[0]] : []) {
-      const [needle] = fold(cand), j = hay.indexOf(needle);
-      if (j >= 0) { from = map[j]; to = map[j + needle.length]; break; }
-    }
-    if (from < 0) { into.append(el("span", "at", m.kind === "all" ? "@everyone" : "@you"), " " + text); return into; }
-    into.append(text.slice(0, from), el("span", "at", "@" + text.slice(from, to)), text.slice(to));
-    return into;
-  };
-  const preview = (r, into) => {
-    if (r.typing && r.typing.length) { into.classList.add("typing"); into.textContent = "✍ " + r.typing.join(", "); return into; }
-    if (mentioned(r)) return mentionLine(r, into);
-    if (r.sender) into.append(el("b", null, r.sender + ": "));
-    into.append(r.text || "");
-    return into;
-  };
-  const send = (obj) => ws && ws.readyState === 1 && ws.send(JSON.stringify(obj));
-  // A muted chat stays out of Inbox / Unread / Seen whatever lands on it; a mention still surfaces.
-  const filters = {
-    all: (r) => mentioned(r) || (!r.muted && !isSeen(r)),
-    mention: mentioned,
-    unread: (r) => r.unread && !r.muted,
-    seen: (r) => isSeen(r) && !r.muted,
-    muted: (r) => r.muted,
-  };
-  // The quick filter narrows every tab, counts included: a badge must match what the list shows.
-  const named = (r) => !query || fold(title(r))[0].includes(query);
-  const pick = () => rows.filter((r) => filters[tab](r) && named(r));
+  const send = (obj) => { if (!(ws && ws.readyState === 1)) return false; ws.send(JSON.stringify(obj)); return true; };
+  const pick = () => rows.filter((r) => filters[tab](r) && named(r, query));
   const counts = () => Object.fromEntries(
-    Object.entries(filters).map(([k, f]) => [k, rows.filter((r) => f(r) && named(r)).length]));
-  // Every occurrence, as text nodes: a chat name is data, never markup.
-  const marked = (node, text) => {
-    const [hay, map] = fold(text);
-    let at = 0, cut = 0, i;  // `at` walks the folded text, `cut` the original one
-    while (query && (i = hay.indexOf(query, at)) >= 0) {
-      node.append(text.slice(cut, map[i]), el("mark", null, text.slice(map[i], map[i + query.length])));
-      at = i + query.length;
-      cut = map[at];
-    }
-    node.append(text.slice(cut));
-    return node;
-  };
+    Object.entries(filters).map(([k, f]) => [k, rows.filter((r) => f(r) && named(r, query)).length]));
 
   const renderHeader = () => {
     const c = counts();
     $tabs.replaceChildren(...Object.entries(TABS).map(([k, lbl]) => {
       const b = el("button", (tab === k ? "on " : "") + (k === "mention" ? "mention" : ""), lbl);
-      b.append(el("b", null, c[k])); b.onclick = () => { tab = k; store("tab", k); render(); }; return b;
+      b.append(el("b", null, c[k])); b.onclick = () => { tab = k; keep("tab", k); render(); }; return b;
     }));
     document.documentElement.style.setProperty("--hdr", $header.offsetHeight + "px");
     $cog.classList.toggle("open", menuOpen);
@@ -269,20 +153,20 @@
     const menu = el("div", "menu"); menu.onclick = (e) => e.stopPropagation();
     const tbox = el("div"), tseg = el("div", "seg");
     for (const [k, lbl] of [["auto", "◐ Auto"], ["light", "☀ Light"], ["dark", "☾ Dark"]]) {
-      const b = el("button", theme === k ? "on" : "", lbl); b.onclick = () => { theme = k; store("theme", k); render(); }; tseg.append(b);
+      const b = el("button", theme === k ? "on" : "", lbl); b.onclick = () => { theme = k; keep("theme", k); render(); }; tseg.append(b);
     }
     tbox.append(el("h3", null, "Theme"), tseg);
     const dbox = el("div"), lab = el("label", null, "Show avatars"), sw = el("input", "switch");
-    sw.type = "checkbox"; sw.checked = avatars; sw.onchange = () => { avatars = sw.checked; store("avatars", avatars ? "1" : "0"); render(); };
+    sw.type = "checkbox"; sw.checked = avatars; sw.onchange = () => { avatars = sw.checked; keep("avatars", avatars ? "1" : "0"); render(); };
     lab.append(sw); dbox.append(el("h3", null, "Display"), lab);
     const mbox = el("div"), mseg = el("div", "seg");
     for (const [k, lbl] of [["teams", "Teams web"], ["chat", "Chat here"]]) {
-      const b = el("button", midclick === k ? "on" : "", lbl); b.onclick = () => { midclick = k; store("midclick", k); render(); }; mseg.append(b);
+      const b = el("button", midclick === k ? "on" : "", lbl); b.onclick = () => { midclick = k; keep("midclick", k); render(); }; mseg.append(b);
     }
     mbox.append(el("h3", null, "Middle click"), mseg);
     const nbox = el("div"), nseg = el("div", "seg");
     for (const [k, lbl] of [["list", "List"], ["split", "Split"]]) {
-      const b = el("button", chatnav === k ? "on" : "", lbl); b.onclick = () => { chatnav = k; store("chatnav", k); render(); }; nseg.append(b);
+      const b = el("button", chatnav === k ? "on" : "", lbl); b.onclick = () => { chatnav = k; keep("chatnav", k); render(); }; nseg.append(b);
     }
     nbox.append(el("h3", null, "Chat navigation"), nseg);
     menu.append(tbox, dbox, mbox, nbox); $cog.append(menu);
@@ -300,12 +184,12 @@
       li.dataset.id = r.id;
       li.style.setProperty("--stripe", `hsl(${hue(r.id)} 62% 55%)`);
       if (avatars) {
-        const av = el("div", "av" + (k === "dm" ? " round" : ""), initials(r));
+        const av = el("div", "av" + (k === "dm" ? " round" : ""), initials(rowTitle(r)));
         av.style.background = `linear-gradient(135deg, hsl(${hue(r.id)} 62% 58%), hsl(${(hue(r.id) + 40) % 360} 62% 48%))`;
         if (glyph[k]) av.append(el("small", null, glyph[k]));
         li.append(av);
       }
-      const name = Object.assign(marked(el("a", "name truncate"), title(r)), { href: r.link || "#", target: "_blank", rel: "noopener", title: r.label });
+      const name = Object.assign(marked(el("a", "name truncate"), rowTitle(r), query), { href: r.link || "#", target: "_blank", rel: "noopener", title: r.label, dir: "auto" });
       // Plain click → the server opens the chat (desktop client); modified/middle click → the https
       // link, through the server's --browser when set, else in this browser.
       const modified = (ev) => ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.button === 1;
@@ -348,7 +232,7 @@
         if (r.mention.edited) tag.append(el("i", null, " · edited " + ago(r.mention.at)));
         tag.title = r.mention.at; ind.append(tag);
       } else if (r.unread) ind.append(el("span", "dot"));
-      const prev = preview(r, el("span", "prev truncate"));
+      const prev = preview(r, el("span", "prev truncate"), meName);
       // Only a line the row width cut gets the whole text on hover; width is known at hover time.
       prev.onmouseenter = () => { prev.title = prev.scrollWidth > prev.clientWidth ? prev.textContent : ""; };
       li.append(name, meta, prev, ind);
@@ -369,119 +253,27 @@
   const $composer = el("li", "composer"), $reply = el("textarea"), $err = el("small"), $pop = el("div");
   $reply.id = "reply"; $reply.rows = 1; $reply.placeholder = "reply · Enter sends, Shift+Enter new line";
   $reply.setAttribute("aria-label", "reply");
-  $pop.id = "pop"; $pop.hidden = true; $pop.setAttribute("role", "listbox");
-  $pop.onmousedown = (e) => e.preventDefault();  // its scrollbar too: a press there must not blur the textarea
-  for (const [k, v] of [["role", "combobox"], ["aria-autocomplete", "list"], ["aria-controls", "pop"], ["aria-expanded", "false"]]) $reply.setAttribute(k, v);
+  $pop.id = "pop"; $pop.hidden = true;
   $composer.append($reply, $pop, $err);
   const grow = () => { $reply.style.height = "auto"; $reply.style.height = $reply.scrollHeight + 2 + "px"; };
+  const edited = () => { drafts.set(replyTo, $reply.value); grow(); };
 
-  // `:` / `@` completion (spec 012): the server answers {complete, q, items}; only the answer to the
-  // latest question counts, an older one arriving late would list the wrong names.
-  let comp = null, want = null, timer = 0, dismissed = -1;
-  const picked = new Map();  // chat id → Map(name → {name, mri, everyone?}): the mentions picked in its draft
-  const token = () => {
-    const at = $reply.selectionStart;
-    if (at !== $reply.selectionEnd) return null;
-    // Word start only: `10:30` and `me@host` must not ask anything. One inner space reaches a last name
-    // (`@ann l`); an inserted `@Ann Lee ` ends in a second one, so it never asks again.
-    // Emoji first: the member pattern's inner space would let `@ann :fi` read as one name.
-    const before = $reply.value.slice(0, at), e = /(?:^|\s):([a-z0-9_+-]{2,})$/i.exec(before);
-    const m = e || /(?:^|\s)@([^\s@]*(?: [^\s@]*)?)$/.exec(before);
-    return m && { kind: e ? "emoji" : "member", q: m[1], start: at - m[1].length - 1 };
-  };
-  // A textarea exposes no caret coordinates: lay the text before the caret out in a hidden copy.
-  const caret = () => {
-    const cs = getComputedStyle($reply), copy = el("div", null, $reply.value.slice(0, $reply.selectionStart)), mark = el("span", null, "\u200b");
-    for (const k of ["font", "padding", "border", "boxSizing", "lineHeight", "letterSpacing", "tabSize", "width"]) copy.style[k] = cs[k];
-    Object.assign(copy.style, { position: "absolute", visibility: "hidden", whiteSpace: "pre-wrap", overflowWrap: "break-word", top: 0, left: 0 });
-    copy.append(mark); document.body.append(copy);
-    const xy = [mark.offsetLeft, mark.offsetTop + mark.offsetHeight];
-    copy.remove();
-    return xy;
-  };
-  const renderPop = () => {
-    $pop.hidden = !comp;
-    $reply.setAttribute("aria-expanded", String(!!comp));
-    if (!comp) { $pop.replaceChildren(); $reply.removeAttribute("aria-activedescendant"); return; }
-    $pop.setAttribute("aria-label", comp.kind === "emoji" ? "emoji" : "members");
-    $pop.replaceChildren(...comp.items.map((it, i) => {
-      const o = el("div");
-      o.id = "pop-" + i; o.setAttribute("role", "option"); o.setAttribute("aria-selected", String(i === comp.active));
-      if (comp.kind === "emoji") {
-        // Images only from our own /emoji/ route: the item comes over the socket, the page trusts no URL.
-        const own = it.custom && /^\/emoji\/[\w-]+$/.test(it.src || "");
-        o.append(own ? Object.assign(el("img"), { src: it.src, alt: "" }) : el("span", "ch", it.custom ? "" : it.char));
-      }
-      o.append(el("span", "truncate", comp.kind === "emoji" ? `:${it.name}:` : it.name));
-      o.onclick = () => { const t = live(); if (t && t.q === comp.q) { comp.active = i; insert(t); } };
-      return o;
-    }));
-    $reply.setAttribute("aria-activedescendant", "pop-" + comp.active);
-    const [x, y] = caret();
-    $pop.style.top = $reply.offsetTop + y - $reply.scrollTop + "px";
-    $pop.style.left = $reply.offsetLeft + Math.max(0, Math.min(x, $reply.offsetWidth - $pop.offsetWidth)) + "px";
-    document.getElementById("pop-" + comp.active).scrollIntoView({ block: "nearest" });
-  };
-  const closePop = () => { clearTimeout(timer); want = null; comp = null; renderPop(); };
-  const lookup = () => {
-    clearTimeout(timer); want = null;
-    const t = token();
-    if (!t || t.start === dismissed) { if (!t) dismissed = -1; comp = null; renderPop(); return; }
-    timer = setTimeout(() => {
-      // No socket or no answer: drop the list, or Enter would wait forever on a prefix nobody answers.
-      if (!(ws && ws.readyState === 1)) { closePop(); return; }
-      want = t; send({ complete: t.kind, q: t.q, thread: replyTo });
-      timer = setTimeout(closePop, 2000);
-    }, 120);
-  };
-  const answered = (msg) => {
-    if (!want || msg.complete !== want.kind || msg.q !== want.q) return;
-    clearTimeout(timer);
-    // A malformed item would throw mid-render and leave the list stuck open.
-    const items = Array.isArray(msg.items) && !msg.error ? msg.items.filter((it) => it && typeof it.name === "string").slice(0, 12) : [];
-    comp = items.length ? { ...want, items, active: 0 } : null;
-    renderPop();
-  };
-  // The word the open list answers, or null once the caret left it.
-  const live = () => { const t = token(); return t && t.start === comp.start && t.kind === comp.kind ? t : null; };
-  const insert = (t) => {
-    const it = comp.items[comp.active], kind = comp.kind;
-    $reply.setRangeText(kind === "member" ? `@${it.name} ` : it.custom ? `:${it.name}:` : it.char, t.start, $reply.selectionStart, "end");
-    if (kind === "member") {
-      if (!picked.has(replyTo)) picked.set(replyTo, new Map());
-      picked.get(replyTo).set(it.name, { name: it.name, mri: it.mri, ...(it.everyone ? { everyone: true } : {}) });
-    }
-    closePop();
-    if (kind === "member") dismissed = t.start;  // `@everyone ` + the next word must not ask `everyone t`…
-    drafts.set(replyTo, $reply.value);
-    grow();
-  };
-  // Enter with the list open picks, never sends; true when the key was the list's. While a longer
-  // prefix is still being asked, the list on screen answers a shorter one: Enter/Tab wait for it.
-  const popKey = (e) => {
-    const n = comp.items.length;
-    if (e.key === "ArrowDown" || e.key === "ArrowUp") { comp.active = (comp.active + (e.key === "ArrowDown" ? 1 : n - 1)) % n; renderPop(); }
-    else if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
-      const t = live();
-      if (!t) { closePop(); return false; }  // caret left the word: the key is the textarea's again
-      if (t.q === comp.q) insert(t);
-    }
-    else if (e.key === "Escape") { dismissed = comp.start; closePop(); }
-    else return false;
-    return true;
-  };
+  const complete = completion({
+    input: $reply, pop: $pop, send: (o) => send(o), chat: () => replyTo, edited: () => edited(), above: false,
+    put: (text, from, to) => $reply.setRangeText(text, from, to, "end"),
+  });
 
   const openReply = (id) => {
     replyTo = sel = id;
     $reply.value = drafts.get(id) || "";
-    dismissed = -1; closePop();
+    complete.reset();
     render();
     if (!$composer.isConnected) return;
     grow();
     $reply.focus();
     $reply.setSelectionRange($reply.value.length, $reply.value.length);
   };
-  const closeReply = () => { replyTo = ""; closePop(); render(); $q.focus(); };
+  const closeReply = () => { replyTo = ""; complete.close(); render(); $q.focus(); };
   // A failed send re-enables the field: give it the focus back unless the user moved on.
   const refocus = (id) => { if (replyTo === id && $composer.isConnected && document.activeElement === document.body) $reply.focus(); };
   const submit = () => {
@@ -489,24 +281,20 @@
     if (!text.trim() || sending.has(id)) return;
     if (!(ws && ws.readyState === 1)) { errors.set(id, "offline, not sent"); render(); return; }
     sending.add(id); errors.delete(id);
-    // Names, not offsets: a picked mention counts only while its `@Name` is still in the text.
-    const mentions = [...(picked.get(id)?.values() || [])].filter((m) => text.includes("@" + m.name));
-    ws.send(JSON.stringify({ send: id, text, mentions, format: "inline" }));
+    ws.send(JSON.stringify({ send: id, text, mentions: complete.mentions(text), format: "inline" }));
     render();
   };
-  $reply.oninput = (e) => { drafts.set(replyTo, $reply.value); grow(); if (!e.isComposing) lookup(); };
-  $reply.addEventListener("compositionend", lookup);
-  $reply.onblur = closePop;
+  $reply.oninput = edited;
   // Teams' keys: Enter sends, Shift+Enter breaks the line (Ctrl+Enter sends too).
   $reply.onkeydown = (e) => {
-    if (comp && !e.isComposing && e.keyCode !== 229 && popKey(e)) { e.preventDefault(); return; }
+    if (complete.key(e)) { e.preventDefault(); return; }
     if (e.key === "Escape") { e.preventDefault(); closeReply(); return; }
     if (e.key !== "Enter" || e.shiftKey || e.isComposing || e.keyCode === 229) return;
     e.preventDefault();
     submit();
   };
 
-  $q.oninput = () => { query = fold($q.value.trim())[0]; sel = ""; render(); };
+  $q.oninput = () => { query = foldText($q.value.trim())[0]; sel = ""; render(); };
   // Arrow keys walk the list without leaving the filter box; Enter opens the selection exactly as a
   // plain click does — through the server, which hands the chat to the desktop client.
   const move = (delta) => {
@@ -535,10 +323,10 @@
     if (sel && pick().some((r) => r.id === sel)) { e.preventDefault(); openReply(sel); }
   });
 
-  let retry = 1000;
+  const retry = backoff();
   const connect = () => {
-    ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
-    ws.onopen = () => { retry = 1000; $status.title = "live"; $status.classList.remove("off"); };
+    ws = new WebSocket(wsUrl("/ws"));
+    ws.onopen = () => { retry.reset(); $status.title = "live"; $status.classList.remove("off"); };
     ws.onmessage = (e) => {
       const msg = JSON.parse(e.data);
       // A newer widget.html on the server (restart, edit): this page is stale, reload it.
@@ -548,11 +336,11 @@
       if ("me" in msg) meName = msg.me || "";
       if ("busy" in msg) $spin.hidden = !msg.busy;
       if (msg.rows) { rows = msg.rows; render(); }
-      if (msg.complete) answered(msg);
+      if (msg.complete) complete.answered(msg);
       if (msg.sent) {
         sending.delete(msg.sent);
         if (msg.ok) {
-          drafts.delete(msg.sent); errors.delete(msg.sent); picked.delete(msg.sent);
+          drafts.delete(msg.sent); errors.delete(msg.sent); complete.forget(msg.sent);
           if (replyTo === msg.sent) { $reply.value = ""; closeReply(); } else render();
         } else { errors.set(msg.sent, msg.error || "not sent"); render(); refocus(msg.sent); }
       }
@@ -562,12 +350,12 @@
       // No ack will come for these: the message may or may not have gone out.
       for (const id of sending) errors.set(id, "connection lost: check the chat before resending");
       if (sending.size) { const id = replyTo; sending.clear(); render(); refocus(id); }
-      setTimeout(connect, retry); retry = Math.min(retry * 2, 30000);  // server restarts → page recovers alone
+      setTimeout(connect, retry.next());  // server restarts → page recovers alone
     };
   };
   render();
   connect();
-  setInterval(render, 30000);  // keep the relative timestamps honest
+  setInterval(render, CLOCK_TICK_MS);
 })();
 </script>
 </body>

@@ -2,63 +2,86 @@
 
 One process, one port: `websockets.serve` answers `GET /` with the bundled page and upgrades
 `/ws`, over which the server pushes the whole row list (small: `--limit` rows) on connect and
-on every change. No REST layer — the only client verb (`seen`) rides the same socket.
+on every change. No REST layer: the page verbs ride the same socket.
+
+Routes: `/` the board page, `/chat/<thread>` a chat page, `/media/<thread>/<file>` and `/emoji/<id>`
+archived and custom-emoji images, `/ws` the socket (`/ws?chat` for a chat page).
 
 Bind is `127.0.0.X:PORT` with X and PORT drawn once and persisted (`web.json`) so the URL
-survives restarts; the whole 127/8 is loopback on Linux, no interface setup needed.
+survives restarts; the whole 127/8 is loopback on Linux, no interface setup needed. Every route
+needs the `mt` cookie, the persisted `web-secret`. No secret goes through argv, the terminal or the
+history: a page opened with `?n=<nonce>` (single use) gets the cookie, and the nonces live in owner-only
+launch files of the run dir — `open.html`, printed at start, and one `chat-*.html` per --browser open.
 """
 
 import asyncio
 import base64
 import contextlib
+import errno
 import functools
 import hashlib
+import hmac
 import html
 import ipaddress
 import json
-import mimetypes
+import os
 import random
 import re
+import secrets
 import sqlite3
+import stat
+import sys
 import time
-from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Coroutine, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from http import HTTPStatus
 from importlib.resources import files
 from pathlib import Path
-from typing import Any
-from urllib.parse import quote, unquote, urlsplit
+from typing import Any, Literal
+from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlencode, urlsplit
 
-import httpx
 import structlog
 from websockets.asyncio.server import ServerConnection, broadcast, serve
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 from websockets.typing import Origin
 
-from .archive_store import find_chat_dir, read_chats, read_messages, read_page
-from .auth import token_source
+from .archive_store import read_chats
+from .chat_verbs import (
+    ANY_VALUE,
+    MSG_ID_RE,
+    ArchiveUnavailable,
+    ChatVerbs,
+    Handler,
+    answer,
+    archive_dir,
+    chat_record,
+    close_archive_pool,
+    index_label,
+    io,
+    stuck_archive_threads,
+)
 from .chats import fetch_conversations, is_meeting, is_private, last_activity
-from .compose import ASYNCGW_HOST, compose_html
-from .config import Settings
-from .directory import Directory
-from .dump import _epoch_seconds, fetch_history
-from .emoji_table import SHORTCODES
-from .emojis import cached_image, fetch_metadata, ids_by_name
-from .emojis import rows as emoji_rows
-from .messages import _TAG_RE, EMOJI, thread_of
-from .render import cards_html, media_url, sanitize
-from .send import delete_message, edit_message, mark_read, message_html, react, send_message
+from .config import Settings, make_private_dir, write_private
+from .directory import Directory, roster_label
+from .dump import fetch_history
+from .emojis import EmojiCache
+from .messages import (
+    EMOJI,
+    is_activity,
+    is_deleted,
+    is_edited,
+    is_me,
+    mention_kind,
+    snippet,
+    thread_of,
+)
+from .send import mark_read
 from .stream import run_forever
 
 log = structlog.get_logger()
 
 _YOU = "You"  # own messages, as Teams' chat list shows them
-_SNIPPET_LEN = 1000  # the row tooltip shows it whole; CSS truncates the visible line
-_EMOJI_ALT_RE = re.compile(r'<emoji\b[^>]*\balt="([^"]*)"[^>]*>')
-# A forward is a blockquote too, but its content IS the message — only a reply quotes another.
-_REPLY_QUOTE_RE = re.compile(r"\A\s*<blockquote\b(?![^>]*Forward)[^>]*>.*?</blockquote>", re.DOTALL)
 # Ad-hoc calls name who started them; scheduled meetings carry an empty list.
 _CALL_STARTER_RE = re.compile(
     r'<partlist[^>]*\btype\s*=\s*"started"[^>]*>.*?<part\s+identity="([^"]+)"', re.S
@@ -74,55 +97,26 @@ _LIMIT_BARE = 250
 # Snippets that mean "the listing did not say": the archive may know better.
 _STUB_SNIPPETS = ("🗑 deleted", "📎 attachment")
 _PAGE_POLL = 2.0  # seconds between widget.html mtime checks (dev reload)
-_SEND_MAX_BYTES = 28 * 1024  # Teams' per-message limit
 _TYPING_TTL = 10.0  # seconds; Teams does not always send ClearTyping
-_CHAT_PAGE = 100  # history messages per page of the chat view
-_SEARCH_HITS = 50  # search hits per answer
-_CHAT_PAGE_MAX = 200  # the archive query is cheap, the page's DOM is not
-_MEDIA_MAX = 50 * 1024 * 1024  # ponytail: whole-body responses; stream if videos ever get linked
-_CURSOR_RE = re.compile(
-    r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z?", re.ASCII
-)  # a composetime, nothing after it
-_MSG_ID_RE = re.compile(r"[0-9]{1,20}")  # Teams message ids are ms-epoch digits
-_QUOTE_MAX = 10  # quotes in one reply
-_PREVIEW_LEN = 100  # characters of the quoted message a Reply block carries
-_ACTIONS = ("react", "edit", "delete")  # page verbs on one message
-_TEXT_TYPES = ("RichText/Html", "Text")  # what a person wrote: quotable, editable
 _SCRIPT_RE = re.compile(r"<script>(.*?)</script>", re.DOTALL)
 # Thread activity that changes the label (topic, member count): drop the cached thread info.
 # Someone reading a chat is not activity: bumping the row on it would defeat "seen".
 _SILENT_TYPES = {"ThreadActivity/MemberConsumptionHorizonUpdate"}
 _RELABEL_TYPES = {"ThreadActivity/TopicUpdate", "ThreadActivity/AddMember", "ThreadActivity/DeleteMember"}
 _BIND_ATTEMPTS = 3  # redraws when the persisted port turns out taken
-_COMPLETE_ITEMS = 12  # completion list length
-_COMPLETE_Q_MAX = 64
-_ROSTER_TTL = 600.0  # seconds a roster is trusted: members join and leave without a board event
-_ROSTER_MAX = 256  # threads whose roster age is remembered; the stream runs for days
-_EMOJI_REFRESH = 6 * 3600.0
-_EMOJI_RETRY = 120.0  # first retry after a failed custom set fetch, doubled up to _EMOJI_RETRY_MAX
-_EMOJI_RETRY_MAX = 3600.0
-_EMOJI_FAILED_TTL = 900.0  # seconds a failed image download is not retried: the page asks per keystroke
-_EMOJI_FAILED_MAX = 512
-_EMOJI_NAME_RE = re.compile(r"[A-Za-z0-9_+-]{1,64}")  # what compose expands between colons
-_EMOJI_ID_RE = re.compile(r"[\w-]{1,128}", re.ASCII)
-_FORMATS = ("inline", "full")
-# The page may not load the asyncgw URL (it needs the skype token): previews point at /emoji/<id>.
-_ASYNCGW_SRC_RE = re.compile(
-    rf'src="https://{re.escape(ASYNCGW_HOST)}/v1/objects/([\w-]+)/views/imgt2_anim"', re.ASCII
-)
-# Non-text last messages: a short marker instead of the raw HTML/card payload.
-_TYPE_MARKERS = {
-    "RichText/Media_GenericFile": "📎 file",
-    "RichText/UriObject": "🖼 image",
-    "RichText/Media_Card": "🃏 card",
-    "RichText/Media_CallRecording": "🎥 recording",
-    "RichText/Media_LocalRecording": "🎥 recording",
-    "ThreadActivity/AddMember": "👥 member added",
-    "ThreadActivity/DeleteMember": "👥 member removed",
-    "ThreadActivity/TopicUpdate": "✎ renamed",
-    "ThreadActivity/MemberConsumptionHorizonUpdate": "👁 read marker",
-    "Event/Call": "📞 call started",
-}
+_RELAY_QUEUE = 256  # live events waiting for their followers; past it one is dropped, the stream never waits
+_RELAY_MAX = 10.0  # seconds one relay may take (name lookups included) before the next one goes
+_MEDIA_BACKOFF = 30.0  # seconds relayed records skip the media folder after a read outlived its deadline
+_COOKIE_FILE = "web-secret"
+_SECRET_RE = re.compile(r"[\w-]{32,}", re.ASCII)
+_COOKIE = "mt"
+_COOKIE_AGE = 365 * 24 * 3600
+_LAUNCH_FILE = "open.html"
+_LAUNCH_TTL = 600.0  # seconds the launch file's nonce stays valid; replaced once used or found expired
+_NONCE_TTL = 60.0  # seconds a --browser chat open's nonce stays valid; its file goes on the next write
+_NONCE_MAX = 64  # nonces kept; the oldest goes first
+
+type OpenTarget = Literal["app", "web", "chat", "split"]
 
 
 def read_up_to(props: dict[str, Any] | None) -> str:
@@ -164,40 +158,6 @@ def _iso(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-def self_mri(access_token: str) -> str:
-    """`8:orgid:<oid>` from the AAD access token's claims; "" when they cannot be read.
-
-    Our own token, already trusted for the API calls it authorises — the payload is decoded
-    without signature verification only to learn who we are (the silent refresh returns no
-    id_token)."""
-    try:
-        payload = access_token.split(".")[1]
-        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-        oid = str(claims.get("oid") or "")
-    except IndexError, ValueError, AttributeError:
-        return ""
-    return f"8:orgid:{oid}" if oid else ""
-
-
-def mention_kind(resource: dict[str, Any], me: str) -> str | None:
-    """`"me"` when the message @mentions `me` by name, `"all"` for an @everyone, else None.
-
-    `properties.mentions` is a JSON string (or list) of entries; `bot` and `share-contact`
-    entries are not mentions of a person. A message from `me` never counts."""
-    if not me or str(resource.get("from") or "").endswith(me):
-        return None
-    kind = None
-    for entry in _json_list((resource.get("properties") or {}).get("mentions")):
-        if not isinstance(entry, dict):
-            continue
-        mtype = str(entry.get("mentionType") or "")
-        if mtype == "person" and entry.get("mri") == me:
-            return "me"
-        if mtype == "everyone":
-            kind = "all"  # the entry's mri is the thread itself; a `me` entry still wins
-    return kind
-
-
 def mention_time(resource: dict[str, Any]) -> tuple[str, bool]:
     """(ISO time the mention became visible, edited?): `edittime` (ms) when edited, else compose."""
     edit = str((resource.get("properties") or {}).get("edittime") or "")
@@ -225,165 +185,14 @@ def in_scope(thread_id: str) -> bool:
     return is_private(thread_id) or is_meeting(thread_id)
 
 
-def _json_list(value: Any) -> list[Any]:
-    """`properties.files` / `.cards` arrive as JSON *strings* (`'[]'` is truthy) or as lists."""
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except ValueError:
-            return []
-    return value if isinstance(value, list) else []
-
-
-def _plain(content: str) -> str:
-    """HTML body as one line of text.
-
-    Emoji are tags whose `alt` holds the character; tags then become spaces, not nothing:
-    `<at>Bob</at>dis` would otherwise read "Bobdis".
-    """
-    return " ".join(html.unescape(_TAG_RE.sub(" ", _EMOJI_ALT_RE.sub(r"\1", content))).split())
-
-
-def snippet(msgtype: str, content: str, props: dict[str, Any] | None = None) -> str:
-    """One-line preview of a message body, marker for non-text types, capped at _SNIPPET_LEN."""
-    props = props or {}
-    if msgtype in ("RichText/Html", "Text"):
-        text = content
-        if msgtype == "RichText/Html":
-            # A reply repeats the quoted message before its own body; preview what was written,
-            # unless the reply is nothing but the quote.
-            body = _REPLY_QUOTE_RE.sub("", content, count=1)
-            text = _plain(body) or _plain(content)
-        text = " ".join(text.split())
-        if not text:
-            # A file/card post has an empty body and its payload in properties; the list stub of
-            # a deleted message has neither; a body that strips to nothing is an image tag.
-            names = [
-                str(f.get("fileName") or "file")
-                for f in _json_list(props.get("files"))
-                if isinstance(f, dict)
-            ]
-            if names:
-                text = "📎 " + ", ".join(names)
-            elif _json_list(props.get("cards")):
-                text = "🃏 card"
-            elif not content.strip():
-                text = "🗑 deleted"
-            else:
-                text = "🖼 image" if "<img" in content else "📎 attachment"
-    elif msgtype == "Event/Call" and "<ended/>" in content:
-        text = "📞 call ended"
-    else:
-        text = (_TYPE_MARKERS.get(msgtype) or f"[{msgtype.rsplit('/', 1)[-1]}]") if msgtype else ""
-    text = " ".join(text.split())
-    return text if len(text) <= _SNIPPET_LEN else text[: _SNIPPET_LEN - 1] + "…"
-
-
-def _record_type(msgtype: str) -> str:
-    if msgtype in ("RichText/Html", "Text"):
-        return "text"
-    if msgtype == "Event/Call":
-        return "call"
-    return "system" if _is_system(msgtype) else "other"
-
-
-def chat_record(
-    message: dict[str, Any], thread_id: str, me: str = "", media_dir: Path | None = None
-) -> dict[str, Any]:
-    """One message as the chat page shows it (spec 011): sanitised body, reactions, mention kind."""
-    props = message.get("properties")
-    props = props if isinstance(props, dict) else {}
-    message = {**message, "properties": props}  # mention_kind reads it too
-    msgtype = str(message.get("messagetype") or "")
-    content = str(message.get("content") or "")
-    kind = _record_type(msgtype)
-    mri = str(message.get("from") or "").rsplit("/", 1)[-1]
-    deleted = _deleted(props)
-    body = ""
-    if not deleted:
-        if msgtype == "RichText/Html":
-            mentions = {
-                str(m.get("itemid")): str(m.get("mri") or "")
-                for m in _json_list(props.get("mentions"))
-                if isinstance(m, dict)
-            }
-            body = sanitize(content, thread_id, media_dir, me, mentions)
-        elif msgtype == "Text":
-            body = html.escape(content)
-        if msgtype == "RichText/Media_Card" or props.get("cards"):
-            # Appended after sanitize(), never through it: the card markup is its own allowlist.
-            cards = cards_html(message, media_url=lambda u: media_url(thread_id, media_dir, u))
-            body += cards
-            kind = "text" if cards and kind == "other" else kind
-        body = body or html.escape(snippet(msgtype, content, props))  # file/card posts, markers
-    reactions = []
-    for emotion in _json_list(props.get("emotions")):
-        if not isinstance(emotion, dict):
-            continue
-        users = emotion.get("users")
-        users = (
-            [str(u.get("mri") or "") for u in users if isinstance(u, dict)] if isinstance(users, list) else []
-        )
-        if users:
-            key = str(emotion.get("key") or "")
-            reactions.append(
-                {
-                    "key": key,
-                    "emoji": EMOJI.get(key, f":{key}:"),
-                    "count": len(users),
-                    "mine": any(_is_me(u, me) for u in users),
-                }
-            )
-    return {
-        "id": str(message.get("id") or ""),
-        "at": str(message.get("composetime") or message.get("originalarrivaltime") or ""),
-        "from": mri,
-        "name": str(message.get("imdisplayname") or ""),
-        "me": _is_me(mri, me),
-        "type": kind,
-        "editable": msgtype in _TEXT_TYPES,
-        "html": body,
-        "edited": bool(message.get("skypeeditedid") or props.get("edittime")),
-        "deleted": deleted,
-        "reactions": reactions,
-        "mentions": mention_kind(message, me),
-    }
-
-
-def reply_quote(message: dict[str, Any], name: str) -> str:
-    """Teams' Reply block quoting `message`, in the shape the archive holds (spec 011)."""
-    msg_id = html.escape(str(message.get("id") or ""))
-    mri = html.escape(str(message.get("from") or "").rsplit("/", 1)[-1])
-    props = message.get("properties")
-    msgtype, content = str(message.get("messagetype") or ""), str(message.get("content") or "")
-    preview = snippet(msgtype, content, props if isinstance(props, dict) else None)[:_PREVIEW_LEN]
-    return (
-        f'<blockquote itemscope itemtype="http://schema.skype.com/Reply" itemid="{msg_id}">'
-        f'<strong itemprop="mri" itemid="{mri}">{html.escape(name)}</strong>'
-        f'<span itemprop="time" itemid="{msg_id}"></span>'
-        f'<p itemprop="preview">{html.escape(preview)}</p></blockquote>'
-    )
-
-
-_APP_MRI = "28:"  # bots and app installs sit in the roster like people do
-
-
 def _seed_label(chat: dict[str, Any], me: str) -> str:
     """The name the widget would have fetched: topic, else the roster without me.
 
     The archive stores every participant, me included; `Directory.label` leaves me out, so reusing
     the stored label verbatim would name every 1:1 after its two members.
     """
-    members = [m for m in chat["participants"] if isinstance(m, dict) and m.get("name")]
-    if chat["topic"]:
-        return f"{chat['topic']} · {len(chat['participants'])}p"
-
-    def is_app(member: dict[str, Any]) -> bool:
-        return str(member.get("mri", "")).startswith(_APP_MRI)
-
-    others = [str(m["name"]) for m in members if m.get("mri") != me and not is_app(m)]
-    apps = [str(m["name"]) for m in members if is_app(m)]
-    return ", ".join(others or apps or [str(m["name"]) for m in members])
+    members = [m for m in chat["participants"] if isinstance(m, dict)]
+    return roster_label(str(chat["topic"] or ""), members, me)
 
 
 def _index_stamp(data_dir: Path | None) -> tuple[int, int, int]:
@@ -395,6 +204,14 @@ def _index_stamp(data_dir: Path | None) -> tuple[int, int, int]:
     except OSError:
         return (0, 0, 0)
     return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def _reseed(
+    data_dir: Path, me: str, known: tuple[int, int, int]
+) -> tuple[tuple[int, int, int], dict[str, dict[str, Any]] | None]:
+    """(index stamp, its seed), the seed None when the index is still the `known` one. Blocking."""
+    stamp = _index_stamp(data_dir)
+    return stamp, None if stamp == known else seed_from_archive(data_dir, me)
 
 
 def seed_from_archive(data_dir: Path, me: str = "") -> dict[str, dict[str, Any]]:
@@ -418,7 +235,7 @@ def seed_from_archive(data_dir: Path, me: str = "") -> dict[str, dict[str, Any]]
                     str(last.get("messagetype") or ""), str(last.get("content") or ""), last.get("properties")
                 ),
                 "sender": _YOU
-                if _is_me(str(last.get("from") or ""), me)
+                if is_me(str(last.get("from") or ""), me)
                 else str(last.get("imdisplayname") or ""),
                 "read_id": read_up_to(conv.get("properties")),
                 "read_at": read_at_ms(conv.get("properties")),
@@ -439,7 +256,7 @@ async def row_from_conversation(
     thread_id = str(conv.get("id") or "")
     last = conv.get("lastMessage") or {}
     msgtype = str(last.get("messagetype") or "")
-    sender = "" if _is_system(msgtype) else await sender_of(last, directory)
+    sender = "" if is_activity(msgtype) else await sender_of(last, directory)
     label = label or await directory.label(thread_id)
     if label == thread_id:  # thread lookup failed (rate limit…): the listing carries the topic
         label = str((conv.get("threadProperties") or {}).get("topic") or thread_id)
@@ -461,16 +278,6 @@ async def row_from_conversation(
     }
 
 
-def _is_system(msgtype: str) -> bool:
-    """Thread activity (member changes, read markers…) is emitted by the thread, not a person."""
-    return msgtype.startswith("ThreadActivity/")
-
-
-def _is_me(mri: str, me: str) -> bool:
-    """`from` is a contact URL ending in the MRI; a call event names the bare MRI."""
-    return bool(me) and mri.rsplit("/", 1)[-1] == me
-
-
 async def sender_of(resource: dict[str, Any], directory: Directory | None) -> str:
     if str(resource.get("messagetype") or "") == "Event/Call":
         # `from` is the meeting organizer, not who joined or hung up: only an ad-hoc call's
@@ -481,13 +288,13 @@ async def sender_of(resource: dict[str, Any], directory: Directory | None) -> st
         mri = started.group(1)
         if directory is None:
             return mri
-        return _YOU if _is_me(mri, directory.me) else await directory.display(mri)
+        return _YOU if is_me(mri, directory.me) else await directory.display(mri)
     mri = str(resource.get("from") or "")
     name = resource.get("imdisplayname")
     if directory is None:
         return str(name or mri)
     directory.note_name(mri, name)
-    if _is_me(mri, directory.me):
+    if is_me(mri, directory.me):
         return _YOU
     return str(name) if name else (await directory.display(mri) if mri else "")
 
@@ -651,7 +458,7 @@ async def _resolve_stub(row: dict[str, Any], recent: list[dict[str, Any]], direc
         return
     msgtype = str(message.get("messagetype") or "")
     row["text"] = snippet(msgtype, str(message.get("content") or ""), message.get("properties"))
-    if not _is_system(msgtype):
+    if not is_activity(msgtype):
         row["sender"] = await sender_of(message, directory)
 
 
@@ -660,18 +467,95 @@ async def _resolve_stub(row: dict[str, Any], recent: list[dict[str, Any]], direc
 
 def parse_bind(value: str) -> tuple[str, int]:
     host, _, port = value.rpartition(":")
+    host = host.removeprefix("[").removesuffix("]")  # [::1]:PORT, the URL form
     if not host or not port.isdigit():
         raise ValueError(f"expected ADDR:PORT, got {value!r}")
-    # The page has no auth: anything but loopback would publish the chat list to the network.
-    if not ipaddress.ip_address(host).is_loopback:
+    address = ipaddress.ip_address(host)
+    # The cookie travels in clear over plain HTTP: anything but loopback would hand it to the network.
+    if not address.is_loopback:
         raise ValueError(f"refusing non-loopback bind {host!r}")
-    return host, int(port)
+    # Canonical: the Host and Origin checks compare text, and a browser sends the compressed form.
+    return str(address), int(port)
+
+
+def netloc(host: str, port: int) -> str:
+    """`host:port` as a URL and a Host header carry it: an IPv6 address goes in brackets."""
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+def load_secret(settings: Settings) -> str:
+    """The pages' cookie value, from `web-secret`; drawn and written owner-only when missing, or when
+    the file could have been read or swapped by someone else (a symlink, group/other bits)."""
+    path = settings.config_dir / _COOKIE_FILE
+    try:
+        secret = (_read_owner_only(path) or "").strip()
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot read {path}: {exc.strerror or exc}; fix its permissions or delete it"
+        ) from None
+    if _SECRET_RE.fullmatch(secret):
+        return secret
+    secret = secrets.token_urlsafe(32)
+    try:
+        write_private(path, secret)
+    except OSError as exc:
+        raise RuntimeError(f"cannot write {path}: {exc.strerror or exc}") from None
+    return secret
+
+
+def _read_owner_only(path: Path) -> str | None:
+    """`path`'s text; None when absent, not a regular file of ours, or open to group/other."""
+    try:
+        # O_NONBLOCK: a FIFO planted there must not hang the start.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:  # a symlink: whoever planted it may read its target
+            return None
+        raise
+    with os.fdopen(fd, encoding="utf-8", errors="replace") as fh:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            return None
+        return fh.read()
+
+
+def run_dir(settings: Settings) -> Path:
+    """Where the launch files go: MINITEAMS_RUN_DIR when set, else `$XDG_RUNTIME_DIR/miniteams` when that
+    runtime dir is ours, else `<config_dir>/run`. Made 0700; refused when it exists open to anyone else."""
+    base = os.environ.get("XDG_RUNTIME_DIR", "")
+    try:
+        ours = bool(base) and Path(base).stat().st_uid == os.getuid()
+    except OSError:
+        ours = False
+    path = Path(base) / "miniteams" if ours else settings.config_dir / "run"
+    if settings.run_dir is not None:
+        path = settings.run_dir.expanduser()
+    if not make_private_dir(path):
+        st = path.lstat()
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            raise RuntimeError(f"refusing {path}: it must be a directory only you can open (0700)")
+    return path
+
+
+def _launch_page(url: str) -> str:
+    """A launch file's whole content: straight on to `url`, a plain link if the refresh is blocked."""
+    href = html.escape(url)
+    return (
+        f'<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url={href}">'
+        f'<a href="{href}">miniteams</a>\n'
+    )
+
+
+def _draw_port() -> int:
+    return random.randint(32768, 60999)
 
 
 def _draw_bind() -> tuple[str, int]:
     # 127.0.0.1 is what every other local daemon binds; a random sibling avoids collisions and
     # keeps the widget off the well-known address (user request).
-    return f"127.0.0.{random.randint(2, 254)}", random.randint(32768, 60999)
+    return f"127.0.0.{random.randint(2, 254)}", _draw_port()
 
 
 def load_bind(settings: Settings, override: str | None = None) -> tuple[str, int]:
@@ -728,22 +612,42 @@ class Board:
         self.open_scheme = open_scheme
         self.browser = browser  # argv for the https link on Ctrl/middle click; None = page's own browser
         self.base_url = ""  # http://host:port, set once bound: `chat` opens point back at us
+        self.secret = ""  # the `mt` cookie every route needs: serve_board loads it, routes read it here
+        self.run_dir: Path | None = None  # the launch files' dir, set by serve_board
+        self.launch_url = ""  # what `open.html` points at now
+        self._nonces: dict[str, tuple[float, Path]] = {}  # single-use nonce → (monotonic expiry, its file)
         self.clients: set[ServerConnection] = set()
         self.busy = busy  # the page shows a spinner until the background fill says otherwise
         self.seed = seed or {}
         self.data_dir = data_dir
         self._seed_read = time.monotonic()
         self._seed_stamp = _index_stamp(data_dir)
-        self._replies: set[asyncio.Task[None]] = set()  # the loop keeps only weak refs to tasks
+        self._seed_lock = asyncio.Lock()
         self._typing_timers: dict[tuple[str, str], asyncio.TimerHandle] = {}
         self._follows: dict[ServerConnection, tuple[str, Path | None]] = {}  # socket → (thread, media dir)
-        self._history_busy: set[ServerConnection] = set()  # sockets with a history answer pending
-        self._action_busy: set[ServerConnection] = set()  # sockets with a message action pending
-        self._search_busy: set[ServerConnection] = set()  # sockets with a search pending
-        self.custom_emojis: dict[str, str] = {}  # name → AMS object id; empty until fetched
-        self._roster_at: OrderedDict[str, float] = OrderedDict()  # thread → when its roster was fetched
-        self._roster_fetch: dict[str, asyncio.Task[list[dict[str, Any]] | None]] = {}  # in flight
-        self._emoji_failed: dict[str, float] = {}  # image id → when its download failed
+        self._relays: asyncio.Queue[tuple[str, Callable[[], Awaitable[None]]]] = asyncio.Queue(_RELAY_QUEUE)
+        self._relay_task: asyncio.Task[None] | None = None  # started by the first relay, ended by close()
+        self._dropped: dict[str, int] = {}  # thread → relays dropped since the queue filled (one stall)
+        self._media_down_until = 0.0  # monotonic; relayed records skip the media folder until then
+        self.emojis = EmojiCache(directory)
+        self.chat = ChatVerbs(directory, self.emojis, self._scope, me, self.me_name, data_dir)
+        board_first: dict[str, Handler] = {
+            "seen": self._on_seen,
+            "unseen": self._on_unseen,
+            "read": self._on_read,
+            "mute": self._on_mute,
+            "unmute": self._on_unmute,
+        }
+        board_last: dict[str, Handler] = {
+            "board": self._on_board,
+            "follow": self._on_follow,
+            "open": self._on_open,
+        }
+        # Dispatch order: a verb carrying several keys is handled as the first one listed.
+        self._handlers: dict[str, Handler] = {**board_first, **self.chat.handlers(), **board_last}
+        # Keys whose value is not a thread id string: how each one is recognised.
+        self._accepts: dict[str, Callable[[Any], bool]] = {"board": lambda value: value is True}
+        self._accepts |= dict.fromkeys(ANY_VALUE, lambda value: True)
         self._seen: dict[str, str] = _load_seen(seen_path)
         self._muted: dict[str, str] = _load_seen(muted_path)  # thread → when muted (same shape)
         for row in rows.values():
@@ -757,16 +661,24 @@ class Board:
         The live lookup is what names a new chat; this is the fallback when it fails (a 429, or a
         chat we were removed from), and the archive may have learned the name after we started.
         """
-        name = str(self.seed.get(thread_id, {}).get("label") or "")
+        name = self._seeded_label(thread_id)
         if name or self.data_dir is None:
             return name
-        stamp = _index_stamp(self.data_dir)
-        if stamp == self._seed_stamp or time.monotonic() - self._seed_read < _SEED_REREAD:
-            return ""  # same file, or too soon: re-reading it would buy nothing
-        # Claimed before the await, not after: a burst of unnamed chats (a reconnect replaying what
-        # it dropped) would otherwise start one 12 MiB read each, all of them reading the same file.
-        self._seed_read, self._seed_stamp = time.monotonic(), stamp
-        self.seed = await asyncio.to_thread(seed_from_archive, self.data_dir, self.me)
+        # One at a time: a burst of unnamed chats (a reconnect replaying what it dropped) would
+        # otherwise start one 12 MiB read each, all of them reading the same file.
+        async with self._seed_lock:
+            if time.monotonic() - self._seed_read < _SEED_REREAD:
+                return ""  # too soon: even the stat is an NFS call, and it runs per unnamed event
+            self._seed_read = time.monotonic()
+            try:
+                stamp, seed = await io("index", _reseed, self.data_dir, self.me, self._seed_stamp)
+            except ArchiveUnavailable:
+                return ""
+            if seed is not None:
+                self.seed, self._seed_stamp = seed, stamp
+        return self._seeded_label(thread_id)
+
+    def _seeded_label(self, thread_id: str) -> str:
         return str(self.seed.get(thread_id, {}).get("label") or "")
 
     def set_busy(self, busy: bool) -> None:
@@ -848,485 +760,29 @@ class Board:
             return False
         return True
 
-    async def send(
-        self,
-        thread_id: str,
-        text: Any,
-        ws: ServerConnection | None = None,
-        quote: Any = None,
-        mentions: Any = None,
-        fmt: Any = None,
-    ) -> str | None:
-        """Page verb `send`: post `text` to the row's chat (or the chat `ws` follows) as me, after
-        one Reply block per `quote` id, with `mentions` (`{name, mri, everyone?}`) and markdown per
-        `fmt` (spec 012). Returns the refusal/failure reason, None once Teams accepted it.
+    # --- followed chats (spec 011) ---
 
-        The row is left alone: the Trouter echo of the sent message updates it like any other."""
-        if not self._may_post(ws, thread_id):
-            return "unknown chat"
-        if error := _text_error(text):
-            return error
-        quote = [] if quote is None else quote
-        if not isinstance(quote, list):
-            return "invalid quote"
-        if len(quote) > _QUOTE_MAX:
-            return "too many quotes"
-        ids_ok = all(isinstance(q, str) and _MSG_ID_RE.fullmatch(q) for q in quote)
-        if not ids_ok or len(set(quote)) < len(quote):
-            return "invalid quote"
-        mentions = [] if mentions is None else mentions
-        if not isinstance(mentions, list) or not all(_mention_shape(m) for m in mentions):
-            return "invalid mention"
-        fmt = "inline" if fmt is None else fmt
-        if fmt not in _FORMATS:
-            return "invalid format"
-        if self.directory is None:
-            return "not connected"
-        if mentions:
-            resolved = await self._resolved(thread_id, mentions)
-            if resolved is None:
-                return "unknown mention"
-            mentions = resolved
-        try:
-            content, props = compose_html(text, mentions, self.custom_emojis, full=fmt == "full")
-        except ValueError as exc:
-            return str(exc)
-        try:
-            extra: dict[str, Any] = {}
-            if quote:
-                copies = await asyncio.to_thread(self._server_copies, thread_id, quote)
-                if any(q not in copies for q in quote):
-                    return "unknown quoted message"
-                if any(
-                    not copies[q].get("from") or copies[q].get("messagetype") not in _TEXT_TYPES
-                    for q in quote
-                ):
-                    return "cannot quote this message"
-                content = "".join(self._reply_quote(copies[q]) for q in quote) + content
-            if len(content.encode()) > _SEND_MAX_BYTES:
-                return "message too long"
-            # Plain text keeps today's call: send_message escapes it itself, to the same bytes.
-            if quote or props or content != message_html(text, False):
-                text, extra["is_html"] = content, True
-            if props:
-                extra["properties"] = props
-            await asyncio.to_thread(
-                send_message,
-                self.directory.settings,
-                self.directory.skype_token,
-                thread_id,
-                text,
-                self.me_name,
-                **extra,
-            )
-        except Exception as exc:  # noqa: BLE001 — a failed send must not drop the socket
-            reason = _failure(exc)
-            log.warning("send_failed", thread=thread_id, error=reason, error_type=type(exc).__name__)
-            return reason
-        return None
-
-    # --- composer completion (spec 012) ---
-
-    async def _members(self, thread_id: str) -> list[dict[str, Any]] | None:
-        """The thread's roster, refetched once older than _ROSTER_TTL; None when it cannot be had.
-
-        Directory keeps the roster itself; this only ages it, as the stream does not report every change.
-        Concurrent callers share one fetch: the page asks on every keystroke.
-        """
-        if self.directory is None:
-            return None
-        task = self._roster_fetch.get(thread_id)
-        if task is None:
-            fetch = self._fetch_members(self.directory, thread_id)
-            task = self._roster_fetch[thread_id] = asyncio.create_task(fetch)
-            task.add_done_callback(lambda _: self._roster_fetch.pop(thread_id, None))
-        # Shielded: a page closing mid-lookup must not cancel the fetch other callers wait on.
-        return await asyncio.shield(task)
-
-    async def _fetch_members(self, directory: Directory, thread_id: str) -> list[dict[str, Any]] | None:
-        now = time.monotonic()
-        at = self._roster_at.pop(thread_id, None)
-        if at is None or now - at > _ROSTER_TTL:
-            directory.forget(thread_id)
-            at = now
-        # Stamped on failure too: Directory spaces retries, a forget per keystroke would defeat that.
-        self._roster_at[thread_id] = at
-        while len(self._roster_at) > _ROSTER_MAX:
-            self._roster_at.popitem(last=False)
-        info = await directory.thread(thread_id)
-        return None if info is None else list(info["members"])
-
-    async def _resolved(self, thread_id: str, mentions: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
-        """The mentions with the roster's name as `label`; None when one is not a human of the thread
-        (or everyone of a group), or its typed name is not that member's."""
-        from .mcp import _fold, chat_kind
-
-        members = await self._members(thread_id)
-        if members is None:
-            return None
-        humans = _humans(members)
-        out: list[dict[str, Any]] = []
-        for m in mentions:
-            if m.get("everyone"):
-                name = m["name"]
-                ok = m["mri"] == thread_id and chat_kind(thread_id) != "private" and _fold(name) == "everyone"
-            else:
-                name = humans.get(m["mri"], "")
-                ok = bool(name) and _fold(name) == _fold(m["name"])
-            if not ok:
-                return None
-            out.append({**m, "label": name})
-        return out
-
-    async def complete(self, ws: ServerConnection | None, request: dict[str, Any]) -> dict[str, Any]:
-        """Page verb `complete`: up to _COMPLETE_ITEMS emojis or members of a chat matching prefix `q`."""
-        kind, q = request["complete"], request.get("q")
-        head = {"complete": kind, "q": q if isinstance(q, str) else None}
-        if not isinstance(q, str) or len(q) > _COMPLETE_Q_MAX or (kind == "emoji" and not q):
-            return {**head, "error": "invalid query"}
-        if kind == "emoji":
-            return {**head, "items": self._emoji_items(q.casefold())}
-        if kind != "member":
-            return {**head, "error": "invalid kind"}
-        thread_id = request.get("thread")
-        if not isinstance(thread_id, str) or not self._may_post(ws, thread_id):
-            return {**head, "error": "unknown chat"}
-        members = await self._members(thread_id)
-        if members is None:
-            return {**head, "error": "chat members unavailable"}
-        return {**head, "items": _member_items(_humans(members), thread_id, self.me, q)}
-
-    def _emoji_items(self, prefix: str) -> list[dict[str, Any]]:
-        found: list[dict[str, Any]] = [
-            {"name": name, "char": char} for name, char in SHORTCODES.items() if name.startswith(prefix)
-        ]
-        # A custom name the built-in table shadows would send the built-in character.
-        found += [
-            {"name": name, "custom": oid, "src": f"/emoji/{oid}"}
-            for name, oid in self.custom_emojis.items()
-            if name.casefold().startswith(prefix) and name not in SHORTCODES
-        ]
-        return sorted(found, key=lambda it: str(it["name"]).casefold())[:_COMPLETE_ITEMS]
-
-    def preview(self, text: Any, fmt: Any) -> dict[str, Any]:
-        """Page verb `preview`: the HTML `send` would post, mentions left as typed."""
-        fmt = "inline" if fmt is None else fmt
-        if not isinstance(text, str) or fmt not in _FORMATS:
-            return {"preview": "", "error": "invalid preview"}
-        try:
-            content, _ = compose_html(text, [], self.custom_emojis, full=fmt == "full")
-        except ValueError as exc:
-            return {"preview": "", "error": str(exc)}
-        return {"preview": _ASYNCGW_SRC_RE.sub(r'src="/emoji/\1"', content)}
-
-    async def emoji_file(self, oid: str) -> tuple[bytes, str] | None:
-        """`/emoji/<id>`: (body, content type) of a known custom emoji's image, None for anything else."""
-        if (
-            not _EMOJI_ID_RE.fullmatch(oid)
-            or oid not in self.custom_emojis.values()
-            or self.directory is None
-        ):
-            return None
-        now = time.monotonic()
-        failed_at = self._emoji_failed.get(oid)
-        if failed_at is not None and now - failed_at < _EMOJI_FAILED_TTL:
-            return None
-        settings = self.directory.settings
-        path = await cached_image(settings, self.directory.skype_token, oid)
-        if path is None:
-            self._emoji_failed = {
-                k: at for k, at in self._emoji_failed.items() if now - at < _EMOJI_FAILED_TTL and k != oid
-            }
-            self._emoji_failed[oid] = now
-            while len(self._emoji_failed) > _EMOJI_FAILED_MAX:
-                del self._emoji_failed[next(iter(self._emoji_failed))]  # oldest first
-            return None
-        return await asyncio.to_thread(_emoji_body, settings.cache_dir / "emojis", path)
-
-    async def refresh_custom_emojis(
-        self,
-        interval: float = _EMOJI_REFRESH,
-        retry: float = _EMOJI_RETRY,
-        retry_max: float = _EMOJI_RETRY_MAX,
-    ) -> None:
-        """Fetch the organisation's custom emojis now and every `interval`; a failure keeps the last set
-        and is retried after `retry`, doubled per failure up to `retry_max`."""
-        wait = retry
-        while True:
-            pause = interval
-            if self.directory is not None:
-                try:
-                    settings, token = self.directory.settings, self.directory.skype_token
-                    self.custom_emojis = await asyncio.to_thread(_custom_emojis, settings, token)
-                    log.info("custom_emojis_loaded", count=len(self.custom_emojis))
-                    wait = retry
-                except Exception as exc:  # noqa: BLE001 — the built-in set still completes
-                    log.warning(
-                        "custom_emojis_unavailable",
-                        error=_failure(exc),
-                        error_type=type(exc).__name__,
-                        retry_in=wait,
-                    )
-                    pause, wait = wait, min(wait * 2, retry_max)
-            await asyncio.sleep(pause)
-
-    # --- chat view (spec 011) ---
-
-    async def act(self, ws: ServerConnection | None, verb: str, request: dict[str, Any]) -> dict[str, Any]:
-        """Page verbs `react`, `edit`, `delete` on one message of a chat `send` may post to."""
-        thread_id, msg_id = request[verb], request.get("msg")
-        error = await self._act(ws, verb, request, thread_id, msg_id)
-        head = {verb: thread_id, "msg": msg_id if isinstance(msg_id, str) else None}
-        return {**head, **({"error": error} if error else {"ok": True})}
-
-    async def _act(
-        self, ws: ServerConnection | None, verb: str, request: dict[str, Any], thread_id: str, msg_id: Any
-    ) -> str | None:
-        if not isinstance(msg_id, str) or not _MSG_ID_RE.fullmatch(msg_id):
-            return "invalid message"
-        if not self._may_post(ws, thread_id):
-            return "unknown chat"
-        key, remove, text = request.get("key"), request.get("remove", False), request.get("text")
-        if verb == "react" and not (isinstance(key, str) and key in EMOJI and isinstance(remove, bool)):
-            return "invalid reaction"
-        if verb == "edit" and (error := _text_error(text)):
-            return error
-        if self.directory is None:
-            return "not connected"
-        settings, token = self.directory.settings, self.directory.skype_token
-        try:
-            copy = (await asyncio.to_thread(self._server_copies, thread_id, [msg_id])).get(msg_id)
-            if copy is None:
-                return "unknown message"
-            # The server's copy decides: the page could name anyone's message.
-            if verb != "react" and not _is_me(str(copy.get("from") or ""), self.me):
-                return "not your message"
-            props = copy.get("properties")
-            if verb != "react" and _deleted(props if isinstance(props, dict) else {}):
-                return "message deleted"
-            if verb == "edit" and copy.get("messagetype") not in _TEXT_TYPES:
-                return "cannot edit this message"
-            if verb == "react":
-                await asyncio.to_thread(react, settings, token, thread_id, msg_id, str(key), remove=remove)
-            elif verb == "edit":
-                await asyncio.to_thread(edit_message, settings, token, thread_id, msg_id, str(text))
-            else:
-                await asyncio.to_thread(delete_message, settings, token, thread_id, msg_id)
-        except Exception as exc:  # noqa: BLE001 — a failed action must not drop the socket
-            reason = _failure(exc)
-            log.warning(
-                "message_action_failed",
-                verb=verb,
-                thread=thread_id,
-                message_id=msg_id,
-                error=reason,
-                error_type=type(exc).__name__,
-            )
-            return reason
-        return None
-
-    def _may_post(self, ws: ServerConnection | None, thread_id: str) -> bool:
+    def _scope(self, ws: ServerConnection | None, thread_id: str) -> bool:
         # Off the board, only a followed chat of the widget's scope: never a channel.
         return thread_id in self.rows or (in_scope(thread_id) and self._following(ws, thread_id))
-
-    def _server_copies(self, thread_id: str, ids: list[str]) -> dict[str, dict[str, Any]]:
-        """Messages `ids` of the thread as the server holds them, by id: the archive, then the latest
-        API page for those it lacks (sent after the archiver's last write). Blocking: worker thread."""
-        found: dict[str, dict[str, Any]] = {}
-        chat_dir = self._archive_dir(thread_id)
-        if chat_dir is not None:
-            try:
-                found = read_messages(chat_dir, ids)
-            except (OSError, sqlite3.Error) as exc:
-                if not isinstance(exc, FileNotFoundError):
-                    log.warning("archive_message_lookup_failed", thread=thread_id, error=str(exc))
-        if len(found) < len(ids) and self.directory is not None:
-            page = fetch_history(
-                self.directory.settings, self.directory.skype_token, thread_id, _CHAT_PAGE_MAX, 1
-            )
-            for message in page:
-                msg_id = str(message.get("id") or "")
-                if msg_id in ids:
-                    found.setdefault(msg_id, message)
-        return found
-
-    def _reply_quote(self, message: dict[str, Any]) -> str:
-        mri = str(message.get("from") or "").rsplit("/", 1)[-1]
-        name = str(message.get("imdisplayname") or "") or (
-            self.directory.name_for(mri) if self.directory else mri
-        )
-        return reply_quote(message, name)
 
     def _following(self, ws: ServerConnection | None, thread_id: str) -> bool:
         return ws is not None and self._follows.get(ws, ("", None))[0] == thread_id
 
-    def media_file(self, path: str) -> tuple[bytes, str] | None:
-        """`/media/<thread>/<file>`: (body, content type) of an archived asset, None for anything
-        else. Blocking (index lookup, NFS read): run it in a worker thread."""
-        parts = path.removeprefix("/media/").split("/")
-        if len(parts) != 2:
-            return None
-        thread_id, name = (unquote(part) for part in parts)
-        chat_dir = self._archive_dir(thread_id)
-        if chat_dir is None:
-            return None
-        try:
-            media = (chat_dir / "media").resolve(strict=True)
-            target = (media / name).resolve(strict=True)
-            # Resolved: `..`, encoded slashes and symlinks out of the folder or onto a partial download
-            # all fail this one check.
-            if target.parent != media or target.name.endswith(".part") or not target.is_file():
-                return None
-            if target.stat().st_size > _MEDIA_MAX:
-                log.info("media_too_large", thread=thread_id, file=name)
-                return None
-            body = target.read_bytes()
-        except OSError, ValueError:  # ValueError: an encoded NUL in the name
-            return None
-        return body, mimetypes.guess_type(name)[0] or "application/octet-stream"
-
-    def _archive_dir(self, thread_id: str) -> Path | None:
-        """The chat's archive folder; None when the archive does not hold it or cannot be read."""
-        if self.data_dir is None:
-            return None
-        try:
-            return find_chat_dir(self.data_dir, thread_id)
-        except (OSError, sqlite3.Error) as exc:
-            log.info("archive_chat_lookup_failed", thread=thread_id, error=str(exc))
-            return None
-
-    def _records(
-        self, messages: list[dict[str, Any]], thread_id: str, media: Path | None
-    ) -> list[dict[str, Any]]:
-        """Records of a page, in a worker thread: sanitising globs the media folder (NFS)."""
-        records = []
-        for message in messages:
-            try:
-                records.append(chat_record(message, thread_id, self.me, media))
-            except Exception as exc:  # noqa: BLE001 — one malformed message must not lose the page
-                log.warning("chat_record_skipped", thread=thread_id, error_type=type(exc).__name__)
-        return records
-
-    def _archive_records(
-        self, chat_dir: Path, thread_id: str, cursor: tuple[str, str], size: int
-    ) -> tuple[list[dict[str, Any]], bool, bool]:
-        messages, older, newer = read_page(chat_dir, size, **dict([cursor]))
-        return self._records(messages, thread_id, chat_dir / "media"), older, newer
-
-    def _api_records(
-        self, thread_id: str, before: str, size: int, media: Path | None
-    ) -> tuple[list[dict[str, Any]], bool]:
-        assert self.directory is not None
-        # endTime is second-granular: ask up to the next second, then cut at `before` exactly.
-        end = _epoch_seconds(before) + 1 if before else None
-        page = fetch_history(self.directory.settings, self.directory.skype_token, thread_id, size, 1, end)
-        kept = [m for m in page if not before or str(m.get("composetime") or "") < before]
-        # A short page is not the end (the API under-fills windows): only an empty one is.
-        return self._records(kept[-size:], thread_id, media), bool(kept)
-
-    async def history(
-        self, thread_id: str, before: Any = None, limit: Any = None, *, after: Any = None, around: Any = None
-    ) -> dict[str, Any]:
-        """Page verb `history`: a page of messages, archive first, else one API page.
-
-        The answer echoes its cursor (`before`, `after` or `around`) so the page can match it to its
-        request."""
-        cursors = {"before": before, "after": after, "around": around}
-        reply = _history_head(thread_id, cursors)
-        try:
-            return {**reply, **await self._history(thread_id, cursors, limit)}
-        except Exception as exc:  # noqa: BLE001 — the page waits for an answer whatever happens
-            log.warning("history_failed", thread=thread_id, error_type=type(exc).__name__)
-            return {**reply, "error": "history unavailable"}
-
-    async def _history(self, thread_id: str, cursors: dict[str, Any], limit: Any) -> dict[str, Any]:
-        given = {k: v for k, v in cursors.items() if v not in (None, "")}  # "" = latest, like null
-        for key, value in given.items():
-            if not (isinstance(value, str) and _CURSOR_RE.fullmatch(value)):
-                return {"error": f"invalid {key}"}
-        if len(given) > 1:
-            return {"error": "one cursor at most"}
-        key, at = next(iter(given.items()), ("before", ""))
-        valid = isinstance(limit, int) and not isinstance(limit, bool) and limit > 0
-        size = min(limit if valid else _CHAT_PAGE, _CHAT_PAGE_MAX)
-        chat_dir = await asyncio.to_thread(self._archive_dir, thread_id)
-        if chat_dir is None and thread_id not in self.rows:
-            return {"error": "unknown chat"}
-        try:
-            if chat_dir is None:
-                raise FileNotFoundError(thread_id)
-            records, older, newer = await asyncio.to_thread(
-                self._archive_records, chat_dir, thread_id, (key, at), size
-            )
-            source = "archive"
-        except (OSError, sqlite3.Error) as exc:
-            if not isinstance(exc, FileNotFoundError):
-                log.warning("archive_history_failed", thread=thread_id, error=str(exc))
-            if key != "before":
-                return {"error": "not available without archive"}
-            if self.directory is None:
-                return {"error": "not connected"}
-            media = chat_dir / "media" if chat_dir else None
-            try:
-                records, older = await asyncio.to_thread(self._api_records, thread_id, at, size, media)
-            except Exception as api_exc:  # noqa: BLE001 — a failed page must not drop the socket
-                reason = _failure(api_exc)
-                log.warning("history_api_failed", thread=thread_id, error=reason)
-                return {"error": reason}
-            source, newer = "api", False
-        return {"messages": records, "older": older, "newer": newer, "source": source}
-
-    async def _history_reply(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
-        try:
-            await self._answer(
-                ws,
-                self.history(
-                    verb["history"],
-                    verb.get("before"),
-                    verb.get("limit"),
-                    after=verb.get("after"),
-                    around=verb.get("around"),
-                ),
-            )
-        finally:
-            self._history_busy.discard(ws)
-
-    async def search(self, thread_id: str, query: Any) -> dict[str, Any]:
-        """Page verb `search`: the thread's archived messages matching `query`, newest first."""
-        head = {"search": thread_id, "q": query if isinstance(query, str) else None}
-        if not isinstance(query, str) or not query.strip():
-            return {**head, "error": "empty query"}
-        chat_dir = await asyncio.to_thread(self._archive_dir, thread_id)
-        if (
-            self.data_dir is None
-            or chat_dir is None
-            or not await asyncio.to_thread((chat_dir / "messages.db").is_file)
-        ):
-            return {**head, "error": "no archive for this chat"}
-        # Imported here: mcp imports this module.
-        from .mcp import Archive
-
-        try:
-            found = await asyncio.to_thread(
-                Archive(self.data_dir).search_messages, query.strip(), "", "", thread_id, _SEARCH_HITS
-            )
-        except Exception as exc:  # noqa: BLE001 — the page waits for an answer whatever happens
-            log.warning("search_failed", thread=thread_id, error_type=type(exc).__name__)
-            return {**head, "error": "search unavailable"}
-        hits = [
-            {"id": h["id"], "at": h["time"], "name": h["sender"], "text": h["text"]}
-            for h in found["messages"]
-        ]
-        return {**head, "hits": hits}
-
     async def follow(self, ws: ServerConnection, thread_id: str) -> dict[str, Any]:
         """Page verb `follow`: this socket receives the thread's live messages from now on."""
-        chat_dir = await asyncio.to_thread(self._archive_dir, thread_id)
+        try:
+            chat_dir = await io("dir", archive_dir, self.data_dir, thread_id)
+        except ArchiveUnavailable:
+            return {"follow": thread_id, "error": "archive unavailable"}
         if chat_dir is None and thread_id not in self.rows:
             return {"follow": thread_id, "error": "unknown chat"}
         self._follows[ws] = (thread_id, chat_dir / "media" if chat_dir else None)
         row = self.rows.get(thread_id)
         label = str(row.get("label") or "") if row else await self.archived_label(thread_id)
+        if not label and chat_dir is not None:  # a channel, or a chat the seed lacks: the index names it
+            with contextlib.suppress(ArchiveUnavailable):  # the page shows the id rather than nothing
+                label = await io("label", index_label, self.data_dir, thread_id)
         # `opener` tells the page whether Open in Teams goes through the server or its own new tab.
         return {
             "follow": thread_id,
@@ -1346,7 +802,7 @@ class Board:
             return
         media = medias[0]
         if resource_type == "NewMessage" and msgtype in ("Control/Typing", "Control/ClearTyping"):
-            if _is_me(str(resource.get("from") or "").rsplit("/", 1)[-1], self.me):
+            if is_me(str(resource.get("from") or "").rsplit("/", 1)[-1], self.me):
                 return
             name = await sender_of(resource, self.directory)
             if msgtype == "Control/Typing":
@@ -1359,54 +815,89 @@ class Board:
             return
         if msgtype.startswith("Control/") or msgtype in _SILENT_TYPES:
             return
-        record = await asyncio.to_thread(chat_record, resource, thread_id, self.me, media)
+        record = await self._record(resource, thread_id, media)
         if "content" not in resource:
             del record["html"]  # a partial update (reaction): the page keeps the body it has
-        if resource_type == "NewMessage" and not _is_system(msgtype):
+        if resource_type == "NewMessage" and not is_activity(msgtype):
             self._typing_stop(thread_id, await sender_of(resource, self.directory))  # their message ends it
         self._relay(thread_id, {"msg" if resource_type == "NewMessage" else "edit": record})
 
+    async def _record(self, resource: dict[str, Any], thread_id: str, media: Path | None) -> dict[str, Any]:
+        """The relayed record; past a media read's deadline, records skip the folder for a while."""
+        custom = self.emojis.custom()
+        if media is not None and time.monotonic() >= self._media_down_until:
+            try:
+                return await io("relay", chat_record, resource, thread_id, self.me, media, custom)
+            except ArchiveUnavailable:
+                self._media_down_until = time.monotonic() + _MEDIA_BACKOFF
+                log.warning("follow_media_unavailable", thread=thread_id, retry_in=_MEDIA_BACKOFF)
+        # Without a media folder sanitising reads no file: cheap enough for the loop.
+        return chat_record(resource, thread_id, self.me, None, custom)
+
+    def _followers(self, thread_id: str) -> list[ServerConnection]:
+        return [ws for ws, (tid, _) in self._follows.items() if tid == thread_id]
+
     def _relay(self, thread_id: str, frame: dict[str, Any]) -> None:
-        followers = [ws for ws, (tid, _) in self._follows.items() if tid == thread_id]
-        if followers:
+        followers = self._followers(thread_id)
+        if followers and self._relay_task is not None and asyncio.current_task() is not self._relay_task:
+            # From the board or a timer: behind the queued relays, a typing clear must not overtake them.
+            self._enqueue_relay(thread_id, "frame", functools.partial(self._relay_async, thread_id, frame))
+        elif followers:
             # Named: a page switching chats may still receive frames of the one it left.
             broadcast(followers, json.dumps({**frame, "thread": thread_id}, ensure_ascii=False))
 
-    def _background(self, work: Coroutine[Any, Any, None]) -> None:
-        task = asyncio.create_task(work)
-        self._replies.add(task)
-        task.add_done_callback(self._replies.discard)
+    # --- launch files: single-use nonces that set the cookie ---
 
-    async def _answer(self, ws: ServerConnection, work: Awaitable[dict[str, Any]]) -> None:
-        answer = await work
-        # A page closed while its answer was computed is not a handler failure.
-        with contextlib.suppress(ConnectionClosed):
-            await ws.send(json.dumps(answer, ensure_ascii=False))
-
-    async def _sent(self, ws: ServerConnection, thread_id: str, verb: dict[str, Any]) -> dict[str, Any]:
-        # Only the sending page learns the outcome; every page sees the echoed message.
-        error = await self.send(
-            thread_id, verb.get("text"), ws, verb.get("quote"), verb.get("mentions"), verb.get("format")
-        )
-        return {"sent": thread_id, **({"error": error} if error else {"ok": True})}
-
-    async def _one_at_a_time(
-        self,
-        ws: ServerConnection,
-        head: dict[str, Any],
-        work: Callable[[], Awaitable[dict[str, Any]]],
-        slots: set[ServerConnection] | None = None,
-    ) -> dict[str, Any]:
-        """One message action (or quoted send, or search) per socket: another while it runs answers
-        `busy`."""
-        slots = self._action_busy if slots is None else slots
-        if ws in slots:
-            return {**head, "error": "busy"}
-        slots.add(ws)
+    def issue_launch(self) -> None:
+        """(Re)write `open.html` with a fresh nonce for the board page; the previous one stops working."""
+        for nonce in [n for n, (_, file) in self._nonces.items() if file.name == _LAUNCH_FILE]:
+            del self._nonces[nonce]
         try:
-            return await work()
-        finally:
-            slots.discard(ws)
+            self._issue(_LAUNCH_FILE, "/", _LAUNCH_TTL)
+        except OSError as exc:
+            log.warning("launch_file_failed", error=str(exc))
+
+    def _issue(self, name: str, path: str, ttl: float, extra: str = "") -> Path:
+        """Write `<run dir>/<name>`, a redirect to `path` with a nonce good once within `ttl` seconds."""
+        assert self.run_dir is not None
+        now = time.monotonic()
+        for expired in [n for n, (until, _) in self._nonces.items() if until <= now]:
+            self._retire(expired)
+        while len(self._nonces) >= _NONCE_MAX:
+            self._retire(next(iter(self._nonces)))
+        nonce = secrets.token_urlsafe(24)
+        url = f"{self.base_url}{path}?n={nonce}{extra}"
+        file = self.run_dir / name
+        write_private(file, _launch_page(url))
+        self._nonces[nonce] = (now + ttl, file)
+        if name == _LAUNCH_FILE:
+            self.launch_url = url
+        return file
+
+    def _retire(self, nonce: str) -> None:
+        """A nonce is spent or found expired: its chat file goes, the launch file gets a fresh nonce."""
+        entry = self._nonces.pop(nonce, None)
+        if entry is None:
+            return
+        if entry[1].name == _LAUNCH_FILE:
+            self.issue_launch()
+        else:
+            with contextlib.suppress(OSError):
+                entry[1].unlink(missing_ok=True)
+
+    def take_nonce(self, nonce: str) -> bool:
+        """A nonce is good once, within its TTL; any use consumes it."""
+        entry = self._nonces.get(nonce)
+        if entry is None:
+            return False
+        self._retire(nonce)
+        return time.monotonic() < entry[0]
+
+    def drop_launch_files(self) -> None:
+        for _, file in self._nonces.values():
+            with contextlib.suppress(OSError):
+                file.unlink(missing_ok=True)
+        self._nonces.clear()
 
     def mark_unseen(self, thread_id: str) -> bool:
         """Undo `seen`: the row shows again until the next click."""
@@ -1450,11 +941,53 @@ class Board:
         msgtype = str(resource.get("messagetype") or "")
         log.debug("web_event", thread=thread_id, resource_type=resource_type, messagetype=msgtype)
         await self._board_event(thread_id, resource_type, resource, msgtype)
-        if self._follows:  # after the board: a relay failure must not cost the row its update
+        if any(tid == thread_id for tid, _ in self._follows.values()):
+            # Queued, not awaited: a record globs the (NFS) media folder, the shared stream must not wait.
+            forward = functools.partial(self._forward, thread_id, resource_type, resource, msgtype)
+            self._enqueue_relay(thread_id, resource_type, forward)
+
+    def _enqueue_relay(self, thread_id: str, kind: Any, work: Callable[[], Awaitable[None]]) -> None:
+        if self._relay_task is None:
+            self._relay_task = asyncio.create_task(self._relay_forever())
+        try:
+            self._relays.put_nowait((thread_id, work))
+        except asyncio.QueueFull:
+            if not self._dropped:
+                log.warning("follow_relay_stalled", thread=thread_id, resource_type=kind)
+            if thread_id not in self._dropped:
+                # Once per stall: the page knows its view has a hole (a message, a typing clear).
+                self._gap(thread_id)
+            self._dropped[thread_id] = self._dropped.get(thread_id, 0) + 1
+
+    def _gap(self, thread_id: str) -> None:
+        broadcast(self._followers(thread_id), json.dumps({"gap": thread_id}, ensure_ascii=False))
+
+    async def _relay_forever(self) -> None:
+        """One relay at a time, in arrival order."""
+        while True:
+            thread_id, work = await self._relays.get()
             try:
-                await self._forward(thread_id, resource_type, resource, msgtype)
-            except Exception as exc:  # noqa: BLE001 — a malformed event must not stop the stream
+                await asyncio.wait_for(work(), _RELAY_MAX)
+            except Exception as exc:  # noqa: BLE001 — a malformed event must not end the relays
                 log.warning("follow_relay_failed", thread=thread_id, error_type=type(exc).__name__)
+            if self._dropped and self._relays.empty():
+                dropped, threads = sum(self._dropped.values()), len(self._dropped)
+                log.warning("follow_relay_resumed", dropped=dropped, threads=threads)
+                # Again once drained: the first gap may have been answered while the hole still grew.
+                for gapped in self._dropped:
+                    self._gap(gapped)
+                self._dropped.clear()
+
+    async def _relay_async(self, thread_id: str, frame: dict[str, Any]) -> None:
+        self._relay(thread_id, frame)
+
+    def close(self) -> None:
+        """Stop the relays, delete the launch files (the archive pool is the
+        process's: run() closes it)."""
+        if self._relay_task is not None:
+            self._relay_task.cancel()
+            self._relay_task = None
+        self.drop_launch_files()
 
     async def _board_event(
         self, thread_id: str, resource_type: Any, resource: dict[str, Any], msgtype: str
@@ -1499,7 +1032,7 @@ class Board:
                 "mention": None,
                 "muted": thread_id in self._muted,
             }
-        sender = "" if _is_system(msgtype) else await sender_of(resource, self.directory)
+        sender = "" if is_activity(msgtype) else await sender_of(resource, self.directory)
         # A bare-id label is a failed lookup: retry it (Directory spaces transient retries 60s apart).
         if self.directory is not None and (msgtype in _RELABEL_TYPES or row["label"] == thread_id):
             if msgtype in _RELABEL_TYPES:
@@ -1508,7 +1041,8 @@ class Board:
             if fresh != thread_id:  # lookup failed (removed from the chat, 429): keep the old name
                 row["label"] = fresh
             elif row["label"] == thread_id:
-                row["label"] = await self.archived_label(thread_id) or row["label"]
+                # The seed only: an index re-read may wait on a hung mount, the stream must not.
+                row["label"] = self._seeded_label(thread_id) or thread_id
         last_id = str(resource.get("id") or "")
         row.update(
             last_activity=str(resource.get("composetime") or resource.get("originalarrivaltime") or ""),
@@ -1533,8 +1067,7 @@ class Board:
         if row is None:
             return
         msg_id = str(resource.get("id") or "")
-        edited = bool(resource.get("skypeeditedid") or props.get("edittime"))
-        deleted = bool(props.get("deletetime"))
+        edited, deleted = is_edited(resource), is_deleted(props)
         changed = False
         if deleted:
             # The mentioning message is gone: nothing left to point at.
@@ -1656,30 +1189,36 @@ class Board:
     async def open_row(
         self,
         thread_id: str,
-        web: bool = False,
+        target: OpenTarget = "app",
         ws: ServerConnection | None = None,
         msg_id: str = "",
-        chat: bool = False,
-        split: bool = False,
     ) -> bool:
-        """Page verb `open`: run the opener (or, for `web`, the browser) on the deep link of the row
-        (or of the chat `ws` follows), at `msg_id` when given, else at the row's last message.
-        `chat` runs the browser on our own `/chat/<thread>` page instead, in split mode with `split`.
+        """Page verb `open`: run the opener (`app`) or the browser (`web`) on the deep link of the row
+        (or of the chat `ws` follows), at `msg_id` when given, else at the row's last message; `chat`
+        and `split` run the browser on our own `/chat/<thread>` page instead, `split` in split mode.
 
         Opening is not reading: the row keeps its seen/unread state until the user says so."""
         row = self.rows.get(thread_id)
-        argv = self.browser if web or chat else self.opener
+        argv = self.opener if target == "app" else self.browser
         if (row is None and not self._following(ws, thread_id)) or argv is None:
             return False
-        if chat:
-            if not self.base_url:
+        if target in ("chat", "split"):
+            if not self.base_url or self.run_dir is None:
                 return False
-            url = f"{self.base_url}/chat/{quote(thread_id, safe='')}"
-            if split:  # the --browser has none of the widget's stored settings
-                url += "?chatnav=split"
+            # A fresh --browser profile has no cookie yet. argv is world-readable: it carries the path of
+            # an owner-only file, which holds the nonce.
+            split = (
+                "&chatnav=split" if target == "split" else ""
+            )  # the --browser has none of the widget's settings
+            name = f"chat-{secrets.token_hex(8)}.html"
+            try:
+                url = self._issue(name, f"/chat/{quote(thread_id, safe='')}", _NONCE_TTL, split).as_uri()
+            except OSError as exc:
+                log.warning("launch_file_failed", error=str(exc))
+                return False
         else:
-            target = msg_id or str((row or {}).get("last_id") or "")
-            url = deep_link(thread_id, target, "https" if web else self.open_scheme)
+            last = msg_id or str((row or {}).get("last_id") or "")
+            url = deep_link(thread_id, last, "https" if target == "web" else self.open_scheme)
         try:
             # argv exec, no shell: the only variable part is a URL built from ids we already hold.
             proc = await asyncio.create_subprocess_exec(
@@ -1694,7 +1233,7 @@ class Board:
             log.warning("opener_failed", opener=argv[0], error=str(exc))
             return False
         asyncio.get_running_loop().create_task(proc.wait())  # reap; xdg-open returns at once
-        log.info("opened", thread=thread_id, web=web, chat=chat)
+        log.info("opened", thread=thread_id, target=target)
         return True
 
     async def watch_page(self, interval: float = _PAGE_POLL) -> None:
@@ -1715,7 +1254,8 @@ class Board:
     async def handle(self, ws: ServerConnection) -> None:
         # A chat page (`/ws?chat`) only needs its own chat: the board's rows reach it only once it
         # asks (`board`, split layout).
-        board_page = ws.request is None or urlsplit(ws.request.path).query != "chat"
+        query = parse_qs(urlsplit(ws.request.path).query, keep_blank_values=True) if ws.request else {}
+        board_page = "chat" not in query
         if board_page:
             self.clients.add(ws)
         try:
@@ -1726,161 +1266,78 @@ class Board:
                     verb = json.loads(raw)
                 except json.JSONDecodeError, TypeError:
                     verb = None
-                at = verb.get("at") if isinstance(verb, dict) else None
-                at = at if isinstance(at, str) else None
-                if isinstance(verb, dict) and isinstance(verb.get("seen"), str):
-                    self.mark_seen(verb["seen"], at)
-                elif isinstance(verb, dict) and isinstance(verb.get("unseen"), str):
-                    self.mark_unseen(verb["unseen"])
-                elif isinstance(verb, dict) and isinstance(verb.get("read"), str):
-                    await self.mark_read(verb["read"])
-                elif isinstance(verb, dict) and isinstance(verb.get("mute"), str):
-                    self.set_muted(verb["mute"], True)
-                elif isinstance(verb, dict) and isinstance(verb.get("unmute"), str):
-                    self.set_muted(verb["unmute"], False)
-                elif isinstance(verb, dict) and isinstance(verb.get("send"), str):
-                    # A send can take the whole HTTP timeout: the page's other verbs must not queue behind it.
-                    sent = functools.partial(self._sent, ws, verb["send"], verb)
-                    # Quotes cost a lookup: they count as a message action.
-                    quoted = verb.get("quote")
-                    work = self._one_at_a_time(ws, {"sent": verb["send"]}, sent) if quoted else sent()
-                    self._background(self._answer(ws, work))
-                elif isinstance(verb, dict) and isinstance(verb.get("history"), str):
-                    if ws in self._history_busy:  # one page in flight per socket
-                        busy = {**_history_head(verb["history"], verb), "error": "busy"}
-                        with contextlib.suppress(ConnectionClosed):
-                            await ws.send(json.dumps(busy, ensure_ascii=False))
-                    else:
-                        # The API fallback is a network round trip: the page's other verbs must not wait.
-                        self._history_busy.add(ws)
-                        self._background(self._history_reply(ws, verb))
-                elif isinstance(verb, dict) and isinstance(verb.get("search"), str):
-                    # Reads the whole chat in a worker thread: one search per socket.
-                    head = {"search": verb["search"], "q": verb.get("q")}
-                    found = functools.partial(self.search, verb["search"], verb.get("q"))
-                    self._background(
-                        self._answer(ws, self._one_at_a_time(ws, head, found, self._search_busy))
-                    )
-                elif isinstance(verb, dict) and isinstance(verb.get("complete"), str):
-                    # A roster fetch is a network round trip: the page's typing must not wait on it.
-                    self._background(self._answer(ws, self.complete(ws, verb)))
-                elif isinstance(verb, dict) and "preview" in verb:
-                    shown = self.preview(verb["preview"], verb.get("format"))
-                    with contextlib.suppress(ConnectionClosed):
-                        await ws.send(json.dumps(shown, ensure_ascii=False))
-                elif isinstance(verb, dict) and verb.get("board") is True:
-                    # A split chat page shows the list too: from now on it gets the board's rows,
-                    # exactly what the widget gets.
-                    if ws not in self.clients:
-                        self.clients.add(ws)
-                        with contextlib.suppress(ConnectionClosed):
-                            await ws.send(self.payload())
-                elif isinstance(verb, dict) and isinstance(verb.get("follow"), str):
-                    await self._answer(ws, self.follow(ws, verb["follow"]))
-                elif isinstance(verb, dict) and isinstance(verb.get("open"), str):
-                    chat = verb.get("chat") is True
-                    split = chat and verb.get("chatnav") == "split"
-                    msg = verb.get("msg")
-                    msg = msg if not chat and isinstance(msg, str) and _MSG_ID_RE.fullmatch(msg) else ""
-                    await self.open_row(
-                        verb["open"], web=verb.get("web") is True, ws=ws, msg_id=msg, chat=chat, split=split
-                    )
-                elif isinstance(verb, dict) and (
-                    action := next((k for k in _ACTIONS if isinstance(verb.get(k), str)), "")
-                ):
-                    # An HTTP round trip, like send: the page's other verbs must not queue behind it.
-                    msg = verb.get("msg")
-                    head = {action: verb[action], "msg": msg if isinstance(msg, str) else None}
-                    acted = functools.partial(self.act, ws, action, verb)
-                    self._background(self._answer(ws, self._one_at_a_time(ws, head, acted)))
-                else:
+                key = _verb_key(self._handlers, self._accepts, verb) if isinstance(verb, dict) else None
+                if key is None:
                     log.debug("ws_client_message_ignored", data=str(raw)[:100])
+                    continue
+                await self._dispatch(ws, key, verb)
         finally:
             self.clients.discard(ws)
             self._follows.pop(ws, None)
-            self._action_busy.discard(ws)
-            self._search_busy.discard(ws)
+
+    async def _dispatch(self, ws: ServerConnection, key: str, verb: dict[str, Any]) -> None:
+        try:
+            await self._handlers[key](ws, verb)
+        except Exception as exc:  # noqa: BLE001 — a failing verb must not close the page's socket
+            # Answering verbs go through `answer`, which replies; this guards the synchronous ones.
+            log.warning("verb_failed", verb=key, error_type=type(exc).__name__, exc_info=True)
+
+    # --- board verbs: one handler per wire key ---
+
+    async def _on_seen(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
+        at = verb.get("at")
+        self.mark_seen(verb["seen"], at if isinstance(at, str) else None)
+
+    async def _on_unseen(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
+        self.mark_unseen(verb["unseen"])
+
+    async def _on_read(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
+        await self.mark_read(verb["read"])
+
+    async def _on_mute(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
+        self.set_muted(verb["mute"], True)
+
+    async def _on_unmute(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
+        self.set_muted(verb["unmute"], False)
+
+    async def _on_board(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
+        # A split chat page shows the list too: from now on it gets the board's rows, exactly what
+        # the widget gets.
+        if ws not in self.clients:
+            self.clients.add(ws)
+            with contextlib.suppress(ConnectionClosed):
+                await ws.send(self.payload())
+
+    async def _on_follow(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
+        await answer(ws, {"follow": verb["follow"]}, self.follow(ws, verb["follow"]))
+
+    async def _on_open(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
+        target, msg = parse_open(verb)
+        await self.open_row(verb["open"], target, ws, msg)
 
 
-def _history_head(thread_id: str, request: dict[str, Any]) -> dict[str, Any]:
-    """The answer's head: the thread and the cursor asked for, `before: null` for the latest page."""
-    key = next((k for k in ("before", "after", "around") if request.get(k) not in (None, "")), "before")
-    value = request.get(key)
-    return {"history": thread_id, key: value if isinstance(value, str) and value else None}
+def parse_open(verb: dict[str, Any]) -> tuple[OpenTarget, str]:
+    """`open` verb → (where to open, message to land on); `chat` wins over `web`."""
+    if verb.get("chat") is True:
+        return ("split" if verb.get("chatnav") == "split" else "chat"), ""
+    msg = verb.get("msg")
+    msg = msg if isinstance(msg, str) and MSG_ID_RE.fullmatch(msg) else ""
+    return ("web" if verb.get("web") is True else "app"), msg
 
 
-def _deleted(props: dict[str, Any]) -> bool:
-    return bool(props.get("deletetime") or props.get("hardDeleteTime"))
-
-
-def _text_error(text: Any) -> str | None:
-    """Why `text` cannot be posted as a message, None when it can."""
-    if not isinstance(text, str) or not text.strip():
-        return "empty message"
-    if len(message_html(text, False).encode()) > _SEND_MAX_BYTES:
-        return "message too long"
+def _verb_key(
+    handlers: dict[str, Handler], accepts: dict[str, Callable[[Any], bool]], verb: dict[str, Any]
+) -> str | None:
+    """The first handled key the verb carries: with a thread id string, or a value its `accepts`
+    check takes."""
+    for key in handlers:
+        if key in verb and accepts.get(key, _is_str)(verb[key]):
+            return key
     return None
 
 
-def _mention_shape(mention: Any) -> bool:
-    return (
-        isinstance(mention, dict)
-        and isinstance(mention.get("name"), str)
-        and isinstance(mention.get("mri"), str)
-        and isinstance(mention.get("everyone", False), bool)
-    )
-
-
-def _humans(members: list[dict[str, Any]]) -> dict[str, str]:
-    """Roster → {mri: display name} of its people; bots and apps left out."""
-    return {str(m["mri"]): str(m["name"] or "") for m in members if not str(m["mri"]).startswith(_APP_MRI)}
-
-
-def _member_items(humans: dict[str, str], thread_id: str, me: str, q: str) -> list[dict[str, Any]]:
-    """Humans but me whose full, first or last name starts with `q` (accents folded); everyone first
-    on groups."""
-    from .mcp import _fold, chat_kind
-
-    prefix = _fold(q)
-    items: list[dict[str, Any]] = []
-    # As the Teams client: every chat but a 1:1 has everyone, whatever its member count.
-    if chat_kind(thread_id) != "private" and "everyone".startswith(prefix):
-        items.append({"name": "everyone", "mri": thread_id, "everyone": True})
-    for mri, name in humans.items():
-        folded = _fold(name)
-        if name and not _is_me(mri, me) and any(p.startswith(prefix) for p in (folded, *folded.split())):
-            items.append({"name": name, "mri": mri})
-    return items[:_COMPLETE_ITEMS]
-
-
-def _custom_emojis(settings: Settings, skype_token: str) -> dict[str, str]:
-    """{name: AMS object id} of the organisation's custom emojis. Blocking: worker thread."""
-    csa_token = token_source(settings).csa_token()
-    if not csa_token:
-        raise RuntimeError("no chat-service token (run `miniteams login`)")
-    found = ids_by_name(emoji_rows(fetch_metadata(settings, skype_token, csa_token)))
-    return {name: oid for name, oid in found.items() if _EMOJI_NAME_RE.fullmatch(name)}
-
-
-def _emoji_body(cache: Path, path: Path) -> tuple[bytes, str] | None:
-    try:
-        target = path.resolve(strict=True)
-        if target.parent != cache.resolve(strict=True) or target.name.endswith(".part"):
-            return None
-        if target.stat().st_size > _MEDIA_MAX:
-            return None
-        return target.read_bytes(), mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-    except OSError:
-        return None
-
-
-def _failure(exc: Exception) -> str:
-    """Reason a failed Teams call shows on the page."""
-    if isinstance(exc, httpx.HTTPStatusError):
-        return f"Teams answered {exc.response.status_code}"
-    if isinstance(exc, httpx.TransportError):
-        return "network error"
-    return str(exc)[:200]
+def _is_str(value: Any) -> bool:
+    return isinstance(value, str)
 
 
 def _save_marks(path: Path | None, marks: dict[str, str]) -> None:
@@ -1903,22 +1360,42 @@ def _page_path(name: str = "widget.html") -> Path:
     return Path(str(files("miniteams").joinpath(name)))
 
 
+_UI = ("ui.css", "ui.js")  # shared by both pages, inlined at their `/* ui.css */` and `/* ui.js */`
+
+
+def _version(name: str) -> str:
+    return "-".join(str(_page_path(part).stat().st_mtime_ns) for part in (name, *_UI))
+
+
 def page_version(name: str = "widget.html") -> str:
     try:
-        return str(_page_path(name).stat().st_mtime_ns)
+        return _version(name)
     except OSError:
         return ""
 
 
+@functools.lru_cache(maxsize=4)
+def _assembled(name: str, version: str) -> str:
+    """`name` with the shared files inlined; `version` (the mtimes) keys the cache, so an edit shows."""
+    page = _page_path(name).read_text(encoding="utf-8")
+    for part in _UI:
+        mark = f"/* {part} */"
+        if page.count(mark) != 1:
+            raise ValueError(f"{name}: needs exactly one {mark}")
+        page = page.replace(mark, _page_path(part).read_text(encoding="utf-8"))
+    return page
+
+
 def _page(name: str = "widget.html") -> str:
-    return _page_path(name).read_text(encoding="utf-8")
+    return _assembled(name, _version(name))
 
 
 @functools.lru_cache(maxsize=4)
-def _chat_csp(page: str) -> str:
-    """CSP for chat.html: only its own script (by hash) runs, so an inline handler in a message cannot.
+def _page_csp(page: str) -> str:
+    """CSP for a served page: only its own script (by hash) runs, so an inline handler cannot.
 
-    Server HTML reaches that page's DOM: no foreign script, image or socket even if the sanitiser slips.
+    Server HTML reaches the pages' DOM (messages, rows): no foreign script, image or socket even if
+    the sanitiser slips.
     """
     found = _SCRIPT_RE.search(page)
     digest = hashlib.sha256(found.group(1).encode() if found else b"").digest()
@@ -1929,79 +1406,183 @@ def _chat_csp(page: str) -> str:
     )
 
 
+# Chat contents: no framing, no sniffing, no cross-origin embedding, no disk cache.
+_PAGE_HEADERS = {
+    "Content-Type": "text/html; charset=utf-8",
+    "X-Content-Type-Options": "nosniff",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Cache-Control": "no-store",
+}
+
+
 def _respond(ws: ServerConnection, body: bytes, headers: dict[str, str]) -> Response:
     resp = ws.respond(HTTPStatus.OK, "")
     resp.body = body
     for name, value in {**headers, "Content-Length": str(len(body))}.items():
-        if name in resp.headers:  # respond() stamps text/plain; Headers is a multidict
-            del resp.headers[name]
-        resp.headers[name] = value
+        _put(resp, name, value)
     return resp
+
+
+def _put(resp: Response, name: str, value: str) -> None:
+    if name in resp.headers:  # respond() stamps text/plain; Headers is a multidict
+        del resp.headers[name]
+    resp.headers[name] = value
+
+
+def _authorized(request: Request, secret: str) -> bool:
+    """The request carries the `mt` cookie (compared in constant time)."""
+    for header in request.headers.get_all("Cookie"):
+        for pair in header.split(";"):
+            name, _, value = pair.strip().partition("=")
+            if name == _COOKIE and hmac.compare_digest(value.encode(), secret.encode()):
+                return True
+    return False
+
+
+def _set_cookie(resp: Response, secret: str) -> None:
+    _put(resp, "Set-Cookie", f"{_COOKIE}={secret}; HttpOnly; SameSite=Strict; Path=/; Max-Age={_COOKIE_AGE}")
+    _put(resp, "Cache-Control", "no-store")  # the response carries the secret
+
+
+def _see_other(ws: ServerConnection, location: str) -> Response:
+    resp = ws.respond(HTTPStatus.SEE_OTHER, "")
+    resp.headers["Location"] = location
+    return resp
+
+
+def _not_signed_in(ws: ServerConnection, board: Board) -> Response:
+    """403 for a page: how to get the cookie, never the secret."""
+    launch = (board.run_dir / _LAUNCH_FILE).as_uri() if board.run_dir else f"file://…/{_LAUNCH_FILE}"
+    hint = (
+        f"Not signed in to this miniteams page: open the launch file printed by `miniteams web` ({launch})\n"
+    )
+    return ws.respond(HTTPStatus.FORBIDDEN, hint)
+
+
+def _launch(ws: ServerConnection, request: Request, board: Board, path: str, query: str) -> Response | None:
+    """`?n=<nonce>` on a page: a live nonce sets the cookie and moves on to the same URL without `n`; a
+    spent one 303s there a page that already has the cookie. 403 otherwise; None without `n`."""
+    params = parse_qsl(query, keep_blank_values=True)
+    nonce = dict(reversed(params)).get("n")  # the first `n`
+    if nonce is None:
+        return None
+    kept = urlencode([(key, value) for key, value in params if key != "n"])
+    landing = path + (f"?{kept}" if kept else "")
+    if board.take_nonce(nonce):
+        # Not a 303: the launch file would stay the initiator, a cross-site one, and the browser would
+        # withhold the SameSite=Strict cookie it just got. A refresh from our own origin is same-site.
+        resp = _respond(
+            ws,
+            _launch_page(landing).encode(),
+            _PAGE_HEADERS | {"Content-Security-Policy": "default-src 'none'"},
+        )
+        _set_cookie(resp, board.secret)
+        return resp
+    if _authorized(request, board.secret):  # a reload of the launch URL, a reopened tab
+        return _see_other(ws, landing)
+    return _not_signed_in(ws, board)
+
+
+_FILE_HEADERS = {
+    # An archived HTML or SVG opened directly must not run as this origin (it could open /ws).
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "sandbox",
+    "Cross-Origin-Resource-Policy": "same-origin",
+}
 
 
 async def _process_request(
     board: Board, bound: str, ws: ServerConnection, request: Request
 ) -> Response | None:
-    path = request.path.split("?", 1)[0]  # the page's view params (?theme=…) ride the query string
+    url = urlsplit(request.path)
+    path = url.path  # the page's view params (?theme=…) ride the query string
     if path == "/ws":
-        return None  # proceed with the websocket upgrade
+        # Any local process can forge an Origin: only a browser holding the cookie gets through.
+        if not _authorized(request, board.secret):
+            return ws.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
+        return None  # proceed with the websocket upgrade; the Origin check runs next
+    # DNS rebinding: a foreign name resolving to our address must not read a page, a chat or its files.
+    if request.headers.get("Host") != bound:
+        return ws.respond(HTTPStatus.NOT_FOUND, "not found\n")
+    page_route = path == "/" or path.startswith("/chat/")
+    if page_route and (launched := _launch(ws, request, board, path, url.query)) is not None:
+        return launched
+    if not _authorized(request, board.secret):
+        return _not_signed_in(ws, board) if page_route else ws.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
+    try:
+        resp = await _route(board, ws, path)
+    except ArchiveUnavailable:
+        return ws.respond(HTTPStatus.SERVICE_UNAVAILABLE, "archive unavailable\n")
+    if page_route and resp.status_code == HTTPStatus.OK:
+        _set_cookie(resp, board.secret)  # a year from the last use, not from the launch
+    return resp
+
+
+async def _route(board: Board, ws: ServerConnection, path: str) -> Response:
     if path == "/":
-        return _respond(ws, _page().encode(), {"Content-Type": "text/html; charset=utf-8"})
-    # DNS rebinding: a foreign name resolving to our address must not read a chat or its files.
-    own_host = request.headers.get("Host") == bound
-    if own_host and path.startswith("/chat/"):
+        page = _page("widget.html")
+        return _respond(ws, page.encode(), _PAGE_HEADERS | {"Content-Security-Policy": _page_csp(page)})
+    if path.startswith("/chat/"):
         thread_id = unquote(path.removeprefix("/chat/"))
-        if thread_id in board.rows or await asyncio.to_thread(board._archive_dir, thread_id) is not None:
+        if thread_id in board.rows or await io("dir", archive_dir, board.data_dir, thread_id) is not None:
             page = _page("chat.html")
-            headers = {"Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": _chat_csp(page)}
-            return _respond(ws, page.encode(), headers)
-    if own_host and path.startswith("/media/"):
-        found = await asyncio.to_thread(board.media_file, path)
+            return _respond(ws, page.encode(), _PAGE_HEADERS | {"Content-Security-Policy": _page_csp(page)})
+    if path.startswith("/media/"):
+        found = await board.chat.media(path)
         if found is not None:
             body, ctype = found
-            # An archived HTML or SVG opened directly must not run as this origin (it could open /ws).
-            safe = {
-                "X-Content-Type-Options": "nosniff",
-                "Content-Security-Policy": "sandbox",
-                "Cross-Origin-Resource-Policy": "same-origin",
-            }
-            return _respond(
-                ws, body, {"Content-Type": ctype, "Cache-Control": "private, max-age=3600"} | safe
-            )
-    if own_host and path.startswith("/emoji/"):
-        found = await board.emoji_file(path.removeprefix("/emoji/"))
+            headers = {"Content-Type": ctype, "Cache-Control": "private, max-age=3600"}
+            return _respond(ws, body, headers | _FILE_HEADERS)
+    if path.startswith("/emoji/"):
+        found = await board.emojis.image(path.removeprefix("/emoji/"))
         if found is not None:
             body, ctype = found
-            safe = {
-                "X-Content-Type-Options": "nosniff",
-                "Content-Security-Policy": "sandbox",
-                "Cross-Origin-Resource-Policy": "same-origin",
-            }
-            return _respond(
-                ws, body, {"Content-Type": ctype, "Cache-Control": "private, max-age=86400"} | safe
-            )
+            headers = {"Content-Type": ctype, "Cache-Control": "private, max-age=86400"}
+            return _respond(ws, body, headers | _FILE_HEADERS)
     return ws.respond(HTTPStatus.NOT_FOUND, "not found\n")
 
 
 async def serve_board(board: Board, settings: Settings, bind: str | None) -> None:
     host, port = load_bind(settings, bind)
-    for attempt in range(_BIND_ATTEMPTS):
-        try:
-            # Only the page we serve may open the socket — any other site's Origin gets 403,
-            # else every open tab could read the chat list (cross-site websocket hijacking).
-            origins = [Origin(f"http://{host}:{port}")]
-            routes = functools.partial(_process_request, board, f"{host}:{port}")
-            board.base_url = f"http://{host}:{port}"
-            async with serve(board.handle, host, port, origins=origins, process_request=routes):
-                log.info("web_listening", url=f"http://{host}:{port}/")
-                await board.watch_page()  # until cancelled
-        except OSError as exc:
-            if bind or attempt == _BIND_ATTEMPTS - 1:
-                raise
-            # Persisted port got taken by something else since the draw — redraw, keep going.
-            log.warning("bind_failed", host=host, port=port, error=str(exc))
-            host, port = _draw_bind()
-            save_bind(settings, host, port)
+    for name in ("widget.html", "chat.html"):
+        _page(name)  # a missing ui.js / ui.css or marker fails here, not on the first page load
+    board.secret = load_secret(settings)  # never logged: it is every route's only credential
+    board.run_dir = run_dir(settings)
+    for stale in board.run_dir.glob("chat-*.html"):  # a previous run's: their nonces died with it
+        stale.unlink(missing_ok=True)
+    try:
+        for attempt in range(_BIND_ATTEMPTS):
+            bound = netloc(host, port)
+            board.base_url = f"http://{bound}"
+            try:
+                # Only the page we serve may open the socket — any other site's Origin gets 403,
+                # else every open tab could read the chat list (cross-site websocket hijacking).
+                server = await serve(
+                    board.handle,
+                    host,
+                    port,
+                    origins=[Origin(board.base_url)],
+                    process_request=functools.partial(_process_request, board, bound),
+                )
+                break
+            except OSError as exc:
+                if bind or attempt == _BIND_ATTEMPTS - 1:
+                    raise
+                # Persisted port got taken by something else since the draw. Same host: the cookie is
+                # scoped to it, a new address would sign every open page out.
+                log.warning("bind_failed", host=host, port=port, error=str(exc))
+                port = _draw_port()
+                save_bind(settings, host, port)
+        async with server:
+            log.info("web_listening", url=f"{board.base_url}/")
+            board.issue_launch()
+            # The user's own terminal: where the launch file is, never the nonce it holds. A closed
+            # stderr must not read as a failed start.
+            with contextlib.suppress(OSError):
+                print(f"open: {(board.run_dir / _LAUNCH_FILE).as_uri()}", file=sys.stderr, flush=True)
+            await board.watch_page()  # until cancelled
+    finally:
+        board.drop_launch_files()
 
 
 def resolve_limit(limit: int | None, seeded: bool) -> int:
@@ -2075,7 +1656,12 @@ async def run(
     directory.me = me
     seen_path = settings.config_dir / "seen.json"
     seen = _load_seen(seen_path)
-    seed = await asyncio.to_thread(seed_from_archive, data_dir, me) if data_dir else {}
+    seed: dict[str, dict[str, Any]] = {}
+    if data_dir is not None:
+        try:
+            seed = await io("index", seed_from_archive, data_dir, me)
+        except ArchiveUnavailable:
+            log.warning("archive_index_timeout", data_dir=str(data_dir))  # the listing fills the table
     cap = resolve_limit(limit, seeded=bool(seed))
     board = Board(
         seeded_rows(seed, cap),
@@ -2103,12 +1689,32 @@ async def run(
     stream = asyncio.create_task(
         run_forever(settings, on_event=board.on_event, directory=directory, epid_name="endpoint_id-web")
     )
-    emojis = asyncio.create_task(board.refresh_custom_emojis())
-    done, pending = await asyncio.wait({server, stream}, return_when=asyncio.FIRST_COMPLETED)
-    fill.cancel()  # the page is going away; a half-finished walk has nobody to tell
-    emojis.cancel()
-    for task in pending:
-        task.cancel()
-    for task in done:
-        task.result()  # re-raise a server failure (e.g. bind) instead of exiting 0
-    raise RuntimeError("live stream ended (auth expired?) — re-run")
+    emojis = asyncio.create_task(board.emojis.refresh())
+    try:
+        done, pending = await asyncio.wait({server, stream}, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        for task in done:
+            task.result()  # re-raise a server failure (e.g. bind) instead of exiting 0
+        raise RuntimeError("live stream ended (auth expired?) — re-run")
+    finally:
+        fill.cancel()  # the page is going away; a half-finished walk has nobody to tell
+        emojis.cancel()
+        board.close()
+        close_archive_pool()
+        stuck = stuck_archive_threads()
+        code = stuck_exit_code(sys.exception(), stuck)
+        if code is not None:
+            log.error("archive_threads_stuck", threads=stuck, exit_code=code)
+            for out in (sys.stdout, sys.stderr):
+                with contextlib.suppress(Exception):
+                    out.flush()
+            os._exit(code)  # the interpreter's exit joins the pool's threads: a dead mount would hold it
+
+
+def stuck_exit_code(exc: BaseException | None, stuck: int) -> int | None:
+    """The code to leave with at once when `stuck` archive threads outlive the run, as `main` would
+    have exited after `exc`; None when there are none."""
+    if not stuck:
+        return None
+    return 0 if exc is None or isinstance(exc, KeyboardInterrupt | asyncio.CancelledError) else 1
