@@ -270,7 +270,7 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
                     include_all=args.all,
                     download_media=not args.no_media,
                     download_avatars=not args.no_avatars,
-                    download_videos=args.videos,
+                    media_types=args.media,
                     reconcile=args.live,
                 )
             )
@@ -292,7 +292,7 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
                         include_all=args.all,
                         download_media=not args.no_media,
                         download_avatars=not args.no_avatars,
-                        download_videos=args.videos,
+                        media_types=args.media,
                         verify_media=args.verify_media,
                         assets_only=args.assets_only,
                         retry_denied=args.retry_denied,
@@ -359,14 +359,17 @@ def cmd_stream(settings: Settings, args: argparse.Namespace) -> int:
     """Full chain → websocket → authenticate → register → stream, with auto-reconnect (M2-M4)."""
     import asyncio
 
+    from .directory import Directory
     from .stream import run_forever
 
     # Stream is long-running and often headless (server/SSH) where a localhost browser redirect
     # can't complete; default the interactive fallback to device-code. A cached token still goes
     # silent; `--device-code` is implied here.
     settings.use_device_code = True
+    directory = Directory(settings)
+    directory.media = args.media
     try:
-        asyncio.run(run_forever(settings, args.jsonl, args.raw, args.typing))
+        asyncio.run(run_forever(settings, args.jsonl, args.raw, args.typing, directory=directory))
     except KeyboardInterrupt:
         log.info("interrupted")
     return 0
@@ -388,6 +391,29 @@ def _utc_floor(value: str) -> str:
         return parse_when(value).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S")
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid ISO date/datetime: {value!r}") from exc
+
+
+def _media_list(value: str) -> frozenset[str]:
+    from .attachments import MEDIA_TYPES
+
+    names = [n.strip() for n in value.split(",")]
+    valid = ", ".join(MEDIA_TYPES)
+    if not all(names):
+        raise argparse.ArgumentTypeError(f"empty type in {value!r}; valid types: {valid}")
+    unknown = [n for n in names if n not in MEDIA_TYPES]
+    if unknown:
+        raise argparse.ArgumentTypeError(f"unknown type {unknown[0]!r}; valid types: {valid}")
+    if len(set(names)) != len(names):
+        raise argparse.ArgumentTypeError(f"duplicate type in {value!r}; valid types: {valid}")
+    return frozenset(names)
+
+
+_MEDIA_HELP = (
+    "comma-separated attachment types to download (default: images,files,transcripts): "
+    "images = inline pictures; files = shared documents and other attachments (card and "
+    "recording thumbnails); transcripts = meeting transcripts, every format served; "
+    "videos = meeting recordings and shared video files (large)"
+)
 
 
 def _reaction_key(value: str) -> str:
@@ -516,7 +542,9 @@ def main(argv: list[str] | None = None) -> int:
     p_archive.add_argument("--thread", help="archive only this conversation (skip enumeration)")
     p_archive.add_argument("--all", action="store_true", help="include channels too")
     p_archive.add_argument(
-        "--no-media", action="store_true", help="skip downloading attachments (messages only)"
+        "--no-media",
+        action="store_true",
+        help="skip downloading attachments (messages only); same as an empty --media",
     )
     p_archive.add_argument(
         "--no-avatars", action="store_true", help="skip downloading group icons / member avatars"
@@ -526,8 +554,9 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="also download meeting recordings and shared video files (large — expect "
         "hundreds of MB per hour of meeting; combine with --verify-media or --assets-only "
-        "to sweep chats already archived without videos)",
+        "to sweep chats already archived without videos); same as --media with videos added",
     )
+    p_archive.add_argument("--media", type=_media_list, metavar="TYPES", help=_MEDIA_HELP)
     p_archive.add_argument(
         "--verify-media",
         action="store_true",
@@ -643,6 +672,7 @@ def main(argv: list[str] | None = None) -> int:
     p_stream.add_argument(
         "--typing", action="store_true", help="show typing indicators (✍ is typing / stopped)"
     )
+    p_stream.add_argument("--media", type=_media_list, metavar="TYPES", help=_MEDIA_HELP)
     p_stream.set_defaults(func=cmd_stream)
 
     args = parser.parse_args(argv)
@@ -674,6 +704,17 @@ def main(argv: list[str] | None = None) -> int:
     # Videos ride the media pass; without it the flag would be a silent no-op.
     if getattr(args, "videos", False) and getattr(args, "no_media", False):
         parser.error("--videos requires media downloads; drop --no-media")
+    if hasattr(args, "media"):
+        from .attachments import DEFAULT_MEDIA
+
+        # One way to say the selection per run: the shorthands are spelled-out --media values.
+        shorthand = [f for f in ("no_media", "videos") if getattr(args, f, False)]
+        if args.media is not None and shorthand:
+            parser.error(f"--media cannot be combined with --{shorthand[0].replace('_', '-')}")
+        if "no_media" in shorthand:
+            args.media = frozenset()
+        elif args.media is None:
+            args.media = DEFAULT_MEDIA | {"videos"} if shorthand else DEFAULT_MEDIA
 
     settings = Settings()  # type: ignore[call-arg]  # tenant_id comes from env/.env
     if args.device_code:

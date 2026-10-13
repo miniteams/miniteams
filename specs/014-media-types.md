@@ -1,6 +1,6 @@
 # 014 — Choose which media types are downloaded
 
-**Status**: approved
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-10-13
 
@@ -29,7 +29,9 @@ is unchanged. The default stays what it is today.
 
 - **Option.** `--media images,files,transcripts,videos` on `archive` (batch and `--live`) and on
   `stream`. Default `images,files,transcripts`. Unknown names, duplicates and an empty list are
-  refused by argparse with the list of valid names.
+  refused by argparse with the list of valid names. `stream` prints only the selected types: a
+  deselected one is neither fetched nor annotated in the printed line (or the `--jsonl`
+  `attachments`), as videos already were in the default.
 - **Existing flags.** `--no-media` = an empty selection; `--videos` = the default plus `videos`.
   Both stay; combining either with `--media` is refused (one way to say it per run).
 - **`--verify-media` and `--assets-only`** re-check and fetch only the selected types.
@@ -46,20 +48,20 @@ is unchanged. The default stays what it is today.
 
 ## Acceptance criteria
 
-- [ ] **AC1** `extract` (or a pure helper next to it) classifies every kind into exactly one type,
+- [x] **AC1** `extract` (or a pure helper next to it) classifies every kind into exactly one type,
       including a `URIObject` picture vs document and an `sp_file` document vs recording/video.
-- [ ] **AC2** `archive --media transcripts` on a chat holding an image, a document, a recording
+- [x] **AC2** `archive --media transcripts` on a chat holding an image, a document, a recording
       with transcript and video downloads only the transcript, in every format it is served in (both
       SharePoint renditions, the AMS one by content type); messages and index are complete.
-- [ ] **AC3** Without `--media` the downloaded set is byte-for-byte the current default;
+- [x] **AC3** Without `--media` the downloaded set is byte-for-byte the current default;
       `--videos` and `--media images,files,transcripts,videos` download the same set.
-- [ ] **AC4** `--no-media` downloads nothing; `--media` with `--no-media` or `--videos` exits with
+- [x] **AC4** `--no-media` downloads nothing; `--media` with `--no-media` or `--videos` exits with
       a usage error; `--media pdf`, `--media ""` and `--media images,images` are usage errors
       naming the valid types.
-- [ ] **AC5** `archive --live` and `stream` honour the selection on new messages.
-- [ ] **AC6** `--verify-media --media images` fetches missing images only and leaves missing
+- [x] **AC5** `archive --live` and `stream` honour the selection on new messages.
+- [x] **AC6** `--verify-media --media images` fetches missing images only and leaves missing
       documents, transcripts and videos missing (and unreported as failures).
-- [ ] **AC7** Files of an excluded type already on disk are untouched by any run.
+- [x] **AC7** Files of an excluded type already on disk are untouched by any run.
 
 ## Phases
 
@@ -79,8 +81,7 @@ None. Selection is per run; manifests keep their shape.
 
 ## Open questions
 
-- How does a `URIObject` say it is a picture: its `type` attribute (`Picture.1`) or the file
-  extension? To check on archived messages before phase 1.
+None.
 
 ## Decisions
 
@@ -91,3 +92,9 @@ None. Selection is per run; manifests keep their shape.
 - Applies to `archive`, `archive --live`, `--verify-media` and `stream` (babs, 2026-10-13).
 - Media of a deselected type are kept, never deleted (babs, 2026-10-13).
 - `transcripts` means every transcript format, never a subset (babs, 2026-10-13).
+- A `URIObject` is a picture when its `type` attribute starts with `Picture.`; every other one is a
+  `files` item (2026-10-13). The archive holds 8,590 `URIObject`s, all with a `type` and none with
+  a file extension on the tag: 7,153 `SWIFT.1` (card placeholder, thumbnail on a host never
+  downloaded) and 1,437 `Video.2/CallRecording.1` (recording thumbnail, `thumbnail_small` view;
+  435 recorded as 404 in `denied_assets`). No `Picture.1`: inline pictures arrive as AMS `<img>`
+  tags. Both kinds stay `files`, so the default set is unchanged.

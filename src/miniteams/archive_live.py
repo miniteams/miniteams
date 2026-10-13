@@ -65,12 +65,12 @@ class LiveArchive:
         include_all: bool = False,
         download_media: bool = True,
         download_avatars: bool = True,
-        download_videos: bool = False,
+        media_types: frozenset[str] = attachments.DEFAULT_MEDIA,
     ) -> None:
         self.settings, self.data_dir, self.provider = settings, data_dir, provider
         self.include_all = include_all
         self.download_media, self.download_avatars = download_media, download_avatars
-        self.download_videos = download_videos
+        self.media_types = media_types
         self.index = Index(data_dir)
         self.stopped = asyncio.Event()  # set when the refresh token is dead
         self._buffering = False
@@ -191,7 +191,7 @@ class LiveArchive:
     def _spawn_media(self, thread_id: str, resource: dict[str, Any]) -> None:
         """Background download: awaiting it would hold the socket's read loop (acks, heartbeats)."""
         content, msgtype = resource.get("content") or "", str(resource.get("messagetype") or "")
-        if not self.download_media or not attachments.extract(content, msgtype, videos=self.download_videos):
+        if not self.download_media or not attachments.extract(content, msgtype, self.media_types):
             return
         task = asyncio.create_task(self._media(thread_id, content, msgtype))
         self._media_tasks.add(task)
@@ -212,7 +212,7 @@ class LiveArchive:
                     graph_token=self.provider.graph_token,
                     skip_url=store.denied_urls(_now_iso()).__contains__,
                     on_fail=partial(record_asset_failure, store),
-                    videos=self.download_videos,
+                    media=self.media_types,
                 )
                 log.info("live_media", thread=thread_id, files=sum(1 for n in files if "→" in n))
             except AuthExpired as exc:
@@ -234,7 +234,7 @@ class LiveArchive:
                 include_all=self.include_all,
                 download_media=self.download_media,
                 download_avatars=self.download_avatars,
-                download_videos=self.download_videos,
+                media_types=self.media_types,
                 force=force,
             )
         )
@@ -307,7 +307,7 @@ async def run_live(
     include_all: bool = False,
     download_media: bool = True,
     download_avatars: bool = True,
-    download_videos: bool = False,
+    media_types: frozenset[str] = attachments.DEFAULT_MEDIA,
     reconcile: float = 1800.0,
 ) -> bool:
     """Returns True when it stopped on a dead refresh token (re-login needed)."""
@@ -318,7 +318,7 @@ async def run_live(
         include_all=include_all,
         download_media=download_media,
         download_avatars=download_avatars,
-        download_videos=download_videos,
+        media_types=media_types,
     )
     stream = asyncio.create_task(
         run_forever(

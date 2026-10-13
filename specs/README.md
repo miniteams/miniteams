@@ -15,5 +15,5 @@
 | [011](011-chat-view.md) | Chat view in the widget (`/chat/<thread>`) | shipped (read receipts amendment approved, spike first) |
 | [012](012-composer-emoji-mentions.md) | Composer: emoji completion and `@` mentions | implemented (phase 5 approved: 5a then 5b) |
 | [013](013-reaction-tooltips.md) | Reaction tooltips with all emotions and participants | shipped |
-| [014](014-media-types.md) | Choose which media types are downloaded (`--media`) | approved |
+| [014](014-media-types.md) | Choose which media types are downloaded (`--media`) | shipped |
 | [015](015-presence.md) | Presence on avatars | approved |
