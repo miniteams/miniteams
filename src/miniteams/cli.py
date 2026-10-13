@@ -2,9 +2,12 @@
 
 import argparse
 import contextlib
+import os
 import re
+import stat
 import sys
 from datetime import UTC
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -72,23 +75,54 @@ def cmd_handshake(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def _read_image(path: Path, limit: int) -> bytes:
+    """A regular file's bytes, at most `limit`; ValueError for anything else."""
+    try:
+        # A FIFO or a device would block or never end (/dev/zero): refused before the open.
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            raise ValueError(f"{path.name}: not a regular file")
+        # Non-blocking and re-checked on the fd: a swap to a FIFO after the stat cannot hang us.
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb") as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                raise ValueError(f"{path.name}: not a regular file")
+            data = fh.read(limit + 1)  # a file growing past the cap is caught too
+    except OSError as exc:
+        raise ValueError(f"{path.name}: {exc.strerror or exc}") from exc
+    if len(data) > limit:
+        raise ValueError(f"{path.name}: over {limit >> 20} MiB")
+    return data
+
+
 def cmd_send(settings: Settings, args: argparse.Namespace) -> int:
     """Send a message — defaults to your own Notes (write-safe target)."""
-    from pathlib import Path
-
-    from .send import send_message
+    from .images import MAX_IMAGE_BYTES, check_batch
+    from .send import send_images, send_message
 
     if args.file:
         text = Path(args.file).read_text(encoding="utf-8")
     elif args.text is not None:
         text = args.text
+    elif args.image:
+        text = ""
     else:
-        log.error("send_no_input", hint="provide TEXT or --file")
+        log.error("send_no_input", hint="provide TEXT, --file or --image")
         return 2
+
+    images: list[tuple[str, bytes]] = []
+    if args.image:
+        try:  # before auth: a bad file never costs a login
+            images = [(Path(path).name, _read_image(Path(path), MAX_IMAGE_BYTES)) for path in args.image]
+            check_batch([data for _, data in images])
+        except ValueError as exc:
+            log.error("send_bad_image", error=str(exc))
+            return 2
 
     aad, skype_token = _ensure_skype_token(settings)
     display_name = (aad.get("id_token_claims") or {}).get("name") or ""
-    send_message(settings, skype_token, args.thread, text, display_name, is_html=args.html)
+    if images:
+        send_images(settings, skype_token, args.thread, text, images, display_name, is_html=args.html)
+    else:
+        send_message(settings, skype_token, args.thread, text, display_name, is_html=args.html)
     print(f"sent → {args.thread}", file=sys.stderr)
     return 0
 
@@ -473,6 +507,12 @@ def main(argv: list[str] | None = None) -> int:
         "--thread",
         default=NOTES_THREAD,
         help="target conversation/thread id (default: Notes to self)",
+    )
+    p_send.add_argument(
+        "--image",
+        action="append",
+        metavar="FILE",
+        help="attach an inline image (PNG, JPEG, GIF, WebP); repeat for several, sent after the text",
     )
     p_send.set_defaults(func=cmd_send)
 
