@@ -540,6 +540,58 @@ async def test_shortening_identical_full_names_keeps_the_selected_person(fake: F
     assert [m["mri"] for m in json.loads(props["mentions"])] == [ANN["mri"], ANN2["mri"]]
 
 
+async def test_a_sent_shortened_mention_lets_the_next_message_ask_again(fake: Fake) -> None:
+    """M1: a send empties the composer without an input event: `@` at the shortened mention's offset
+    must ask again for the next message."""
+    page, box = _parts(fake)
+    await box.press_sequentially("@ann")
+    await shows(page, ["Ann Lee"])
+    await box.press("Enter")
+    await box.press("Backspace")
+    assert await box.input_value() == "@Ann "
+    await box.press("Enter")
+    await wait(lambda: len(fake.of("send")) == 1)
+    await until(page, "document.getElementById('reply').value === ''")
+    await box.press_sequentially("@ann")
+    await shows(page, ["Ann Lee"])
+
+
+async def test_backspace_inside_a_longer_picked_name_is_plain_deletion(fake: Fake) -> None:
+    """`@Ann Lee` inside a picked `@Ann Lee Smith` is no mention of Ann Lee: Backspace there deletes a
+    letter and leaves both picks."""
+    long = {"name": "Ann Lee Smith", "mri": "8:orgid:ann-lee-smith"}
+    fake.members = [ANN, long]
+    page, box = _parts(fake)
+    await box.press_sequentially("@ann lee")
+    await shows(page, ["Ann Lee", "Ann Lee Smith"])
+    await box.press("ArrowDown")
+    await box.press("Enter")
+    await box.press_sequentially("and @ann l")
+    await shows(page, ["Ann Lee", "Ann Lee Smith"])
+    await box.press("Enter")
+    assert await box.input_value() == "@Ann Lee Smith and @Ann Lee "
+    await box.evaluate("b => b.setSelectionRange(8, 8)")
+    await box.press("Backspace")
+    assert await box.input_value() == "@Ann Le Smith and @Ann Lee "
+
+
+@pytest.mark.parametrize("glue", ["x", "𝐀"])
+async def test_backspace_inside_a_glued_name_is_plain_deletion(fake: Fake, glue: str) -> None:
+    """L4: `@Ann Leex` is no mention, nor `@Ann Lee𝐀` (a letter outside the BMP): Backspace after `Lee`
+    deletes a letter; the real `@Ann Lee` after it keeps its full name."""
+    page, box = _parts(fake)
+    for prefix in ("@ann", "@ann"):
+        await box.press_sequentially(prefix)
+        await shows(page, ["Ann Lee"])
+        await box.press("Enter")
+    await box.evaluate("b => b.setSelectionRange(8, 8)")
+    await box.press_sequentially(glue)
+    await box.press("Escape")
+    await box.evaluate("b => b.setSelectionRange(8, 8)")
+    await box.press("Backspace")
+    assert await box.input_value() == f"@Ann Le{glue} @Ann Lee "
+
+
 async def test_reaction_hover_lists_every_emotion_and_its_people(fake: Fake) -> None:
     page, _ = _parts(fake)
     reactions = [
@@ -1022,6 +1074,28 @@ async def test_a_deleted_pick_does_not_mention_its_namesake(fake: Fake, picks: l
     """M1: a namesake picked then deleted from the text is not mentioned; the one picked last is."""
     fake.members = [ANN, ANN2]
     assert await pick_namesakes(fake, picks) == sent
+
+
+async def test_a_deleted_pick_stays_out_when_its_name_is_typed_again(fake: Fake) -> None:
+    """L8: each pick prunes the picks gone from the text: a later hand-typed `@Ann Lee` must not revive
+    the namesake deleted before the last pick."""
+    fake.members = [ANN, ANN2]
+    page, box = _parts(fake)
+    await box.press_sequentially("@ann")
+    await shows(page, ["Ann Lee", "Ann Lee"])
+    await box.press("Enter")
+    await box.press("Control+a")
+    await box.press("Backspace")
+    await box.press_sequentially("@ann")
+    await shows(page, ["Ann Lee", "Ann Lee"])
+    await box.press("ArrowDown")
+    await box.press("Enter")
+    await box.press_sequentially("and @Ann Lee")
+    await shows(page, ["Ann Lee", "Ann Lee"])
+    await box.press("Escape")
+    await box.press("Enter")
+    await wait(lambda: len(fake.of("send")) == 1)
+    assert fake.of("send")[0]["mentions"] == [ANN2]
 
 
 async def test_picks_out_of_text_order_mention_both(fake: Fake) -> None:

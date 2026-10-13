@@ -154,7 +154,7 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   - Backspace after a picked full-name mention shortens it to the first name while keeping its recipient.
   - Widget: inline formatting.
   - Chat page: bold, italic, strike, code, lists, quotes through a toolbar or Ctrl+B / Ctrl+I, plus a preview of the message as posted.
-- **Messages**: hover for actions: reply with a quote, react (Teams' 8 reactions), edit and delete your own. Reaction chips toggle.
+- **Messages**: hover for actions: reply with a quote, react (Teams' 6 default reactions), edit and delete your own. Only chips of the 8 keys the page's `react` verb accepts (`messages.EMOJI`, `yes`/`no` included) toggle; others show their count.
   Hover any reaction chip to see all the message's reactions, grouped by emoji with their participants.
   Native skin tones (`yes-tone1` → 👍🏻 through `yes-tone5` → 👍🏿) are preserved on supported emoji.
   Cards from bots and apps are rendered; runs of deleted messages are folded.

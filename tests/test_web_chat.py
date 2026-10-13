@@ -433,6 +433,24 @@ def test_record_deleted_message_has_no_body() -> None:
         ("110000_invalid", ":110000_invalid:"),
         ("d800_invalid", ":d800_invalid:"),
         ("party_custom", ":party_custom:"),
+        ("raisedfist", "✊"),
+        ("raisedfist-tone3", "✊🏽"),
+        ("ok", "👌"),
+        ("pointupindex", "☝️"),
+        ("pointupindex-tone2", "☝🏼"),
+        ("fistbump", "👊"),
+        ("fistbump-tone4", "👊🏾"),
+        ("heartyellow", "💛"),
+        ("hearteyes", "😍"),
+        ("seenoevil", "🙈"),
+        ("upsidedownface", "🙃"),
+        ("1f3f4-e0067-e0062-e0065-e006e-e0067-e007f_england", "🏴󠁧󠁢󠁥󠁮󠁧󠁿"),
+        ("202e_x", ":202e_x:"),
+        ("200f_x", ":200f_x:"),
+        ("2028_x", ":2028_x:"),
+        ("0007_bell", ":0007_bell:"),
+        ("e0000_x", ":e0000_x:"),
+        ("partyparrot;0-frs-d1-0123456789abcdef", ":partyparrot:"),
     ],
 )
 def test_record_decodes_unicode_reaction_keys(key: str, emoji: str) -> None:
@@ -480,6 +498,27 @@ def test_record_resolves_reaction_people_without_losing_unknown_users() -> None:
     assert record["reactions"][0]["people"] == ["Ann Lee", "Me Self", "unknown"]
     mine = CV.chat_record(_m("8", _at(8), **{"from": f"https://h/v1/users/ME/contacts/{ME}"}), T, ME)
     assert (mine["me"], mine["from"], mine["mentions"]) == (True, ME, None)
+
+
+async def test_history_names_reaction_people(
+    tmp_path: Path, quiet_directory: Directory, no_api: None
+) -> None:
+    """013: history pages resolve reaction MRIs through the directory."""
+    emotions = [{"key": "like", "users": [{"mri": ANN}]}]
+    board = W.Board(
+        {},
+        quiet_directory,
+        data_dir=_archive(tmp_path / "d", T, [_m("1", _at(1), properties={"emotions": emotions})]),
+    )
+    quiet_directory._names[ANN] = "Ann Lee"
+    [message] = (await _history(board, T))["messages"]
+    assert message["reactions"][0]["people"] == ["Ann Lee"]
+
+
+def test_resolved_refuses_a_blank_roster_name() -> None:
+    """A whitespace-only display name is no name: refused, not an IndexError."""
+    for label in ("  ", "", "x"):
+        assert CV._resolved(T, [{"mri": ANN, "name": "  "}], [{"name": label, "mri": ANN}]) is None
 
 
 @pytest.mark.parametrize(

@@ -20,6 +20,7 @@ _data/
 .scratchpad/
 .claude/scratchpad/
 *.annotations.json5
+specs/*.annotations.d/
 
 # local notes and runners (per-machine, never part of the project)
 /HANDOFF*.md

@@ -96,11 +96,12 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
     itemid="<mri>">Name</strong><span itemprop="time" itemid="<id>"></span><p
     itemprop="preview">first 100 chars</p></blockquote>`, author and preview taken from the
     server's copy of the message, never from the page.
-  - **React** (any message): a picker with Teams' 8 default keys (`messages.EMOJI`); clicking a
+  - **React** (any message): a picker with Teams' 6 defaults (`like heart laugh surprised sad
+    angry`; `yes`/`no` stay accepted keys of `messages.EMOJI` but would repeat 👍); clicking a
     reaction I already gave removes it. The reactions line under a message is clickable too: a
     chip I gave removes my reaction, any other chip adds mine, as in Teams (chip marked when
     `mine`). Verb `{"react": "<thread>", "msg": id, "key": k,
-    "remove": bool}` → `send.react()`. Keys outside the 8 are refused.
+    "remove": bool}` → `send.react()`. Keys outside `messages.EMOJI`'s 8 are refused.
   - **Edit** (own messages only): the message body turns into a textarea holding its plain text;
     Enter saves, Escape cancels. Verb `{"edit": "<thread>", "msg": id, "text": …}` →
     `send.edit_message()`, same validation as `send`. Mentions, emoji and quotes in the original
@@ -147,7 +148,7 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 ## Out of scope
 
 - File or image upload, paste of images.
-- Reactions beyond Teams' 8 default keys (any-emoji reactions could reuse spec 012's popup later).
+- Reactions beyond `messages.EMOJI`'s 8 keys (any-emoji reactions could reuse spec 012's popup later).
 - An edit keeping the original's mentions, emoji or quote (edit is plain text).
 - Marking the chat read in Teams on open or on send.
 - Unread separator, search across chats (the MCP server already does it).
@@ -197,7 +198,7 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
       `quote` id that is not a message of that thread, or more than 10 ids, is refused without
       posting anything (an id the archive lacks may cost one history read); the page renders the sent reply with its quotes.
 - [x] **AC12** `react` calls `send.react()` once with the key, `remove: true` when I already
-      reacted with it; a key outside the 8 defaults is refused without an API call.
+      reacted with it; a key outside `messages.EMOJI` is refused without an API call.
 - [x] **AC13** `edit` on my own message calls `edit_message()` once with the new text; on another
       person's message, an empty text or a body over 28 KB it is refused without an API call.
 - [x] **AC14** `delete` on my own message calls `delete_message()` once after the confirm; on

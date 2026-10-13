@@ -1,5 +1,6 @@
 """Settings properties, owner-only file and directory helpers, and the low-level stdout helpers."""
 
+import json
 import os
 import stat
 from pathlib import Path
@@ -30,6 +31,24 @@ def test_force_blocking_stdout_never_raises() -> None:
 async def test_emit_writes_to_stdout(capsys) -> None:
     await emit("hello\n")
     assert capsys.readouterr().out == "hello\n"
+
+
+async def test_emit_escapes_terminal_controls_but_keeps_lines_and_tabs(capsys) -> None:
+    await emit("a\x1b[2Jb\rc\x07d\x9b31me\x7f\tf\n")
+    assert capsys.readouterr().out == "a\\u001b[2Jb\\u000dc\\u0007d\\u009b31me\\u007f\tf\n"
+
+
+async def test_emit_turns_crlf_into_a_plain_line_end(capsys) -> None:
+    await emit("a\r\nb\n")
+    assert capsys.readouterr().out == "a\nb\n"
+
+
+async def test_emit_keeps_jsonl_content_lossless(capsys) -> None:
+    record = {"content": "a\x85b\x9bc\x7fd\x1b"}
+    await emit(json.dumps(record, ensure_ascii=False) + "\n")
+    line = capsys.readouterr().out
+    assert not any(c in line for c in "\x85\x9b\x7f\x1b")
+    assert json.loads(line) == record
 
 
 def _mode(path: Path) -> int:

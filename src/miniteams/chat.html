@@ -358,8 +358,9 @@
   const LIVE_MAX = 600;  // messages kept on screen at the bottom (and buffered while detached)
   const EDGE = 150;  // px from the top or bottom that loads the next page
   const typing = new Set();
-  // Teams' 8 default reactions, the keys `react` accepts (messages.EMOJI).
+  // The keys `react` accepts (messages.EMOJI); the picker offers Teams' 6, `yes`/`no` would repeat 👍 and add 👎.
   const EMOJI = { like: "👍", heart: "❤️", laugh: "😆", surprised: "😮", sad: "😢", angry: "😡", yes: "👍", no: "👎" };
+  const PICKER = ["like", "heart", "laugh", "surprised", "sad", "angry"];
   const QUOTE_MAX = 10;
   let quotes = [];  // [{id, name, line}] quoted by the next send, in the order picked
 
@@ -468,7 +469,7 @@
       const line = el("div", "reacts");
       const people = r.reactions.map((x) => `${x.emoji} — ${(x.people || []).join(", ") || x.count}`).join("\n");
       for (const x of r.reactions) {
-        // `react` refuses keys outside Teams' 8: those chips only show the count.
+        // `react` refuses keys outside messages.EMOJI: those chips only show the count.
         const active = !readOnly && Object.hasOwn(EMOJI, x.key);
         const chip = el(active ? "button" : "span", x.mine ? "mine" : null, `${x.emoji} ${x.count}`);
         chip.title = people;
@@ -488,8 +489,8 @@
       if (r.editable && r.from) button("reply", "↩", "reply with quote", () => addQuote(r, node));
       const picker = el("span", "picker");
       picker.hidden = true;
-      for (const [key, emoji] of Object.entries(EMOJI)) {
-        const mine = (r.reactions || []).some((x) => x.key === key && x.mine);
+      for (const key of PICKER) {
+        const emoji = EMOJI[key], mine = (r.reactions || []).some((x) => x.key === key && x.mine);
         const b = el("button", mine ? "mine" : null, emoji);
         b.dataset.key = key; b.title = mine ? `remove ${key}` : key; b.setAttribute("aria-label", b.title);
         b.onclick = () => { picker.hidden = true; send({ react: thread, msg: r.id, key, remove: mine }) || ($err.textContent = "offline, not sent"); };

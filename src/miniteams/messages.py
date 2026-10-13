@@ -76,8 +76,27 @@ _REACTION_ALIASES = {
     "praying": "pray",
     "victory": "v",
     "ok": "ok_hand",
-    "raisedfist": "fist",
+    "raisedfist": "fist_raised",
     "pointupindex": "point_up",
+    "fistbump": "punch",
+    "screamingfear": "scream",
+    "think": "thinking",
+    "sweatgrinning": "sweat_smile",
+    "upsidedownface": "upside_down_face",
+    "cwl": "joy",
+    "hearteyes": "heart_eyes",
+    "seenoevil": "see_no_evil",
+    "speaknoevil": "speak_no_evil",
+    "puke": "vomiting_face",
+    "lipssealed": "zipper_mouth_face",
+    "hi": "wave",
+    "heartorange": "orange_heart",
+    "heartgreen": "green_heart",
+    "heartyellow": "yellow_heart",
+    "angryface": "angry",
+    "devil": "smiling_imp",
+    "tongueout": "stuck_out_tongue",
+    "grinningfacewithsmilingeyes": "smile",
 }
 
 # Only Unicode Emoji_Modifier_Base characters can take a skin tone.
@@ -119,13 +138,20 @@ def _reaction_base(key: str) -> str:
     codes, sep, _ = key.partition("_")
     if sep and re.fullmatch(r"[0-9a-fA-F]{4,6}(?:-[0-9a-fA-F]{4,6}){0,15}", codes):
         points = [int(code, 16) for code in codes.split("-")]
-        # Reject controls, surrogates and unassigned characters from remote keys.
+        # Reject controls, surrogates, unassigned, format (bidi) and line/paragraph separators from
+        # remote keys; emoji sequences need the ZWJ and tag format characters.
         if all(
-            point <= 0x10FFFF and unicodedata.category(chr(point)) not in ("Cc", "Cs", "Cn")
+            point <= 0x10FFFF
+            and (
+                unicodedata.category(chr(point)) not in ("Cc", "Cs", "Cn", "Cf", "Zl", "Zp")
+                or point == 0x200D
+                or 0xE0020 <= point <= 0xE007F
+            )
             for point in points
         ):
             return "".join(chr(point) for point in points)
-    return f":{key}:"
+    # Custom org reactions carry `;<id>` after their name.
+    return f":{key.partition(';')[0]}:"
 
 
 def _gunzip_b64(data: str) -> str:

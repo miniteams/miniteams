@@ -515,8 +515,8 @@ def _resolved(
             ok = m["mri"] == thread_id and chat_kind(thread_id) != "private" and fold(name) == "everyone"
         else:
             name = humans.get(m["mri"], "")
-            first = name.split()[0] if name else ""
-            ok = bool(name) and fold(m["name"]) in (fold(name), fold(first))
+            first = (name.split() or [""])[0]
+            ok = bool(first) and fold(m["name"]) in (fold(name), fold(first))
             if ok and fold(m["name"]) != fold(name):
                 name = first
         if not ok:

@@ -870,6 +870,17 @@ async def test_row_read_sends_read_and_the_menu_sends_seen(split: Split) -> None
     assert split.fake.of("seen") == [{"seen": _id(4), "at": split.fake.rows[4]["last_activity"]}]
 
 
+async def test_a_menu_entry_clicked_leaves_no_pinned_actions(split: Split) -> None:
+    """A pointer pick closes the menu without parking the focus on ⋯: once the mouse leaves, the row
+    (still listed: the fake ignores the mute) hides its hover actions."""
+    page, row = await _row_menu(split, 4)
+    await row.locator('[data-k="mute"]').click()
+    assert await page.locator(".rowmenu").count() == 0
+    await page.mouse.move(0, 0)
+    assert await row.count() == 1
+    assert not await row.locator('[data-k="more"]').is_visible()
+
+
 async def test_row_menu_mute_escape_and_outside_click(split: Split) -> None:
     """Mute sends mute; Escape closes the menu back to its ⋯; a click outside closes it."""
     page, row = await _row_menu(split, 4)

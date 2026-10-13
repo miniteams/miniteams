@@ -298,7 +298,9 @@
           const first = m.name.split(/\s+/)[0];
           if (m.everyone || first === m.name) continue;
           const space = before.endsWith(`@${m.name} `) ? " " : "", start = at - m.name.length - 1 - space.length;
-          if (!before.endsWith(`@${m.name}${space}`) || start > 0 && /[\p{L}\p{N}_]/u.test(before[start - 1])) continue;
+          // Both ends on a word boundary, as `scan` reads a mention: `@Ann Leex` is no `@Ann Lee`.
+          if (!before.endsWith(`@${m.name}${space}`) || /[\p{L}\p{N}_]$/u.test(before.slice(0, start))
+            || !space && /^[\p{L}\p{N}_]/u.test(input.value.slice(at))) continue;
           // Resolve occurrences before changing the label: namesakes must keep their own recipient.
           const active = mentions(input.value), names = active.map((p) => p.name), seen = new Map();
           const ordered = scan(input.value, names).map((name) => {
@@ -306,6 +308,8 @@
             seen.set(name, nth + 1);
             return matches[Math.min(nth, matches.length - 1)];
           });
+          // Inside a longer picked name (`@Ann Lee` of `@Ann Lee Smith`) the server reads that one.
+          if (scan(input.value.slice(start), names)[0] !== m.name) continue;
           const pos = scan(input.value.slice(0, start), names).length;
           ordered[pos] = pick({ ...ordered[pos], name: first });
           picked.set(chat(), ordered);
@@ -340,7 +344,8 @@
       const ok = list.filter((m) => m && typeof m.name === "string" && typeof m.mri === "string" && [undefined, true].includes(m.everyone));
       picked.set(chat(), ok.map(pick));
     };
-    const forget = (id) => picked.delete(id);
+    // A sent text empties the composer without an input event: its dismissed word must not outlive it.
+    const forget = (id) => { picked.delete(id); if (id === chat()) dismissed = -1; };
     input.addEventListener("input", (e) => { if (!e.isComposing) lookup(); });
     input.addEventListener("compositionend", lookup);
     input.addEventListener("blur", close);

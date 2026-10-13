@@ -4,7 +4,7 @@
 **Requested by**: babs
 **Date**: 2026-10-09
 
-**Amendment 2026-10-13**: phase 5 (clipboard images) is draft, pending validation; phases 1–4 remain implemented.
+**Amendment 2026-10-13**: phase 5 (clipboard images) is draft, pending validation; phases 1–4 implemented.
 
 ## Problem
 
@@ -124,10 +124,11 @@ the person (or everyone) is notified and the name shows highlighted in Teams, as
 - [x] **AC15** In both composers, picking Ann Lee and pressing Backspace immediately after
       `@Ann Lee ` changes it to `@Ann ` and retains Ann Lee as the recipient. Backspace elsewhere
       remains ordinary deletion; everyone and single-word names are not shortened.
-- [ ] **AC16** (generated Mention span, display name, recipient and roster validation tested;
-      Teams-side highlight awaits the user's look) A shortened mention displays Ann in the sent Teams message, keeps the selected
+- [ ] **AC16** A shortened mention displays Ann in the sent Teams message, keeps the selected
       member's original identifier, and remains highlighted. The server accepts only that member's
       complete name or first name as the label and still rejects recipients outside the roster.
+      (Generated Mention span, display name, recipient and roster validation tested; Teams-side
+      highlight awaits the user's look.)
 - [x] **AC17** Two members sharing a first name retain their respective identities when their
       picked mentions are shortened.
 - [x] **AC18** Restoring a draft retains shortened mentions and their selected recipients.

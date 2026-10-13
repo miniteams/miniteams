@@ -118,6 +118,13 @@ async def test_print_reactions_added_then_removed(directory: Directory, capsys) 
     assert "unreacted" in capsys.readouterr().out
 
 
+async def test_print_reactions_escapes_controls_from_remote_keys(directory: Directory, capsys) -> None:
+    res = {"id": "m1", "content": "<p>x</p>", "conversationLink": NOTES_LINK}
+    await _print_reactions(res, [{"key": "x\x1b[31m\x07\r\x9b", "users": [{"mri": "8:orgid:u1"}]}], directory)
+    out = capsys.readouterr().out
+    assert ":x\\u001b[31m\\u0007\\u000d\\u009b:" in out and not any(c in out for c in "\x1b\x07\r\x9b")
+
+
 async def test_handle_delivery_prints_new_message(directory: Directory, capsys) -> None:
     body = {
         "type": "EventMessage",
