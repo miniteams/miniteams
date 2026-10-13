@@ -148,13 +148,14 @@ the person (or everyone) is notified and the name shows highlighted in Teams, as
       same page. A successful send clears only its submitted draft; new edits remain intact.
 - [ ] **AC23** Upload or send failure retains the text and pending images, displays an actionable
       error and reuses completed uploads on retry. An ambiguous send result must not trigger
-      an automatic duplicate send. Sending twice concurrently is blocked.
+      an automatic duplicate send; a manual retry sends only if the chat's recent messages do not
+      already hold that `clientmessageid`. Sending twice concurrently is blocked.
 - [ ] **AC24** The upload route requires the existing authenticated session and same-origin
       protections. The server validates image content, destination, count and byte limits;
       it never trusts a MIME label, filename or browser-supplied remote URL alone.
 - [ ] **AC25** Unsupported or oversized images produce a clear error while preserving the
       draft. Thumbnails and object URLs are released on removal, success and page teardown.
-- [ ] **AC26** A controlled live send shows every pasted image in native Teams with the
+- [x] **AC26** A controlled live send shows every pasted image in native Teams with the
       accompanying text. Any protocol uncertainty is resolved before claiming this phase shipped.
 
 ## Phases
@@ -205,6 +206,25 @@ the person (or everyone) is notified and the name shows highlighted in Teams, as
 - **Data model impact**: none.
 - **DoD**: two images and text sent in one message to the throwaway 1:1 test chat show in native
   Teams; a repeated `clientmessageid` is checked for Teams-side dedup and the result recorded here.
+- **Live proof 2026-10-13** (`send_images` from a scratch script, code after review round 1,
+  silent auth, throwaway 1:1 test chat, one message "miniteams image test 2" with a generated 64x48 PNG and an 80x40 JPEG carrying
+  EXIF Orientation=6): object create, `imgpsh` upload and send all answered 201 on `fr-prod`.
+  - Sent: `<p>text</p><p><img alt="image" height id="<oid>" itemid="<oid>" itemscope="<png|jpeg>"
+    itemtype=AMSImage src="https://fr-prod…/v1/objects/<oid>/views/imgo" width>…</p>`, images in order.
+  - Stored (read back): same, with a newline between the paragraphs and `id` turned into `x_<oid>`
+    by the service (`itemid` stays bare); a first run that sent `x_<oid>` came back as `x_x_<oid>`.
+  - Rotated JPEG: sent as width 40, height 80 (the displayed size); its `views/imgo` is 40x80 with
+    no EXIF left, so Teams bakes the rotation in. Both `views/imgo` answer 200 with JPEG bytes
+    (Teams re-encodes the PNG too, same size).
+  - Final code after review round 2: one message "miniteams image test 3" with the same two
+    images sent the same way to the "test miniteams" group chat; read back identical in shape
+    (bare `id` sent, `x_` stored, PNG 64x48, rotated JPEG 40x80, both `views/imgo` 200).
+  - Real CLI path (`miniteams send TEXT --thread … --image … --image …`, final code): "miniteams image
+    test 4 (CLI)" to the "test miniteams" chat, two uploads then one send, 201.
+  - On-screen check in the native client (babs, 2026-10-13, "test miniteams" chat): both images shown,
+    the green PNG and the orange JPEG, in one message with the text.
+- **Dedup 2026-10-13**: no. The same `clientmessageid` sent twice gave two 201s and two distinct
+  messages; a retry with a reused `clientmessageid` can duplicate, so 5b must never retry blindly.
 
 ### Phase 5b — clipboard queue in both composers
 
@@ -212,7 +232,9 @@ the person (or everyone) is notified and the name shows highlighted in Teams, as
   isolation; send = one JSON frame then one binary WebSocket frame per image, in order (socket
   `max_size` ~11 MiB); upload to Teams only at send; a per-draft cache (image digest → AMS object
   id) reuses objects on retry; an ambiguous send shows a spinner and waits for the self-echo (same
-  `clientmessageid`, ~15 s), never retries on its own; manual retry reuses the `clientmessageid`.
+  `clientmessageid`, ~15 s), never retries on its own; a manual retry first looks for that
+  `clientmessageid` in the chat's recent messages (server side, read-only) and sends, with the same
+  id, only if it is absent.
 - **Covers**: AC19–AC25.
 - **Data model impact**: none; image blobs stay in browser memory until sent.
 - **DoD**: browser tests cover repeated/multiple paste, image-only send, removal, per-chat isolation,
@@ -248,8 +270,10 @@ None.
   animated, WebP), byte and count limits and integer dimensions 1–100000; no Pillow (babs, 2026-10-13).
 - Images travel as binary WebSocket frames after the JSON send frame; nothing reaches Teams before
   send (babs, 2026-10-13).
-- Ambiguous sends: spinner, self-echo decides, no automatic retry, manual retry reuses the
-  `clientmessageid` (babs, 2026-10-13).
+- Ambiguous sends: spinner, self-echo decides, no automatic retry. Teams does not dedupe a repeated
+  `clientmessageid`, so a manual retry first checks the chat's recent messages for it (server side,
+  read-only) and sends, reusing the id, only if it is absent (babs, 2026-10-13, after the 5a dedup
+  proof).
 - Both composers, the widget in a compact layout; may be switched off from usage (babs, 2026-10-13).
 
 - Shortened mentions use the first whitespace-separated word of the existing display name.

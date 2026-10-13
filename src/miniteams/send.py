@@ -14,13 +14,14 @@ the SkPy client: PUT the message id with `skypeeditedid` set to it — confirmed
 import html
 import re
 import time
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import quote, unquote
 
 import httpx
 import structlog
 
 from .config import Settings
+from .images import MAX_OBJECT_ID, OBJECT_ID_RE, check_batch, images_html
 
 log = structlog.get_logger()
 
@@ -65,18 +66,22 @@ def _headers(skype_token: str, settings: Settings) -> dict[str, str]:
     }
 
 
+def _fail(resp: httpx.Response, action: str) -> NoReturn:
+    # raise_for_status() drops the body, and the body holds the reason (MessageAlreadyDeleted…).
+    try:
+        reason = str(resp.json().get("message") or "")
+    except ValueError, AttributeError:  # non-JSON (gateway page) or non-object body
+        reason = ""
+    raise httpx.HTTPStatusError(
+        f"{action} failed: HTTP {resp.status_code} {reason or resp.reason_phrase}"[:300],
+        request=resp.request,
+        response=resp,
+    )
+
+
 def _check(resp: httpx.Response, action: str) -> dict[str, Any]:
     if resp.is_error:
-        # raise_for_status() drops the body, and the body holds the reason (MessageAlreadyDeleted…).
-        try:
-            reason = str(resp.json().get("message") or "")
-        except ValueError, AttributeError:  # non-JSON (gateway page) or non-object body
-            reason = ""
-        raise httpx.HTTPStatusError(
-            f"{action} failed: HTTP {resp.status_code} {reason or resp.reason_phrase}"[:300],
-            request=resp.request,
-            response=resp,
-        )
+        _fail(resp, action)
     data = resp.json() if resp.content else {}
     if isinstance(data, dict) and data.get("errorCode"):  # 2xx with an error envelope
         raise RuntimeError(f"{action} rejected: {data.get('errorCode')}: {data.get('message')}")
@@ -92,10 +97,11 @@ def send_message(
     *,
     is_html: bool = False,
     properties: dict[str, Any] | None = None,
+    client_message_id: str | None = None,
 ) -> dict[str, Any]:
     base = f"https://{settings.contacts_host}/v1/users/ME/conversations/{quote(thread_id, safe='')}"
     # JS-style epoch milliseconds; also the de-dup key for the self-echo over Trouter.
-    client_message_id = str(int(time.time() * 1000))
+    client_message_id = client_message_id or str(int(time.time() * 1000))
     body: dict[str, Any] = {
         "clientmessageid": client_message_id,
         "content": message_html(text, is_html),
@@ -109,6 +115,85 @@ def send_message(
     result = _check(resp, "send")
     log.info("message_sent", thread=thread_id, clientmessageid=client_message_id, status=result["status"])
     return {"clientmessageid": client_message_id, **result}
+
+
+def upload_image(settings: Settings, skype_token: str, thread_id: str, data: bytes, filename: str) -> str:
+    """Create an AMS object readable by `thread_id`, upload `data` into it, return its id
+    (purple-teams `teams_conversation_send_image`, on the native client's asyncgw host)."""
+    base = f"https://{settings.asyncgw_host}/v1/objects"
+    headers = {
+        "Authorization": f"skype_token {skype_token}",
+        "User-Agent": settings.user_agent,
+        "Origin": "https://teams.microsoft.com",
+        "Referer": "https://teams.microsoft.com/",
+    }
+    body = {
+        "type": "pish/image",
+        "permissions": {thread_id: ["read"]},
+        "filename": filename,
+        "sharingMode": "Inline",
+    }
+    resp = _CLIENT.post(
+        f"{base}/",
+        headers={**headers, "Accept": "application/json", "x-ms-client-version": settings.clientinfo_version},
+        json=body,
+    )
+    if not resp.is_success:  # a 3xx is not an object either: redirects are not followed
+        _fail(resp, "image create")
+    try:
+        created = resp.json()
+    except ValueError:
+        created = None
+    object_id = created.get("id") if isinstance(created, dict) else None
+    if not isinstance(object_id, str) or not OBJECT_ID_RE.fullmatch(object_id):
+        raise RuntimeError("image create returned no usable object id")
+    resp = _CLIENT.put(
+        f"{base}/{object_id}/content/imgpsh",
+        headers={**headers, "Accept": "*/*", "Content-Type": "application/octet-stream"},
+        content=data,
+    )
+    if not resp.is_success:  # the success body is not JSON, _check would choke on it
+        _fail(resp, "image upload")
+    log.info("image_uploaded", thread=thread_id, object_id=object_id, size=len(data))
+    return object_id
+
+
+def send_images(
+    settings: Settings,
+    skype_token: str,
+    thread_id: str,
+    text: str,
+    images: list[tuple[str, bytes]],
+    display_name: str,
+    *,
+    is_html: bool = False,
+    client_message_id: str | None = None,
+) -> dict[str, Any]:
+    """One message: `text` first, then `images` ((filename, bytes), in order) in one paragraph.
+
+    Every image is validated before the first upload, so a bad one sends nothing."""
+    sniffed = check_batch([data for _, data in images])
+    body = message_html(text, is_html)
+    if body and not is_html:
+        body = f"<p>{body}</p>"
+    # Longest possible id as a stand-in: the real block can only be shorter, so nothing uploads in vain.
+    widest = images_html(settings.asyncgw_host, [("0" * MAX_OBJECT_ID, image) for image in sniffed])
+    if too_long(body + widest, is_html=True):
+        raise ValueError("message too long for Teams once the images are added")
+    uploaded = [
+        (upload_image(settings, skype_token, thread_id, data, filename), image)
+        for (filename, data), image in zip(images, sniffed, strict=True)
+    ]
+    content = body + images_html(settings.asyncgw_host, uploaded)
+    return send_message(
+        settings,
+        skype_token,
+        thread_id,
+        content,
+        display_name,
+        is_html=True,
+        client_message_id=client_message_id,
+    )
 
 
 def send_typing(settings: Settings, skype_token: str, thread_id: str) -> dict[str, Any]:
