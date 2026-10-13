@@ -690,7 +690,7 @@ REC_VID = (
 
 
 def test_extract_videos_flag_includes_recording_once() -> None:
-    items = A.extract(REC_VID, "RichText/Media_CallRecording", videos=True)
+    items = A.extract(REC_VID, "RichText/Media_CallRecording", media=A.DEFAULT_MEDIA | {"videos"})
     sp = [i["url"] for i in items if i["kind"] == "sp_file"]
     assert sp == [_SP_VID]  # the <item> and the Play <a> carry the same URL — captured once
     # AMS fallback copy is captured too, and LAST — process() must see the SP outcome first.
@@ -700,7 +700,7 @@ def test_extract_videos_flag_includes_recording_once() -> None:
 def test_extract_videos_flag_includes_shared_video_files() -> None:
     by_prefix = '<a href="https://c.sharepoint.com/:v:/r/personal/x/rec.mp4?web=1">rec</a>'
     by_ext = '<a itemtype="http://schema.skype.com/HyperLink/Files" href="https://c.sharepoint.com/sites/x/clip.mkv">c</a>'
-    items = A.extract(by_prefix + by_ext, "RichText/Html", videos=True)
+    items = A.extract(by_prefix + by_ext, "RichText/Html", media=A.DEFAULT_MEDIA | {"videos"})
     sp = {i["url"] for i in items if i["kind"] == "sp_file"}
     assert sp == {
         "https://c.sharepoint.com/:v:/r/personal/x/rec.mp4?web=1",
@@ -741,7 +741,7 @@ async def test_process_ams_video_skipped_when_sp_copy_downloads(settings: Settin
         settings.media_dir,
         download=True,
         graph_token=lambda: "GTOK",
-        videos=True,
+        media=A.DEFAULT_MEDIA | {"videos"},
     )
     assert (settings.media_dir / "rec.mp4").exists()  # durable SharePoint copy
     assert not any(u.endswith("/video") for u in fetched)  # AMS copy NOT pulled — redundant
@@ -763,7 +763,7 @@ async def test_process_ams_video_fallback_when_sp_denied(settings: Settings, mon
         graph_token=lambda: "GTOK",
         # SharePoint copy previously 403'd (block-download policy) → denied cache vetoes it.
         skip_url=lambda u: "sharepoint" in u,
-        videos=True,
+        media=A.DEFAULT_MEDIA | {"videos"},
     )
     assert (settings.media_dir / "rec1.video.mp4").read_bytes() == b"MP4BYTES"
     assert any(n.startswith("[video:") and "→" in n for n in notes)
@@ -785,7 +785,7 @@ async def test_process_ams_video_failure_feeds_on_fail(settings: Settings, monke
         download=True,
         skip_url=lambda u: "sharepoint" in u,  # SP copy already denied → AMS attempted
         on_fail=lambda u, exc: failed.append(u),
-        videos=True,
+        media=A.DEFAULT_MEDIA | {"videos"},
     )
     assert failed == [f"{_OBJ}/video"]  # the AMS URL lands in the denied cache
     assert any(n == f"[video: {_OBJ}/video]" for n in notes)  # ref-only, no download claimed
@@ -818,7 +818,7 @@ async def test_process_ams_video_fallback_when_sp_fails(settings: Settings, monk
         settings.media_dir,
         download=True,
         graph_token=lambda: "GTOK",
-        videos=True,
+        media=A.DEFAULT_MEDIA | {"videos"},
     )
     assert (settings.media_dir / "rec1.video.mp4").read_bytes() == b"MP4BYTES"
     assert any(n.startswith("[video:") and "→" in n for n in notes)

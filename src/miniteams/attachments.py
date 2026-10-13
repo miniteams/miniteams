@@ -120,23 +120,42 @@ def recording_files(content: str, media_dir: Path) -> dict[str, Any]:
     }
 
 
-def extract(content: str, msgtype: str, videos: bool = False) -> list[dict[str, str]]:
-    """Pull attachment references out of message content. No network.
+MEDIA_TYPES = ("images", "files", "transcripts", "videos")
+DEFAULT_MEDIA = frozenset({"images", "files", "transcripts"})  # videos are GB-scale: opt-in
 
-    `videos=True` opts in to meeting recordings and shared video files (GB-scale — excluded
-    by default). The durable SharePoint copy rides the `sp_file` Graph path; the fast-expiring
-    AMS copy (`amsVideo`) is emitted as a trailing `video` fallback: SharePoint blocks the
-    file download of recordings owned by others ("block download" policy — streaming only),
-    while the AMS object host still serves the bytes with the skype token."""
+
+def media_type(kind: str, url: str, hint: str = "") -> str:
+    """The `--media` type of one extracted item. `hint` is the `type` attribute of the tag it came
+    from: a `URIObject` (`Picture.1` is a picture) or a recording `<item>` (`onedriveForBusinessVideo`)."""
+    if kind == "image" or (kind == "file" and hint.startswith("Picture.")):
+        return "images"
+    if kind in ("transcript", "sp_transcript"):
+        return "transcripts"
+    if kind == "video" or (kind == "sp_file" and (hint == "onedriveForBusinessVideo" or _is_video_url(url))):
+        return "videos"
+    return "files"
+
+
+def extract(content: str, msgtype: str, media: frozenset[str] = DEFAULT_MEDIA) -> list[dict[str, str]]:
+    """Pull attachment references of the selected `media` types out of message content. No network.
+
+    Videos (meeting recordings, shared video files) are GB-scale and left out of the default. The
+    durable SharePoint copy rides the `sp_file` Graph path; the fast-expiring AMS copy (`amsVideo`)
+    is emitted as a trailing `video` fallback: SharePoint blocks the file download of recordings
+    owned by others ("block download" policy — streaming only), while the AMS object host still
+    serves the bytes with the skype token."""
     items: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()  # a recording's :v: URL is both an <item> and the Play <a>
     # AMS fallbacks go LAST: process() walks items in order and must learn whether the
     # SharePoint copy resolved before deciding to pull the (redundant) AMS bytes.
     ams_videos: list[str] = []
 
-    def _add(kind: str, url: str) -> None:
-        if (kind, url) not in seen:
-            seen.add((kind, url))
+    def _add(kind: str, url: str, hint: str = "") -> None:
+        if (kind, url) in seen:
+            return
+        # Seen even when deselected: the recording's Play <a> must not come back as a document.
+        seen.add((kind, url))
+        if media_type(kind, url, hint) in media:
             items.append({"kind": kind, "url": url})
 
     for tag in _IMG_RE.findall(content):
@@ -147,7 +166,7 @@ def extract(content: str, msgtype: str, videos: bool = False) -> list[dict[str, 
         attrs = _attrs(tag)
         url = attrs.get("uri") or attrs.get("url_thumbnail")
         if url:
-            _add("file", url)
+            _add("file", url, attrs.get("type", ""))
     # Meeting-recording items. Two transcript sources: `amsTranscript` (fast-expiring AMS copy,
     # skype-token) and `onedriveForBusinessTranscript` (durable SharePoint copy, needs a
     # SharePoint bearer) — capture both, dedup on download.
@@ -157,21 +176,19 @@ def extract(content: str, msgtype: str, videos: bool = False) -> list[dict[str, 
             _add("transcript", attrs["uri"])
         elif attrs.get("type") == "onedriveForBusinessTranscript" and attrs.get("uri"):
             _add("sp_transcript", attrs["uri"])
-        elif videos and attrs.get("type") == "onedriveForBusinessVideo" and attrs.get("uri"):
-            _add("sp_file", attrs["uri"])  # recording on OneDrive: same Graph /shares path as docs
-        elif videos and attrs.get("type") == "amsVideo" and attrs.get("uri"):
+        elif attrs.get("type") == "onedriveForBusinessVideo" and attrs.get("uri"):
+            # recording on OneDrive: same Graph /shares path as docs
+            _add("sp_file", attrs["uri"], "onedriveForBusinessVideo")
+        elif attrs.get("type") == "amsVideo" and attrs.get("uri"):
             ams_videos.append(attrs["uri"])
-    # SharePoint-hosted documents shared into the chat (xls/ppt/pdf/doc) — fetched via Graph.
-    # Videos (:v:) and folders (:f:) are left out unless `videos` opts in.
+    # SharePoint-hosted documents and videos shared into the chat — fetched via Graph. Folders
+    # (:f:), sites and OneNote (:u:/:o:) are never single files.
     for tag in _A_RE.findall(content):
         attrs = _attrs(tag)
         href = attrs.get("href") or ""
         if "sharepoint.com" not in href:
             continue
-        is_video = _is_video_url(href)
-        if is_video and not videos:
-            continue  # excluded by default (huge)
-        if is_video or attrs.get("itemtype") == _FILE_LINK or _SP_DOC_PREFIX.search(href):
+        if _is_video_url(href) or attrs.get("itemtype") == _FILE_LINK or _SP_DOC_PREFIX.search(href):
             _add("sp_file", href)
     for url in ams_videos:
         _add("video", url)
@@ -442,7 +459,7 @@ async def process(
     graph_token: Callable[[], str | None] | None = None,
     skip_url: Callable[[str], bool] | None = None,
     on_fail: Callable[[str, Exception], None] | None = None,
-    videos: bool = False,
+    media: frozenset[str] = DEFAULT_MEDIA,
 ) -> list[str]:
     """Return human annotations for the print line, downloading bytes when enabled.
 
@@ -451,8 +468,9 @@ async def process(
     `sp_token(host)` supplies a SharePoint bearer for durable OneDrive transcripts; `graph_token()`
     a Graph bearer for SharePoint-hosted shared documents. Without them those items are refs only.
     `skip_url(url)` vetoes a download (ref-only note, no network) — the archive's denied-asset
-    cache; `on_fail(url, exc)` observes each failed download so callers can feed that cache."""
-    items = extract(content, msgtype, videos=videos)
+    cache; `on_fail(url, exc)` observes each failed download so callers can feed that cache.
+    Only the `media` types are extracted: a deselected item is neither fetched nor annotated."""
+    items = extract(content, msgtype, media)
     notes: list[str] = []
     _remote = {"sp_transcript", "sp_file"}
     _ref_label = {"sp_transcript": "transcript(sp)", "sp_file": "file(sp)"}

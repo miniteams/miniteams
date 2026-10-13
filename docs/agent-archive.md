@@ -10,9 +10,10 @@ data/
   index.db                          # one row per conversation (the channel directory)
   <thread-id>/                      # thread id with `/` → `_`; usually verbatim
     messages.db                     # every message of that conversation, raw API JSON
-    media/                          # downloaded images/files (optional, --no-media skips);
-                                    # with --videos also meeting recordings/shared videos, named
-                                    # <driveItem-name>.mp4 (SharePoint) or <id>.video.mp4 (AMS)
+    media/                          # attachments of the --media selection (default images,
+                                    # files, transcripts; --no-media skips); --videos adds meeting
+                                    # recordings/shared videos, named <driveItem-name>.mp4
+                                    # (SharePoint) or <id>.video.mp4 (AMS)
       recordings.json               # recording ↔ video/transcript pairing (see below)
     avatars/                        # sender avatars, <sanitized-MRI>.jpg
 ```

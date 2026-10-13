@@ -276,7 +276,7 @@ async def _download_media(
     sp_token: Callable[[str], str | None] | None = None,
     graph_token: Callable[[], str | None] | None = None,
     ignore_denied: bool = False,
-    videos: bool = False,
+    media: frozenset[str] = attachments.DEFAULT_MEDIA,
 ) -> int:
     """Best-effort pass: download every stored message's attachments at original quality.
 
@@ -297,7 +297,7 @@ async def _download_media(
         content, msgtype = m.get("content") or "", str(m.get("messagetype") or "")
         if msgtype == "RichText/Media_CallRecording":
             recordings.append(m)
-        if attachments.extract(content, msgtype, videos=videos):
+        if attachments.extract(content, msgtype, media):
             targets.append(m)
     if not targets:
         # Still derive the recordings manifest: a chat can hold recording messages whose only
@@ -332,7 +332,7 @@ async def _download_media(
                     graph_token=graph_token,
                     skip_url=_skip,
                     on_fail=partial(record_asset_failure, store),
-                    videos=videos,
+                    media=media,
                 )
             except Exception as exc:  # noqa: BLE001 — one message's media must not abort the pass
                 log.debug("message_media_failed", id=message.get("id"), error=str(exc))
@@ -404,7 +404,7 @@ async def archive_chat(
     conv: dict[str, Any] | None = None,
     download_media: bool = True,
     download_avatars: bool = True,
-    download_videos: bool = False,
+    media_types: frozenset[str] = attachments.DEFAULT_MEDIA,
     verify_media: bool = False,
     assets_only: bool = False,
     retry_assets: bool = False,
@@ -430,7 +430,7 @@ async def archive_chat(
                     sp_token,
                     graph_token,
                     ignore_denied=retry_assets,
-                    videos=download_videos,
+                    media=media_types,
                 )
                 index.touch(thread_id, _now_iso())
                 log.info("chat_assets", thread=thread_id, total=store.count(), media=media)
@@ -504,7 +504,7 @@ async def archive_chat(
                 sp_token,
                 graph_token,
                 ignore_denied=retry_assets,
-                videos=download_videos,
+                media=media_types,
             )
             if download_media
             else 0
@@ -547,7 +547,7 @@ async def run_archive(
     include_all: bool = False,
     download_media: bool = True,
     download_avatars: bool = True,
-    download_videos: bool = False,
+    media_types: frozenset[str] = attachments.DEFAULT_MEDIA,
     verify_media: bool = False,
     assets_only: bool = False,
     retry_denied: bool = False,
@@ -633,7 +633,7 @@ async def run_archive(
                     conv=conv,
                     download_media=download_media,
                     download_avatars=download_avatars,
-                    download_videos=download_videos,
+                    media_types=media_types,
                     verify_media=verify_media,
                     assets_only=assets_only,
                     retry_assets=retry_assets,

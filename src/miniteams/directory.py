@@ -20,6 +20,7 @@ from urllib.parse import quote
 import httpx
 import structlog
 
+from .attachments import DEFAULT_MEDIA
 from .config import Settings, write_private
 from .http import aget_with_retry, failure
 
@@ -80,6 +81,7 @@ class Directory:
         self.skype_token = ""
         self.bearer = ""  # AAD id_token, for the profile lookup (Bearer auth)
         self.me = ""  # own MRI; left out of roster-built labels (a 1:1 is named after the other)
+        self.media = DEFAULT_MEDIA  # `stream --media`: attachment types printed and downloaded
         # thread_id → (monotonic time fetched, info); LRU-bounded (see _THREADS_MAX).
         self._threads: OrderedDict[str, tuple[float, dict[str, Any] | None]] = OrderedDict()
         self._thread_fetch: dict[str, asyncio.Task[dict[str, Any] | None]] = {}  # in flight

@@ -30,6 +30,7 @@ uv sync
 uv run miniteams login            # browser (FOCI seed), falls back to device-code; masked tokens
 uv run miniteams --device-code login   # force device-code flow (no browser)
 uv run miniteams stream           # live: incoming messages, reactions, attachments
+uv run miniteams stream --media images,transcripts   # download only these attachment types
 uv run miniteams chats            # 20 most recent private chats (id + last activity + names)
 uv run miniteams chats --since 2026-07-01 --until 2026-07-10   # activity window; --all, --jsonl
 uv run miniteams send "hello"     # send to your Notes (write-safe default)
@@ -50,6 +51,7 @@ uv run miniteams archive --verify-media                # re-check every asset on
                                                        # (recovers old transcripts from SharePoint too)
 uv run miniteams archive --videos --verify-media       # also grab meeting recordings + shared videos
                                                        # (large; --verify-media sweeps existing chats)
+uv run miniteams archive --media transcripts --verify-media   # only these attachment types (below)
 uv run miniteams archive --loop 600                    # re-run forever, sleeping 600s between runs
                                                        # (bare --loop = 300s); stops on auth expiry
 uv run miniteams archive --live                        # catch up, then store each message as it
@@ -192,11 +194,26 @@ transcript still being generated. `--retry-assets` forces both, and refuses to r
 ends with an `archive_recap` log line (chats, failures, new messages, media files, avatars,
 duration). `data/` is gitignored (personal chat data).
 
+`--media TYPES` (spec 014, on `archive`, `archive --live` and `stream`) picks the attachment
+types downloaded, comma-separated; the rest of the run is unchanged:
+
+| Type | Downloads |
+|---|---|
+| `images` | inline pictures, full and optimized views; picture `URIObject`s |
+| `files` | shared documents (SharePoint) and other attachments (card and recording thumbnails) |
+| `transcripts` | meeting transcripts, every format served (AMS by content type, SharePoint JSON + VTT) |
+| `videos` | meeting recordings and shared video files (large) |
+
+The default is `images,files,transcripts`. `--no-media` is an empty selection and `--videos` the
+default plus `videos`; neither combines with `--media`. `--verify-media` and `--assets-only` only
+fetch the selected types, and a deselected type is neither fetched nor annotated. Files already on
+disk are never deleted, whatever the selection.
+
 `archive --live` (spec 005) replaces the `--loop` timer with the event stream. It subscribes first,
 buffers events while a normal pass catches the archive up, then applies them and writes each new
 one as it arrives. Edits, reactions and deletes update `messages.raw`; the version they replace is
 kept in `message_versions`. Attachments download in the background as each message arrives
-(`--no-media` and `--videos` apply). Read markers land in `index.db`. A reconnect, a real
+(`--no-media`, `--videos` and `--media` apply). Read markers land in `index.db`. A reconnect, a real
 `trouter.message_loss`, a failed write or the reconcile timer (`--live SECONDS`, default 1800)
 triggers a new catch-up. A live write stays pending until a pass tops the chat up past it, so a
 message the stream dropped without saying so is still fetched by the next pass. It uses its own Trouter endpoint,
