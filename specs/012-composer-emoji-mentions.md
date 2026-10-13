@@ -4,7 +4,7 @@
 **Requested by**: babs
 **Date**: 2026-10-09
 
-**Amendment 2026-10-13**: phase 5 (clipboard images) is draft, pending validation; phases 1–4 implemented.
+**Amendment 2026-10-13**: phase 5 (clipboard images) validated after review (5a protocol proof, then 5b UI); phases 1–4 implemented.
 
 ## Problem
 
@@ -133,7 +133,7 @@ the person (or everyone) is notified and the name shows highlighted in Teams, as
       picked mentions are shortened.
 - [x] **AC18** Restoring a draft retains shortened mentions and their selected recipients.
 
-### Clipboard images (phase 5, draft)
+### Clipboard images (phase 5)
 
 - [ ] **AC19** In either composer, pasting image files adds local thumbnails to the current
       chat's draft. Pasting does not send a message or upload the images to Teams.
@@ -192,18 +192,32 @@ the person (or everyone) is notified and the name shows highlighted in Teams, as
 - **DoD**: browser tests cover both composers, first-name collisions and draft restoration;
   server tests cover shortened rendering and validation; `pre-commit run --all-files` rc=0.
 
-### Phase 5 — clipboard images (draft)
+### Phase 5a — image send protocol proof
 
-- Work: confirm the native Teams image upload/message format using the existing libpurple
-  reference; add authenticated image upload and integrate it with sending; implement a shared
-  clipboard queue, enlarged previews and removable thumbnails in both composers; cover failures
-  and chat switching.
-- **Covers**: AC19–AC26 above.
-- **Data model impact**: no database migration. Image blobs and thumbnail URLs remain in browser
-  memory until explicit send. Temporary upload data is bounded and cleaned up; tokens stay server-side.
-- **DoD**: browser tests cover repeated/multiple paste, image-only send, removal, per-chat isolation
-  and retry; server tests cover authentication, validation and failed uploads; pre-commit passes;
-  AC26 is confirmed with a controlled native Teams send.
+- Work: `miniteams send --image <file>…` (CLI): create the AMS object (`POST
+  https://<asyncgw host>/v1/objects/` with `{"type": "pish/image", "permissions": {"<thread>":
+  ["read"]}, "filename": …, "sharingMode": "Inline"}`, skype token), upload the bytes (`PUT
+  …/v1/objects/<id>/content/imgpsh`), then send one message: text first, then the images in order
+  (`<p>text</p><p><img …></p>`), each `<img>` with `alt`, `height`, `id`, `itemid`, `itemscope`,
+  `itemtype="http://schema.skype.com/AMSImage"`, `src="https://<asyncgw host>/v1/objects/<id>/views/imgo"`
+  and `width` (natural pixel size). `send_message` takes the `clientmessageid` as a parameter.
+- **Covers**: AC26 (first), the server half of AC24.
+- **Data model impact**: none.
+- **DoD**: two images and text sent in one message to the throwaway 1:1 test chat show in native
+  Teams; a repeated `clientmessageid` is checked for Teams-side dedup and the result recorded here.
+
+### Phase 5b — clipboard queue in both composers
+
+- Work: paste queue, thumbnails (compact 32 px in the widget), enlarged preview, removal, per-chat
+  isolation; send = one JSON frame then one binary WebSocket frame per image, in order (socket
+  `max_size` ~11 MiB); upload to Teams only at send; a per-draft cache (image digest → AMS object
+  id) reuses objects on retry; an ambiguous send shows a spinner and waits for the self-echo (same
+  `clientmessageid`, ~15 s), never retries on its own; manual retry reuses the `clientmessageid`.
+- **Covers**: AC19–AC25.
+- **Data model impact**: none; image blobs stay in browser memory until sent.
+- **DoD**: browser tests cover repeated/multiple paste, image-only send, removal, per-chat isolation,
+  ambiguous send and retry; server tests cover validation (magic bytes, limits, dimensions) and
+  failed uploads; pre-commit passes.
 
 ## Data model impact (summary, including proposed phase 5)
 
@@ -224,6 +238,19 @@ None.
 - Initial local bounds are 8 images and 10 MiB per image, with a 40 MiB total per draft. These
   are application limits, not claimed Teams limits, and can be revised before implementation.
 - No Microsoft Graph API is introduced for image upload.
+- Phase 5 is split: 5a proves the protocol from the CLI before 5b builds the UI (babs, 2026-10-13).
+- Several pasted images go in one message, as the native client does (724 multi-image messages in
+  the archive) (babs, 2026-10-13).
+- One host for the three calls and the `src`: `MINITEAMS_ASYNCGW_HOST` (`fr-prod` by default), what
+  the native client uses here, not purple-teams' hard-coded `as-prod`/`as-api` (babs, 2026-10-13).
+- Text first, then the images in paste order (babs, 2026-10-13).
+- The browser measures natural width/height; the server checks magic bytes (PNG, JPEG, GIF incl.
+  animated, WebP), byte and count limits and integer dimensions 1–100000; no Pillow (babs, 2026-10-13).
+- Images travel as binary WebSocket frames after the JSON send frame; nothing reaches Teams before
+  send (babs, 2026-10-13).
+- Ambiguous sends: spinner, self-echo decides, no automatic retry, manual retry reuses the
+  `clientmessageid` (babs, 2026-10-13).
+- Both composers, the widget in a compact layout; may be switched off from usage (babs, 2026-10-13).
 
 - Shortened mentions use the first whitespace-separated word of the existing display name.
   Highlighting remains in the sent message; the textarea stays plain text.

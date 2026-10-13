@@ -414,13 +414,14 @@ None.
   (`MINITEAMS_ASYNCGW_HOST` overrides it; per-region wiring waits for a check of the authz
   response); at exit, threads stuck on a dead mount do not hold the process.
 
-## Recipient read receipts amendment, draft
+## Recipient read receipts amendment (validated 2026-10-13, spike first)
 
 ### Problem and solution
 
-The chat view does not show whether recipients read our messages. Add a Seen indicator to
-outgoing messages and a hover list of confirmed readers. Group chats can show a partial
-reader count; only confirmed reads contribute. Missing receipts do not prove a message unread.
+The chat view does not show who read what. Like Element X, each member's avatar sits at the right of
+the newest message they read, whatever its author, and moves as they read on; more than 3 readers on
+a message show 3 avatars and "+N", the hover lists them all. Only confirmed reads count; missing
+receipts prove nothing.
 
 ### Evidence and limits
 
@@ -456,3 +457,17 @@ reader count; only confirmed reads contribute. Missing receipts do not prove a m
    **Data model impact**: proposed latest horizon per tenant/chat/recipient; storage choice follows
    the verified snapshot/reconnect behaviour. **DoD**: acceptance tests and pre-commit pass,
    and the indicator agrees with native Teams on a controlled conversation.
+
+### Decisions (grill, babs, 2026-10-13)
+
+- The spike reuses the presence harness (`misc/presence-spike/probe.py`, a receipts mode): a
+  dedicated Trouter endpoint logs `ThreadActivity/MemberConsumptionHorizonUpdate` on the 1:1 test
+  chat then the group, and a GET probe looks for a per-member horizons snapshot (unverified, e.g.
+  `/v1/threads/<id>/consumptionhorizons`); sanitized fixtures in `misc/`; no Graph.
+- Element X layout: one avatar per member at their newest read message, any author; own avatar
+  excluded; a message's author not shown on it; >3 → 3 avatars + "+N", hover lists every reader;
+  avatars from the archive, initials fallback.
+- Unknown state shows nothing (never "unread"); partial knowledge shows confirmed members only;
+  the latest horizon per chat and member is kept in the local SQLite cache shared with presence
+  (spec 015) across restarts; horizons never move backwards.
+- Chat page only; widget rows unchanged.

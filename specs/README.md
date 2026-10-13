@@ -12,6 +12,8 @@
 | [008](008-mcp-stdio.md) | MCP server over stdio (`miniteams mcp`) | shipped |
 | [009](009-watch-command.md) | `miniteams watch`: events on declared criteria | shipped |
 | [010](010-typing-indicator.md) | Outgoing typing indicator (`miniteams typing`) | implemented |
-| [011](011-chat-view.md) | Chat view in the widget (`/chat/<thread>`) | shipped (draft amendment: read receipts) |
-| [012](012-composer-emoji-mentions.md) | Composer: emoji completion and `@` mentions | implemented (phase 5 draft) |
+| [011](011-chat-view.md) | Chat view in the widget (`/chat/<thread>`) | shipped (read receipts amendment approved, spike first) |
+| [012](012-composer-emoji-mentions.md) | Composer: emoji completion and `@` mentions | implemented (phase 5 approved: 5a then 5b) |
 | [013](013-reaction-tooltips.md) | Reaction tooltips with all emotions and participants | shipped |
+| [014](014-media-types.md) | Choose which media types are downloaded (`--media`) | approved |
+| [015](015-presence.md) | Presence on avatars | approved |
