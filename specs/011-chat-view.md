@@ -96,8 +96,9 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
     itemid="<mri>">Name</strong><span itemprop="time" itemid="<id>"></span><p
     itemprop="preview">first 100 chars</p></blockquote>`, author and preview taken from the
     server's copy of the message, never from the page.
-  - **React** (any message): a picker with Teams' 6 defaults (`like heart laugh surprised sad
-    angry`; `yes`/`no` stay accepted keys of `messages.EMOJI` but would repeat 👍); clicking a
+  - **React** (any message): a picker with Teams' 6 defaults plus 🙏 and 🙃 (`like heart laugh
+    surprised sad angry praying upsidedownface`; `yes`/`no` stay accepted keys of `messages.EMOJI`
+    but would repeat 👍); clicking a
     reaction I already gave removes it. The reactions line under a message is clickable too: a
     chip I gave removes my reaction, any other chip adds mine, as in Teams (chip marked when
     `mine`). Verb `{"react": "<thread>", "msg": id, "key": k,
@@ -148,7 +149,7 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 ## Out of scope
 
 - File or image upload, paste of images.
-- Reactions beyond `messages.EMOJI`'s 8 keys (any-emoji reactions could reuse spec 012's popup later).
+- Reactions beyond `messages.EMOJI`'s 10 keys (any-emoji reactions could reuse spec 012's popup later).
 - An edit keeping the original's mentions, emoji or quote (edit is plain text).
 - Marking the chat read in Teams on open or on send.
 - Unread separator, search across chats (the MCP server already does it).

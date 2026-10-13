@@ -64,6 +64,8 @@ EMOJI = {
     "angry": "😡",
     "yes": "👍",
     "no": "👎",
+    "praying": "🙏",
+    "upsidedownface": "🙃",
 }
 
 # Teams names differ from the composer's GitHub/Slack shortcodes.
@@ -73,7 +75,6 @@ _REACTION_ALIASES = {
     "loudlycrying": "sob",
     "clappinghands": "clap",
     "handsinair": "raised_hands",
-    "praying": "pray",
     "victory": "v",
     "ok": "ok_hand",
     "raisedfist": "fist_raised",

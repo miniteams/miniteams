@@ -423,13 +423,14 @@ async def test_quote_list_stops_at_ten(chat: Pages) -> None:
 
 
 async def test_react_toggles_my_reaction(board: W.Board, chat: Pages, calls: list[tuple[Any, ...]]) -> None:
-    """011-AC12: the picker offers Teams' 6 distinct keys; one I already gave is sent with `remove: true`."""
+    """011-AC12: the picker offers Teams' 6 defaults plus 🙏 and 🙃; one I already gave is sent with
+    `remove: true`."""
     page = await chat.open(_chat(T))
     await _handled(page, "history")
     await page.locator('[data-id="1"]').hover()
     await _act(page, "1", "react").click()
     picker = page.locator('[data-id="1"] .picker')
-    keys = ["like", "heart", "laugh", "surprised", "sad", "angry"]
+    keys = ["like", "heart", "laugh", "surprised", "sad", "angry", "praying", "upsidedownface"]
     assert await picker.locator("button").evaluate_all("bs => bs.map(b => b.dataset.key)") == keys
     assert await picker.locator("button").all_inner_texts() == [EMOJI[k] for k in keys]
     await picker.locator("[data-key=like]").click()
@@ -443,6 +444,24 @@ async def test_react_toggles_my_reaction(board: W.Board, chat: Pages, calls: lis
     await page.locator('[data-id="1"] .picker [data-key=like]').click()
     await _until(calls, 2)
     assert calls == [("react", T, "1", "like", False), ("react", T, "1", "like", True)]
+
+
+async def test_the_page_knows_every_accepted_reaction_key(
+    board: W.Board, chat: Pages, calls: list[tuple[Any, ...]]
+) -> None:
+    """011-AC12: the page's reaction keys are messages.EMOJI's: every one is a toggling chip, 🙏 included."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    theirs = {"emotions": [{"key": k, "users": [{"mri": "8:orgid:someone"}]} for k in EMOJI]}
+    partial = {k: v for k, v in _m("1", _at(1)).items() if k != "content"}
+    await board.on_event(_event("MessageUpdate", T, **{**partial, "properties": theirs}))
+    chips = page.locator('[data-id="1"] .reacts button')
+    shown = "document.querySelectorAll('[data-id=\"1\"] .reacts button').length"
+    await page.wait_for_function(f"{shown} === {len(EMOJI)}")
+    assert await chips.all_inner_texts() == [f"{EMOJI[k]} 1" for k in EMOJI]
+    await page.locator('[data-id="1"] .reacts button', has_text="🙏").click()
+    await _until(calls, 1)
+    assert calls == [("react", T, "1", "praying", False)]
 
 
 async def test_edit_and_delete_only_on_my_messages(chat: Pages) -> None:

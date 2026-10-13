@@ -1594,7 +1594,7 @@ async def test_quote_counts_toward_the_size_cap(act_board: W.Board, calls: list[
     assert [c[0] for c in calls] == ["send"]
 
 
-async def test_react_adds_and_removes_one_of_the_eight_keys(
+async def test_react_adds_and_removes_one_of_the_accepted_keys(
     act_board: W.Board, calls: list[tuple[Any, ...]]
 ) -> None:
     """011-AC12: one react() per verb with the key and `remove`; other keys and bad flags refused."""
@@ -1609,6 +1609,9 @@ async def test_react_adds_and_removes_one_of_the_eight_keys(
     assert (
         await act_board.chat.act_answer(ws, "react", {"react": T, "msg": "2", "key": "heart", "remove": True})
     )["ok"]
+    for key in ("praying", "upsidedownface"):  # Teams' own names for 🙏 and 🙃
+        request = {"react": T, "msg": "3", "key": key, "remove": False}
+        assert (await act_board.chat.act_answer(ws, "react", request))["ok"]
     for request, error in (
         ({"key": "1f525_fire"}, "invalid reaction"),
         ({"key": "Like"}, "invalid reaction"),
@@ -1619,7 +1622,12 @@ async def test_react_adds_and_removes_one_of_the_eight_keys(
     ):
         answer = await act_board.chat.act_answer(ws, "react", {"react": T, "msg": "1", **request})
         assert answer.get("error") == error, request
-    assert _writes(calls) == [("react", T, "1", "like", False), ("react", T, "2", "heart", True)]
+    assert _writes(calls) == [
+        ("react", T, "1", "like", False),
+        ("react", T, "2", "heart", True),
+        ("react", T, "3", "praying", False),
+        ("react", T, "3", "upsidedownface", False),
+    ]
 
 
 async def test_edit_only_my_own_message_with_valid_text(

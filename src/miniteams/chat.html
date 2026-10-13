@@ -210,7 +210,7 @@
   .msg:has(.editor) .actions { display: none !important; }  /* outranks the focus-within rule: the editor holds focus */
   .actions button { border: 0; background: transparent; border-radius: 6px; padding: 0 6px; cursor: pointer; color: var(--dim); font-size: 12.5px; }
   .actions button:hover { background: var(--panel-2); color: var(--accent); }
-  .actions .picker { display: flex; border-left: 1px solid var(--line); margin-left: 2px; padding-left: 2px; }
+  .actions .picker { display: grid; grid-template-columns: repeat(4, auto); border-left: 1px solid var(--line); margin-left: 2px; padding-left: 2px; }
   .actions .picker[hidden] { display: none; }
   .actions .picker button.mine { background: var(--accent-soft); }
   body.readonly .actions [data-act]:not([data-act="teams"]) { display: none; }
@@ -358,9 +358,9 @@
   const LIVE_MAX = 600;  // messages kept on screen at the bottom (and buffered while detached)
   const EDGE = 150;  // px from the top or bottom that loads the next page
   const typing = new Set();
-  // The keys `react` accepts (messages.EMOJI); the picker offers Teams' 6, `yes`/`no` would repeat 👍 and add 👎.
-  const EMOJI = { like: "👍", heart: "❤️", laugh: "😆", surprised: "😮", sad: "😢", angry: "😡", yes: "👍", no: "👎" };
-  const PICKER = ["like", "heart", "laugh", "surprised", "sad", "angry"];
+  // The keys `react` accepts (messages.EMOJI); the picker skips `yes`/`no`, which would repeat 👍 and add 👎.
+  const EMOJI = { like: "👍", heart: "❤️", laugh: "😆", surprised: "😮", sad: "😢", angry: "😡", yes: "👍", no: "👎", praying: "🙏", upsidedownface: "🙃" };
+  const PICKER = ["like", "heart", "laugh", "surprised", "sad", "angry", "praying", "upsidedownface"];
   const QUOTE_MAX = 10;
   let quotes = [];  // [{id, name, line}] quoted by the next send, in the order picked
 
