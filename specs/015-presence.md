@@ -44,10 +44,10 @@ hover gives the label ("Busy · In a meeting"). Unknown presence shows no dot.
 
 ## Acceptance criteria
 
-- [ ] **AC1** The spike's long observation (~1 h) records at least one real availability/activity
+- [x] **AC1** The spike's long observation (~1 h) records at least one real availability/activity
       transition and the subscription lifetime, as sanitized fixtures in `misc/presence-spike/`;
       the renewal period is set from it.
-- [ ] **AC2** A subscription on the `web` process's own Trouter socket delivers presence callbacks
+- [x] **AC2** A subscription on the `web` process's own Trouter socket delivers presence callbacks
       without disturbing chat deliveries (or the dedicated-endpoint fallback is documented).
 - [ ] **AC3** 1:1 rows (widget and chat page list) and message author avatars show a dot coloured
       by availability, with an "Availability · Activity" hover; unknown or missing presence shows
@@ -84,8 +84,7 @@ A regenerable local SQLite cache; no change to the archive.
 
 ## Open questions
 
-- Subscription lifetime and renewal period (phase 1).
-- Whether the existing Trouter socket accepts the presence subscription (phase 1).
+None left from phase 1 (answers in Decisions, evidence in `misc/presence-spike/README.md`).
 
 ## Decisions
 
@@ -97,3 +96,12 @@ A regenerable local SQLite cache; no change to the archive.
   stale after two periods → unknown; own presence never published (babs, 2026-10-13).
 - Separate spec from the read-receipts amendment (spec 011), sharing the spike harness and the
   local cache (babs, 2026-10-13).
+- **Renewal period: 10 min** (spike, 2026-10-13). 60 min observation of 50 peers: 19 availability
+  transitions delivered, 0 missed against 2-min snapshots; deltas arrived unrenewed for 45 min with
+  no expiry signal (none in the response, no readable status endpoint). A renewal re-POST returns
+  an immediate full snapshot callback, which is the confirmation. Stale after two periods unchanged.
+  Add status `40020` came back for exactly the 3 people whose snapshot was `PresenceUnknown`: treat as unknown.
+- **Socket: the `web` socket, no dedicated endpoint** (spike, 2026-10-13). One endpoint registered
+  like `web` carried 96 chat deliveries and 32 presence callbacks over 60 min, no close, no
+  message loss after the connect flood, `user.activity` not needed. Verified on a fresh probe
+  endpoint with the `web` registration, not inside the running `web` process.
