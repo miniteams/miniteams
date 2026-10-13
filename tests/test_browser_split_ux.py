@@ -930,8 +930,10 @@ async def test_the_last_row_s_menu_opens_upwards_in_sight(split: Split) -> None:
     await row.locator('[data-k="more"]').click()
     js = (
         "(() => { const m = document.querySelector('.rowmenu').getBoundingClientRect(),"
+        " trigger = document.querySelector('[data-k=more][aria-expanded=true]').getBoundingClientRect(),"
         " list = document.getElementById('rows').getBoundingClientRect();"
-        " return m.bottom <= Math.min(innerHeight, list.bottom); })()"
+        " return m.bottom <= Math.min(innerHeight, list.bottom)"
+        " && Math.abs(m.right - trigger.right) <= 1 && Math.abs(trigger.top - m.bottom - 4) <= 1; })()"
     )
     assert await page.evaluate(js)
     split.fake.broadcast()

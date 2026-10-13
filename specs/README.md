@@ -14,3 +14,4 @@
 | [010](010-typing-indicator.md) | Outgoing typing indicator (`miniteams typing`) | implemented |
 | [011](011-chat-view.md) | Chat view in the widget (`/chat/<thread>`) | shipped |
 | [012](012-composer-emoji-mentions.md) | Composer: emoji completion and `@` mentions | implemented |
+| [013](013-reaction-tooltips.md) | Reaction tooltips with all emotions and participants | shipped |

@@ -459,6 +459,133 @@ async def test_picks_survive_the_reload_a_newer_page_triggers(pages: Pages) -> N
     assert pages.external == []
 
 
+@pytest.mark.parametrize("third_short", [False, True])
+async def test_shortened_mentions_keep_distinct_recipients_and_survive_reload(
+    pages: Pages, third_short: bool
+) -> None:
+    other = {"name": "Ann Roe", "mri": "8:orgid:other-ann"}
+    fake = Fake(members=[ANN, other])
+    page = await _open(pages, fake)
+    box = page.locator("#reply")
+    for name in ("@ann l", "and @ann r"):
+        await box.press_sequentially(name)
+        await shows(page, [ANN["name"] if name == "@ann l" else other["name"]])
+        await box.press("Enter")
+        await box.press("Backspace")
+    assert await box.input_value() == "@Ann and @Ann "
+    await box.press_sequentially("and @ann l")
+    await shows(page, ["Ann Lee"])
+    await box.press("Enter")
+    if third_short:
+        await box.press("Backspace")
+    expected = "@Ann and @Ann and " + ("@Ann " if third_short else "@Ann Lee ")
+    assert await box.input_value() == expected
+    fake.version = "2"
+    async with page.expect_event("load", timeout=10000):
+        await fake.ws.close()
+    await box.wait_for()
+    assert await box.input_value() == expected
+    await box.press("Enter")
+    await wait(lambda: len(fake.of("send")) == 1)
+    assert fake.of("send")[0]["mentions"] == [
+        {**ANN, "name": "Ann"},
+        {**other, "name": "Ann"},
+        {**ANN, "name": "Ann"} if third_short else ANN,
+    ]
+    verb = fake.of("send")[0]
+    _, props = compose_html(verb["text"], verb["mentions"], {})
+    assert props is not None
+    assert [m["mri"] for m in json.loads(props["mentions"])] == [ANN["mri"], other["mri"], ANN["mri"]]
+
+
+async def test_shortening_an_earlier_mention_keeps_first_names_in_text_order(fake: Fake) -> None:
+    other = {"name": "Ann Roe", "mri": "8:orgid:other-ann"}
+    fake.members = [ANN, other]
+    page, box = _parts(fake)
+    for name in ("@ann l", "and @ann r"):
+        await box.press_sequentially(name)
+        await shows(page, [ANN["name"] if name == "@ann l" else other["name"]])
+        await box.press("Enter")
+    await box.press("Backspace")
+    await box.evaluate("b => b.setSelectionRange(9, 9)")
+    await box.press("Backspace")
+    assert await box.input_value() == "@Ann and @Ann "
+    await box.press("End")
+    await box.press("Enter")
+    await wait(lambda: len(fake.of("send")) == 1)
+    assert fake.of("send")[0]["mentions"] == [{**ANN, "name": "Ann"}, {**other, "name": "Ann"}]
+
+
+@pytest.mark.parametrize("which", [0, 1])
+async def test_shortening_identical_full_names_keeps_the_selected_person(fake: Fake, which: int) -> None:
+    fake.members = [ANN, ANN2]
+    page, box = _parts(fake)
+    for i, prefix in enumerate(("@ann", "and @ann")):
+        await box.press_sequentially(prefix)
+        await shows(page, ["Ann Lee", "Ann Lee"])
+        if i:
+            await box.press("ArrowDown")
+        await box.press("Enter")
+    caret = 9 if which == 0 else len("@Ann Lee and @Ann Lee ")
+    await box.evaluate("(b, caret) => b.setSelectionRange(caret, caret)", caret)
+    await box.press("Backspace")
+    expected = "@Ann and @Ann Lee " if which == 0 else "@Ann Lee and @Ann "
+    assert await box.input_value() == expected
+    await box.press("End")
+    await box.press("Enter")
+    await wait(lambda: len(fake.of("send")) == 1)
+    verb = fake.of("send")[0]
+    _, props = compose_html(verb["text"], verb["mentions"], {})
+    assert props is not None
+    assert [m["mri"] for m in json.loads(props["mentions"])] == [ANN["mri"], ANN2["mri"]]
+
+
+async def test_reaction_hover_lists_every_emotion_and_its_people(fake: Fake) -> None:
+    page, _ = _parts(fake)
+    reactions = [
+        {"key": "launch", "emoji": "🚀", "count": 1, "mine": False, "people": ["Ann Lee"]},
+        {"key": "crossedfingers", "emoji": "🤞", "count": 2, "mine": False, "people": ["Bob Roe", "Me"]},
+        {"key": "yes-tone1", "emoji": "👍🏻", "count": 1, "mine": False, "people": ["Ann Lee"]},
+    ]
+    fake.send({"edit": {**MINE, "reactions": reactions}, "thread": T})
+    await fake.handled()
+    chips = page.locator('[data-id="1"] .reacts > *')
+    assert await chips.count() == 3
+    for chip in await chips.all():
+        await chip.hover()
+        assert await chip.get_attribute("title") == "🚀 — Ann Lee\n🤞 — Bob Roe, Me\n👍🏻 — Ann Lee"
+    assert await chips.nth(2).inner_text() == "👍🏻 1"
+    fake.send({"edit": {**MINE, "reactions": reactions[:1]}, "thread": T})
+    await fake.handled()
+    assert await chips.first.get_attribute("title") == "🚀 — Ann Lee"
+
+
+async def test_repick_after_reload_keeps_both_short_and_full_mentions(pages: Pages) -> None:
+    fake = Fake()
+    page = await _open(pages, fake)
+    box = page.locator("#reply")
+    await box.press_sequentially("@ann")
+    await shows(page, ["Ann Lee"])
+    await box.press("Enter")
+    await box.press("Backspace")
+    fake.version = "2"
+    async with page.expect_event("load", timeout=10000):
+        await fake.ws.close()
+    await box.wait_for()
+    await box.press_sequentially("and @ann")
+    await shows(page, ["Ann Lee"])
+    await box.press("Enter")
+    assert await box.input_value() == "@Ann and @Ann Lee "
+    # A second reload must also preserve both labels for the same person.
+    fake.version = "3"
+    async with page.expect_event("load", timeout=10000):
+        await fake.ws.close()
+    await box.wait_for()
+    await box.press("Enter")
+    await wait(lambda: len(fake.of("send")) == 1)
+    assert fake.of("send")[0]["mentions"] == [{**ANN, "name": "Ann"}, ANN]
+
+
 async def test_invalid_saved_picks_are_left_out(pages: Pages) -> None:
     """012-AC8: a saved draft whose picks were tampered with sends only the well-formed ones, two
     people sharing a name included."""

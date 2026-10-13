@@ -129,7 +129,12 @@
   // Returns the inline buttons and the menu (none or one) to append to the row's `li`.
   const rowActions = (list, render, send) => {
     let open = "", up = false;
-    const close = (id) => { open = ""; render(); focusIn(list.querySelector(`li[data-id="${CSS.escape(id)}"]`), "more"); };
+    const close = (id, restore = true) => {
+      // Pointer dismissal must not leave focus pinning the row's hover actions open.
+      if (!restore && list.contains(document.activeElement)) document.activeElement.blur();
+      open = ""; render();
+      if (restore) focusIn(list.querySelector(`li[data-id="${CSS.escape(id)}"]`), "more");
+    };
     addEventListener("click", (e) => { if (open && !e.target.closest?.(".rowmenu, [data-k=more]")) { open = ""; render(); } });
     // After the move, not during it: a broadcast re-render puts the focus back into the menu first. Its own ⋯ keeps it, to toggle.
     // Only the menu node goes: a full render between press and release would drop the click that moved the focus.
@@ -141,18 +146,28 @@
       menu.remove();
     }));
     const btn = (cls, text, k, act) => { const b = el("button", cls, text); b.dataset.k = k; b.onclick = act; return b; };
+    // Anchor to the trigger, not the row: previews and mention badges make rows taller.
+    const anchor = (menu) => {
+      const li = menu.parentElement;
+      if (!li) return;
+      const row = li.getBoundingClientRect(), more = li.querySelector("[data-k=more]").getBoundingClientRect();
+      menu.style.right = `${row.right - more.right}px`;
+      menu.style.setProperty("--menu-top", `${more.bottom - row.top + 4}px`);
+      menu.style.setProperty("--menu-bottom", `${row.bottom - more.top + 4}px`);
+    };
     return (r) => {
       const inline = [];
       if (r.last_id) inline.push(Object.assign(btn("read", "👁", "read", () => send({ read: r.id })), { title: "mark read in Teams" }));
-      const more = btn("more", "⋯", "more", () => {
-        if (open === r.id) { close(r.id); return; }
+      const more = btn("more", "⋯", "more", (e) => {
+        if (open === r.id) { close(r.id, e.detail === 0); return; }
         open = r.id; up = false; render();
         const menu = list.querySelector(".rowmenu");
         if (menu) {
+          anchor(menu);
           // Rows near the bottom of what scrolls (the list, or else the window under its sticky header) open upwards when that has more room.
           const box = getComputedStyle(list).overflowY === "visible"
             ? { top: document.querySelector("header")?.getBoundingClientRect().bottom ?? 0, bottom: innerHeight } : list.getBoundingClientRect();
-          const row = menu.parentElement.getBoundingClientRect(), bottom = Math.min(innerHeight, box.bottom);
+          const row = menu.parentElement.querySelector("[data-k=more]").getBoundingClientRect(), bottom = Math.min(innerHeight, box.bottom);
           if (menu.getBoundingClientRect().bottom > bottom && row.top - Math.max(0, box.top) > bottom - row.bottom) { up = true; menu.classList.add("up"); }
           menu.querySelector("button")?.focus();
         }
@@ -163,8 +178,9 @@
       const m = mentioned(r), undo = isSeen(r) && !m;
       // What was on screen: a message or mention landing between render and click must keep the row visible.
       const shownAt = m && Date.parse(r.mention.at) > Date.parse(r.last_activity) ? r.mention.at : r.last_activity;
-      const act = (verb) => () => { close(r.id); send(verb); };
+      const act = (verb) => (e) => { close(r.id, e.detail === 0); send(verb); };
       const menu = el("div", up ? "rowmenu up" : "rowmenu");
+      queueMicrotask(() => anchor(menu));
       menu.append(
         btn(null, undo ? "↺ Unseen" : "✓ Mark seen", "seen", act(undo ? { unseen: r.id } : { seen: r.id, at: shownAt })),
         Object.assign(btn(null, r.muted ? "🔔 Unmute" : "🔕 Mute", "mute", act(r.muted ? { unmute: r.id } : { mute: r.id })),
@@ -186,7 +202,7 @@
     pop.setAttribute("role", "listbox");
     pop.onmousedown = (e) => e.preventDefault();  // its scrollbar too: a press there must not blur the input
     let comp = null, want = null, timer = 0, dismissed = -1;
-    const picked = new Map();  // chat id → Map(mri → {name, mri, everyone?}): two people may share a name
+    const picked = new Map();  // chat id → ordered picks: repeated first names can have different recipients
     const token = () => {
       const at = input.selectionStart;
       if (at !== input.selectionEnd) return null;
@@ -264,19 +280,41 @@
       const it = comp.items[comp.active], member = comp.kind === "member", text = member ? `@${it.name} ` : it.custom ? `:${it.name}:` : it.char;
       if (member) {
         const id = chat();
-        if (!picked.has(id)) picked.set(id, new Map());
-        picked.get(id).delete(it.mri);  // a re-pick is the latest: it moves to the end
-        picked.get(id).set(it.mri, pick(it));
+        picked.set(id, [...(picked.get(id) || []), pick(it)]);
       }
       close();
       if (member) dismissed = t.start;  // `@everyone ` + the next word must not ask `everyone t`…
       put(text, t.start, input.selectionStart);
+      if (member) picked.set(chat(), mentions(input.value));
       edited();
     };
     // Enter with the list open picks, never sends; true when the key was the list's. While a longer
     // prefix is still being asked, the list on screen answers a shorter one: Enter/Tab wait for it.
     const key = (e) => {
-      if (!comp || e.isComposing || e.keyCode === 229) return false;
+      if (e.isComposing || e.keyCode === 229) return false;
+      if (e.key === "Backspace" && !e.ctrlKey && !e.altKey && !e.metaKey && input.selectionStart === input.selectionEnd) {
+        const at = input.selectionStart, before = input.value.slice(0, at);
+        for (const m of [...(picked.get(chat()) || [])].reverse()) {
+          const first = m.name.split(/\s+/)[0];
+          if (m.everyone || first === m.name) continue;
+          const space = before.endsWith(`@${m.name} `) ? " " : "", start = at - m.name.length - 1 - space.length;
+          if (!before.endsWith(`@${m.name}${space}`) || start > 0 && /[\p{L}\p{N}_]/u.test(before[start - 1])) continue;
+          // Resolve occurrences before changing the label: namesakes must keep their own recipient.
+          const active = mentions(input.value), names = active.map((p) => p.name), seen = new Map();
+          const ordered = scan(input.value, names).map((name) => {
+            const matches = active.filter((p) => p.name === name), nth = seen.get(name) || 0;
+            seen.set(name, nth + 1);
+            return matches[Math.min(nth, matches.length - 1)];
+          });
+          const pos = scan(input.value.slice(0, start), names).length;
+          ordered[pos] = pick({ ...ordered[pos], name: first });
+          picked.set(chat(), ordered);
+          close(); dismissed = start;
+          put(`@${first}${space}`, start, at); edited();
+          return true;
+        }
+      }
+      if (!comp) return false;
       const n = comp.items.length;
       if (e.key === "ArrowDown" || e.key === "ArrowUp") { comp.active = (comp.active + (e.key === "ArrowDown" ? 1 : n - 1)) % n; render(); }
       else if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
@@ -293,14 +331,14 @@
     // Names, not offsets: of the picks under one name the last `count` stand, `count` its `@Name`s in the
     // text; a pick deleted from the text then re-picked as a namesake must not take the n-th `@Name`.
     const mentions = (text, id = chat()) => {
-      const all = [...(picked.get(id)?.values() || [])], count = new Map();
+      const all = picked.get(id) || [], count = new Map();
       for (const name of scan(text, all.map((m) => m.name))) count.set(name, (count.get(name) || 0) + 1);
       return all.filter((m, i) => all.slice(i + 1).filter((n) => n.name === m.name).length < (count.get(m.name) || 0));
     };
     // Picks saved across a reload: data from sessionStorage, checked like any input.
     const restore = (list) => {
       const ok = list.filter((m) => m && typeof m.name === "string" && typeof m.mri === "string" && [undefined, true].includes(m.everyone));
-      picked.set(chat(), new Map(ok.map((m) => [m.mri, pick(m)])));
+      picked.set(chat(), ok.map(pick));
     };
     const forget = (id) => picked.delete(id);
     input.addEventListener("input", (e) => { if (!e.isComposing) lookup(); });

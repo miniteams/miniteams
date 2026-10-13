@@ -35,6 +35,7 @@ from miniteams import chat_verbs as CV
 from miniteams import web as W
 from miniteams.archive_store import ChatStore, find_chat_dir
 from miniteams.config import Settings
+from miniteams.messages import EMOJI
 
 pytestmark = pytest.mark.browser
 pages = browser_helpers.pages
@@ -428,7 +429,7 @@ async def test_react_toggles_my_reaction(board: W.Board, chat: Pages, calls: lis
     await page.locator('[data-id="1"]').hover()
     await _act(page, "1", "react").click()
     picker = page.locator('[data-id="1"] .picker')
-    assert await picker.locator("button").evaluate_all("bs => bs.map(b => b.dataset.key)") == list(W.EMOJI)
+    assert await picker.locator("button").evaluate_all("bs => bs.map(b => b.dataset.key)") == list(EMOJI)
     await picker.locator("[data-key=like]").click()
     await _until(calls, 1)
     mine = {"emotions": [{"key": "like", "users": [{"mri": ME}]}]}
@@ -1242,6 +1243,45 @@ async def test_widget_row_menu_never_opens_under_the_sticky_header(widget: Widge
     hit = "b => { const r = b.getBoundingClientRect(), x = r.x + r.width / 2, y = r.y + r.height / 2;"
     hit += " return document.elementFromPoint(x, y) === b; }"
     assert await first.evaluate(hit)
+
+
+@pytest.mark.parametrize("view", ["widget", "split"])
+async def test_row_menu_stays_anchored_to_its_visible_trigger(
+    split: Pages, board: W.Board, view: str
+) -> None:
+    """An open menu stays beside its trigger, including after hover/focus leave and a broadcast."""
+    page = await split.open("/") if view == "widget" else await _open_split(split)
+    await page.wait_for_selector("#rows > li")
+    li = page.locator("#rows > li").first
+    await li.hover()
+    await li.locator('[data-k="more"]').click()
+    await page.mouse.move(0, 0)
+    # Removing focus must not hide the trigger while the menu still exists.
+    assert await li.evaluate("""li => {
+      const focused = document.activeElement;
+      focused.blur();
+      const visible = getComputedStyle(li.querySelector('[data-k=more]')).display !== 'none';
+      focused.focus();
+      return visible;
+    }""")
+    geometry = """li => {
+      const menu = li.querySelector('.rowmenu'), more = li.querySelector('[data-k=more]');
+      const m = menu.getBoundingClientRect(), b = more.getBoundingClientRect();
+      return {right: m.right - b.right, gap: menu.classList.contains('up')
+        ? b.top - m.bottom : m.top - b.bottom};
+    }"""
+    for broadcast in (False, True):
+        if broadcast:
+            frames = await page.evaluate("window.__frames.filter(f => 'rows' in f).length")
+            board.broadcast()
+            await page.wait_for_function(f"window.__frames.filter(f => 'rows' in f).length > {frames}")
+        bounds = await li.evaluate(geometry)
+        assert abs(bounds["right"]) <= 1, bounds
+        assert 3 <= bounds["gap"] <= 5, bounds
+    await li.locator('[data-k="more"]').click()
+    await page.mouse.move(0, 0)
+    assert await li.locator(".rowmenu").count() == 0
+    assert not await li.locator('[data-k="more"]').is_visible()
 
 
 def _teams_tab(widget: Widget) -> str:

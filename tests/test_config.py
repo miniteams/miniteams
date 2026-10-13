@@ -51,8 +51,9 @@ def test_write_private_new_parent_is_0700_existing_left_alone(tmp_path: Path) ->
 
 
 def test_launch_file_defaults_under_config_dir_and_is_absolute(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)  # Settings reads ./.env: a local MINITEAMS_LAUNCH_FILE must not leak in
+    monkeypatch.delenv("MINITEAMS_LAUNCH_FILE", raising=False)
     assert Settings(tenant_id="t", config_dir=tmp_path).launch_file == tmp_path / "open.html"
-    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MINITEAMS_LAUNCH_FILE", "rel/open.html")
     assert Settings(tenant_id="t").launch_file == tmp_path / "rel" / "open.html"
     monkeypatch.setenv("MINITEAMS_LAUNCH_FILE", "~/x.html")

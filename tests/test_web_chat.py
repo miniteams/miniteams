@@ -393,6 +393,54 @@ def test_record_deleted_message_has_no_body() -> None:
     assert CV.chat_record(_m("8", _at(8), skypeeditedid="8"), T)["edited"] is True
 
 
+@pytest.mark.parametrize(
+    ("key", "emoji"),
+    [
+        ("2705_whiteheavycheckmark", "✅"),
+        ("1f680_rocket", "🚀"),
+        ("fire", "🔥"),
+        ("cry", "😢"),
+        ("crossedfingers", "🤞"),
+        ("launch", "🚀"),
+        ("loudlycrying", "😭"),
+        ("yes", "👍"),
+        ("no", "👎"),
+        ("yes-tone1", "👍🏻"),
+        ("yes-tone2", "👍🏼"),
+        ("yes-tone3", "👍🏽"),
+        ("yes-tone4", "👍🏾"),
+        ("yes-tone5", "👍🏿"),
+        ("no-tone2", "👎🏼"),
+        ("crossedfingers-tone3", "🤞🏽"),
+        ("clappinghands-tone4", "👏🏾"),
+        ("handsinair-tone5", "🙌🏿"),
+        ("praying-tone1", "🙏🏻"),
+        ("victory-tone2", "✌🏼"),
+        ("1f919_callmehand-tone4", "🤙🏾"),
+        ("270d_writinghand-tone3", "✍🏽"),
+        ("1f469-200d-1f4bb_technologist-tone2", "👩🏼‍💻"),
+        ("launch-tone1", ":launch-tone1:"),
+        ("party_custom-tone1", ":party_custom-tone1:"),
+        ("yes-tone0", ":yes-tone0:"),
+        ("yes-tone6", ":yes-tone6:"),
+        ("unknown👍-tone1", ":unknown👍-tone1:"),
+        ("1f44d_thumbsup-tone1-tone2", ":1f44d_thumbsup-tone1-tone2:"),
+        ("1f44d_thumbsup-tone6", ":1f44d_thumbsup-tone6:"),
+        ("1f44d-1f3fd_thumbsup-tone1", ":1f44d-1f3fd_thumbsup-tone1:"),
+        ("1f469-200d-1f467_family-tone1", ":1f469-200d-1f467_family-tone1:"),
+        ("1f44d-1f3fd_thumbsup", "👍🏽"),
+        ("1f469-200d-1f4bb_technologist", "👩‍💻"),
+        ("110000_invalid", ":110000_invalid:"),
+        ("d800_invalid", ":d800_invalid:"),
+        ("party_custom", ":party_custom:"),
+    ],
+)
+def test_record_decodes_unicode_reaction_keys(key: str, emoji: str) -> None:
+    emotions = [{"key": key, "users": [{"mri": ME}]}]
+    record = CV.chat_record(_m("7", _at(7), properties={"emotions": emotions}), T, ME)
+    assert record["reactions"] == [{"key": key, "emoji": emoji, "count": 1, "mine": True, "people": [ME]}]
+
+
 def test_record_reactions_count_and_mine() -> None:
     """011-AC7: reactions line, `mine` when my MRI is among the users (JSON string or list)."""
     emotions = [
@@ -403,9 +451,9 @@ def test_record_reactions_count_and_mine() -> None:
         "junk",
     ]
     expected = [
-        {"key": "like", "emoji": "👍", "count": 2, "mine": True},
-        {"key": "heart", "emoji": "❤️", "count": 1, "mine": False},
-        {"key": "party_custom", "emoji": ":party_custom:", "count": 1, "mine": False},
+        {"key": "like", "emoji": "👍", "count": 2, "mine": True, "people": [ANN, ME]},
+        {"key": "heart", "emoji": "❤️", "count": 1, "mine": False, "people": [ANN]},
+        {"key": "party_custom", "emoji": ":party_custom:", "count": 1, "mine": False, "people": [ANN]},
     ]
     for value in (emotions, json.dumps(emotions)):
         assert CV.chat_record(_m("7", _at(7), properties={"emotions": value}), T, ME)["reactions"] == expected
@@ -421,6 +469,15 @@ def test_record_mentions_and_me() -> None:
     record = CV.chat_record(_m("7", _at(7), content, properties=props), T, ME)
     assert record["mentions"] == "me"
     assert record["html"] == f'<p><span class="mention mention-me" data-mri="{ME}">Me</span> look</p>'
+
+
+def test_record_resolves_reaction_people_without_losing_unknown_users() -> None:
+    emotions = [{"key": "launch", "users": [{"mri": ANN}, {"mri": ME}, {"mri": "unknown"}]}]
+    names = {ANN: "Ann Lee", ME: "Me Self"}
+    record = CV.chat_record(
+        _m("7", _at(7), properties={"emotions": emotions}), T, ME, name_for=lambda mri: names.get(mri, mri)
+    )
+    assert record["reactions"][0]["people"] == ["Ann Lee", "Me Self", "unknown"]
     mine = CV.chat_record(_m("8", _at(8), **{"from": f"https://h/v1/users/ME/contacts/{ME}"}), T, ME)
     assert (mine["me"], mine["from"], mine["mentions"]) == (True, ME, None)
 
@@ -613,10 +670,14 @@ async def test_follow_relays_messages_edits_deletes_reactions_and_typing(
         assert (await _frame(ws))["edit"]["deleted"] is True
 
         emotions = {"emotions": [{"key": "like", "users": [{"mri": ME, "time": 1}]}]}
+        assert board.directory is not None
+        board.directory._names[ME] = "Me Self"
         reaction = {"id": "9", "composetime": _at(9), "messagetype": "RichText/Html", "properties": emotions}
         await board.on_event(_event("MessageUpdate", T, **reaction))
         edit = (await _frame(ws))["edit"]
-        assert edit["reactions"] == [{"key": "like", "emoji": "👍", "count": 1, "mine": True}]
+        assert edit["reactions"] == [
+            {"key": "like", "emoji": "👍", "count": 1, "mine": True, "people": ["Me Self"]}
+        ]
         assert "html" not in edit  # partial update: the page keeps the body it shows
 
         await board.on_event(_event("NewMessage", T, messagetype="Control/Typing"))
@@ -2247,11 +2308,13 @@ async def test_a_hung_media_folder_relays_without_media(
     seen: list[Any] = []
     real = W.chat_record
 
-    def record(message: dict[str, Any], thread_id: str, me: str, media: Any, custom: Any) -> dict[str, Any]:
+    def record(
+        message: dict[str, Any], thread_id: str, me: str, media: Any, custom: Any, name_for: Any = None
+    ) -> dict[str, Any]:
         seen.append(media)
         if media is not None:
             release.wait(5)
-        return real(message, thread_id, me, media, custom)
+        return real(message, thread_id, me, media, custom, name_for)
 
     monkeypatch.setattr(W, "chat_record", record)
     monkeypatch.setitem(CV._DEADLINES, "relay", 0.05)

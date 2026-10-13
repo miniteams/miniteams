@@ -4,6 +4,8 @@
 **Requested by**: babs
 **Date**: 2026-10-09
 
+**Amendment 2026-10-13**: recipient read receipts are draft; the shipped chat view remains unchanged.
+
 ## Problem
 
 The widget (spec 002) is a list of rows; reading a conversation means leaving for Teams. The quick
@@ -410,3 +412,46 @@ None.
 - Known limits after the fix round: the custom emoji host defaults to the fr-prod region
   (`MINITEAMS_ASYNCGW_HOST` overrides it; per-region wiring waits for a check of the authz
   response); at exit, threads stuck on a dead mount do not hold the process.
+
+## Recipient read receipts amendment, draft
+
+### Problem and solution
+
+The chat view does not show whether recipients read our messages. Add a Seen indicator to
+outgoing messages and a hover list of confirmed readers. Group chats can show a partial
+reader count; only confirmed reads contribute. Missing receipts do not prove a message unread.
+
+### Evidence and limits
+
+- Miniteams currently consumes our own `consumptionhorizon` from ConversationUpdate to update
+  unread rows. It deliberately ignores `ThreadActivity/MemberConsumptionHorizonUpdate`.
+- The inspected purple-teams message handlers send our own consumption horizon when we read
+  a conversation. They do not establish how to consume recipient read receipts.
+  [Native reference](https://github.com/EionRobb/purple-teams/blob/master/teams_messages.c).
+- Teams supports receipts in 1:1 and group chats of 20 people or fewer, subject to policy,
+  individual settings and recipient availability. Disabled or unavailable receipts remain unknown.
+  [Microsoft reference](https://support.microsoft.com/en-us/teams/chat/use-read-receipts-for-messages-in-microsoft-teams).
+- Native recipient identity, message-boundary semantics, initial snapshot and live update format
+  remain to be verified. Our read marker must never stand in for another person's receipt.
+
+### Acceptance criteria
+
+- [ ] A read-only native spike identifies an actual recipient receipt and its message boundary,
+      confirms snapshot/reconnect behaviour and records a sanitized fixture. No Graph API.
+- [ ] An outgoing message shows Seen only with a confirmed recipient read; hovering lists
+      confirmed readers by name. Group partial counts do not imply everyone has read.
+- [ ] Live receipt updates refresh the indicator without changing message time, chat ordering,
+      unread counters or local seen state. Out-of-order events never regress a confirmed receipt.
+- [ ] Missing, disabled, unsupported or malformed receipts show no false Seen or Unread claim.
+- [ ] Reconnection reconciles native state; tests cover 1:1, partial group reads, unknown state,
+      recipient identity and unrelated activity events.
+
+### Phases and data impact
+
+1. Spike native receipt retrieval and Trouter events, including the libpurple reference.
+   **Data model impact**: none. **DoD**: validated protocol and sanitized fixtures saved in misc;
+   unresolved protocol questions block implementation.
+2. Implement receipt state and the chat indicator after validation of this amendment and spike.
+   **Data model impact**: proposed latest horizon per tenant/chat/recipient; storage choice follows
+   the verified snapshot/reconnect behaviour. **DoD**: acceptance tests and pre-commit pass,
+   and the indicator agrees with native Teams on a controlled conversation.

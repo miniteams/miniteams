@@ -47,6 +47,7 @@ from .messages import (
     json_list,
     mention_kind,
     message_text,
+    reaction_emoji,
     snippet,
 )
 from .render import cards_html, media_url, sanitize
@@ -208,6 +209,7 @@ def chat_record(
     me: str = "",
     media_dir: Path | None = None,
     custom: frozenset[str] = frozenset(),
+    name_for: Callable[[str], str] | None = None,
 ) -> dict[str, Any]:
     """One message as the chat page shows it (spec 011): sanitised body, reactions, mention kind.
     `custom`: the custom emoji object ids `/emoji/<id>` serves."""
@@ -249,9 +251,10 @@ def chat_record(
             reactions.append(
                 {
                     "key": key,
-                    "emoji": EMOJI.get(key, f":{key}:"),
+                    "emoji": reaction_emoji(key),
                     "count": len(users),
                     "mine": any(is_me(u, me) for u in users),
+                    "people": [name_for(u) if name_for else u for u in users],
                 }
             )
     return {
@@ -503,8 +506,7 @@ async def answer(ws: ServerConnection, head: dict[str, Any], work: Awaitable[dic
 def _resolved(
     thread_id: str, members: list[dict[str, Any]], mentions: list[dict[str, Any]]
 ) -> list[dict[str, Any]] | None:
-    """The mentions with the roster's name as `label`; None when one is not a human of the thread
-    (or everyone of a group), or its typed name is not that member's."""
+    """Resolve full/first names from the roster; refuse nonmembers and unrelated labels."""
     humans = _humans(members)
     out: list[dict[str, Any]] = []
     for m in mentions:
@@ -513,7 +515,10 @@ def _resolved(
             ok = m["mri"] == thread_id and chat_kind(thread_id) != "private" and fold(name) == "everyone"
         else:
             name = humans.get(m["mri"], "")
-            ok = bool(name) and fold(name) == fold(m["name"])
+            first = name.split()[0] if name else ""
+            ok = bool(name) and fold(m["name"]) in (fold(name), fold(first))
+            if ok and fold(m["name"]) != fold(name):
+                name = first
         if not ok:
             return None
         out.append({**m, "label": name})
@@ -936,7 +941,16 @@ class ChatVerbs:
         custom = self.emojis.custom()
         for message in messages:
             try:
-                records.append(chat_record(message, thread_id, self.me, media, custom))
+                records.append(
+                    chat_record(
+                        message,
+                        thread_id,
+                        self.me,
+                        media,
+                        custom,
+                        self.directory.name_for if self.directory else None,
+                    )
+                )
             except Exception as exc:  # noqa: BLE001 — one malformed message must not lose the page
                 log.warning("chat_record_skipped", thread=thread_id, error_type=type(exc).__name__)
         return records

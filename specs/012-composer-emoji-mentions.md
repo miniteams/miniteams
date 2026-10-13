@@ -4,6 +4,8 @@
 **Requested by**: babs
 **Date**: 2026-10-09
 
+**Amendment 2026-10-13**: phase 5 (clipboard images) is draft, pending validation; phases 1–4 remain implemented.
+
 ## Problem
 
 The composer (spec 006, reused by the chat view of spec 011) sends plain text. No way to drop an
@@ -36,6 +38,10 @@ the person (or everyone) is notified and the name shows highlighted in Teams, as
   Enter with the popup open never sends. Inserting an emoji writes the character (unicode) or
   `:name:` (custom); inserting a member writes `@Full Name` and records `{name, mri}` in the
   composer's picked set for that draft. Typing `:name:` by hand with a known name also works.
+- **Shortened mentions.** In either composer, Backspace immediately after a picked
+  full-name mention, including its inserted trailing space, reduces `@First Last ` to `@First `
+  while retaining the selected person's identity. The server validates the shortened label against
+  that person's roster name; the sent message remains a real Teams mention.
 - **Send.** The `send` verb gains `mentions: [{name, mri}]` (the picked set, whatever the page
   still finds in the text). Server-side `compose_html(text, mentions, emojis)`:
   - escape, newlines → `<br>` (as today);
@@ -115,6 +121,40 @@ the person (or everyone) is notified and the name shows highlighted in Teams, as
       typed; `[x](javascript:…)` stays text; `<b>` typed by hand is escaped.
 - [x] **AC14** In the chat view, the toolbar wraps the selection in the right markers, and the
       preview shows the server's HTML without sending; the widget composer has no toolbar.
+- [x] **AC15** In both composers, picking Ann Lee and pressing Backspace immediately after
+      `@Ann Lee ` changes it to `@Ann ` and retains Ann Lee as the recipient. Backspace elsewhere
+      remains ordinary deletion; everyone and single-word names are not shortened.
+- [ ] **AC16** (generated Mention span, display name, recipient and roster validation tested;
+      Teams-side highlight awaits the user's look) A shortened mention displays Ann in the sent Teams message, keeps the selected
+      member's original identifier, and remains highlighted. The server accepts only that member's
+      complete name or first name as the label and still rejects recipients outside the roster.
+- [x] **AC17** Two members sharing a first name retain their respective identities when their
+      picked mentions are shortened.
+- [x] **AC18** Restoring a draft retains shortened mentions and their selected recipients.
+
+### Clipboard images (phase 5, draft)
+
+- [ ] **AC19** In either composer, pasting image files adds local thumbnails to the current
+      chat's draft. Pasting does not send a message or upload the images to Teams.
+- [ ] **AC20** Several images in one paste and repeated pastes accumulate in order. A user can
+      open each thumbnail in a larger local preview and remove each pending image independently
+      during composition. Closing the preview preserves the image and text; deleting the
+      previewed image closes its preview. Ordinary text paste still works.
+- [ ] **AC21** The user can write or edit text and mentions after pasting, then explicitly send
+      the queued images with that text, or send images alone. Enter follows the existing
+      completion and send rules. Pending images cannot be silently omitted.
+- [ ] **AC22** Pending images stay attached to their original chat when switching chats in the
+      same page. A successful send clears only its submitted draft; new edits remain intact.
+- [ ] **AC23** Upload or send failure retains the text and pending images, displays an actionable
+      error and reuses completed uploads on retry. An ambiguous send result must not trigger
+      an automatic duplicate send. Sending twice concurrently is blocked.
+- [ ] **AC24** The upload route requires the existing authenticated session and same-origin
+      protections. The server validates image content, destination, count and byte limits;
+      it never trusts a MIME label, filename or browser-supplied remote URL alone.
+- [ ] **AC25** Unsupported or oversized images produce a clear error while preserving the
+      draft. Thumbnails and object URLs are released on removal, success and page teardown.
+- [ ] **AC26** A controlled live send shows every pasted image in native Teams with the
+      accompanying text. Any protocol uncertainty is resolved before claiming this phase shipped.
 
 ## Phases
 
@@ -142,9 +182,32 @@ the person (or everyone) is notified and the name shows highlighted in Teams, as
 - **DoD**: `pytest tests/test_compose.py` green with each case above; a message with bold, a link,
   a list and a code block sent from the chat view renders the same in Teams.
 
-## Data model impact (summary)
+### Phase 4 — shorten picked mentions (implemented, approved 2026-10-13)
+- Work: handle Backspace for picked mentions, preserve shortened labels in drafts and sending,
+  and validate those labels against the existing roster.
+- **Covers**: AC15, AC16, AC17, AC18
+- **Data model impact**: shortened mentions reuse the existing `name` field in mention payloads
+  and session drafts; no schema change, migration or additional directory storage.
+- **DoD**: browser tests cover both composers, first-name collisions and draft restoration;
+  server tests cover shortened rendering and validation; `pre-commit run --all-files` rc=0.
 
-None. Custom emoji images cached under `~/.cache/miniteams/emojis/` (existing `emojis.py` cache).
+### Phase 5 — clipboard images (draft)
+
+- Work: confirm the native Teams image upload/message format using the existing libpurple
+  reference; add authenticated image upload and integrate it with sending; implement a shared
+  clipboard queue, enlarged previews and removable thumbnails in both composers; cover failures
+  and chat switching.
+- **Covers**: AC19–AC26 above.
+- **Data model impact**: no database migration. Image blobs and thumbnail URLs remain in browser
+  memory until explicit send. Temporary upload data is bounded and cleaned up; tokens stay server-side.
+- **DoD**: browser tests cover repeated/multiple paste, image-only send, removal, per-chat isolation
+  and retry; server tests cover authentication, validation and failed uploads; pre-commit passes;
+  AC26 is confirmed with a controlled native Teams send.
+
+## Data model impact (summary, including proposed phase 5)
+
+No database migration. Custom emoji images cached under `~/.cache/miniteams/emojis/` (existing `emojis.py` cache).
+Phase 4 reuses the existing `name` field for shortened labels; payload and draft schemas stay the same.
 
 ## Open questions
 
@@ -152,6 +215,17 @@ None.
 
 ## Decisions
 
+- Phase 5 is an amendment to this composer spec, rather than a separate spec 014.
+- Clipboard attachments cover images; arbitrary document upload and drag-and-drop are outside
+  this amendment. Multiple clipboard image files and repeated Ctrl+V are supported.
+- Pending image blobs are not persisted across a page reload in this iteration. Existing text
+  draft persistence remains; the attachment queue explicitly indicates its temporary lifetime.
+- Initial local bounds are 8 images and 10 MiB per image, with a 40 MiB total per draft. These
+  are application limits, not claimed Teams limits, and can be revised before implementation.
+- No Microsoft Graph API is introduced for image upload.
+
+- Shortened mentions use the first whitespace-separated word of the existing display name.
+  Highlighting remains in the sent message; the textarea stays plain text.
 - Formatting split by composer (babs, 2026-10-09; WYSIWYG may come later): light inline markdown in the
   widget, full subset + toolbar + preview in the chat view. Converted on the server so both
   composers and the preview share one function.
