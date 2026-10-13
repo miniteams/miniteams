@@ -1,5 +1,6 @@
 """Settings properties, owner-only file and directory helpers, and the low-level stdout helpers."""
 
+import json
 import os
 import stat
 from pathlib import Path
@@ -32,6 +33,24 @@ async def test_emit_writes_to_stdout(capsys) -> None:
     assert capsys.readouterr().out == "hello\n"
 
 
+async def test_emit_escapes_terminal_controls_but_keeps_lines_and_tabs(capsys) -> None:
+    await emit("a\x1b[2Jb\rc\x07d\x9b31me\x7f\tf\n")
+    assert capsys.readouterr().out == "a\\u001b[2Jb\\u000dc\\u0007d\\u009b31me\\u007f\tf\n"
+
+
+async def test_emit_turns_crlf_into_a_plain_line_end(capsys) -> None:
+    await emit("a\r\nb\n")
+    assert capsys.readouterr().out == "a\nb\n"
+
+
+async def test_emit_keeps_jsonl_content_lossless(capsys) -> None:
+    record = {"content": "a\x85b\x9bc\x7fd\x1b"}
+    await emit(json.dumps(record, ensure_ascii=False) + "\n")
+    line = capsys.readouterr().out
+    assert not any(c in line for c in "\x85\x9b\x7f\x1b")
+    assert json.loads(line) == record
+
+
 def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
@@ -51,8 +70,9 @@ def test_write_private_new_parent_is_0700_existing_left_alone(tmp_path: Path) ->
 
 
 def test_launch_file_defaults_under_config_dir_and_is_absolute(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)  # Settings reads ./.env: a local MINITEAMS_LAUNCH_FILE must not leak in
+    monkeypatch.delenv("MINITEAMS_LAUNCH_FILE", raising=False)
     assert Settings(tenant_id="t", config_dir=tmp_path).launch_file == tmp_path / "open.html"
-    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MINITEAMS_LAUNCH_FILE", "rel/open.html")
     assert Settings(tenant_id="t").launch_file == tmp_path / "rel" / "open.html"
     monkeypatch.setenv("MINITEAMS_LAUNCH_FILE", "~/x.html")

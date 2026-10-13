@@ -353,7 +353,8 @@ async def pick_then_glue(fake: Fake) -> Any:
     await box.press_sequentially("@ann")
     await shows(page, ["Ann Lee"])
     await box.press("Enter")
-    await box.press("Backspace")
+    await box.press("ArrowLeft")
+    await box.press("Delete")
     await box.press_sequentially("ds")
     assert await box.input_value() == "@Ann Leeds"
     await box.press("Enter")

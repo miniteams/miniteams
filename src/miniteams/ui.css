@@ -37,9 +37,9 @@
   li > .prev { cursor: pointer; }
   /* A row's ⋯ menu; its row stacks above the next rows, which would paint over it. */
   li:has(> .rowmenu) { z-index: 1; }
-  .rowmenu { position: absolute; right: 8px; top: calc(100% - 4px); display: grid; min-width: 120px; padding: 4px; background: var(--panel);
+  .rowmenu { position: absolute; right: 8px; top: var(--menu-top); display: grid; min-width: 120px; padding: 4px; background: var(--panel);
     border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); }
-  .rowmenu.up { top: auto; bottom: calc(100% - 4px); }
+  .rowmenu.up { top: auto; bottom: var(--menu-bottom); }
   .rowmenu button { border: 0; background: transparent; text-align: left; padding: 3px 8px; border-radius: 6px; cursor: pointer; font-size: 12.5px; white-space: nowrap; }
   .rowmenu button:hover { background: var(--accent-soft); color: var(--accent); }
   .rowmenu button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }

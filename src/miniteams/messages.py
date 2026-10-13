@@ -19,6 +19,7 @@ import structlog
 from . import attachments
 from ._io import emit
 from .directory import Directory
+from .emoji_table import SHORTCODES
 
 log = structlog.get_logger()
 
@@ -53,7 +54,7 @@ _TYPE_MARKERS = {
 }
 _THREAD_RE = re.compile(r"/conversations/([^/]+)")
 
-# Teams reaction keys → emoji; unknown keys fall back to ":key:".
+# These are also the reaction keys accepted for sending.
 EMOJI = {
     "like": "👍",
     "heart": "❤️",
@@ -61,9 +62,96 @@ EMOJI = {
     "surprised": "😮",
     "sad": "😢",
     "angry": "😡",
-    "yes": "✅",
-    "no": "❌",
+    "yes": "👍",
+    "no": "👎",
 }
+
+# Teams names differ from the composer's GitHub/Slack shortcodes.
+_REACTION_ALIASES = {
+    "crossedfingers": "crossed_fingers",
+    "launch": "rocket",
+    "loudlycrying": "sob",
+    "clappinghands": "clap",
+    "handsinair": "raised_hands",
+    "praying": "pray",
+    "victory": "v",
+    "ok": "ok_hand",
+    "raisedfist": "fist_raised",
+    "pointupindex": "point_up",
+    "fistbump": "punch",
+    "screamingfear": "scream",
+    "think": "thinking",
+    "sweatgrinning": "sweat_smile",
+    "upsidedownface": "upside_down_face",
+    "cwl": "joy",
+    "hearteyes": "heart_eyes",
+    "seenoevil": "see_no_evil",
+    "speaknoevil": "speak_no_evil",
+    "puke": "vomiting_face",
+    "lipssealed": "zipper_mouth_face",
+    "hi": "wave",
+    "heartorange": "orange_heart",
+    "heartgreen": "green_heart",
+    "heartyellow": "yellow_heart",
+    "angryface": "angry",
+    "devil": "smiling_imp",
+    "tongueout": "stuck_out_tongue",
+    "grinningfacewithsmilingeyes": "smile",
+}
+
+# Only Unicode Emoji_Modifier_Base characters can take a skin tone.
+# https://www.unicode.org/Public/17.0.0/ucd/emoji/emoji-data.txt
+_TONE_BASES = frozenset(
+    "☝⛹✊✋✌✍🎅🏂🏃🏄🏇🏊🏋🏌👂👃👆👇👈👉👊👋👌👍👎👏👐👦👧👨👩👪👫👬👭"
+    "👮👯👰👱👲👳👴👵👶👷👸👼💁💂💃💅💆💇💏💑💪🕴🕵🕺🖐🖕🖖🙅🙆🙇🙋🙌🙍🙎🙏"
+    "🚣🚴🚵🚶🛀🛌🤌🤏🤘🤙🤚🤛🤜🤝🤞🤟🤦🤰🤱🤲🤳🤴🤵🤶🤷🤸🤹🤼🤽🤾🥷🦵🦶🦸🦹"
+    "🦻🧍🧎🧏🧑🧒🧓🧔🧕🧖🧗🧘🧙🧚🧛🧜🧝🫃🫄🫅🫰🫱🫲🫳🫴🫵🫶🫷🫸"
+)
+
+
+def reaction_emoji(key: str) -> str:
+    """Resolve Teams names, Unicode keys and native -tone1 through -tone5 suffixes."""
+    base, sep, tone = key.rpartition("-tone")
+    if not sep:
+        return _reaction_base(key)
+    if tone not in ("1", "2", "3", "4", "5") or "-tone" in base:
+        return f":{key}:"
+    emoji = _reaction_base(base)
+    if emoji == f":{base}:":
+        return f":{key}:"
+    positions = [i for i, char in enumerate(emoji) if char in _TONE_BASES]
+    # Multi-person and already toned sequences need an explicit Unicode key.
+    if len(positions) != 1 or any("🏻" <= char <= "🏿" for char in emoji):
+        return f":{key}:"
+    i = positions[0] + 1
+    tail = emoji[i:].removeprefix("\ufe0f")
+    return emoji[:i] + chr(0x1F3FA + int(tone)) + tail
+
+
+def _reaction_base(key: str) -> str:
+    """Resolve legacy names and Teams' hexadecimal Unicode reaction keys."""
+    if key in EMOJI:
+        return EMOJI[key]
+    name = _REACTION_ALIASES.get(key, key)
+    if name in SHORTCODES:
+        return SHORTCODES[name]
+    codes, sep, _ = key.partition("_")
+    if sep and re.fullmatch(r"[0-9a-fA-F]{4,6}(?:-[0-9a-fA-F]{4,6}){0,15}", codes):
+        points = [int(code, 16) for code in codes.split("-")]
+        # Reject controls, surrogates, unassigned, format (bidi) and line/paragraph separators from
+        # remote keys; emoji sequences need the ZWJ and tag format characters.
+        if all(
+            point <= 0x10FFFF
+            and (
+                unicodedata.category(chr(point)) not in ("Cc", "Cs", "Cn", "Cf", "Zl", "Zp")
+                or point == 0x200D
+                or 0xE0020 <= point <= 0xE007F
+            )
+            for point in points
+        ):
+            return "".join(chr(point) for point in points)
+    # Custom org reactions carry `;<id>` after their name.
+    return f":{key.partition(';')[0]}:"
 
 
 def _gunzip_b64(data: str) -> str:
@@ -331,7 +419,7 @@ async def _print_reactions(resource: dict[str, Any], emotions: list[Any], direct
     ctx = f' to "{snippet}"' if snippet else ""
     for emotion in emotions:
         key = emotion.get("key", "?")
-        emoji = EMOJI.get(key, f":{key}:")
+        emoji = reaction_emoji(key)
         users = [str(u.get("mri", "")) for u in (emotion.get("users") or [])]
         added, removed = directory.reaction_diff(msg_id, key, users)
         for mri in added:

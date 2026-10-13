@@ -4,6 +4,8 @@
 **Requested by**: babs
 **Date**: 2026-10-09
 
+**Amendment 2026-10-13**: recipient read receipts are draft; the shipped chat view remains unchanged.
+
 ## Problem
 
 The widget (spec 002) is a list of rows; reading a conversation means leaving for Teams. The quick
@@ -94,11 +96,12 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
     itemid="<mri>">Name</strong><span itemprop="time" itemid="<id>"></span><p
     itemprop="preview">first 100 chars</p></blockquote>`, author and preview taken from the
     server's copy of the message, never from the page.
-  - **React** (any message): a picker with Teams' 8 default keys (`messages.EMOJI`); clicking a
+  - **React** (any message): a picker with Teams' 6 defaults (`like heart laugh surprised sad
+    angry`; `yes`/`no` stay accepted keys of `messages.EMOJI` but would repeat 👍); clicking a
     reaction I already gave removes it. The reactions line under a message is clickable too: a
     chip I gave removes my reaction, any other chip adds mine, as in Teams (chip marked when
     `mine`). Verb `{"react": "<thread>", "msg": id, "key": k,
-    "remove": bool}` → `send.react()`. Keys outside the 8 are refused.
+    "remove": bool}` → `send.react()`. Keys outside `messages.EMOJI`'s 8 are refused.
   - **Edit** (own messages only): the message body turns into a textarea holding its plain text;
     Enter saves, Escape cancels. Verb `{"edit": "<thread>", "msg": id, "text": …}` →
     `send.edit_message()`, same validation as `send`. Mentions, emoji and quotes in the original
@@ -145,7 +148,7 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 ## Out of scope
 
 - File or image upload, paste of images.
-- Reactions beyond Teams' 8 default keys (any-emoji reactions could reuse spec 012's popup later).
+- Reactions beyond `messages.EMOJI`'s 8 keys (any-emoji reactions could reuse spec 012's popup later).
 - An edit keeping the original's mentions, emoji or quote (edit is plain text).
 - Marking the chat read in Teams on open or on send.
 - Unread separator, search across chats (the MCP server already does it).
@@ -195,7 +198,7 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
       `quote` id that is not a message of that thread, or more than 10 ids, is refused without
       posting anything (an id the archive lacks may cost one history read); the page renders the sent reply with its quotes.
 - [x] **AC12** `react` calls `send.react()` once with the key, `remove: true` when I already
-      reacted with it; a key outside the 8 defaults is refused without an API call.
+      reacted with it; a key outside `messages.EMOJI` is refused without an API call.
 - [x] **AC13** `edit` on my own message calls `edit_message()` once with the new text; on another
       person's message, an empty text or a body over 28 KB it is refused without an API call.
 - [x] **AC14** `delete` on my own message calls `delete_message()` once after the confirm; on
@@ -410,3 +413,61 @@ None.
 - Known limits after the fix round: the custom emoji host defaults to the fr-prod region
   (`MINITEAMS_ASYNCGW_HOST` overrides it; per-region wiring waits for a check of the authz
   response); at exit, threads stuck on a dead mount do not hold the process.
+
+## Recipient read receipts amendment (validated 2026-10-13, spike first)
+
+### Problem and solution
+
+The chat view does not show who read what. Like Element X, each member's avatar sits at the right of
+the newest message they read, whatever its author, and moves as they read on; more than 3 readers on
+a message show 3 avatars and "+N", the hover lists them all. Only confirmed reads count; missing
+receipts prove nothing.
+
+### Evidence and limits
+
+- Miniteams currently consumes our own `consumptionhorizon` from ConversationUpdate to update
+  unread rows. It deliberately ignores `ThreadActivity/MemberConsumptionHorizonUpdate`.
+- The inspected purple-teams message handlers send our own consumption horizon when we read
+  a conversation. They do not establish how to consume recipient read receipts.
+  [Native reference](https://github.com/EionRobb/purple-teams/blob/master/teams_messages.c).
+- Teams supports receipts in 1:1 and group chats of 20 people or fewer, subject to policy,
+  individual settings and recipient availability. Disabled or unavailable receipts remain unknown.
+  [Microsoft reference](https://support.microsoft.com/en-us/teams/chat/use-read-receipts-for-messages-in-microsoft-teams).
+- Native recipient identity, message-boundary semantics, initial snapshot and live update format
+  remain to be verified. Our read marker must never stand in for another person's receipt.
+
+### Acceptance criteria
+
+- [ ] A read-only native spike identifies an actual recipient receipt and its message boundary,
+      confirms snapshot/reconnect behaviour and records a sanitized fixture. No Graph API.
+- [ ] An outgoing message shows Seen only with a confirmed recipient read; hovering lists
+      confirmed readers by name. Group partial counts do not imply everyone has read.
+- [ ] Live receipt updates refresh the indicator without changing message time, chat ordering,
+      unread counters or local seen state. Out-of-order events never regress a confirmed receipt.
+- [ ] Missing, disabled, unsupported or malformed receipts show no false Seen or Unread claim.
+- [ ] Reconnection reconciles native state; tests cover 1:1, partial group reads, unknown state,
+      recipient identity and unrelated activity events.
+
+### Phases and data impact
+
+1. Spike native receipt retrieval and Trouter events, including the libpurple reference.
+   **Data model impact**: none. **DoD**: validated protocol and sanitized fixtures saved in misc;
+   unresolved protocol questions block implementation.
+2. Implement receipt state and the chat indicator after validation of this amendment and spike.
+   **Data model impact**: proposed latest horizon per tenant/chat/recipient; storage choice follows
+   the verified snapshot/reconnect behaviour. **DoD**: acceptance tests and pre-commit pass,
+   and the indicator agrees with native Teams on a controlled conversation.
+
+### Decisions (grill, babs, 2026-10-13)
+
+- The spike reuses the presence harness (`misc/presence-spike/probe.py`, a receipts mode): a
+  dedicated Trouter endpoint logs `ThreadActivity/MemberConsumptionHorizonUpdate` on the 1:1 test
+  chat then the group, and a GET probe looks for a per-member horizons snapshot (unverified, e.g.
+  `/v1/threads/<id>/consumptionhorizons`); sanitized fixtures in `misc/`; no Graph.
+- Element X layout: one avatar per member at their newest read message, any author; own avatar
+  excluded; a message's author not shown on it; >3 → 3 avatars + "+N", hover lists every reader;
+  avatars from the archive, initials fallback.
+- Unknown state shows nothing (never "unread"); partial knowledge shows confirmed members only;
+  the latest horizon per chat and member is kept in the local SQLite cache shared with presence
+  (spec 015) across restarts; horizons never move backwards.
+- Chat page only; widget rows unchanged.

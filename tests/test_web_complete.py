@@ -600,6 +600,25 @@ async def test_mention_names_come_from_the_roster(board: W.Board, sent: list[Any
     assert names == ["Ann Lee", "Élodie Martin"]
 
 
+async def test_shortened_mentions_keep_the_roster_identity(board: W.Board, sent: list[Any]) -> None:
+    picked = [{"name": "ann", "mri": ANN}, {"name": "elodie", "mri": ELO}]
+    assert await _send(board, B, "@ann and @elodie", None, None, picked) is None
+    [(_, body, kw)] = sent
+    assert body == (
+        f'<span itemtype="{MENTION}" itemscope="" itemid="0">Ann</span> and '
+        f'<span itemtype="{MENTION}" itemscope="" itemid="1">Élodie</span>'
+    )
+    assert [(m["displayName"], m["mri"]) for m in json.loads(kw["properties"]["mentions"])] == [
+        ("Ann", ANN),
+        ("Élodie", ELO),
+    ]
+    for name in ("Lee", "An", "Boss"):
+        assert (
+            await _send(board, B, f"@{name}", None, None, [{"name": name, "mri": ANN}]) == "unknown mention"
+        )
+    assert len(sent) == 1
+
+
 async def test_typed_names_elsewhere_in_the_text_stay_as_typed(board: W.Board, sent: list[Any]) -> None:
     """Only the mention takes the roster spelling: a URL, code and a link label/target keep `@ann lee`."""
     text = "https://x.com/@ann lee `@ann lee` [@ann lee](https://y/@ann) @ann lee"

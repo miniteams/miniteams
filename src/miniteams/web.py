@@ -69,12 +69,12 @@ from .dump import fetch_history
 from .emojis import EmojiCache
 from .http import failure
 from .messages import (
-    EMOJI,
     is_activity,
     is_deleted,
     is_edited,
     is_me,
     mention_kind,
+    reaction_emoji,
     snippet,
     thread_of,
 )
@@ -820,14 +820,15 @@ class Board:
     async def _record(self, resource: dict[str, Any], thread_id: str, media: Path | None) -> dict[str, Any]:
         """The relayed record; past a media read's deadline, records skip the folder for a while."""
         custom = self.emojis.custom()
+        name_for = self.directory.name_for if self.directory else None
         if media is not None and time.monotonic() >= self._media_down_until:
             try:
-                return await io("relay", chat_record, resource, thread_id, self.me, media, custom)
+                return await io("relay", chat_record, resource, thread_id, self.me, media, custom, name_for)
             except ArchiveUnavailable:
                 self._media_down_until = time.monotonic() + _MEDIA_BACKOFF
                 log.warning("follow_media_unavailable", thread=thread_id, retry_in=_MEDIA_BACKOFF)
         # Without a media folder sanitising reads no file: cheap enough for the loop.
-        return chat_record(resource, thread_id, self.me, None, custom)
+        return chat_record(resource, thread_id, self.me, None, custom, name_for)
 
     def _followers(self, thread_id: str) -> list[ServerConnection]:
         return [ws for ws, (tid, _) in self._follows.items() if tid == thread_id]
@@ -1071,7 +1072,7 @@ class Board:
             for u in users:
                 mri = str(u.get("mri", ""))
                 if mri in added:
-                    candidate = (int(u.get("time") or 0), EMOJI.get(key, f":{key}:"), mri)
+                    candidate = (int(u.get("time") or 0), reaction_emoji(key), mri)
                     latest = max(latest, candidate) if latest else candidate
         if latest is None:
             return

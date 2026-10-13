@@ -137,6 +137,43 @@ async def test_at_lists_members_everyone_first_and_send_carries_the_mentions(fak
     ]
 
 
+@pytest.mark.parametrize("trailing_space", [True, False])
+async def test_backspace_shortens_a_picked_mention_without_losing_the_recipient(
+    fake: Fake, trailing_space: bool
+) -> None:
+    page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
+    await box.press_sequentially("@ann")
+    await shows(page, ["Ann Lee"])
+    await box.press("Enter")
+    if not trailing_space:
+        await box.press("ArrowLeft")
+        await box.press("Delete")
+    await box.press("Backspace")
+    assert await box.input_value() == ("@Ann " if trailing_space else "@Ann")
+    await box.press_sequentially("hi" if trailing_space else " hi")
+    await box.press("Backspace")
+    assert await box.input_value() == "@Ann h"
+    await box.press("Enter")
+    await wait(lambda: len(fake.of("send")) == 1)
+    assert fake.of("send")[0]["mentions"] == [{**ANN, "name": "Ann"}]
+
+
+@pytest.mark.parametrize("member", [EVERYONE, {"name": "Cher", "mri": "8:orgid:cher"}])
+async def test_backspace_leaves_everyone_and_single_word_mentions_as_normal_text(
+    fake: Fake, member: Any
+) -> None:
+    fake.members = [member]
+    page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
+    await box.press_sequentially("@" + member["name"][:2].lower())
+    await shows(page, [member["name"]])
+    await box.press("Enter")
+    await box.press("Backspace")
+    assert await box.input_value() == "@" + member["name"]
+    await box.press("Enter")
+    await wait(lambda: len(fake.of("send")) == 1)
+    assert fake.of("send")[0]["mentions"] == [member]
+
+
 async def test_a_removed_mention_is_not_sent_and_picks_survive_a_failure_only(fake: Fake) -> None:
     """012-AC8: a pick whose `@Name` left the text is not sent; the picks survive a failed send and
     clear on a successful one."""

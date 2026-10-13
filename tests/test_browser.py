@@ -35,6 +35,7 @@ from miniteams import chat_verbs as CV
 from miniteams import web as W
 from miniteams.archive_store import ChatStore, find_chat_dir
 from miniteams.config import Settings
+from miniteams.messages import EMOJI
 
 pytestmark = pytest.mark.browser
 pages = browser_helpers.pages
@@ -422,13 +423,15 @@ async def test_quote_list_stops_at_ten(chat: Pages) -> None:
 
 
 async def test_react_toggles_my_reaction(board: W.Board, chat: Pages, calls: list[tuple[Any, ...]]) -> None:
-    """011-AC12: the picker offers the 8 keys; one I already gave is sent with `remove: true`."""
+    """011-AC12: the picker offers Teams' 6 distinct keys; one I already gave is sent with `remove: true`."""
     page = await chat.open(_chat(T))
     await _handled(page, "history")
     await page.locator('[data-id="1"]').hover()
     await _act(page, "1", "react").click()
     picker = page.locator('[data-id="1"] .picker')
-    assert await picker.locator("button").evaluate_all("bs => bs.map(b => b.dataset.key)") == list(W.EMOJI)
+    keys = ["like", "heart", "laugh", "surprised", "sad", "angry"]
+    assert await picker.locator("button").evaluate_all("bs => bs.map(b => b.dataset.key)") == keys
+    assert await picker.locator("button").all_inner_texts() == [EMOJI[k] for k in keys]
     await picker.locator("[data-key=like]").click()
     await _until(calls, 1)
     mine = {"emotions": [{"key": "like", "users": [{"mri": ME}]}]}
@@ -1242,6 +1245,67 @@ async def test_widget_row_menu_never_opens_under_the_sticky_header(widget: Widge
     hit = "b => { const r = b.getBoundingClientRect(), x = r.x + r.width / 2, y = r.y + r.height / 2;"
     hit += " return document.elementFromPoint(x, y) === b; }"
     assert await first.evaluate(hit)
+
+
+async def test_widget_last_row_menu_opens_upwards_in_sight(widget: Widget) -> None:
+    """The window scrolls the widget's list: the bottom row's menu opens upwards, inside the viewport,
+    anchored above its ⋯."""
+    for i in range(2, 14):
+        widget.board.rows[f"19:r{i}@thread.v2"] = row(
+            f"19:r{i}@thread.v2", f"Row {i}", _at(i), last_id=str(i)
+        )
+    page = await widget.load(False)
+    await page.set_viewport_size({"width": 600, "height": 400})
+    li = page.locator("#rows > li").last
+    await li.scroll_into_view_if_needed()
+    await li.hover()
+    await li.locator('[data-k="more"]').click()
+    await li.locator(".rowmenu button").first.wait_for()
+    assert await li.evaluate("""li => {
+      const menu = li.querySelector('.rowmenu'), m = menu.getBoundingClientRect(),
+        b = li.querySelector('[data-k=more]').getBoundingClientRect();
+      return menu.classList.contains('up') && m.bottom <= innerHeight && Math.abs(m.right - b.right) <= 1
+        && Math.abs(b.top - m.bottom - 4) <= 1;
+    }""")
+
+
+@pytest.mark.parametrize("view", ["widget", "split"])
+async def test_row_menu_stays_anchored_to_its_visible_trigger(
+    split: Pages, board: W.Board, view: str
+) -> None:
+    """An open menu stays beside its trigger, including after hover/focus leave and a broadcast."""
+    page = await split.open("/") if view == "widget" else await _open_split(split)
+    await page.wait_for_selector("#rows > li")
+    li = page.locator("#rows > li").first
+    await li.hover()
+    await li.locator('[data-k="more"]').click()
+    await page.mouse.move(0, 0)
+    # Removing focus must not hide the trigger while the menu still exists.
+    assert await li.evaluate("""li => {
+      const focused = document.activeElement;
+      focused.blur();
+      const visible = getComputedStyle(li.querySelector('[data-k=more]')).display !== 'none';
+      focused.focus();
+      return visible;
+    }""")
+    geometry = """li => {
+      const menu = li.querySelector('.rowmenu'), more = li.querySelector('[data-k=more]');
+      const m = menu.getBoundingClientRect(), b = more.getBoundingClientRect();
+      return {right: m.right - b.right, gap: menu.classList.contains('up')
+        ? b.top - m.bottom : m.top - b.bottom};
+    }"""
+    for broadcast in (False, True):
+        if broadcast:
+            frames = await page.evaluate("window.__frames.filter(f => 'rows' in f).length")
+            board.broadcast()
+            await page.wait_for_function(f"window.__frames.filter(f => 'rows' in f).length > {frames}")
+        bounds = await li.evaluate(geometry)
+        assert abs(bounds["right"]) <= 1, bounds
+        assert 3 <= bounds["gap"] <= 5, bounds
+    await li.locator('[data-k="more"]').click()
+    await page.mouse.move(0, 0)
+    assert await li.locator(".rowmenu").count() == 0
+    assert not await li.locator('[data-k="more"]').is_visible()
 
 
 def _teams_tab(widget: Widget) -> str:

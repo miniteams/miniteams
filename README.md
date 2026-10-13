@@ -151,9 +151,12 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
 - **Composer** (also the widget's quick reply): completes `:emoji` and `@member` (`@everyone` on group chats, not 1:1;
   picked members are notified; a mention needs a non-word character before `@`, and two members with the same name map
   in the order they were picked). Messages are limited to 28 KB.
+  - Backspace after a picked full-name mention shortens it to the first name while keeping its recipient.
   - Widget: inline formatting.
   - Chat page: bold, italic, strike, code, lists, quotes through a toolbar or Ctrl+B / Ctrl+I, plus a preview of the message as posted.
-- **Messages**: hover for actions: reply with a quote, react (Teams' 8 reactions), edit and delete your own. Reaction chips toggle.
+- **Messages**: hover for actions: reply with a quote, react (Teams' 6 default reactions), edit and delete your own. Only chips of the 8 keys the page's `react` verb accepts (`messages.EMOJI`, `yes`/`no` included) toggle; others show their count.
+  Hover any reaction chip to see all the message's reactions, grouped by emoji with their participants.
+  Native skin tones (`yes-tone1` → 👍🏻 through `yes-tone5` → 👍🏿) are preserved on supported emoji.
   Cards from bots and apps are rendered; runs of deleted messages are folded.
 - **Browsing**: infinite scroll both ways, "↓ latest" when away from the bottom, header search, Open in Teams.
 - **Archive**: history and search read the archive under `--data-dir`. Without one the page shows the latest API page only
