@@ -278,6 +278,15 @@ def _topic(initiator: str, value: str) -> str:
     )
 
 
+def _members(*people: str | tuple[str, str]) -> str:
+    """A meeting chat's MemberJoined/MemberLeft body: the organizer initiates, never a member."""
+    members = [
+        {"id": p, "friendlyname": ""} if isinstance(p, str) else {"id": p[0], "friendlyname": p[1]}
+        for p in people
+    ]
+    return json.dumps({"eventtime": 1, "initiator": _CARL, "members": members})
+
+
 def _line(msgtype: str, content: str) -> str | None:
     activity = M.parse_activity(msgtype, content)
     return activity and M.activity_line(msgtype, activity, _ME, _NAMES.__getitem__)
@@ -292,6 +301,16 @@ def test_activity_lines_name_who_did_what() -> None:
     assert _line(_DEL, _deleted(_BOB, _BOB)) == "👥 Bob Roe left"
     assert _line(_DEL, _deleted(_ANN, _ME)) == "👥 Ann Lee removed You"
     assert _line(_TOPIC, _topic(_ANN, "Q&amp;A")) == "✎ Ann Lee renamed the chat to «Q&A»"
+
+
+def test_meeting_member_events_name_the_members() -> None:
+    """A meeting chat's JSON joins and leaves name their members, not the initiator."""
+    joined, left = "ThreadActivity/MemberJoined", "ThreadActivity/MemberLeft"
+    assert _line(joined, _members(_ANN, _BOB)) == "👥 Ann Lee, Bob Roe joined"
+    assert _line(left, _members(_BOB)) == "👥 Bob Roe left"
+    assert _line(left, _members((_BOB, "Bob F"), _ME)) == "👥 Bob F, You left"
+    activity = M.parse_activity(left, _members(_BOB))
+    assert activity is not None and activity.initiator == ""  # name_activity never looks the organizer up
 
 
 def test_activity_friendly_names_win_and_name_their_own_mri() -> None:
@@ -321,5 +340,11 @@ def test_malformed_activity_is_none() -> None:
         (_TOPIC, _topic(_ANN, "<script>x</script>")),  # raw markup is no leaf value
         ("ThreadActivity/MemberConsumptionHorizonUpdate", "<x/>"),
         (_ADD, '{"initiator": "8:orgid:x", "members": []}'),
+        ("ThreadActivity/MemberLeft", '{"initiator": "8:orgid:x", "members": []}'),
+        ("ThreadActivity/MemberLeft", '{"initiator": "8:orgid:x", "members": [{"friendlyname": "x"}]}'),
+        ("ThreadActivity/MemberLeft", '{"initiator": "8:orgid:x", "members": "8:orgid:y"}'),
+        ("ThreadActivity/MemberJoined", '[{"id": "8:orgid:y"}]'),
+        ("ThreadActivity/MemberJoined", _members(_BOB)[:30]),
+        ("ThreadActivity/MemberJoined", _added(_ANN, _BOB)),
     ]:
         assert M.parse_activity(msgtype, content) is None, content
