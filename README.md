@@ -126,8 +126,14 @@ Teams session expired (refresh token dead): `web` logs `auth_expired` and waits;
 terminal and it reconnects within seconds (it watches the token cache file).
 
 **First launch**
-- Launch with `chromium --app=file://$HOME/.config/miniteams/open.html` (or the `MINITEAMS_LAUNCH_FILE` path). `web` writes that launch file (`0600`) and `web.json` (`0600`, the bind) with a single-use token; the page trades the token at `/auth` for the `mt` cookie (`HttpOnly; SameSite=Strict`, one year, refreshed on each page load) and drops it from the address bar. `web` writes a new token after each use, so the same command always works, and once a browser holds the cookie the plain `http://host:port/` URL works too.
-- Snap Chromium: its confinement (the snap `home` interface) denies hidden files and directories under `~`, so it cannot open `~/.config/miniteams/open.html`. Set `MINITEAMS_LAUNCH_FILE=~/snap/chromium/common/miniteams/open.html` in `.env` (the snap's own data directory, kept across snap refreshes) and launch `chromium --app=file://$HOME/snap/chromium/common/miniteams/open.html`. Non-snap browsers (`google-chrome` or Firefox from a `.deb`) read the default path.
+- Launch with the path `web` logs at start (`web_listening … launch=file://…`):
+  ```bash
+  chromium --class=miniteams --user-data-dir=$HOME/snap/chromium/common/miniteams/profile \
+    --app=file://$HOME/snap/chromium/common/miniteams/open.html
+  ```
+  `--user-data-dir` gives the widget its own profile and process, so it neither stacks with the other Chromium windows nor reuses their session; `--class=miniteams` gives it its own window class (taskbar entry, window rules). With a non-snap browser use any profile dir and the logged path (default `~/.config/miniteams/open.html`).
+- `web` writes that launch file (`0600`) and `web.json` (`0600`, the bind) with a single-use token; the page trades the token at `/auth` for the `mt` cookie (`HttpOnly; SameSite=Strict`, one year, refreshed on each page load) and drops it from the address bar. `web` writes a new token after each use, so the same command always works, and once a browser holds the cookie the plain `http://host:port/` URL works too.
+- Snap Chromium: its confinement (the snap `home` interface) denies hidden files and directories under `~`, so it cannot open `~/.config/miniteams/open.html`. When `~/snap/chromium` exists (and the config dir is the default one), the launch file defaults to `~/snap/chromium/common/miniteams/open.html` (the snap's own data directory, kept across snap refreshes); `MINITEAMS_LAUNCH_FILE` overrides it.
 - Alternative: `chromium --app="http://$(jq -r '"\(.host):\(.port)/#\(.token)"' ~/.config/miniteams/web.json)"`. It puts the single-use token in argv, where a process reading `/proc` could spend it first; the page then shows `Not signed in`.
 - The secret never appears on a command line, in the terminal or in the browser history.
 - Pages load without the cookie, but show `Not signed in` and stay empty until launched with a token: data (the socket, media, emoji) needs the cookie.
@@ -265,7 +271,7 @@ second `web`, `stream` or `archive --live` its own Trouter endpoint ids, so it d
 deliveries of the one already running; a second `web` also needs its own `--bind` (sharing the config
 dir, it leaves the first one's `web.json` and launch file alone, and prints its own launch URL on
 stderr at start and after each use: enter it through that URL, or with a cookie a browser already holds for that host).
-`MINITEAMS_LAUNCH_FILE` moves the launch file (default `~/.config/miniteams/open.html`). Defaults are the purple-teams
+`MINITEAMS_LAUNCH_FILE` moves the launch file (default `~/snap/chromium/common/miniteams/open.html` when snap Chromium is installed, else `~/.config/miniteams/open.html`). Defaults are the purple-teams
 **work/TFW** constants — override only if auth starts returning 4xx, after re-capturing from a
 live browser session. `MINITEAMS_ASYNCGW_HOST` sets the custom emoji host (default `fr-prod.asyncgw.teams.microsoft.com`); set it when your tenant lives in another region.
 

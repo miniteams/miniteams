@@ -1571,7 +1571,7 @@ async def serve_board(board: Board, settings: Settings, bind: str | None) -> Non
             log.warning("bind_failed", host=host, port=port, error=str(exc))
             port = _draw_port()
     async with server:
-        log.info("web_listening", url=f"{board.base_url}/")
+        log.info("web_listening", url=f"{board.base_url}/", launch=f"file://{settings.launch_file}")
         # Once bound: a run failing on the port keeps the live one's web.json.
         board.publish = functools.partial(publish, settings, host, port, bool(bind))
         if not board.publish(board.token):
