@@ -193,6 +193,21 @@ async def test_live_append_edit_delete_reaction_and_typing(board: W.Board, chat:
     await page.wait_for_function("document.getElementById('typing').textContent.includes('Ann Lee')")
 
 
+async def test_a_system_line_shows_who_and_its_time(board: W.Board, chat: Pages) -> None:
+    """A live thread activity line names who did what and shows its time, the full timestamp on hover."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    added = f"<addmember><initiator>{ME}</initiator><target>{ANN}</target></addmember>"
+    activity = {"messagetype": "ThreadActivity/AddMember", "from": "", "imdisplayname": ""}
+    await board.on_event(_event("NewMessage", T, **_m("4", _at(4), added, **activity)))
+    line = page.locator('[data-id="4"].system')
+    await line.wait_for()
+    assert await line.locator(".html").inner_text() == f"👥 You added {ANN.split(':')[-1]}"
+    when = line.locator(".when")
+    assert await when.is_visible() and await when.get_attribute("title") == _at(4)
+    assert await when.inner_text() == await page.locator(".msg:not(.system) .when").first.inner_text()
+
+
 async def test_composer_keys_success_and_failure(
     chat: Pages, sent: list[tuple[str, str]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1389,20 +1404,25 @@ async def test_middle_click_chat_setting_opens_the_chat_page(
 
 
 @_PARTS
+@pytest.mark.parametrize("key", ["Control", "Meta"])
 @pytest.mark.parametrize("setting", ["teams", "chat"])
 @pytest.mark.parametrize("browser", [True, False], ids=["browser", "no-browser"])
-async def test_ctrl_and_plain_click_are_unchanged(
-    widget: Widget, setting: str, browser: bool, part: str
+async def test_ctrl_click_is_middle_click(
+    widget: Widget, setting: str, browser: bool, part: str, key: str
 ) -> None:
-    """011-AC2: Ctrl click and plain click do the same whatever the middle-click setting, on the title
-    and on the preview line."""
+    """011-AC2: Ctrl/⌘ click does what middle click does for either setting, Shift click opens Teams web,
+    plain click is unchanged; on the title and on the preview line."""
     page = await widget.load(browser, midclick=setting)
     widget.part = part
     if browser:
-        ctrl = await widget.act(lambda: page.locator(part).click(modifiers=["Control"]))
-        assert ctrl == ([(T, True)], [])
+        ctrl = await widget.act(lambda: page.locator(part).click(modifiers=[key]))
+        assert ctrl == ([(T, "chat" if setting == "chat" else True)], [])
+        shift = await widget.act(lambda: page.locator(part).click(modifiers=["Shift"]))
+        assert shift == ([(T, True)], [])
     else:
-        assert await widget.opens_tab(_teams_tab(widget), modifiers=["Control"]) == []
+        url = widget.base + _chat(T) if setting == "chat" else _teams_tab(widget)
+        assert await widget.opens_tab(url, modifiers=[key]) == []
+        assert await widget.opens_tab(_teams_tab(widget), modifiers=["Shift"]) == []
     assert await widget.act(lambda: page.locator(part).click()) == ([(T, False)], [])
 
 
@@ -1811,7 +1831,8 @@ async def test_split_middle_click_opens_a_new_tab(
     board: W.Board, split: Pages, monkeypatch: pytest.MonkeyPatch, browser: bool, part: str
 ) -> None:
     """011-AC21: middle click on a row (its title or its preview line) opens that chat in a new tab, in
-    split too, through --browser when set; Ctrl click opens Teams through it. The shown chat stays."""
+    split too, through --browser when set, and so does Ctrl/⌘ click; Shift click opens Teams through it.
+    The shown chat stays."""
     opened: list[Verb] = []
 
     async def spy(
@@ -1830,14 +1851,17 @@ async def test_split_middle_click_opens_a_new_tab(
     if browser:
         await name.click(button="middle")
         await name.click(modifiers=["Control"])
-        await _until(opened, 2)
-        assert opened == [(L, "split"), (L, False)]
+        await name.click(modifiers=["Meta"])
+        await name.click(modifiers=["Shift"])
+        await _until(opened, 4)
+        assert opened == [(L, "split"), (L, "split"), (L, "split"), (L, False)]
     else:
-        async with page.context.expect_page() as tab:
-            await name.click(button="middle")
-        new = await tab.value
-        await new.wait_for_url(f"http://{split.host}{_chat(L)}?chatnav=split")
-        await new.close()
+        for click in ({"button": "middle"}, {"modifiers": ["Control"]}, {"modifiers": ["Meta"]}):
+            async with page.context.expect_page() as tab:
+                await name.click(**click)  # type: ignore[arg-type]
+            new = await tab.value
+            await new.wait_for_url(f"http://{split.host}{_chat(L)}?chatnav=split")
+            await new.close()
     assert page.url.endswith(_chat(T) + "?chatnav=split")
 
 

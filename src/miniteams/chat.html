@@ -208,6 +208,7 @@
   .html .card summary { cursor: pointer; color: var(--accent); font-size: 12.5px; }
   .msg.system { display: block; text-align: center; color: var(--faint); font-size: 12.5px; padding: 2px 8px; }
   .msg.system .html { display: inline; }
+  .msg.system .when { margin-left: 6px; }
   .actions { display: none; position: absolute; right: 8px; top: -10px; background: var(--panel); border: 1px solid var(--line);
     border-radius: 8px; box-shadow: var(--shadow); padding: 2px; }
   /* A click focuses the message itself (not focus-visible): no bar pinned. Not `:has(:focus-visible)`:
@@ -529,7 +530,7 @@
     const body = el("div", "body");
     if (r.deleted) body.append(el("div", "html", "message deleted"));
     else { const h = el("div", "html"); h.dir = "auto"; h.innerHTML = r.html || ""; body.append(h); }
-    if (sys) { node.append(body); node.title = r.at; return node; }
+    if (sys) { body.append(Object.assign(el("span", "when", fmtTime(r.at)), { title: r.at })); node.append(body); node.title = r.at; return node; }
     node.tabIndex = 0;  // keyboard users reach the actions through focus-visible
     const name = r.name || (r.me ? "You" : "?");
     const av = el("div", "av", initials(name));
@@ -1195,20 +1196,22 @@
     const name = Object.assign(marked(el("a", "name truncate"), rowTitle(r), query), { href: r.link || "#", target: "_blank", rel: "noopener", title: r.label, dir: "auto" });
     name.dataset.k = "name";
     name.tabIndex = -1;  // renderRows gives one row the Tab stop
-    // Plain click switches in place; Ctrl click opens Teams as on the board; middle click is onauxclick's.
-    name.onclick = (ev) => {
-      if (ev.button === 1) { ev.preventDefault(); return; }
-      if (ev.ctrlKey || ev.metaKey || ev.shiftKey) { if (browser) { ev.preventDefault(); send({ open: r.id, web: true }); } return; }
+    // The new tab opens in split too: --browser has none of this page's stored settings.
+    const middle = (ev) => {
       ev.preventDefault();
-      switchTo(r.id, true);
-    };
-    name.onauxclick = (ev) => {
-      if (ev.button !== 1) return;
-      ev.preventDefault();
-      // The new tab opens in split too: --browser has none of this page's stored settings.
       if (browser) send({ open: r.id, chat: true, chatnav: "split" });
       else window.open(chatPath(r.id) + "?chatnav=split", "_blank", "noopener");
     };
+    // Plain click switches in place; Shift click opens Teams as on the board; middle click is onauxclick's.
+    name.onclick = (ev) => {
+      if (ev.button === 1) { ev.preventDefault(); return; }
+      // Ctrl/⌘ click = middle click: a touchpad has no easy middle button.
+      if (ev.ctrlKey || ev.metaKey) { middle(ev); return; }
+      if (ev.shiftKey) { if (browser) { ev.preventDefault(); send({ open: r.id, web: true }); } return; }
+      ev.preventDefault();
+      switchTo(r.id, true);
+    };
+    name.onauxclick = (ev) => { if (ev.button === 1) middle(ev); };
     const meta = el("span", "meta"), [acts, menu] = actions(r);
     meta.append(...acts, Object.assign(el("span", "ago", ago(r.last_activity)), { title: r.last_activity }));
     const ind = el("span", "ind");

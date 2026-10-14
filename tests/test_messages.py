@@ -238,3 +238,88 @@ def test_is_edited_reads_both_edit_marks() -> None:
 
 def test_fold_drops_case_and_accents() -> None:
     assert M.fold("ZOÉ Élodie") == "zoe elodie"
+
+
+# --- thread activity (made-up MRIs) ---
+
+_ME = "8:orgid:00000000-0000-0000-0000-0000000000aa"
+_ANN = "8:orgid:00000000-0000-0000-0000-0000000000bb"
+_BOB = "8:orgid:00000000-0000-0000-0000-0000000000cc"
+_CARL = "8:orgid:00000000-0000-0000-0000-0000000000dd"
+_NAMES = {_ANN: "Ann Lee", _BOB: "Bob Roe", _CARL: "Carl Day"}
+_ADD = "ThreadActivity/AddMember"
+_DEL = "ThreadActivity/DeleteMember"
+_TOPIC = "ThreadActivity/TopicUpdate"
+
+
+def _added(initiator: str, *targets: str) -> str:
+    infos = "".join(
+        f"<target>{t}</target><detailedtargetinfo><id>{t}</id><sharehistorytime>0</sharehistorytime>"
+        "</detailedtargetinfo>"
+        for t in targets
+    )
+    return (
+        f"<addmember><eventtime>1721293708701</eventtime><initiator>{initiator}</initiator>"
+        f"<rosterVersion>7</rosterVersion>{infos}</addmember>"
+    )
+
+
+def _deleted(initiator: str, target: str) -> str:
+    return (
+        f"<deletemember><eventtime>1</eventtime><initiator>{initiator}</initiator>"
+        f"<target>{target}</target></deletemember>"
+    )
+
+
+def _topic(initiator: str, value: str) -> str:
+    return (
+        f"<topicupdate><eventtime>1</eventtime><initiator>{initiator}</initiator>"
+        f"<value>{value}</value></topicupdate>"
+    )
+
+
+def _line(msgtype: str, content: str) -> str | None:
+    activity = M.parse_activity(msgtype, content)
+    return activity and M.activity_line(msgtype, activity, _ME, _NAMES.__getitem__)
+
+
+def test_activity_lines_name_who_did_what() -> None:
+    """Add (several targets), remove, leave, rename; our own MRI reads "You"."""
+    assert _line(_ADD, _added(_ANN, _BOB, _CARL)) == "👥 Ann Lee added Bob Roe, Carl Day"
+    assert _line(_ADD, _added(_ME, _BOB)) == "👥 You added Bob Roe"
+    assert _line(_ADD, _added(_BOB, _BOB)) == "👥 Bob Roe joined"
+    assert _line(_DEL, _deleted(_ANN, _BOB)) == "👥 Ann Lee removed Bob Roe"
+    assert _line(_DEL, _deleted(_BOB, _BOB)) == "👥 Bob Roe left"
+    assert _line(_DEL, _deleted(_ANN, _ME)) == "👥 Ann Lee removed You"
+    assert _line(_TOPIC, _topic(_ANN, "Q&amp;A")) == "✎ Ann Lee renamed the chat to «Q&A»"
+
+
+def test_activity_friendly_names_win_and_name_their_own_mri() -> None:
+    """A friendlyName (any case) names the MRI just before it; without a directory: "someone"."""
+    friendly = (
+        f"<deletemember><eventtime>1</eventtime><initiator>{_ANN}</initiator>"
+        "<detailedinitiatorinfo><friendlyName>Ann F</friendlyName></detailedinitiatorinfo>"
+        f"<target>{_BOB}</target><detailedtargetinfo><id>{_BOB}</id><friendlyname>Bob F</friendlyname>"
+        "</detailedtargetinfo></deletemember>"
+    )
+    assert _line(_DEL, friendly) == "👥 Ann F removed Bob F"
+    activity = M.parse_activity(_ADD, _added(_ANN, _BOB))
+    assert activity is not None
+    assert M.activity_line(_ADD, activity, _ME, None) == "👥 someone added someone"
+
+
+def test_malformed_activity_is_none() -> None:
+    """Empty, truncated, foreign or targetless content: None, the caller keeps the marker."""
+    for msgtype, content in [
+        (_ADD, ""),
+        (_ADD, "<addmember/>"),
+        (_ADD, f"<addmember><initiator>{_ANN}</initiator></addmember>"),  # nobody added
+        (_ADD, f"<addmember><target>{_BOB}</target></addmember>"),  # nobody adding
+        (_ADD, _added(_ANN, _BOB)[:60]),  # cut inside the initiator
+        (_DEL, _added(_ANN, _BOB)),  # an addmember body under another type
+        (_TOPIC, _topic(_ANN, "")),
+        (_TOPIC, _topic(_ANN, "<script>x</script>")),  # raw markup is no leaf value
+        ("ThreadActivity/MemberConsumptionHorizonUpdate", "<x/>"),
+        (_ADD, '{"initiator": "8:orgid:x", "members": []}'),
+    ]:
+        assert M.parse_activity(msgtype, content) is None, content

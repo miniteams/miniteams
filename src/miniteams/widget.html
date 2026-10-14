@@ -195,27 +195,28 @@
         li.append(av);
       }
       const name = Object.assign(marked(el("a", "name truncate"), rowTitle(r), query), { href: r.link || "#", target: "_blank", rel: "noopener", title: r.label, dir: "auto" });
-      // Plain click → the server opens the chat (desktop client); modified/middle click → the https
-      // link, through the server's --browser when set, else in this browser.
-      const modified = (ev) => ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.button === 1;
-      const chatHere = (ev) => ev.button === 1 && (nav || midclick === "chat");
-      // Without a message id the only link form is chat-only, which the desktop client cannot
-      // route in page (it reloads, dropping a call): let that one open in the browser instead.
-      name.onclick = (ev) => {
-        if (chatHere(ev)) { ev.preventDefault(); return; }  // onauxclick owns it: no Teams tab from the link too
-        if (modified(ev)) { if (browser) { ev.preventDefault(); send({ open: r.id, web: true }); } return; }
-        if (nav) { ev.preventDefault(); location.assign(chatPage(r.id)); return; }
-        if (opener && r.last_id) { ev.preventDefault(); send({ open: r.id, web: false }); }
-      };
-      name.onauxclick = (ev) => {
-        if (chatHere(ev)) {
+      // Plain click → the server opens the chat (desktop client); Shift click → the https link, through
+      // the server's --browser when set, else in this browser; middle click → `middle`.
+      const chatHere = nav || midclick === "chat";
+      // Without --browser, the Teams link's native new tab (middle or Ctrl click alike) does the work.
+      const middle = (ev) => {
+        if (chatHere) {
           ev.preventDefault();
           if (browser) send({ open: r.id, chat: true, ...(chatnav === "split" && { chatnav }) });
           else window.open(chatPage(r.id), "_blank", "noopener");
-          return;
-        }
-        if (ev.button === 1 && browser) { ev.preventDefault(); send({ open: r.id, web: true }); }
+        } else if (browser) { ev.preventDefault(); send({ open: r.id, web: true }); }
       };
+      // Without a message id the only link form is chat-only, which the desktop client cannot
+      // route in page (it reloads, dropping a call): let that one open in the browser instead.
+      name.onclick = (ev) => {
+        if (ev.button === 1) { if (chatHere || browser) ev.preventDefault(); return; }  // onauxclick owns it: no Teams tab from the link too
+        // Ctrl/⌘ click = middle click: a touchpad has no easy middle button.
+        if (ev.ctrlKey || ev.metaKey) { middle(ev); return; }
+        if (ev.shiftKey) { if (browser) { ev.preventDefault(); send({ open: r.id, web: true }); } return; }
+        if (nav) { ev.preventDefault(); location.assign(chatPage(r.id)); return; }
+        if (opener && r.last_id) { ev.preventDefault(); send({ open: r.id, web: false }); }
+      };
+      name.onauxclick = (ev) => { if (ev.button === 1) middle(ev); };
       const replyBtn = el("button", "reply", "✎"); replyBtn.title = "reply (r)"; replyBtn.dataset.k = "reply";
       replyBtn.onclick = () => openReply(r.id);
       const meta = el("span", "meta"), [acts, menu] = actions(r);

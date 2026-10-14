@@ -678,7 +678,7 @@ def main(argv: list[str] | None = None) -> int:
     p_web.add_argument(
         "--browser",
         default="",
-        help="command run with Teams web links (Ctrl/middle click) and with chat pages opened from the "
+        help="command run with Teams web links (Shift/Ctrl/middle click) and with chat pages opened from the "
         "widget (e.g. firefox); default: the page's own browser",
     )
     p_web.set_defaults(func=cmd_web)

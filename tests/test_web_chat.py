@@ -608,6 +608,57 @@ def test_record_types_and_markers(
     assert (record["type"], record["html"]) == (kind, body)
 
 
+_BOB = "8:orgid:00000000-0000-0000-0000-00000000000c"
+_CARL = "8:orgid:00000000-0000-0000-0000-00000000000d"
+_ACTS = "19:acts@thread.v2"  # archived by the test that reads it
+
+
+def _activity(msg_id: str, msgtype: str, content: str) -> dict[str, Any]:
+    return {**_m(msg_id, _at(int(msg_id)), content), "messagetype": msgtype, "from": "", "imdisplayname": ""}
+
+
+def test_activity_records_say_who_did_what_as_text() -> None:
+    """A system line names the people (directory names, "You" for us) and stays text: no markup passes."""
+    names = {ANN: "Ann Lee", _BOB: "Bob <b>Roe</b>"}.get
+    added = _activity(
+        "1",
+        "ThreadActivity/AddMember",
+        f"<addmember><initiator>{ME}</initiator><target>{ANN}</target><target>{_BOB}</target></addmember>",
+    )
+    record = CV.chat_record(added, T, ME, name_for=lambda m: names(m) or "?")
+    assert (record["type"], record["html"]) == ("system", "👥 You added Ann Lee, Bob &lt;b&gt;Roe&lt;/b&gt;")
+    topic = (
+        "<topicupdate><initiator>{}</initiator><value>&lt;script&gt;x&lt;/script&gt;</value></topicupdate>"
+    )
+    record = CV.chat_record(_activity("2", "ThreadActivity/TopicUpdate", topic.format(ANN)), T, ME)
+    assert record["html"] == "✎ someone renamed the chat to «&lt;script&gt;x&lt;/script&gt;»"
+
+
+async def test_history_names_activity_people_once(
+    board: W.Board, data_dir: Path, quiet_directory: Directory, monkeypatch: pytest.MonkeyPatch, no_api: None
+) -> None:
+    """Unknown MRIs of a page's system lines are resolved before the answer; cached ones ask nothing."""
+    removed = f"<deletemember><initiator>{_BOB}</initiator><target>{_CARL}</target></deletemember>"
+    left = f"<deletemember><initiator>{_CARL}</initiator><target>{_CARL}</target></deletemember>"
+    gone = "ThreadActivity/DeleteMember"
+    _archive(data_dir, _ACTS, [_activity("1", gone, removed), _m("2", _at(2)), _activity("3", gone, left)])
+    asked: list[Any] = []
+
+    async def post(self: httpx.AsyncClient, url: str, **kw: Any) -> httpx.Response:
+        asked.append(kw["json"])
+        users = [{"mri": _BOB, "displayName": "Bob Roe"}, {"mri": _CARL, "displayName": "Carl Day"}]
+        return httpx.Response(200, json={"value": users}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", post)
+    quiet_directory.bearer = "b"
+    for _ in range(2):
+        answer = await _history(board, _ACTS)
+        lines = [m["html"] for m in answer["messages"] if m["type"] == "system"]
+        assert lines == ["👥 Bob Roe removed Carl Day", "👥 Carl Day left"]
+        assert all("_activity" not in m for m in answer["messages"])
+    assert asked == [[_BOB, _CARL]]
+
+
 def _card(*body: dict[str, Any], **extra: Any) -> dict[str, Any]:
     return {"type": "AdaptiveCard", "body": list(body), **extra}
 
@@ -2502,6 +2553,26 @@ async def test_a_hung_media_folder_relays_without_media(
         release.set()
     assert [f["msg"]["id"] for f in frames] == ["9", "10"]
     assert seen[0] is not None and seen[1:] == [None, None]  # the timed-out read, its fallback, then none
+    board.close()
+
+
+async def test_a_live_activity_line_names_its_people(board: W.Board, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A relayed system line asks the directory for the people it lacks; no private key goes out."""
+    frames = _relayed(monkeypatch)
+    asked: list[list[str]] = []
+
+    async def resolve(mris: list[str], *, refresh: bool = False) -> None:
+        asked.append(mris)
+        board.directory.note_name(_BOB, "Bob Roe")
+
+    assert board.directory is not None
+    monkeypatch.setattr(board.directory, "resolve", resolve)
+    await _following(board, C)
+    removed = f"<deletemember><initiator>{ME}</initiator><target>{_BOB}</target></deletemember>"
+    await board.on_event(_event("NewMessage", C, **_activity("9", "ThreadActivity/DeleteMember", removed)))
+    await _settled(frames, 1)
+    assert frames[0]["msg"]["html"] == "👥 You removed Bob Roe" and "_activity" not in frames[0]["msg"]
+    assert asked == [[_BOB]]
     board.close()
 
 
