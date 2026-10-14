@@ -648,7 +648,15 @@ class Board:
         self.receipts: Receipts | None = None  # set by run(); None = no read receipts
         self._authors: dict[ServerConnection, list[str]] = {}  # chat socket → authors it shows
         self.emojis = EmojiCache(directory)
-        self.chat = ChatVerbs(directory, self.emojis, self._scope, me, self.me_name, data_dir)
+        self.chat = ChatVerbs(
+            directory,
+            self.emojis,
+            self._scope,
+            me,
+            self.me_name,
+            data_dir,
+            lambda thread_id: str(self.rows.get(thread_id, {}).get("last_id") or ""),
+        )
         board_first: dict[str, Handler] = {
             "seen": self._on_seen,
             "unseen": self._on_unseen,

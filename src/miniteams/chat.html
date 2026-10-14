@@ -132,6 +132,12 @@
   #list { flex: 1; overflow-y: auto; padding: 8px 12px; }
   #latest { position: absolute; right: 20px; bottom: 10px; box-shadow: var(--shadow); color: var(--accent); }
   #latest[hidden] { display: none; }
+  #lag { position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%); pointer-events: none; padding: 3px 10px; border: 1px solid var(--line);
+    border-radius: 8px; background: var(--panel); color: var(--dim); font-size: 12.5px; box-shadow: var(--shadow); white-space: nowrap; }
+  #lag[hidden] { display: none; }
+  #lag::before { content: ""; display: inline-block; vertical-align: -2px; width: 10px; height: 10px; margin-right: 6px; border-radius: 50%;
+    border: 2px solid var(--line); border-top-color: var(--accent); animation: imgspin 0.8s linear infinite; }
+  @media (prefers-reduced-motion: reduce) { #lag::before { animation: none; } }
   #note { text-align: center; color: var(--dim); padding: 1em; }
   #note.err { color: var(--hot); }
   .msg { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 0 10px; padding: 4px 8px; border-radius: 10px; position: relative; }
@@ -297,6 +303,7 @@
 <div id="pane">
   <div id="list"><div id="note">loading…</div><div id="msgs"></div></div>
   <button id="latest" class="btn" hidden>↓ latest</button>
+  <div id="lag" role="status" hidden>loading latest messages…</div>
 </div>
 <div id="typing" aria-live="polite"></div>
 <footer>
@@ -328,7 +335,7 @@
         $label = document.getElementById("label"), $members = document.getElementById("members"),
         $status = document.getElementById("status"), $teams = document.getElementById("teams"),
         $typing = document.getElementById("typing"), $reply = document.getElementById("reply"), $err = document.getElementById("err"),
-        $quotes = document.getElementById("quotes"), $latest = document.getElementById("latest"),
+        $quotes = document.getElementById("quotes"), $latest = document.getElementById("latest"), $lag = document.getElementById("lag"),
         $find = document.getElementById("find"), $hits = document.getElementById("hits");
 
   const BUSY_RETRY_MS = 500, BUSY_TRIES = 10;  // the server answers `busy` while it runs this socket's last ask
@@ -359,10 +366,30 @@
     busy: 0,  // `busy` answers in a row to history asks
   });
   let hist = newHist();
+  // The archive behind the stream (an answer's `behind`, the id it lacks): the latest page is asked
+  // again, backing off, and `$lag` shows once it lasts LAG_SHOW_MS, then stays LAG_KEEP_MS: no flash.
+  const LAG_SHOW_MS = 600, LAG_KEEP_MS = 400;
+  const lag = { id: "", retry: backoff(), ask: 0, show: 0, hide: 0, shownAt: 0 };
+  const settle = (now = false) => {
+    clearTimeout(lag.ask); clearTimeout(lag.show); clearTimeout(lag.hide);
+    lag.id = ""; lag.show = 0; lag.retry.reset();
+    if ($lag.hidden) return;
+    if (now) { $lag.hidden = true; return; }
+    lag.hide = setTimeout(() => { $lag.hidden = true; }, Math.max(0, lag.shownAt + LAG_KEEP_MS - Date.now()));
+  };
+  const behind = (id) => {
+    if (hist.records.has(id)) { settle(); return; }  // the relay brought it meanwhile
+    lag.id = id;
+    clearTimeout(lag.hide); clearTimeout(lag.ask);
+    if ($lag.hidden && !lag.show) lag.show = setTimeout(() => { lag.show = 0; $lag.hidden = false; lag.shownAt = Date.now(); }, LAG_SHOW_MS);
+    const t = thread;
+    lag.ask = setTimeout(() => { if (t === thread && !hist.newer) { hist.catchUp = true; requestHistory(); } }, lag.retry.next());
+  };
   // The one place a navigation in progress is dropped or redirected, per entry point.
   const resetNav = (entry, to = null) => {
+    clearTimeout(lag.ask); hist.catchUp = false;  // the navigation's own ask tells whether the archive lags
     switch (entry) {
-      case "switch": hist = newHist(); break;
+      case "switch": hist = newHist(); settle(true); break;
       case "open": hist.pending.clear(); Object.assign(hist, { restore: to, target: null, aroundAt: "" }); break;  // asks died with the old socket, or a gap superseded them
       case "jump": Object.assign(hist, { target: to, aroundAt: to.at }); break;
       case "latest": Object.assign(hist, { restore: null, target: null, aroundAt: "" }); break;
@@ -780,6 +807,23 @@
     regroup();
     $note.hidden = true;
     if (was) { trim(); toBottom(); } else { hist.unseen++; showLatest(); }
+    if (r.id === lag.id) settle();
+  };
+  // A latest page asked again while the archive lagged: what it adds goes in by time, the screen and
+  // the reader's place stay.
+  const merge = (messages) => {
+    const was = hist.stick, first = firstAt();
+    let added = 0;
+    for (const r of messages) {
+      if (hist.records.has(r.id) || (hist.older && r.at < first)) continue;  // above the screen: scrolling up reads it
+      hist.records.set(r.id, r); added++;
+      $msgs.insertBefore(renderMessage(r), [...$msgs.children].find((x) => x.dataset.at > r.at) || null);
+    }
+    hist.live = []; hist.liveEdits = [];  // attached: append and replace showed them
+    if (!added) return;
+    regroup();
+    $note.hidden = true;
+    if (was) toBottom(); else { hist.unseen += added; showLatest(); }
   };
 
   // No `html`: a partial update (a reaction), whose other fields are blank, not news.
@@ -818,6 +862,10 @@
       return;
     }
     hist.busy = 0;
+    const catchUp = !at && hist.catchUp;
+    if (!at) hist.catchUp = false;
+    // Detached since: the way back to the latest page asks again.
+    if (catchUp && (m.error || hist.newer)) { if (hist.newer) settle(true); else behind(lag.id); return; }
     if (m.error === "busy") m = { ...m, error: "history unavailable" };  // the server's word for any failure
     if (side === "around") hist.aroundAt = "";
     if (m.error) {
@@ -831,7 +879,10 @@
     hist.source = m.source;
     const messages = m.messages || [];
     const cursor = typeof m.cursor === "string" ? m.cursor : "";
-    if (!at || side === "around") {
+    // The archive's tail, as the server checks it against the board row.
+    const tail = !m.newer && (side !== "before" || !at);
+    if (catchUp) merge(messages);
+    else if (!at || side === "around") {
       // An `around` cursor would not say which side it continues: both edges are messages again.
       Object.assign(hist, { olderAt: !at && m.older ? cursor : "", newerAt: "" });
       showPage(messages, m, side === "around");
@@ -847,6 +898,8 @@
       addPage(messages, false);
       if (cursor) more();
     }
+    if (tail) { if (typeof m.behind === "string") behind(m.behind); else settle(); }
+    else if (!at || side === "around") settle(true);  // detached by a jump: the way back asks again
   };
   $latest.onclick = () => {
     if (!hist.newer) { toBottom(); return; }
