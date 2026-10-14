@@ -189,6 +189,21 @@ async def test_live_append_edit_delete_reaction_and_typing(board: W.Board, chat:
     await page.wait_for_function("document.getElementById('typing').textContent.includes('Ann Lee')")
 
 
+async def test_a_system_line_shows_who_and_its_time(board: W.Board, chat: Pages) -> None:
+    """A live thread activity line names who did what and shows its time, the full timestamp on hover."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    added = f"<addmember><initiator>{ME}</initiator><target>{ANN}</target></addmember>"
+    activity = {"messagetype": "ThreadActivity/AddMember", "from": "", "imdisplayname": ""}
+    await board.on_event(_event("NewMessage", T, **_m("4", _at(4), added, **activity)))
+    line = page.locator('[data-id="4"].system')
+    await line.wait_for()
+    assert await line.locator(".html").inner_text() == f"👥 You added {ANN.split(':')[-1]}"
+    when = line.locator(".when")
+    assert await when.is_visible() and await when.get_attribute("title") == _at(4)
+    assert await when.inner_text() == await page.locator(".msg:not(.system) .when").first.inner_text()
+
+
 async def test_composer_keys_success_and_failure(
     chat: Pages, sent: list[tuple[str, str]], monkeypatch: pytest.MonkeyPatch
 ) -> None:

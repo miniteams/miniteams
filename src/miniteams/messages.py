@@ -12,7 +12,8 @@ import html
 import json
 import re
 import unicodedata
-from typing import Any
+from collections.abc import Callable
+from typing import Any, NamedTuple
 
 import structlog
 
@@ -51,6 +52,13 @@ _TYPE_MARKERS = {
     "ThreadActivity/TopicUpdate": "✎ renamed",
     "ThreadActivity/MemberConsumptionHorizonUpdate": "👁 read marker",
     "Event/Call": "📞 call started",
+}
+# Untrusted XML-ish content: flat leaf tags read by regex, nothing parsed as a document.
+_ACTIVITY_LEAF_RE = re.compile(r"<(initiator|target|id|friendlyname|value)>([^<]*)</\1>", re.IGNORECASE)
+_ACTIVITY_ROOTS = {
+    "ThreadActivity/AddMember": "<addmember>",
+    "ThreadActivity/DeleteMember": "<deletemember>",
+    "ThreadActivity/TopicUpdate": "<topicupdate>",
 }
 _THREAD_RE = re.compile(r"/conversations/([^/]+)")
 
@@ -285,6 +293,59 @@ def snippet(msgtype: str, content: str, props: dict[str, Any] | None = None) -> 
         text = (_TYPE_MARKERS.get(msgtype) or f"[{msgtype.rsplit('/', 1)[-1]}]") if msgtype else ""
     text = " ".join(text.split())
     return text if len(text) <= SNIPPET_LEN else text[: SNIPPET_LEN - 1] + "…"
+
+
+class Activity(NamedTuple):
+    """A roster or topic change: who made it, whom it touched, the new topic."""
+
+    initiator: str
+    targets: tuple[str, ...]
+    value: str
+    names: dict[str, str]  # MRI → the friendlyName the event carries, when it does
+
+
+def parse_activity(msgtype: str, content: str) -> Activity | None:
+    """The people and topic of an AddMember, DeleteMember or TopicUpdate; None when malformed."""
+    root = _ACTIVITY_ROOTS.get(msgtype)
+    if root is None or not content.lstrip().lower().startswith(root):
+        return None
+    initiator, value, last = "", "", ""
+    targets: list[str] = []
+    names: dict[str, str] = {}
+    for match in _ACTIVITY_LEAF_RE.finditer(content):
+        tag, text = match.group(1).lower(), html.unescape(match.group(2)).strip()
+        if tag == "value":
+            value = text
+        elif tag == "friendlyname":
+            if last and text:
+                names.setdefault(last, text)  # names the MRI just before it, initiator or target
+        elif text:
+            last = text
+            if tag == "initiator":
+                initiator = initiator or text
+            elif tag == "target":
+                targets.append(text)
+    topic = msgtype == "ThreadActivity/TopicUpdate"
+    if not initiator or not (value if topic else targets):
+        return None
+    return Activity(initiator, tuple(targets), value, names)
+
+
+def activity_line(msgtype: str, activity: Activity, me: str, name_for: Callable[[str], str] | None) -> str:
+    """The plain-text line a system message shows: "👥 Ann added Bob, Carl", "👥 Bob left"…"""
+
+    def who(mri: str) -> str:
+        if is_me(mri, me):
+            return "You"
+        return activity.names.get(mri) or (name_for(mri) if name_for else "someone")
+
+    actor = who(activity.initiator)
+    if msgtype == "ThreadActivity/TopicUpdate":
+        return f"✎ {actor} renamed the chat to «{activity.value}»"
+    added = msgtype == "ThreadActivity/AddMember"
+    if activity.targets == (activity.initiator,):
+        return f"👥 {actor} {'joined' if added else 'left'}"
+    return f"👥 {actor} {'added' if added else 'removed'} {', '.join(map(who, activity.targets))}"
 
 
 def is_deleted(props: dict[str, Any]) -> bool:
