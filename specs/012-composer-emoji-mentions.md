@@ -4,7 +4,7 @@
 **Requested by**: babs
 **Date**: 2026-10-09
 
-**Amendment 2026-10-13**: phase 5 (clipboard images) validated after review (5a protocol proof, then 5b UI); phases 1–4 implemented.
+**Amendment 2026-10-13**: phase 5 (clipboard images) validated after review (5a protocol proof, then 5b UI); phases 1–4, 5a and 5b implemented.
 
 ## Problem
 
@@ -135,25 +135,25 @@ the person (or everyone) is notified and the name shows highlighted in Teams, as
 
 ### Clipboard images (phase 5)
 
-- [ ] **AC19** In either composer, pasting image files adds local thumbnails to the current
+- [x] **AC19** In either composer, pasting image files adds local thumbnails to the current
       chat's draft. Pasting does not send a message or upload the images to Teams.
-- [ ] **AC20** Several images in one paste and repeated pastes accumulate in order. A user can
+- [x] **AC20** Several images in one paste and repeated pastes accumulate in order. A user can
       open each thumbnail in a larger local preview and remove each pending image independently
       during composition. Closing the preview preserves the image and text; deleting the
       previewed image closes its preview. Ordinary text paste still works.
-- [ ] **AC21** The user can write or edit text and mentions after pasting, then explicitly send
+- [x] **AC21** The user can write or edit text and mentions after pasting, then explicitly send
       the queued images with that text, or send images alone. Enter follows the existing
       completion and send rules. Pending images cannot be silently omitted.
-- [ ] **AC22** Pending images stay attached to their original chat when switching chats in the
+- [x] **AC22** Pending images stay attached to their original chat when switching chats in the
       same page. A successful send clears only its submitted draft; new edits remain intact.
-- [ ] **AC23** Upload or send failure retains the text and pending images, displays an actionable
+- [x] **AC23** Upload or send failure retains the text and pending images, displays an actionable
       error and reuses completed uploads on retry. An ambiguous send result must not trigger
       an automatic duplicate send; a manual retry sends only if the chat's recent messages do not
       already hold that `clientmessageid`. Sending twice concurrently is blocked.
-- [ ] **AC24** The upload route requires the existing authenticated session and same-origin
+- [x] **AC24** The upload route requires the existing authenticated session and same-origin
       protections. The server validates image content, destination, count and byte limits;
       it never trusts a MIME label, filename or browser-supplied remote URL alone.
-- [ ] **AC25** Unsupported or oversized images produce a clear error while preserving the
+- [x] **AC25** Unsupported or oversized images produce a clear error while preserving the
       draft. Thumbnails and object URLs are released on removal, success and page teardown.
 - [x] **AC26** A controlled live send shows every pasted image in native Teams with the
       accompanying text. Any protocol uncertainty is resolved before claiming this phase shipped.
@@ -240,6 +240,23 @@ the person (or everyone) is notified and the name shows highlighted in Teams, as
 - **DoD**: browser tests cover repeated/multiple paste, image-only send, removal, per-chat isolation,
   ambiguous send and retry; server tests cover validation (magic bytes, limits, dimensions) and
   failed uploads; pre-commit passes.
+- **Implemented 2026-10-14** (`tests/test_web_images.py`, `tests/test_browser_images.py`):
+  - `send` gains `images: [{w, h, size}]`, `cmid` (page-made) and `check`; answers may carry
+    `unsure: true`. Socket `max_size` 11 MiB.
+  - Every retry of an unchanged draft (same verb, same images) keeps its `cmid` and sends `check`:
+    any failure may hide a posted message (a 201 with an odd body, a 504). A changed draft gets a new
+    `cmid` and no check, so an edit is never swallowed by "already sent" (review round 1).
+  - Browser `w`/`h` are shape-checked only; the `<img>` size comes from the bytes (`images.sniff`).
+  - Unsure = the POST failed after it may have reached Teams (read/write timeout or error, remote
+    protocol error); the server waits 15 s for the echo, then answers `unsure`. A `check` retry reads
+    the latest API page (100 messages) for my message with that `cmid`; unreadable, nothing is sent.
+  - Upload reuse: (thread, cmid) → digest → object ids, 16 drafts kept, dropped on success.
+  - Any edit (typing, an image added or removed) drops the attempt, so a later identical text is a new
+    message (review round 2).
+  - Known limit: the attempt lives in the page only; after a reload, a retried draft goes out without the
+    check.
+  - AC24's session and same-origin part: the frames ride the page socket, under its cookie and
+    Origin checks (`test_the_socket_needs_the_cookie`, `test_chat_socket_checks_the_origin`).
 
 ## Data model impact (summary, including proposed phase 5)
 

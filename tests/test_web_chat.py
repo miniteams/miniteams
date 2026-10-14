@@ -1031,7 +1031,9 @@ async def test_chat_route_serves_the_page_for_board_and_archived_chats(
             csp = page.headers["content-security-policy"]
             script = page.text.split("<script>", 1)[1].split("</script>", 1)[0]
             digest = base64.b64encode(hashlib.sha256(script.encode()).digest()).decode()
-            assert f"script-src 'sha256-{digest}';" in csp and "img-src 'self'" in csp
+            assert f"script-src 'sha256-{digest}';" in csp
+            # blob: only for the pasted images' thumbnails (spec 012 phase 5b): no remote image source.
+            assert [d for d in csp.split("; ") if d.startswith("img-src")] == ["img-src 'self' blob:"]
             assert "unsafe-inline" not in csp.split("script-src", 1)[1].split(";", 1)[0]
             assert "/ws?chat" in page.text
         for path in (_chat_url(host, NOPE), f"http://{host}/chat/", f"http://{host}/chat/{T}/x"):
@@ -1211,7 +1213,9 @@ async def test_follow_names_a_board_chat_and_tells_the_opener(
 def sent(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
     calls: list[tuple[str, str]] = []
 
-    def fake_send(settings: Any, token: str, thread_id: str, text: str, me_name: str) -> dict[str, Any]:
+    def fake_send(
+        settings: Any, token: str, thread_id: str, text: str, me_name: str, **kw: Any
+    ) -> dict[str, Any]:
         calls.append((thread_id, text))
         return {"status": 201}
 

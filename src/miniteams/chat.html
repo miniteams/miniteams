@@ -297,6 +297,7 @@
     <button id="show" title="preview the formatted message" aria-label="preview" aria-pressed="false">preview</button>
   </div>
   <div id="quotes" hidden></div>
+  <div id="imgs" class="imgs" hidden></div>
   <textarea id="reply" rows="1" placeholder="message · Enter sends, Shift+Enter new line" aria-label="message"></textarea>
   <div id="pop" hidden></div>
   <small id="err"></small>
@@ -304,7 +305,7 @@
 </div>
 <script>
 (() => {
-  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn rowActions completion
+  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn rowActions completion imageQueue
   /* ui.js */
   let thread = null;
   try { thread = decodeURIComponent(location.pathname.slice("/chat/".length)); } catch (e) {}
@@ -839,6 +840,7 @@
   let readOnly = false;
   const setSending = (id, on) => {
     if (on) sending.add(id); else sending.delete(id);
+    imgs.render();
     if (id !== thread) return;
     $reply.disabled = on || readOnly;
     if (!on) $reply.focus();
@@ -886,9 +888,15 @@
   };
   const submit = () => {
     const text = $reply.value;
-    if (!text.trim() || sending.has(thread)) return;
+    if ((!text.trim() && !imgs.list(thread).length && !imgs.adding()) || sending.has(thread)) return;
     const verb = { send: thread, text, mentions: complete.mentions(text), format: "full", ...(quotes.length ? { quote: quotes.map((qt) => qt.id) } : {}) };
-    if (!send(verb)) { $err.textContent = "offline, not sent"; return; }
+    if (!(ws && ws.readyState === 1)) { $err.textContent = "offline, not sent"; return; }
+    const id = thread;
+    imgs.send(ws, id, verb).then((sent) => {
+      if (sent || !sending.has(id)) return;
+      if (!(id === thread ? $err.textContent : drafts.get(id)?.err)) noteFor(id, "nothing to send");  // a refused image keeps its reason
+      setSending(id, false);
+    });
     $err.textContent = "";
     hideView();
     setSending(thread, true);
@@ -907,6 +915,8 @@
     input: $reply, pop: $pop, send: (o) => send(o), chat: () => thread, edited: () => edited(), above: true,
     put: (text, from, to) => put(text, from, to, from + text.length, from + text.length),
   });
+  const imgs = imageQueue({ input: $reply, box: document.getElementById("imgs"), chat: () => thread, busy: (id) => sending.has(id), error: (id, text) => noteFor(id, text) });
+  const UNSURE = "no answer from Teams: it may have gone out · Enter checks the chat before sending again";
 
   // Toolbar (spec 012, full format): markers around the selection, or around the caret to type into.
   const MARK = { bold: "**", italic: "*", strike: "~~", code: "`" };
@@ -986,6 +996,8 @@
   const onSent = (m) => {
     if (!sending.has(m.sent)) return;
     if (m.ok) complete.forget(m.sent);
+    imgs.settled(m.sent, m);
+    if (m.unsure) m.error = UNSURE;
     if (m.sent !== thread) {
       const d = drafts.get(m.sent);
       if (!m.ok) noteFor(m.sent, why(m.error) || "not sent");
@@ -1176,6 +1188,7 @@
     complete.reset(); hideView();
     unstash();
     $reply.disabled = readOnly || sending.has(thread);
+    imgs.render();
     const row = rows.find((r) => r.id === id);
     $label.textContent = row ? rowTitle(row) : id;
     document.title = $label.textContent + " · miniteams";
@@ -1322,7 +1335,7 @@
       if (asked) hideView();  // its answer died with the socket: no pressed button over an empty box
       asked = 0;
       // No ack will come: the message may or may not have gone out.
-      for (const id of [...sending]) { noteFor(id, "connection lost: check the chat before resending"); setSending(id, false); }
+      for (const id of [...sending]) { noteFor(id, "connection lost: Enter checks the chat before sending again"); setSending(id, false); }
       for (const box of $msgs.querySelectorAll(".editor[data-saving]")) {
         delete box.dataset.saving;
         box.nextElementSibling.textContent = "connection lost: check the message before saving again";

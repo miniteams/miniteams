@@ -88,6 +88,7 @@
   #reply:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
   #reply:disabled { opacity: .6; }
   .composer small { display: block; color: var(--hot); font-size: 12px; margin-top: 2px; }
+  li.composer .imgs { --thumb: 32px; margin: 4px 0 0; gap: 8px; }
   #empty { padding: 2em; text-align: center; color: var(--dim); }
   /* Still filling in from the live listing: the rows on screen come from the local archive. */
   .spin { position: fixed; right: 14px; bottom: 14px; width: 16px; height: 16px; border-radius: 50%;
@@ -111,7 +112,7 @@
 <div id="spin" class="spin" hidden title="loading the live list…"></div>
 <script>
 (() => {
-  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn rowActions completion
+  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn rowActions completion imageQueue
   /* ui.js */
   const $rows = document.getElementById("rows"), $empty = document.getElementById("empty"),
         $status = document.getElementById("status"), $tabs = document.getElementById("tabs"),
@@ -237,6 +238,7 @@
     if (at < 0) { $composer.remove(); $rows.append(...items); }
     else { if (!$composer.isConnected) $rows.append($composer); $composer.before(...items.slice(0, at + 1)); $composer.after(...items.slice(at + 1)); }
     $reply.disabled = sending.has(replyTo);
+    imgs.render();
     $err.textContent = errors.get(replyTo) || "";
     if (fk) focusIn($rows.querySelector(`li[data-id="${CSS.escape(fid)}"]`), fk);
     $empty.textContent = query ? "no chat matches" : "nothing yet";
@@ -244,11 +246,11 @@
   };
 
   const actions = rowActions($rows, () => render(), send);
-  const $composer = el("li", "composer"), $reply = el("textarea"), $err = el("small"), $pop = el("div");
+  const $composer = el("li", "composer"), $reply = el("textarea"), $err = el("small"), $pop = el("div"), $imgs = el("div", "imgs");
   $reply.id = "reply"; $reply.rows = 1; $reply.placeholder = "reply · Enter sends, Shift+Enter new line";
   $reply.setAttribute("aria-label", "reply");
   $pop.id = "pop"; $pop.hidden = true;
-  $composer.append($reply, $pop, $err);
+  $composer.append($reply, $pop, $imgs, $err);
   const grow = () => { $reply.style.height = "auto"; $reply.style.height = $reply.scrollHeight + 2 + "px"; };
   const edited = () => { drafts.set(replyTo, $reply.value); grow(); };
 
@@ -256,6 +258,11 @@
     input: $reply, pop: $pop, send: (o) => send(o), chat: () => replyTo, edited: () => edited(), above: false,
     put: (text, from, to) => $reply.setRangeText(text, from, to, "end"),
   });
+  const imgs = imageQueue({
+    input: $reply, box: $imgs, chat: () => replyTo, busy: (id) => sending.has(id),
+    error: (id, text) => { errors.set(id, text); render(); },
+  });
+  const UNSURE = "no answer from Teams: it may have gone out · Enter checks the chat before sending again";
 
   const openReply = (id) => {
     replyTo = sel = id;
@@ -272,10 +279,14 @@
   const refocus = (id) => { if (replyTo === id && $composer.isConnected && document.activeElement === document.body) $reply.focus(); };
   const submit = () => {
     const id = replyTo, text = $reply.value;
-    if (!text.trim() || sending.has(id)) return;
+    if ((!text.trim() && !imgs.list(id).length && !imgs.adding()) || sending.has(id)) return;
     if (!(ws && ws.readyState === 1)) { errors.set(id, "offline, not sent"); render(); return; }
     sending.add(id); errors.delete(id);
-    ws.send(JSON.stringify({ send: id, text, mentions: complete.mentions(text), format: "inline" }));
+    imgs.send(ws, id, { send: id, text, mentions: complete.mentions(text), format: "inline" }).then((sent) => {
+      if (sent || !sending.delete(id)) return;
+      if (!errors.has(id)) errors.set(id, "nothing to send");  // a refused image keeps its own reason
+      render(); refocus(id);
+    });
     render();
   };
   $reply.oninput = edited;
@@ -333,16 +344,17 @@
       if (msg.complete) complete.answered(msg);
       if (msg.sent) {
         sending.delete(msg.sent);
+        imgs.settled(msg.sent, msg);
         if (msg.ok) {
           drafts.delete(msg.sent); errors.delete(msg.sent); complete.forget(msg.sent);
           if (replyTo === msg.sent) { $reply.value = ""; closeReply(); } else render();
-        } else { errors.set(msg.sent, msg.error || "not sent"); render(); refocus(msg.sent); }
+        } else { errors.set(msg.sent, msg.unsure ? UNSURE : msg.error || "not sent"); render(); refocus(msg.sent); }
       }
     };
     ws.onclose = () => {
       $status.title = "disconnected"; $status.classList.add("off");
       // No ack will come for these: the message may or may not have gone out.
-      for (const id of sending) errors.set(id, "connection lost: check the chat before resending");
+      for (const id of sending) errors.set(id, "connection lost: Enter checks the chat before sending again");
       if (sending.size) { const id = replyTo; sending.clear(); render(); refocus(id); }
       setTimeout(connect, retry.next());  // server restarts → page recovers alone
     };

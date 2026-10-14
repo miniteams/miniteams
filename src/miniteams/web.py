@@ -68,6 +68,7 @@ from .directory import Directory, roster_label
 from .dump import fetch_history
 from .emojis import EmojiCache
 from .http import failure
+from .images import MAX_IMAGE_BYTES
 from .messages import (
     is_activity,
     is_deleted,
@@ -105,6 +106,7 @@ _SCRIPT_RE = re.compile(r"<script>(.*?)</script>", re.DOTALL)
 # Someone reading a chat is not activity: bumping the row on it would defeat "seen".
 _SILENT_TYPES = {"ThreadActivity/MemberConsumptionHorizonUpdate"}
 _RELABEL_TYPES = {"ThreadActivity/TopicUpdate", "ThreadActivity/AddMember", "ThreadActivity/DeleteMember"}
+MAX_FRAME = MAX_IMAGE_BYTES + (1 << 20)  # one pasted image per binary frame, plus room for a long JSON verb
 _BIND_ATTEMPTS = 3  # redraws when the persisted port turns out taken
 _RELAY_QUEUE = 256  # live events waiting for their followers; past it one is dropped, the stream never waits
 _RELAY_MAX = 10.0  # seconds one relay may take (name lookups included) before the next one goes
@@ -953,6 +955,7 @@ class Board:
         if resource_type == "ConversationUpdate":
             self._conversation_update(thread_id, resource)
         elif resource_type == "NewMessage":
+            self.chat.echoed(thread_id, str(resource.get("clientmessageid") or ""))
             if msgtype in ("Control/Typing", "Control/ClearTyping"):
                 await self._typing(thread_id, resource, started=msgtype == "Control/Typing")
             elif not msgtype.startswith("Control/") and msgtype not in _SILENT_TYPES:
@@ -1212,6 +1215,9 @@ class Board:
             if board_page:
                 await ws.send(self.payload())
             async for raw in ws:
+                if isinstance(raw, bytes):
+                    self.chat.frame(ws, raw)
+                    continue
                 try:
                     verb = json.loads(raw)
                 except json.JSONDecodeError, TypeError:
@@ -1224,6 +1230,7 @@ class Board:
         finally:
             self.clients.discard(ws)
             self._follows.pop(ws, None)
+            self.chat.forget(ws)
 
     async def _dispatch(self, ws: ServerConnection, key: str, verb: dict[str, Any]) -> None:
         try:
@@ -1348,9 +1355,10 @@ def _page_csp(page: str) -> str:
     """
     found = _SCRIPT_RE.search(page)
     digest = hashlib.sha256(found.group(1).encode() if found else b"").digest()
+    # blob: the pasted images' local thumbnails (object URLs), never a remote image.
     return (
         f"default-src 'none'; script-src 'sha256-{base64.b64encode(digest).decode()}'; "
-        "style-src 'unsafe-inline'; img-src 'self'; connect-src 'self'; base-uri 'none'; "
+        "style-src 'unsafe-inline'; img-src 'self' blob:; connect-src 'self'; base-uri 'none'; "
         "form-action 'none'; frame-ancestors 'none'"
     )
 
@@ -1483,6 +1491,7 @@ async def serve_board(board: Board, settings: Settings, bind: str | None) -> Non
                 host,
                 port,
                 origins=[Origin(board.base_url)],
+                max_size=MAX_FRAME,
                 process_request=functools.partial(_process_request, board, bound),
             )
             break

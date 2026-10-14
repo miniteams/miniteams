@@ -351,3 +351,104 @@
     input.addEventListener("blur", close);
     return { mentions, restore, forget, answered, key, close, reset };
   };
+
+  // Pasted images (spec 012 phase 5): queued per chat in paste order, kept in memory only (a reload
+  // loses them, the text draft stays), uploaded by the server only when sent. Limits mirror images.py;
+  // the server checks the bytes again. Hooks: `chat()` the chat shown, `error(id, text)` a refusal,
+  // `busy(id)` its send awaits an answer.
+  const IMG_MAX = 8, IMG_BYTES = 10 << 20, IMG_TOTAL = 40 << 20, IMG_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+  const imageQueue = ({ input, box, chat, error, busy }) => {
+    const queues = new Map(), tries = new Map();  // tries: chat id → its draft's last attempt
+    let chain = Promise.resolve(), adding = 0, last = 0, shown = null;
+    const list = (id = chat()) => queues.get(id) || [];
+    const view = el("dialog", "imgview"), big = el("img"), bar = el("div"), shut = el("button", null, "Close"), del = el("button", null, "Remove");
+    view.setAttribute("aria-label", "image preview");
+    bar.append(del, shut); view.append(big, bar); document.body.append(view);
+    shut.onclick = () => view.close();
+    view.onclick = (e) => { if (e.target === view) view.close(); };  // the backdrop
+    view.onclose = () => { shown = null; big.removeAttribute("src"); if (!input.disabled) input.focus(); };
+    const remove = (id, it) => {
+      if (shown?.[1] === it) view.close();
+      URL.revokeObjectURL(it.url);
+      queues.set(id, list(id).filter((x) => x !== it));
+      tries.delete(id);
+      render();
+    };
+    del.onclick = () => { if (shown) remove(...shown); };
+    const render = () => {
+      const id = chat(), items = list(id), off = busy(id);
+      box.hidden = !items.length && !off;
+      box.classList.toggle("busy", off);
+      box.replaceChildren(...items.map((it, i) => {
+        const t = el("span", "thumb"), open = el("button", "open"), x = el("button", "rm", "×");
+        open.append(Object.assign(el("img"), { src: it.url, alt: `image ${i + 1}` }));
+        open.title = "preview"; open.onclick = () => { shown = [id, it]; big.src = it.url; big.alt = `image ${i + 1}`; del.disabled = off; view.showModal(); };
+        x.title = "remove"; x.setAttribute("aria-label", `remove image ${i + 1}`); x.disabled = off; x.onclick = () => remove(id, it);
+        t.append(open, x);
+        return t;
+      }), el("span", "temp", off ? "sending…" : "images are lost on reload"));
+    };
+    const measure = (url) => new Promise((ok, ko) => {
+      const img = new Image();
+      img.onload = () => ok([img.naturalWidth, img.naturalHeight]);
+      img.onerror = ko;
+      img.src = url;
+    });
+    // One paste after the other: a second Ctrl+V must not overtake the first one's measuring.
+    const add = (id, files) => { adding++; chain = chain.then(async () => {
+      for (const file of files) {
+        const items = list(id), total = items.reduce((n, it) => n + it.file.size, 0);
+        const refusal = !IMG_TYPES.includes(file.type) ? "unsupported image: PNG, JPEG, GIF or WebP only"
+          : items.length >= IMG_MAX ? `at most ${IMG_MAX} images per message`
+          : file.size > IMG_BYTES ? `an image is over ${IMG_BYTES >> 20} MiB`
+          : total + file.size > IMG_TOTAL ? `images are over ${IMG_TOTAL >> 20} MiB in total` : "";
+        if (refusal) { error(id, refusal); continue; }
+        const url = URL.createObjectURL(file);
+        try {
+          const [w, h] = await measure(url);
+          queues.set(id, [...list(id), { file, url, w, h }]);
+          tries.delete(id);
+        } catch (e) { URL.revokeObjectURL(url); error(id, "unsupported image: PNG, JPEG, GIF or WebP only"); }
+        render();
+      }
+    }).catch(() => error(id, "could not read the pasted image")).finally(() => { adding--; }); };
+    // Files without text: a text paste that also carries a picture of itself (office suites) stays text.
+    input.addEventListener("paste", (e) => {
+      const files = [...(e.clipboardData?.files || [])];
+      if (!files.length || e.clipboardData.getData("text/plain")) return;
+      e.preventDefault();
+      add(chat(), files);
+    });
+    // Any edit makes the draft a new message: a later identical text must not be looked up as the old one.
+    input.addEventListener("input", () => tries.delete(chat()));
+    addEventListener("pagehide", (e) => { if (!e.persisted) for (const q of queues.values()) for (const it of q) URL.revokeObjectURL(it.url); });
+    // The send verb for `id` gets its images and a message id, then each image follows as one binary
+    // frame, in order. A retry of the very same draft keeps its id and asks the server to look for it
+    // first (Teams does not dedupe, and any failure may hide a posted message); an edited draft is a
+    // new message, so an edit is never swallowed by the check. Waits for images still being measured;
+    // false when nothing is left to send (every pasted image refused), for the page to settle.
+    const send = async (ws, id, verb) => {
+      await chain;
+      if (ws.readyState !== 1) return true;  // closed meanwhile: the page's onclose already said so
+      const items = list(id);
+      if (!items.length && !verb.text.trim()) return false;
+      const json = JSON.stringify(verb), prev = tries.get(id);
+      const same = !!prev && prev.json === json;  // images added or removed already dropped the attempt
+      const cmid = same ? prev.cmid : String(last = Math.max(Date.now(), last + 1));
+      tries.set(id, { cmid, json });
+      ws.send(JSON.stringify({ ...verb, cmid, ...(same ? { check: true } : {}),
+        ...(items.length ? { images: items.map((it) => ({ w: it.w, h: it.h, size: it.file.size })) } : {}) }));
+      for (const it of items) ws.send(it.file);
+      return true;
+    };
+    // Success drops the chat's images (its composer is locked while it sends, so they are the ones sent).
+    const settled = (id, m) => {
+      if (m.ok) {
+        tries.delete(id);
+        for (const it of list(id)) URL.revokeObjectURL(it.url);
+        queues.delete(id);
+      }
+      render();
+    };
+    return { list, send, settled, render, adding: () => adding > 0 };
+  };

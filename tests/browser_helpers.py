@@ -30,11 +30,13 @@ PNG = bytes.fromhex(
     "1f15c4890000000d49444154789c63000100000500010d0a2db40000000049454e44ae426082"  # pragma: allowlist secret
 )
 # Each socket frame lands in window.__frames once the page's own handler ran (setTimeout: after it);
-# every frame the page sends lands in window.__out; window.__ws is the page's latest socket.
+# every frame the page sends lands in window.__out (a binary one as {binary: <bytes>}); window.__ws is the
+# page's latest socket.
 FRAMES = """(() => { const Real = WebSocket; window.__frames = []; window.__out = [];
   window.WebSocket = class extends Real { constructor(...a) { super(...a); window.__ws = this;
     this.addEventListener("message", (e) => setTimeout(() => window.__frames.push(JSON.parse(e.data)))); }
-    send(d) { window.__out.push(JSON.parse(d)); super.send(d); } };
+    send(d) { window.__out.push(typeof d === "string" ? JSON.parse(d) : { binary: d.size ?? d.byteLength });
+      super.send(d); } };
 })();"""
 # An element's text contrast against what is under it (backgrounds and opacity up its parents).
 CONTRAST = """e => {
@@ -219,13 +221,21 @@ class Fake:
     held: list[dict[str, Any]] = field(default_factory=list)
     hold: bool = False
     ws: Any = None
+    frames: list[bytes] = field(default_factory=list)  # binary messages, in order
+    # `send` message ids, kept out of `verbs` so the composer files compare verbs without them
+    cmids: list[str] = field(default_factory=list)
 
     def attach(self, ws: Any) -> None:
         self.ws = ws
         ws.on_message(self._on_message)
 
     def _on_message(self, raw: str | bytes) -> None:
+        if isinstance(raw, bytes):
+            self.frames.append(raw)
+            return
         msg = json.loads(raw)
+        if "send" in msg and "cmid" in msg:
+            self.cmids.append(msg.pop("cmid"))
         self.verbs.append(msg)
         if msg != BARRIER:
             self.on_verb(msg)

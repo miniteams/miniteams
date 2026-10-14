@@ -203,7 +203,7 @@ async def test_composer_keys_success_and_failure(
     await page.wait_for_function("document.getElementById('reply').value === ''")
     assert sent == [(T, "first line\nsecond")]
 
-    def failing(*args: Any) -> None:
+    def failing(*args: Any, **kw: Any) -> None:
         raise httpx.ConnectError("boom", request=httpx.Request("POST", "https://x"))
 
     monkeypatch.setattr(CV, "send_message", failing)
