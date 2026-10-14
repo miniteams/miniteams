@@ -163,6 +163,10 @@
   .html blockquote.reply { border-left-color: var(--accent); background: var(--panel-2); border-radius: 0 6px 6px 0; }
   .html blockquote.reply strong { display: block; color: var(--text); font-size: 12.5px; }
   .html img { max-width: min(100%, 420px); max-height: 360px; height: auto; border-radius: 6px; display: block; margin: 4px 0; }
+  #msgs .html img:not(.emoji) { cursor: zoom-in; }
+  #zoom { padding: 0; border: 0; background: transparent; max-width: 96vw; max-height: 96vh; cursor: zoom-out; }
+  #zoom::backdrop { background: rgb(0 0 0 / .8); }
+  #zoom img { display: block; max-width: 96vw; max-height: 96vh; object-fit: contain; }
   .html img.emoji { display: inline; height: 1.4em; width: auto; margin: 0; vertical-align: -.3em; border-radius: 0; }
   .html a { color: var(--accent); }
   .html table { border-collapse: collapse; }
@@ -307,6 +311,7 @@
   <button id="latest" class="btn" hidden>↓ latest</button>
   <div id="lag" role="status" hidden>loading latest messages…</div>
 </div>
+<dialog id="zoom" aria-label="image"><img alt=""></dialog>
 <div id="typing" aria-live="polite"></div>
 <footer>
   <div id="view" class="html" hidden aria-label="preview"></div>
@@ -496,6 +501,15 @@
     if (listH && h) $list.scrollTop += listH - h;
     listH = h;
   }).observe($list);
+  // A message image opens full size; Escape (native to <dialog>) or a click closes it.
+  const $zoom = document.getElementById("zoom");
+  $msgs.addEventListener("click", (e) => {
+    const img = e.target.closest(".html img:not(.emoji)");
+    if (!img || img.closest("a")) return;  // a linked image keeps its link
+    Object.assign($zoom.firstElementChild, { src: img.src, alt: img.alt });
+    $zoom.showModal();
+  });
+  $zoom.onclick = () => $zoom.close();
   const toBottom = () => { $list.scrollTop = $list.scrollHeight; hist.stick = !hist.newer; if (hist.stick) hist.unseen = 0; showLatest(); };
   const byId = (id) => $msgs.querySelector(`[data-id="${CSS.escape(id)}"]`);
   // The reader's place as a message and its offset, not pixels: pages above it change the pixels.
