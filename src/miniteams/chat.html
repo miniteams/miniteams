@@ -494,13 +494,17 @@
     hist.filled = side + at;
     requestHistory(side, at);
   };
-  // The composer, quotes or pasted images grow from below: the list keeps its bottom edge, not its top.
+  // Reactions, read receipts, loading images grow the messages; the composer, quotes or pasted images
+  // shrink the list from below. A reader at the bottom stays there, any other keeps the bottom edge.
   let listH = $list.clientHeight;
-  new ResizeObserver(() => {
+  const keepBottom = new ResizeObserver(() => {
     const h = $list.clientHeight;
-    if (listH && h) $list.scrollTop += listH - h;
+    if (hist.stick) toBottom();
+    else if (listH && h) $list.scrollTop += listH - h;
     listH = h;
-  }).observe($list);
+  });
+  keepBottom.observe($list);
+  keepBottom.observe($msgs);
   // A message image opens full size; Escape (native to <dialog>) or a click closes it.
   const $zoom = document.getElementById("zoom");
   $msgs.addEventListener("click", (e) => {
@@ -534,8 +538,6 @@
     n.classList.add("hit");
     n.scrollIntoView({ block: t.id ? "center" : "start" });
   };
-  // Images grow the list after it was laid out: keep the bottom in view when it was.
-  $list.addEventListener("load", () => { if (hist.stick) toBottom(); }, true);
 
   const fmtTime = (iso) => {
     const d = new Date(iso);
@@ -1501,10 +1503,8 @@
       // Relayed frames name their chat: those of a chat left since (split) are dropped.
       if ("thread" in m && m.thread !== thread) return;
       if ("receipts" in m) {
-        const was = hist.stick;  // the avatar row grows the last message: keep the newest reader in view
         receipts = m.receipts && typeof m.receipts === "object" ? m.receipts : {};
         paintReceipts();
-        if (was) toBottom();
       }
       else if ("gap" in m) { if (m.gap === thread) resync(); }  // no `thread` key: a gap of a chat left is ignored here
       else if ("follow" in m) onFollow(m);

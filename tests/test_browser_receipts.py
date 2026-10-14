@@ -197,7 +197,7 @@ async def test_a_live_receipt_at_the_bottom_stays_in_view(
     await until(chat, f"{GAP} < 2 && document.getElementById('list').scrollTop > 0")
     await _live(board, BOB, 60)
     await until(chat, "document.querySelector('[data-id=\"60\"] .reads') !== null")
-    assert await chat.evaluate(GAP) < 2
+    await until(chat, f"{GAP} < 2")  # the list follows in its resize observer, before the next paint
 
 
 async def test_a_live_receipt_does_not_scroll_a_page_read_higher_up(

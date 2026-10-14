@@ -328,6 +328,8 @@ async def test_a_growing_composer_pushes_the_chat_up(board: W.Board, chat: Pages
     height = f"{_LIST}.clientHeight"
     for scroll in ("l.scrollHeight", "l.scrollHeight / 2"):
         await page.locator("#reply").fill("")
+        # The cleared draft regrows the list: let that resize settle before the scroll it would undo.
+        await page.evaluate("new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
         await page.evaluate(
             f"(l => {{ l.scrollTop = {scroll}; l.dispatchEvent(new Event('scroll')); }})({_LIST})"
         )
@@ -335,6 +337,19 @@ async def test_a_growing_composer_pushes_the_chat_up(board: W.Board, chat: Pages
         await page.locator("#reply").fill("1\n2\n3\n4\n5")
         await page.wait_for_function(f"{height} < {tall} - 40")
         await page.wait_for_function(f"Math.abs({gap} - {before}) < 2")
+
+
+async def test_a_reaction_keeps_a_reader_at_the_bottom(board: W.Board, chat: Pages) -> None:
+    """A reaction grows its message, the last one or one above: a reader at the bottom stays there."""
+    page = await chat.open(_chat(L), viewport={"width": 700, "height": 400})
+    await _handled(page, "history")
+    await page.wait_for_function(_AT_BOTTOM.replace("< 40", "< 2"))
+    for msg in ("39", "30"):
+        partial = {k: v for k, v in _m(msg, _at(int(msg))).items() if k != "content"}
+        reactions = {"emotions": [{"key": k, "users": [{"mri": ANN}]} for k in EMOJI]}
+        await board.on_event(_event("MessageUpdate", L, **{**partial, "properties": reactions}))
+        await page.wait_for_selector(f'[data-id="{msg}"] .reacts')
+        await page.wait_for_function(_AT_BOTTOM.replace("< 40", "< 2"))
 
 
 async def test_edit_during_the_history_read_is_applied_after_it(
