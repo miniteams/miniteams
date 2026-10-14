@@ -70,9 +70,14 @@ def roster_label(topic: str | None, members: list[dict[str, Any]], me: str) -> s
     return ", ".join(others or apps or [str(m["name"]) for m in named])
 
 
+def _bare(mri: str) -> str:
+    # A message's `from` is a contact URL whose host varies by region: key the cache on the MRI.
+    return mri.rsplit("/", 1)[-1]
+
+
 def _mri_from_userlink(user_link: str | None) -> str:
     # userLink is a contact URL ending in the MRI, e.g. ".../v1/users/8:orgid:<guid>".
-    return user_link.rsplit("/", 1)[-1] if user_link else ""
+    return _bare(user_link or "")
 
 
 class Directory:
@@ -95,7 +100,8 @@ class Directory:
     def _load_names(self) -> dict[str, str]:
         try:
             loaded = json.loads(self._names_path.read_text())
-            return loaded if isinstance(loaded, dict) else {}
+            # Contact-URL keys are never looked up: lookups key on the bare MRI.
+            return {k: v for k, v in loaded.items() if "/" not in k} if isinstance(loaded, dict) else {}
         except OSError, ValueError:
             return {}
 
@@ -112,6 +118,7 @@ class Directory:
             self.bearer = bearer
 
     def note_name(self, mri: str, name: str | None) -> None:
+        mri = _bare(mri)
         if mri and name:
             self._names[mri] = name
 
@@ -120,12 +127,15 @@ class Directory:
 
     def name_for(self, mri: str) -> str:
         # Strip the "8:orgid:" style prefix for an unresolved MRI.
+        mri = _bare(mri)
         return self._names.get(mri) or mri.split(":")[-1]
 
     async def resolve(self, mris: list[str], *, refresh: bool = False) -> None:
         """Batched MRI → display-name lookup; caches results (incl. negatives, to avoid refetch).
         `refresh` re-asks for negatives too: a user unknown once may resolve now."""
-        todo = sorted({m for m in mris if m and (m not in self._names or (refresh and self._unknown(m)))})
+        todo = sorted(
+            {m for m in map(_bare, mris) if m and (m not in self._names or (refresh and self._unknown(m)))}
+        )
         if not todo or not self.bearer:
             return
         headers = {
@@ -152,6 +162,7 @@ class Directory:
 
     async def display(self, mri: str) -> str:
         """Resolve an MRI to a display name (cached); falls back to the stripped id."""
+        mri = _bare(mri)
         if mri not in self._names and self.bearer and mri.startswith("8:orgid:"):
             await self.resolve([mri])
         return self.name_for(mri)

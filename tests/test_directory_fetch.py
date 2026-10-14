@@ -95,6 +95,27 @@ async def test_display_resolves_via_profile_and_caches(directory: Directory, mon
     assert calls["n"] == 1
 
 
+async def test_display_resolves_a_contact_url(directory: Directory, monkeypatch) -> None:
+    # A typing event's `from` is a contact URL, never seen with a name before.
+    directory.set_token("sk", bearer="id-tok")
+
+    def handler(url: str) -> _Resp:
+        return _Resp({"value": [{"mri": "8:orgid:guid", "displayName": "Alice"}]})
+
+    monkeypatch.setattr(directory_mod.httpx, "AsyncClient", lambda *a, **k: _AsyncClientPost(handler))
+    contact = "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:guid"
+    assert await directory.display(contact) == "Alice"
+
+
+async def test_resolve_keys_a_contact_url_on_its_mri(directory: Directory, monkeypatch) -> None:
+    directory.set_token("sk", bearer="id-tok")
+    monkeypatch.setattr(
+        directory_mod.httpx, "AsyncClient", lambda *a, **k: _AsyncClientPost(lambda url: _Resp({"value": []}))
+    )
+    await directory.resolve(["https://fr.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:zzz"])
+    assert directory._names == {"8:orgid:zzz": "zzz"}
+
+
 async def test_display_negative_caches_unresolved(directory: Directory, monkeypatch) -> None:
     directory.set_token("sk", bearer="id-tok")
     calls = {"n": 0}
