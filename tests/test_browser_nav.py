@@ -10,7 +10,7 @@ import browser_helpers
 import pytest
 import test_browser
 from browser_helpers import Page, Route, wait  # its import skips without playwright
-from test_browser import Widget, _chat, _teams_tab
+from test_browser import _PARTS, Widget, _chat, _teams_tab
 from test_web_chat import T
 
 pytestmark = pytest.mark.browser
@@ -117,15 +117,23 @@ async def test_middle_click_carries_the_split_setting(
         assert await widget.opens_tab(widget.base + _chat(T) + _SUFFIX[chatnav], button="middle") == []
 
 
+@_PARTS
+@pytest.mark.parametrize("key", ["Control", "Meta"])
 @pytest.mark.parametrize("browser", [True, False], ids=["browser", "no-browser"])
-async def test_nav_ctrl_click_is_unchanged(widget: Widget, browser: bool) -> None:
-    """011-AC20: Ctrl click in nav mode still opens Teams."""
-    page = await _load(widget, browser, "/?nav=chat")
+async def test_nav_ctrl_click_is_middle_click(widget: Widget, browser: bool, key: str, part: str) -> None:
+    """011-AC20: in nav mode Ctrl/⌘ click opens the chat page as middle click does, Shift click opens
+    Teams; on the title and on the preview line."""
+    page = await _load(widget, browser, "/?nav=chat", midclick="teams")
+    await widget.ctx.route(re.compile(r"/chat/"), _stub_chat)
+    widget.part = part
     if browser:
-        ctrl = await widget.act(lambda: page.locator("a.name").click(modifiers=["Control"]))
-        assert ctrl == ([(T, True)], [])
+        ctrl = await widget.act(lambda: page.locator(part).click(modifiers=[key]))
+        assert ctrl == ([(T, "chat")], [])
+        shift = await widget.act(lambda: page.locator(part).click(modifiers=["Shift"]))
+        assert shift == ([(T, True)], [])
     else:
-        assert await widget.opens_tab(_teams_tab(widget), modifiers=["Control"]) == []
+        assert await widget.opens_tab(widget.base + _chat(T), modifiers=[key]) == []
+        assert await widget.opens_tab(_teams_tab(widget), modifiers=["Shift"]) == []
     assert page.url == widget.base + "/?nav=chat"
 
 
@@ -136,6 +144,7 @@ async def test_board_without_nav_is_unchanged(widget: Widget, chatnav: str) -> N
     assert await widget.act(lambda: page.locator("a.name").click()) == ([(T, False)], [])
     assert await widget.act(lambda: page.locator("a.name").click(button="middle")) == ([(T, True)], [])
     assert await widget.act(lambda: page.locator("a.name").click(modifiers=["Control"])) == ([(T, True)], [])
+    assert await widget.act(lambda: page.locator("a.name").click(modifiers=["Shift"])) == ([(T, True)], [])
     assert page.url == widget.base + "/"
 
 
