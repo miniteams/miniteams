@@ -414,6 +414,16 @@
     window.open(teamsLink(msgId), "_blank", "noopener");
   };
   const lastId = () => $msgs.lastElementChild?.dataset.id || "";
+  // The authors on screen, newest first: the server follows their presence (spec 015) while the page shows them.
+  let authorsTimer = 0, authorsSent = "";
+  const authorsSoon = () => {
+    clearTimeout(authorsTimer);
+    authorsTimer = setTimeout(() => {
+      const shown = [...new Set([...$msgs.querySelectorAll(".av[data-pmri]")].reverse().map((a) => a.dataset.pmri))].slice(0, 50);
+      const key = shown.join(" ");
+      if (key !== authorsSent && send({ authors: shown })) authorsSent = key;
+    }, 300);
+  };
   // Detached by a jump, the last message shown is not the chat's last: open the chat itself.
   $teams.onclick = () => openTeams(hist.newer ? "" : lastId());
 
@@ -492,6 +502,7 @@
     const name = r.name || (r.me ? "You" : "?");
     const av = el("div", "av", initials(name));
     av.style.background = `linear-gradient(135deg, hsl(${hue(r.from || name)} 62% 58%), hsl(${(hue(r.from || name) + 40) % 360} 62% 48%))`;
+    if (r.from) { av.dataset.pmri = r.from.toLowerCase(); presenceDot(av); authorsSoon(); }
     const head = el("div", "head");
     head.append(Object.assign(el("b", null, name), { dir: "auto" }), Object.assign(el("span", "when", fmtTime(r.at)), { title: r.at }));
     if (r.edited && !r.deleted) head.append(el("span", "edited", "edited"));
@@ -1088,6 +1099,7 @@
     if (pref("avatars") !== "0") {
       const av = el("div", "rav" + (dm ? " round" : ""), initials(rowTitle(r)));
       av.style.background = `linear-gradient(135deg, hsl(${hue(r.id)} 62% 58%), hsl(${(hue(r.id) + 40) % 360} 62% 48%))`;
+      if (r.peer) { av.dataset.pmri = r.peer; presenceDot(av); }
       li.append(av);
     }
     const name = Object.assign(marked(el("a", "name truncate"), rowTitle(r), query), { href: r.link || "#", target: "_blank", rel: "noopener", title: r.label, dir: "auto" });
@@ -1363,11 +1375,13 @@
       $status.title = "live"; $status.classList.remove("off");
       send({ follow: thread });
       if (split) send({ board: true });
+      authorsSent = ""; authorsSoon();  // a new socket starts with no authors on the server
       resync();
     };
     ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
       if (m.rows) { onBoard(m); return; }
+      if (m.presence) { paintPresence(m.presence); return; }
       // Relayed frames name their chat: those of a chat left since (split) are dropped.
       if ("thread" in m && m.thread !== thread) return;
       if ("gap" in m) { if (m.gap === thread) resync(); }  // no `thread` key: a gap of a chat left is ignored here

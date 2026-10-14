@@ -24,6 +24,7 @@ import hashlib
 import hmac
 import html
 import ipaddress
+import itertools
 import json
 import os
 import random
@@ -48,6 +49,7 @@ from websockets.http11 import Request, Response
 from websockets.typing import Origin
 
 from .archive_store import read_chats
+from .auth import token_source
 from .chat_verbs import (
     ANY_VALUE,
     MSG_ID_RE,
@@ -79,6 +81,7 @@ from .messages import (
     snippet,
     thread_of,
 )
+from .presence import Presence, dm_peer, open_cache, person
 from .send import mark_read
 from .stream import run_forever
 
@@ -116,6 +119,9 @@ _SECRET_RE = re.compile(r"[\w-]{32,}", re.ASCII)
 _COOKIE = "mt"
 _COOKIE_AGE = 365 * 24 * 3600
 _TOKEN_HEADER = "X-Miniteams-Token"
+_PRESENCE_PEERS = 50  # 1:1 rows whose peer's presence is followed, newest first (spec 015)
+_PRESENCE_AUTHORS = 50  # authors one chat page may ask presence for
+_PRESENCE_MAX = 100  # people followed in all, in one post: upstream chunks at 100, the spike tested 50
 
 type OpenTarget = Literal["app", "web", "chat", "split"]
 
@@ -625,6 +631,8 @@ class Board:
         self._relay_task: asyncio.Task[None] | None = None  # started by the first relay, ended by close()
         self._dropped: dict[str, int] = {}  # thread → relays dropped since the queue filled (one stall)
         self._media_down_until = 0.0  # monotonic; relayed records skip the media folder until then
+        self.presence: Presence | None = None  # set by run(); None = no dots
+        self._authors: dict[ServerConnection, list[str]] = {}  # chat socket → authors it shows
         self.emojis = EmojiCache(directory)
         self.chat = ChatVerbs(directory, self.emojis, self._scope, me, self.me_name, data_dir)
         board_first: dict[str, Handler] = {
@@ -638,11 +646,15 @@ class Board:
             "board": self._on_board,
             "follow": self._on_follow,
             "open": self._on_open,
+            "authors": self._on_authors,
         }
         # Dispatch order: a verb carrying several keys is handled as the first one listed.
         self._handlers: dict[str, Handler] = {**board_first, **self.chat.handlers(), **board_last}
         # Keys whose value is not a thread id string: how each one is recognised.
-        self._accepts: dict[str, Callable[[Any], bool]] = {"board": lambda value: value is True}
+        self._accepts: dict[str, Callable[[Any], bool]] = {
+            "board": lambda value: value is True,
+            "authors": lambda value: isinstance(value, list),
+        }
         self._accepts |= dict.fromkeys(ANY_VALUE, lambda value: True)
         self._seen: dict[str, str] = _load_seen(seen_path)
         self._muted: dict[str, str] = _load_seen(muted_path)  # thread → when muted (same shape)
@@ -1134,6 +1146,7 @@ class Board:
         # `page` lets an open tab notice a newer widget.html (server restart, edit) and reload.
         for row in ordered:
             row["link"] = deep_link(row["id"], row.get("last_id", ""))
+            row["peer"] = dm_peer(row["id"], self.me)  # whose presence dot the row shows
         return json.dumps(
             {
                 "rows": ordered,
@@ -1203,6 +1216,26 @@ class Board:
         # Library helper: never awaits a slow page; a client with a full buffer just misses one
         # frame (the next push carries the full list anyway).
         broadcast(self.clients, self.payload())
+        self._follow_presence()
+
+    # --- presence (spec 015) ---
+
+    def _follow_presence(self) -> None:
+        """Peers of the newest 1:1 rows, plus the authors every chat page shows."""
+        if self.presence is None:
+            return
+        newest = sorted(self.rows.values(), key=lambda r: str(r.get("last_activity") or ""), reverse=True)
+        peers = (p for r in newest if (p := dm_peer(r["id"], self.me)))
+        authors = (m for shown in self._authors.values() for m in shown)
+        followed = dict.fromkeys([*itertools.islice(peers, _PRESENCE_PEERS), *authors])
+        self.presence.want(itertools.islice(followed, _PRESENCE_MAX))
+
+    def presence_frame(self) -> str:
+        return json.dumps(self.presence.frame() if self.presence else {"presence": {}})
+
+    def broadcast_presence(self) -> None:
+        """Every page, board or chat: the same person's dots change everywhere at once."""
+        broadcast(self.clients | self._authors.keys(), self.presence_frame())
 
     async def handle(self, ws: ServerConnection) -> None:
         # A chat page (`/ws?chat`) only needs its own chat: the board's rows reach it only once it
@@ -1214,6 +1247,8 @@ class Board:
         try:
             if board_page:
                 await ws.send(self.payload())
+                if self.presence is not None:
+                    await ws.send(self.presence_frame())
             async for raw in ws:
                 if isinstance(raw, bytes):
                     self.chat.frame(ws, raw)
@@ -1231,6 +1266,8 @@ class Board:
             self.clients.discard(ws)
             self._follows.pop(ws, None)
             self.chat.forget(ws)
+            if self._authors.pop(ws, None) is not None:
+                self._follow_presence()
 
     async def _dispatch(self, ws: ServerConnection, key: str, verb: dict[str, Any]) -> None:
         try:
@@ -1264,6 +1301,8 @@ class Board:
             self.clients.add(ws)
             with contextlib.suppress(ConnectionClosed):
                 await ws.send(self.payload())
+                if self.presence is not None:
+                    await ws.send(self.presence_frame())
 
     async def _on_follow(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
         await answer(ws, {"follow": verb["follow"]}, self.follow(ws, verb["follow"]))
@@ -1271,6 +1310,16 @@ class Board:
     async def _on_open(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
         target, msg = parse_open(verb)
         await self.open_row(verb["open"], target, ws, msg)
+
+    async def _on_authors(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
+        # A chat page's message authors, newest first: page data, so only org MRIs, and a bounded few.
+        if self.presence is None:
+            return
+        shown = list(dict.fromkeys(p for m in verb["authors"] if (p := person(m))))[:_PRESENCE_AUTHORS]
+        self._authors[ws] = shown
+        self._follow_presence()
+        with contextlib.suppress(ConnectionClosed):
+            await ws.send(self.presence_frame())
 
 
 def parse_open(verb: dict[str, Any]) -> tuple[OpenTarget, str]:
@@ -1609,6 +1658,15 @@ async def run(
             seed_stamp=stamp,
         )
         log.info("web_seeded", rows=len(board.rows), seeded=len(seed), limit=cap, me=bool(me))
+        presence = board.presence = Presence(
+            settings,
+            # Lazy: building the MSAL app discovers its authority online.
+            lambda: token_source(settings).presence_token(),
+            board.broadcast_presence,
+            open_cache(settings),
+        )
+        renewals = asyncio.create_task(presence.run())
+        board._follow_presence()  # the seeded rows' peers, before any event moves a row
         # The stream waits out a dead login (see run_forever) and returns only on failure: a page that
         # silently stops updating is worse than an exit, so the server goes down with it.
         server = asyncio.create_task(serve_board(board, settings, bind))
@@ -1624,6 +1682,8 @@ async def run(
                 directory=directory,
                 epid_name="endpoint_id-web",
                 wait_for_login=True,  # a `miniteams login` elsewhere brings the widget back
+                on_session=presence.on_session,
+                on_presence=presence.on_presence,
             )
         )
         emojis = asyncio.create_task(board.emojis.refresh())
@@ -1637,7 +1697,10 @@ async def run(
         finally:
             fill.cancel()  # the page is going away; a half-finished walk has nobody to tell
             emojis.cancel()
+            renewals.cancel()
             board.close()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(presence.close(), 5)  # unsubscribe; a hung post must not hold the exit
     finally:
         _leave_if_stuck()
 

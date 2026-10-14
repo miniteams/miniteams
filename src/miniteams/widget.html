@@ -191,6 +191,7 @@
         const av = el("div", "av" + (k === "dm" ? " round" : ""), initials(rowTitle(r)));
         av.style.background = `linear-gradient(135deg, hsl(${hue(r.id)} 62% 58%), hsl(${(hue(r.id) + 40) % 360} 62% 48%))`;
         if (glyph[k]) av.append(el("small", null, glyph[k]));
+        if (r.peer) { av.dataset.pmri = r.peer; presenceDot(av); }
         li.append(av);
       }
       const name = Object.assign(marked(el("a", "name truncate"), rowTitle(r), query), { href: r.link || "#", target: "_blank", rel: "noopener", title: r.label, dir: "auto" });
@@ -341,6 +342,7 @@
       if ("me" in msg) meName = msg.me || "";
       if ("busy" in msg) $spin.hidden = !msg.busy;
       if (msg.rows) { rows = msg.rows; render(); }
+      if (msg.presence) paintPresence(msg.presence);
       if (msg.complete) complete.answered(msg);
       if (msg.sent) {
         sending.delete(msg.sent);

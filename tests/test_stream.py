@@ -178,7 +178,7 @@ async def test_run_forever_renews_directory_token_and_stops_the_refresher(
     sessions: list[int] = []
 
     class _Client:
-        def __init__(self, *_a: Any) -> None:
+        def __init__(self, *_a: Any, **_kw: Any) -> None:
             sessions.append(1)
 
         async def run(self) -> None:  # the session stays up until the refresher has renewed the pair

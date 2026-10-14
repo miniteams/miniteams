@@ -137,6 +137,16 @@ terminal and it reconnects within seconds (it watches the token cache file).
 - Known limit: the cookie is host-scoped, not port-scoped, so another HTTP server on the same `127.0.0.X` address receives it. `web` draws a dedicated `127.0.0.X` and keeps it across restarts to make that unlikely.
 - Archive reads have a deadline: a hung mount answers `archive unavailable` (history, search, follow) or HTTP 503 (pages, media) and logs one `archive_unavailable` warning per 30 s. A chat page that missed live frames reloads its latest page. At exit, threads stuck on a dead mount do not hold the process.
 
+**Presence** (spec 015)
+- A dot on the avatar of 1:1 rows (widget and split list) and of message authors: green available, red busy or
+  do-not-disturb, amber away, grey ring offline. Hover: `Availability · Activity` (e.g. `Busy · In a meeting`).
+- Unknown presence (no answer, `PresenceUnknown`, refused subscription) shows no dot, never Offline.
+- Followed: the peers of the 50 newest 1:1 rows plus the authors an open chat page shows (50 per page, 100 people in all).
+- Native presence service + `web`'s own Trouter socket, no Graph; re-subscribed on every reconnect and every 10 min.
+  Two periods (20 min) without a confirmation and the dots go. The collector publishes nothing of your own presence.
+- Latest states are cached in `~/.cache/miniteams/presence.sqlite3` (local disk, `0600`): after a restart they show
+  at once, faded and `(unconfirmed)`, until the service confirms them. Delete the file anytime; it is regenerated.
+
 ### Chat page
 
 A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings are per browser (`localStorage`).

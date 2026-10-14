@@ -74,3 +74,12 @@
   /* min-width: a tiny image previews larger than its thumbnail, scaled up whole. */
   .imgview img { display: block; min-width: min(240px, calc(90vw - 18px)); max-width: calc(90vw - 18px); max-height: calc(90vh - 60px); object-fit: contain; }
   .imgview div { display: flex; justify-content: flex-end; gap: 6px; margin-top: 6px; }
+  /* Presence dot (spec 015) on an avatar carrying data-pmri; unconfirmed (cached) states are faded. */
+  [data-pmri] { position: relative; }
+  .pres { position: absolute; right: -3px; bottom: -3px; width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--bg); box-sizing: border-box; }
+  .pres.ok { background: var(--ok); }
+  .pres.busy { background: var(--hot); }
+  .pres.dnd { background: var(--hot); box-shadow: inset 0 0 0 2px #fff8; }
+  .pres.away { background: #f5a524; }
+  .pres.off { background: var(--panel); box-shadow: inset 0 0 0 2px var(--faint); }
+  .pres.unsure { opacity: .45; }

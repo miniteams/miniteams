@@ -1,6 +1,6 @@
 # 015 — Presence on avatars
 
-**Status**: approved
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-10-13
 
@@ -28,13 +28,14 @@ hover gives the label ("Busy · In a meeting"). Unknown presence shows no dot.
   https://presence.teams.microsoft.com/v1/presence/getpresence/` and subscription `POST
   …/v1/pubsub/subscriptions/<endpoint>` with the presence resource token; deliveries over Trouter.
 - **Freshness.** Re-subscribe on every Trouter reconnect and every renewal period (measured by the
-  spike, 10 min by default). Without a confirmation (callback or successful renewal) for two periods
-  the dot disappears: unknown, never a stale status.
+  spike, 10 min by default). Without a confirmation (a callback or a snapshot; a renewal's `20200`
+  is not one) for two periods the dot disappears: unknown, never a stale status.
 - **Cache.** Latest presence per `(tenant, mri)` in a SQLite file on local disk
   (`~/.cache/miniteams/presence.sqlite3`, not the NAS data dir), shown at start as unconfirmed until
-  the first callback. Single writer, latest state only, no history. Schema from
-  `misc/presence-spike/schema-proposal.sql`, shared later with the read-receipts horizons (spec 011).
-- **Own presence** is never published or forced (no `user.activity`).
+  the first callback. Single writer, latest state only, no history. Schema: a subset of
+  `misc/presence-spike/schema-proposal.sql` (no names stored), shared later with the read-receipts horizons (spec 011).
+- **Own presence** is never published or forced by the collector; the widget's existing
+  `user.activity` signal is unchanged.
 
 ## Out of scope
 
@@ -49,17 +50,18 @@ hover gives the label ("Busy · In a meeting"). Unknown presence shows no dot.
       the renewal period is set from it.
 - [x] **AC2** A subscription on the `web` process's own Trouter socket delivers presence callbacks
       without disturbing chat deliveries (or the dedicated-endpoint fallback is documented).
-- [ ] **AC3** 1:1 rows (widget and chat page list) and message author avatars show a dot coloured
+- [x] **AC3** 1:1 rows (widget and chat page list) and message author avatars show a dot coloured
       by availability, with an "Availability · Activity" hover; unknown or missing presence shows
       no dot and is never shown as Offline.
-- [ ] **AC4** A presence callback updates every visible dot for that person without a page reload.
-- [ ] **AC5** After two renewal periods without confirmation, or while Trouter is disconnected
+- [x] **AC4** A presence callback updates every visible dot for that person without a page reload.
+- [x] **AC5** After two renewal periods without confirmation, or while Trouter is disconnected
       beyond that, the dots disappear; a reconnect re-subscribes and restores them.
-- [ ] **AC6** The followed list stays bounded (≤ ~50 peers + open chat authors) and follows row and
+- [x] **AC6** The followed list stays bounded (≤ ~50 peers + open chat authors) and follows row and
       chat changes (subscriptions added and removed).
-- [ ] **AC7** A `web` restart shows cached presence as unconfirmed at once, confirmed after the first
+- [x] **AC7** A `web` restart shows cached presence as unconfirmed at once, confirmed after the first
       callback; the cache lives on local disk.
-- [ ] **AC8** No request publishes or forces the user's own presence; no Graph call.
+- [x] **AC8** The presence collector publishes nothing (no own-presence call of its own) and never
+      calls Graph; the widget's existing `user.activity` signal is unchanged.
 
 ## Phases
 
@@ -105,3 +107,5 @@ None left from phase 1 (answers in Decisions, evidence in `misc/presence-spike/R
   like `web` carried 96 chat deliveries and 32 presence callbacks over 60 min, no close, no
   message loss after the connect flood, `user.activity` not needed. Verified on a fresh probe
   endpoint with the `web` registration, not inside the running `web` process.
+- **`web` keeps sending `user.activity`** (babs, 2026-10-14): it keeps the user active in Teams;
+  dropping it was a regression. The presence collector itself publishes nothing.
