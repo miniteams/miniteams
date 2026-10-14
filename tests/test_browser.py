@@ -219,6 +219,19 @@ async def test_times_read_24h_whatever_the_locale(board: W.Board, chat: Pages) -
     assert text.endswith("15:04") and "M" not in text.upper().replace("SEP", ""), text
 
 
+async def test_a_message_image_opens_full_size(board: W.Board, chat: Pages) -> None:
+    """A click on a message image opens it in a modal; Escape or a click closes it."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    img, zoom = page.locator('[data-id="2"] .html img'), page.locator("#zoom")
+    for close in ("Escape", "click"):
+        await img.click()
+        await zoom.wait_for()
+        assert await zoom.locator("img").evaluate("i => i.src") == await img.evaluate("i => i.src")
+        await (page.keyboard.press("Escape") if close == "Escape" else zoom.click())
+        await zoom.wait_for(state="hidden")
+
+
 async def test_composer_keys_success_and_failure(
     chat: Pages, sent: list[tuple[str, str]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
