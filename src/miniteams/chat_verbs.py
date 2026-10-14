@@ -63,6 +63,7 @@ log = structlog.get_logger()
 type Side = Literal["before", "after", "around"]  # which side of `at` a history page reads
 type Action = Literal["react", "edit", "delete"]
 type Scope = Callable[[ServerConnection | None, str], bool]  # may this socket (None: any) act on the chat?
+type Latest = Callable[[str], str]  # the chat's newest message id the board saw, "" = none
 type IoKind = Literal["history", "search", "index", "media", "label", "dir", "relay"]
 type Handler = Callable[[ServerConnection, dict[str, Any]], Awaitable[None]]
 
@@ -607,10 +608,12 @@ class ChatVerbs:
         me: str = "",
         me_name: str = "",
         data_dir: Path | None = None,
+        latest: Latest = lambda _: "",
     ) -> None:
         self.directory = directory
         self.emojis = emojis
         self.scope = scope
+        self.latest = latest
         self.me = me
         self.me_name = me_name
         self.data_dir = data_dir
@@ -1039,7 +1042,7 @@ class ChatVerbs:
         chat_dir = await io("dir", archive_dir, self.data_dir, thread_id)
         if chat_dir is None and not self.scope(None, thread_id):
             return {"error": "unknown chat"}
-        resume = ""
+        resume = behind = ""
         try:
             if chat_dir is None:
                 raise FileNotFoundError(thread_id)
@@ -1075,9 +1078,37 @@ class ChatVerbs:
                 return {"error": reason}
             records, older = await io("history", self.records, kept, thread_id, media), bool(kept)
             source, newer = "api", False
+        if chat_dir and source == "archive" and not newer and (side != "before" or not at):
+            # The archive's tail: the archiver may lag the stream the board row follows.
+            after = at if side == "after" else ""
+            records, behind = await self._catch_up(thread_id, records, after, chat_dir / "media")
         page = {"messages": records, "older": older, "newer": newer, "source": source}
         # Unreadable windows read past without a message: the page asks on from there.
-        return page | ({"cursor": resume} if resume else {})
+        return page | ({"cursor": resume} if resume else {}) | ({"behind": behind} if behind else {})
+
+    async def _catch_up(
+        self, thread_id: str, records: list[dict[str, Any]], after: str, media: Path
+    ) -> tuple[list[dict[str, Any]], str]:
+        """The archive's tail plus the API's newer messages when the board saw one the archive lacks;
+        the API unreachable, the tail alone and the id it lags behind (the page asks again)."""
+        last = self.latest(thread_id)
+        newest = max((int(r["id"]) for r in records if r["id"].isdigit()), default=0)
+        if not last.isdigit() or int(last) <= newest or self.directory is None:
+            return records, ""
+        try:
+            # ponytail: one API page; an archive lagging more than that leaves a hole above its tail
+            kept = await asyncio.to_thread(self._api_page, thread_id, "", _CHAT_PAGE)
+        except Exception as exc:  # noqa: BLE001 — offline: the archive's page, flagged
+            log.warning(
+                "history_catch_up_failed", thread=thread_id, error=failure(exc), error_type=type(exc).__name__
+            )
+            return records, last
+        shown = {r["id"] for r in records}
+        floor = max([after, *(r["at"] for r in records)])
+        fresh = [
+            m for m in kept if str(m.get("id") or "") not in shown and str(m.get("composetime") or "") > floor
+        ]
+        return records + await io("history", self.records, fresh, thread_id, media), ""
 
     async def search(self, request: SearchRequest) -> dict[str, Any]:
         """The thread's archived messages matching the query, newest first."""

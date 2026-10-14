@@ -142,7 +142,11 @@ def data_dir(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-async def chat(board: W.Board, settings: Settings, pages: Pages) -> AsyncIterator[Pages]:
+async def chat(
+    board: W.Board, settings: Settings, pages: Pages, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[Pages]:
+    # Live messages the archive lacks make the latest page ask the API (test_browser_lag): it has none.
+    monkeypatch.setattr(CV, "fetch_history", lambda *a: [])
     async with _served(board, settings) as host:
         pages.serve(host, board)
         yield pages

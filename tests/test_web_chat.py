@@ -347,6 +347,72 @@ async def test_history_without_a_connection(tmp_path: Path) -> None:
     assert await _history(board, B) == {"history": B, "before": None, "error": "not connected"}
 
 
+# --- history: an archive behind the board row ---
+
+
+@pytest.fixture
+def ahead(board: W.Board, monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """T on the board with message 7, the archive ending at 5; the API holds 4 to 7. Its calls' sizes."""
+    board.rows[T] = {"id": T, "last_activity": _at(7), "last_id": "7", "typing": []}
+    calls: list[int] = []
+
+    def fake_history(*args: Any) -> list[dict[str, Any]]:
+        calls.append(args[3])
+        return [_m(str(i), _at(i)) for i in (4, 5, 6, 7)]
+
+    monkeypatch.setattr(CV, "fetch_history", fake_history)
+    return calls
+
+
+async def test_history_latest_page_merges_what_the_archive_lacks(board: W.Board, ahead: list[int]) -> None:
+    """The archived tail, then the API's newer messages once each, oldest first, in one API call."""
+    answer = await _history(board, T)
+    assert (_ids(answer), answer["source"], "behind" in answer) == (
+        ["1", "2", "3", "4", "5", "6", "7"],
+        "archive",
+        False,
+    )
+    assert answer["messages"][-1]["html"] == "<p>m7</p>"  # a record, like the archived ones
+    assert ahead == [CV._CHAT_PAGE]
+
+
+async def test_history_after_page_at_the_archive_end_merges_too(board: W.Board, ahead: list[int]) -> None:
+    """A reconnect walks back down with `after`: its last page catches up like the latest one."""
+    answer = await _history(board, T, after=_at(3))
+    assert (_ids(answer), answer["newer"]) == (["4", "5", "6", "7"], False)
+    assert (_ids(await _history(board, T, after=_at(5))), len(ahead)) == (["6", "7"], 2)
+
+
+async def test_history_api_down_answers_the_archive_flagged_behind(
+    board: W.Board, ahead: list[int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Offline: the archive's page and the id it lags, not an error."""
+
+    def failing(*args: Any) -> list[Any]:
+        raise httpx.ConnectError("offline", request=httpx.Request("GET", "https://x"))
+
+    monkeypatch.setattr(CV, "fetch_history", failing)
+    answer = await _history(board, T)
+    assert (_ids(answer), answer["behind"], "error" in answer) == (["1", "2", "3", "4", "5"], "7", False)
+
+
+@pytest.mark.parametrize("last_id", ["5", "3", "", "x"])
+async def test_history_up_to_date_archive_makes_no_api_call(
+    board: W.Board, no_api: None, last_id: str
+) -> None:
+    """The board row no newer than the archive (or unknown): the archive alone, unflagged."""
+    board.rows[T] = {"id": T, "last_activity": _at(5), "last_id": last_id, "typing": []}
+    answer = await _history(board, T)
+    assert (_ids(answer), "behind" in answer) == (["1", "2", "3", "4", "5"], False)
+
+
+async def test_history_older_pages_ignore_the_board_row(board: W.Board, no_api: None) -> None:
+    """Only the archive's tail can lag: a `before` or mid-archive `after` page reads it alone."""
+    board.rows[T] = {"id": T, "last_activity": _at(7), "last_id": "7", "typing": []}
+    assert _ids(await _history(board, T, before=_at(3))) == ["1", "2"]
+    assert _ids(await _history(board, T, after=_at(1), limit=2)) == ["2", "3"]
+
+
 # --- unknown thread (011-AC9) ---
 
 

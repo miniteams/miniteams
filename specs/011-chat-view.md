@@ -45,6 +45,10 @@ click opens Teams web (2026-10-14 decision).
   `invalid before` (not an ISO time), `busy` (one history request in flight per socket), `archive unavailable` (archive read deadline hit). Any verb that raises
   (history and search included) answers a generic `failed`; the exception stays in the log. "history unavailable" /
   "search unavailable" are only the page's own messages after 10 busy retries. A null or empty cursor means the latest page. The API source only serves the latest page and `before` (no `after`/`around`).
+  The archive's tail (`newer` false, not an older `before` page) behind the board row's last message id gets one API page's
+  newer messages appended; the API unreachable, it is answered alone plus `"behind": "<that id>"`, and the page asks the
+  latest page again (backoff 1 s → 30 s), merging what it adds in place, a "loading latest messages…" indicator shown after
+  600 ms and kept at least 400 ms, until an answer has no `behind` or the relay brings that id.
   Message record: `id`, `at` (composetime ISO), `from` (mri), `name`, `me` (bool), `type`
   (`text`, `system`, `call`, `other`), `html` (sanitised body), `edited` (bool), `deleted` (bool),
   `reactions` ([{key, emoji, count, mine}]), `mentions` (spec 003 kind: `me`, `all`, `null`).
