@@ -461,15 +461,19 @@ async def test_custom_set_failure_keeps_the_builtin_set(
 ) -> None:
     """A failed fetch logs a warning and completes from the built-in set; a later fetch fills it."""
     board.emojis.names = {}
-    outcomes: list[Exception | dict[str, str]] = [RuntimeError("no chat-service token"), {"fiesta": OID}]
+    fetched = ({"fiesta": OID}, {"fiesta": "fiesta;0-weu-d1-key"})
+    outcomes: list[Exception | tuple[dict[str, str], dict[str, str]]] = [
+        RuntimeError("no chat-service token"),
+        fetched,
+    ]
 
-    def fake_fetch(settings: Settings, token: str) -> dict[str, str]:
+    def fake_fetch(settings: Settings, token: str) -> tuple[dict[str, str], dict[str, str]]:
         outcome = outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
 
-    monkeypatch.setattr(emojis, "_custom_names", fake_fetch)
+    monkeypatch.setattr(emojis, "_custom_set", fake_fetch)
     with structlog.testing.capture_logs() as logs:
         task = asyncio.create_task(board.emojis.refresh(interval=3600))
         await wait(lambda: bool(logs), "the failure logged")
@@ -505,11 +509,11 @@ def test_custom_emojis_need_the_chat_service_token(
 
     monkeypatch.setattr(emojis, "fetch_metadata", fake_meta)
     monkeypatch.setattr(emojis, "token_source", lambda s: _Source("CSA"))
-    assert emojis._custom_names(settings, "SK") == {"fiesta": OID}
+    assert emojis._custom_set(settings, "SK") == ({"fiesta": OID}, {"fiesta": "fiesta;0-weu-d1-key"})
     assert seen == [("SK", "CSA")]
     monkeypatch.setattr(emojis, "token_source", lambda s: _Source(None))
     with pytest.raises(RuntimeError, match="chat-service token"):
-        emojis._custom_names(settings, "SK")
+        emojis._custom_set(settings, "SK")
 
 
 async def test_run_cancels_the_emoji_refresh_on_shutdown(
@@ -689,15 +693,17 @@ async def test_a_failed_custom_set_is_retried_with_a_capped_backoff(
     board: W.Board, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     board.emojis.names = {}
-    outcomes: list[Exception | dict[str, str]] = [RuntimeError("down")] * 4 + [{"fiesta": OID}]
+    outcomes: list[Exception | tuple[dict[str, str], dict[str, str]]] = [RuntimeError("down")] * 4 + [
+        ({"fiesta": OID}, {})
+    ]
 
-    def fake_fetch(settings: Settings, token: str) -> dict[str, str]:
+    def fake_fetch(settings: Settings, token: str) -> tuple[dict[str, str], dict[str, str]]:
         outcome = outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
 
-    monkeypatch.setattr(emojis, "_custom_names", fake_fetch)
+    monkeypatch.setattr(emojis, "_custom_set", fake_fetch)
     with structlog.testing.capture_logs() as logs:
         task = asyncio.create_task(board.emojis.refresh(interval=3600, retry=0.01, retry_max=0.02))
         await wait(lambda: bool(board.emojis.names), "the names fetched")
@@ -721,7 +727,7 @@ def test_custom_names_compose_cannot_expand_are_left_out(
 
     monkeypatch.setattr(emojis, "token_source", lambda s: _Source())
     monkeypatch.setattr(emojis, "fetch_metadata", lambda *a: {"categories": [{"emoticons": emoticons}]})
-    assert emojis._custom_names(settings, "SK") == {"ok_1+x": "0-weu-d1-0"}
+    assert emojis._custom_set(settings, "SK") == ({"ok_1+x": "0-weu-d1-0"}, {"ok_1+x": "ok_1+x;0-weu-d1-0"})
 
 
 async def test_custom_emojis_use_the_configured_asyncgw_host(board: W.Board, sent: list[Any]) -> None:
@@ -734,3 +740,29 @@ async def test_custom_emojis_use_the_configured_asyncgw_host(board: W.Board, sen
     )
     shown = board.chat.preview_answer({"preview": ":fiesta:"})["preview"]
     assert f'src="/emoji/{OID}"' in shown and "asyncgw" not in shown
+
+
+async def test_a_custom_emoji_item_carries_the_key_the_cli_lists(
+    board: W.Board, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """016-AC2, 016-AC6: a custom item's `key` is Teams' emoticon id, byte-identical to what `emojis`
+    lists (rows()["key"]) and what `react` sends, even when its tail is not the image's documentId."""
+    meta = {
+        "categories": [
+            {"emoticons": [{"id": "fiesta;0-weu-d1-key", "shortcuts": ["fiesta"], "documentId": OID}]}
+        ]
+    }
+
+    class _Source:
+        def csa_token(self) -> str:
+            return "CSA"
+
+    monkeypatch.setattr(emojis, "token_source", lambda s: _Source())
+    monkeypatch.setattr(emojis, "fetch_metadata", lambda *a: meta)
+    board.emojis.names, board.emojis.keys = emojis._custom_set(settings, "SK")
+    listed = emojis.rows(meta)[0]["key"]
+    items = (await _complete(board, "emoji", "fies"))["items"]
+    assert items == [{"name": "fiesta", "custom": OID, "src": f"/emoji/{OID}", "key": listed}]
+    assert listed.partition(";")[2] != OID
+    request = CV.parse_act("react", {"react": T, "msg": "1", "key": items[0]["key"]})
+    assert isinstance(request, CV.ActRequest) and request.key == listed

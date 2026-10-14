@@ -822,7 +822,7 @@ async def test_settings_menu_keyboard_escape_and_outside_click(split: Split) -> 
     assert await _focused(narrow) == "#gear"
     assert await narrow.locator("#side").is_visible()
     await page.keyboard.press("Enter")
-    for _ in range(6):  # Light, Dark, the switch, List, Split, then out
+    for _ in range(15):  # Light, Dark, the switch, List, Split, 8 reaction slots, Reset (no slot chosen), out
         await page.keyboard.press("Tab")
     await until(page, "!document.querySelector('#cog .menu')")
     await _settings(page)

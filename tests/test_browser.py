@@ -423,17 +423,16 @@ async def test_quote_list_stops_at_ten(chat: Pages) -> None:
 
 
 async def test_react_toggles_my_reaction(board: W.Board, chat: Pages, calls: list[tuple[Any, ...]]) -> None:
-    """011-AC12: the picker offers Teams' 6 defaults plus 🙏 and 🙃; one I already gave is sent with
-    `remove: true`."""
+    """011-AC12, 016-AC2: the picker offers Teams' 6 defaults plus 🙏 and 🙃, sent with Teams' names;
+    one I already gave is sent with `remove: true`."""
     page = await chat.open(_chat(T))
     await _handled(page, "history")
     await page.locator('[data-id="1"]').hover()
     await _act(page, "1", "react").click()
     picker = page.locator('[data-id="1"] .picker')
     keys = ["like", "heart", "laugh", "surprised", "sad", "angry", "praying", "upsidedownface"]
-    assert await picker.locator("button").evaluate_all("bs => bs.map(b => b.dataset.key)") == keys
-    assert await picker.locator("button").all_inner_texts() == [EMOJI[k] for k in keys]
-    await picker.locator("[data-key=like]").click()
+    assert await picker.locator("button").all_inner_texts() == [*(EMOJI[k] for k in keys), "…"]
+    await picker.locator('[data-fav="👍"]').click()
     await _until(calls, 1)
     mine = {"emotions": [{"key": "like", "users": [{"mri": ME}]}]}
     partial = {k: v for k, v in _m("1", _at(1)).items() if k != "content"}
@@ -441,15 +440,23 @@ async def test_react_toggles_my_reaction(board: W.Board, chat: Pages, calls: lis
     await page.wait_for_selector('[data-id="1"] .reacts button.mine')
     await page.locator('[data-id="1"]').hover()
     await _act(page, "1", "react").click()
-    await page.locator('[data-id="1"] .picker [data-key=like]').click()
+    await page.locator('[data-id="1"] .picker [data-fav="👍"]').click()
     await _until(calls, 2)
-    assert calls == [("react", T, "1", "like", False), ("react", T, "1", "like", True)]
+    await page.locator('[data-id="1"]').hover()
+    await _act(page, "1", "react").click()
+    await page.locator('[data-id="1"] .picker [data-fav="🙏"]').click()
+    await _until(calls, 3)
+    assert calls == [
+        ("react", T, "1", "like", False),
+        ("react", T, "1", "like", True),
+        ("react", T, "1", "praying", False),
+    ]
 
 
 async def test_the_page_knows_every_accepted_reaction_key(
     board: W.Board, chat: Pages, calls: list[tuple[Any, ...]]
 ) -> None:
-    """011-AC12: the page's reaction keys are messages.EMOJI's: every one is a toggling chip, 🙏 included."""
+    """011-AC12, 016-AC4: every messages.EMOJI key is a toggling chip, 🙏 included."""
     page = await chat.open(_chat(T))
     await _handled(page, "history")
     theirs = {"emotions": [{"key": k, "users": [{"mri": "8:orgid:someone"}]} for k in EMOJI]}
@@ -687,7 +694,7 @@ async def test_actions_reachable_from_the_keyboard_and_picker_closes(chat: Pages
     await page.keyboard.press("Enter")
     picker = page.locator('[data-id="1"] .picker')
     assert await picker.is_visible()
-    assert await picker.locator("[data-key=like]").get_attribute("aria-label") == "like"
+    assert await picker.locator('[data-fav="👍"]').get_attribute("aria-label") == "👍"
     await page.keyboard.press("Escape")
     assert await picker.is_hidden()
     await page.locator("#reply").click()  # keyboard focus left the bar; the mouse path starts clean
@@ -1463,15 +1470,19 @@ async def test_a_live_delete_after_a_run_grows_it(board: W.Board, chat: Pages) -
 
 
 async def test_reaction_chips_add_or_remove_mine(chat: Pages, calls: list[tuple[Any, ...]]) -> None:
-    """011-AC26: a chip I gave removes my reaction, another adds it; chips are labelled, marked when
-    mine, reachable by Tab; a key `react` refuses is not a button."""
+    """011-AC26, 016-AC4: a chip I gave removes my reaction, another adds it; chips are labelled, marked
+    when mine, reachable by Tab; every chip is a button, unknown names too."""
     page = await chat.open(_chat(R))
     await _handled(page, "history")
     chips = page.locator('[data-id="1"] .reacts button')
     labels = await chips.evaluate_all("bs => bs.map(b => [b.ariaLabel, b.classList.contains('mine')])")
-    assert labels == [["👍 1, remove", True], ["❤️ 1, add", False]]
-    spans = page.locator('[data-id="1"] .reacts span')
-    assert await spans.all_inner_texts() == [":party: 1", ":toString: 1"]
+    assert labels == [
+        ["👍 1, remove", True],
+        ["❤️ 1, add", False],
+        [":party: 1, add", False],
+        [":toString: 1, add", False],
+    ]
+    assert await page.locator('[data-id="1"] .reacts span').count() == 0
     await chips.first.click()
     await _until(calls, 1)
     await chips.nth(1).click()
@@ -1885,6 +1896,7 @@ async def test_pages_redial_a_restarted_server_with_their_cookie(
         requests: list[str] = []
         for page in opened:
             await until(page, live)
+            await until(page, "[...document.images].every(i => i.complete)")  # a late image is not a redial
             await page.evaluate("window.__same = 1")
             page.on("request", lambda r: requests.append(r.url))
     for page in opened:
@@ -1948,3 +1960,184 @@ async def test_both_settings_menus_share_one_style(chat: Pages, theme: str) -> N
         assert await page.locator(".menu").evaluate("m => getComputedStyle(m).zIndex") == "6", path
         ratios = await page.locator(".menu h3").evaluate_all(f"hs => hs.map({CONTRAST})")
         assert ratios and min(ratios) >= 4.5, (path, ratios)
+
+
+# --- custom reaction picker (spec 016) ---
+
+_OID = "0-wus-d1-0123456789abcdef"  # the image's documentId
+_PARROT = "parrot;0-wus-d1-fedcba9876543210"  # Teams' emoticon id: its tail is not the documentId
+_FAV = f"{_PARROT} {_OID}"  # a stored custom favorite: key, then image
+_DEFAULT = ["👍", "❤️", "😆", "😮", "😢", "😡", "🙏", "🙃"]
+
+
+@pytest.fixture
+def parrot(board: W.Board, monkeypatch: pytest.MonkeyPatch) -> None:
+    """One org custom emoji the completion offers, its image served without a download."""
+
+    async def image(oid: str) -> tuple[bytes, str] | None:
+        return (PNG, "image/png") if oid == _OID else None
+
+    board.emojis.names, board.emojis.keys = {"parrot": _OID}, {"parrot": _PARROT}
+    monkeypatch.setattr(board.emojis, "image", image)
+
+
+async def _picker(page: Page, msg_id: str = "1") -> list[str]:
+    """The open picker's faces: the emoji, or a custom one's image path."""
+    await page.locator(f'[data-id="{msg_id}"]').hover()
+    await _act(page, msg_id, "react").click()
+    faces = await page.locator(f'[data-id="{msg_id}"] .picker button').evaluate_all(
+        "bs => bs.map(b => b.querySelector('img')?.getAttribute('src') || b.textContent)"
+    )
+    await page.keyboard.press("Escape")
+    return list(faces)
+
+
+async def _slots(page: Page) -> list[str]:
+    return list(
+        await page.locator("#settings .favs button").evaluate_all(
+            "bs => bs.map(b => b.querySelector('img')?.getAttribute('src') || b.textContent)"
+        )
+    )
+
+
+async def _search_pick(page: Page, q: str) -> None:
+    """Type `q` in the open emoji search and take its first item."""
+    search = page.locator(".esearch input")
+    assert await search.input_value() == ":"
+    await search.press_sequentially(q)
+    await page.wait_for_selector("#epop:not([hidden])")
+    await search.press("Enter")
+
+
+async def test_reaction_slots_replace_reorder_reset_and_survive_a_reload(chat: Pages, parrot: None) -> None:
+    """016-AC1: the ⚙ Reactions row shows the 8 slots; a slot replaced through the emoji completion,
+    moved with the arrows, or reset, changes the picker at once and after a reload."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    await page.locator("#gear").click()
+    assert await _slots(page) == _DEFAULT
+    await page.locator("#settings .favs button").nth(0).click()
+    await _search_pick(page, "fox")
+    await page.locator("#settings .favs button").nth(7).click()
+    await _search_pick(page, "parr")
+    assert await _slots(page) == ["🦊", *_DEFAULT[1:7], f"/emoji/{_OID}"]
+    assert await page.locator("#settings .favs button").nth(7).evaluate("b => b === document.activeElement")
+    await page.locator("#settings .favs button").nth(0).click()
+    await page.keyboard.press("Escape")  # closes the search, not the ⚙ menu
+    assert await page.locator(".esearch").count() == 0
+    await page.locator("#settings [aria-label='move the chosen slot right']").click()
+    moved = [_DEFAULT[1], "🦊", *_DEFAULT[2:7], f"/emoji/{_OID}"]
+    assert await _slots(page) == moved
+    await page.keyboard.press("Escape")
+    assert await _picker(page) == [*moved, "…"]
+    await page.wait_for_function("document.querySelector('.picker img')?.naturalWidth > 0")
+    await page.reload()
+    await _handled(page, "history")
+    assert await _picker(page) == [*moved, "…"]
+    await page.locator("#gear").click()
+    assert await _slots(page) == moved
+    await page.locator("#settings [aria-label='back to the default reactions']").click()
+    assert await _slots(page) == _DEFAULT
+    await page.keyboard.press("Escape")
+    assert await _picker(page) == [*_DEFAULT, "…"]
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        "not json",
+        json.dumps(["🦊"] * 7),  # partial
+        json.dumps(["🦊"] * 9),
+        json.dumps([*_DEFAULT[:7], "<img src=x onerror=alert(1)>"]),
+        json.dumps([*_DEFAULT[:7], "abc"]),
+        json.dumps([*_DEFAULT[:7], "x;../../ws"]),
+        json.dumps([*_DEFAULT[:7], f"{_PARROT} ../ws"]),
+        json.dumps([*_DEFAULT[:7], _PARROT]),  # no image id
+        json.dumps([*_DEFAULT[:7], 7]),
+        json.dumps({"0": "🦊"}),
+        "null",
+    ],
+)
+async def test_a_corrupt_stored_list_falls_back_to_the_default(chat: Pages, stored: str) -> None:
+    """016-AC5: an unreadable or partial stored list gives the default picker and slots, no page error."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    await page.evaluate("v => localStorage.setItem('reactions', v)", stored)
+    await page.reload()
+    await _handled(page, "history")
+    assert await _picker(page) == [*_DEFAULT, "…"]
+    await page.locator("#gear").click()
+    assert await _slots(page) == _DEFAULT
+
+
+async def test_any_emoji_reacts_at_once_and_leaves_the_favorites(
+    chat: Pages, parrot: None, calls: list[tuple[Any, ...]]
+) -> None:
+    """016-AC6, 016-AC2: "…" opens the emoji search; a Unicode pick Teams does not name goes as its hex
+    key, a custom one as `<name>;<id>`; the favorites stay; Escape closes the search."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    for q in ("fox", "parr"):
+        await page.locator('[data-id="1"]').hover()
+        await _act(page, "1", "react").click()
+        await page.locator('[data-id="1"] .picker .more').click()
+        assert await page.locator('[data-id="1"] .picker').is_hidden()
+        await _search_pick(page, q)
+        assert await page.locator(".esearch").count() == 0
+        assert await page.evaluate("document.activeElement.dataset.id") == "1"  # not <body>
+    await _until(calls, 2)
+    assert calls == [("react", T, "1", "1f98a_foxface", False), ("react", T, "1", _PARROT, False)]
+    assert await page.evaluate("localStorage.getItem('reactions')") is None
+    await page.locator('[data-id="1"]').hover()
+    await _act(page, "1", "react").click()
+    await page.locator('[data-id="1"] .picker .more').click()
+    await page.locator(".esearch input").press_sequentially("pr")
+    await page.wait_for_selector("#epop:not([hidden])")
+    await page.keyboard.press("Escape")
+    assert await page.locator(".esearch").count() == 0
+    assert await page.evaluate("document.activeElement.dataset.id") == "1"
+    assert len(calls) == 2
+
+
+async def test_a_keyless_custom_emoji_is_refused_with_a_reason(
+    board: W.Board, chat: Pages, parrot: None, calls: list[tuple[Any, ...]]
+) -> None:
+    """016-AC6: a custom emoji Teams gave no reaction key can't be sent: the page says so and the focus
+    goes back to the message instead of falling to <body>."""
+    board.emojis.keys = {}
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    await page.locator('[data-id="1"]').hover()
+    await _act(page, "1", "react").click()
+    await page.locator('[data-id="1"] .picker .more').click()
+    await _search_pick(page, "parr")
+    assert await page.locator("#err").inner_text() == "this emoji can't be used as a reaction"
+    assert await page.evaluate("document.activeElement.dataset.id") == "1"
+    assert calls == []
+
+
+async def test_every_chip_toggles_with_its_own_key(
+    board: W.Board, chat: Pages, parrot: None, calls: list[tuple[Any, ...]]
+) -> None:
+    """016-AC4: custom, toned, Unicode and unknown-name chips each send their own key; mine removes it.
+    A custom favorite joins the chip of the same key, and a Unicode one the chip of the same emoji."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    keys = [_PARROT, "yes-tone1", "1f98a_foxface", "whew", "like"]
+    users = {_PARROT: ME, "like": ME}
+    emotions = [{"key": k, "users": [{"mri": users.get(k, ANN)}]} for k in keys]
+    partial = {k: v for k, v in _m("1", _at(1)).items() if k != "content"}
+    await board.on_event(_event("MessageUpdate", T, **{**partial, "properties": {"emotions": emotions}}))
+    chips = page.locator('[data-id="1"] .reacts button')
+    await page.wait_for_function("document.querySelectorAll('[data-id=\"1\"] .reacts button').length === 5")
+    for i in range(len(keys)):
+        await chips.nth(i).click()
+        await _until(calls, i + 1)
+    assert calls == [("react", T, "1", k, k in users) for k in keys]
+    await page.evaluate("v => localStorage.setItem('reactions', v)", json.dumps([*_DEFAULT[:6], "🦊", _FAV]))
+    for fav in (_FAV, "🦊"):
+        await page.locator('[data-id="1"]').hover()
+        await _act(page, "1", "react").click()
+        await page.locator(f'[data-id="1"] .picker [data-fav="{fav}"]').click()
+    await _until(calls, len(keys) + 2)
+    assert calls[len(keys) :] == [("react", T, "1", _PARROT, True), ("react", T, "1", "1f98a_foxface", False)]

@@ -40,7 +40,6 @@ from .emojis import EmojiCache
 from .http import failure
 from .images import MAX_IMAGE_BYTES, MAX_IMAGES, MAX_TOTAL_BYTES, check_batch, check_dimensions
 from .messages import (
-    EMOJI,
     TEXT_TYPES,
     fold,
     is_activity,
@@ -51,6 +50,7 @@ from .messages import (
     mention_kind,
     message_text,
     reaction_emoji,
+    reaction_key,
     snippet,
 )
 from .render import cards_html, media_url, sanitize
@@ -427,9 +427,9 @@ def parse_act(action: Action, verb: dict[str, Any]) -> ActRequest | str:
         return "invalid message"
     key, remove, text = verb.get("key"), verb.get("remove", False), verb.get("text")
     if action == "react":
-        if not (isinstance(key, str) and key in EMOJI and isinstance(remove, bool)):
+        if not (isinstance(key, str) and (sent := reaction_key(key)) and isinstance(remove, bool)):
             return "invalid reaction"
-        return ActRequest(action, thread, msg, key=key, remove=remove)
+        return ActRequest(action, thread, msg, key=sent, remove=remove)
     if action == "edit":
         if error := _text_error(text):
             return error
@@ -1211,8 +1211,14 @@ class ChatVerbs:
             {"name": name, "char": char} for name, char in SHORTCODES.items() if name.startswith(prefix)
         ]
         # A custom name the built-in table shadows would send the built-in character.
+        keys = self.emojis.keys
         found += [
-            {"name": name, "custom": oid, "src": f"/emoji/{oid}"}
+            {
+                "name": name,
+                "custom": oid,
+                "src": f"/emoji/{oid}",
+                **({"key": keys[name]} if name in keys else {}),
+            }
             for name, oid in self.emojis.names.items()
             if name.casefold().startswith(prefix) and name not in SHORTCODES
         ]

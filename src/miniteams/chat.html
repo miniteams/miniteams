@@ -210,9 +210,19 @@
   .msg:has(.editor) .actions { display: none !important; }  /* outranks the focus-within rule: the editor holds focus */
   .actions button { border: 0; background: transparent; border-radius: 6px; padding: 0 6px; cursor: pointer; color: var(--dim); font-size: 12.5px; }
   .actions button:hover { background: var(--panel-2); color: var(--accent); }
-  .actions .picker { display: grid; grid-template-columns: repeat(4, auto); border-left: 1px solid var(--line); margin-left: 2px; padding-left: 2px; }
+  .actions .picker { display: grid; grid-template-columns: repeat(4, auto) auto; border-left: 1px solid var(--line); margin-left: 2px; padding-left: 2px; }
   .actions .picker[hidden] { display: none; }
   .actions .picker button.mine { background: var(--accent-soft); }
+  .actions .picker .more { grid-column: 5; grid-row: 1 / span 2; }
+  .picker img, .favs img { width: 1.2em; height: 1.2em; vertical-align: middle; }
+  .esearch { position: relative; display: inline-block; }
+  .esearch input { width: 9em; font: inherit; font-size: 12.5px; color: inherit; background: var(--panel); border: 1px solid var(--accent); border-radius: 6px; padding: 1px 6px; }
+  .menu .favs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px; margin-bottom: 4px; }
+  .menu .favs button, .menu .favtools button { border: 1px solid var(--line); background: var(--panel); border-radius: 6px; cursor: pointer; font-size: 15px; }
+  .menu .favs button.on { border-color: var(--accent); background: var(--accent-soft); }
+  .menu .favtools { display: flex; gap: 4px; margin-bottom: 4px; }
+  .menu .favtools button { font-size: 12px; }
+  .menu .favtools button:last-child { margin-left: auto; }
   body.readonly .actions [data-act]:not([data-act="teams"]) { display: none; }
   /* innerText skips what is not displayed: an edit starts from the message without its quotes. */
   .plain blockquote.reply, .plain .card { display: none; }
@@ -359,9 +369,29 @@
   const LIVE_MAX = 600;  // messages kept on screen at the bottom (and buffered while detached)
   const EDGE = 150;  // px from the top or bottom that loads the next page
   const typing = new Set();
-  // The keys `react` accepts (messages.EMOJI); the picker skips `yes`/`no`, which would repeat 👍 and add 👎.
-  const EMOJI = { like: "👍", heart: "❤️", laugh: "😆", surprised: "😮", sad: "😢", angry: "😡", yes: "👍", no: "👎", praying: "🙏", upsidedownface: "🙃" };
-  const PICKER = ["like", "heart", "laugh", "surprised", "sad", "angry", "praying", "upsidedownface"];
+  // The picker's favorites (spec 016): an emoji, or a custom one's `<name>;<id> <image id>`, stored like the ⚙
+  // settings. An emoji is sent as its code points: the server turns them into Teams' key for it.
+  const FAVS = ["👍", "❤️", "😆", "😮", "😢", "😡", "🙏", "🙃"];
+  // Teams' key, then the image: the key's tail need not be the image's id.
+  const CUSTOM = /^([A-Za-z0-9_+-]{1,64};[\w-]{1,128}) ([\w-]{1,128})$/;
+  const favOk = (f) => typeof f === "string" && (CUSTOM.test(f) || f.length <= 32 && /^\p{Emoji}/u.test(f) && /\P{ASCII}/u.test(f));
+  const favs = () => {
+    try { const v = JSON.parse(store("reactions")); if (Array.isArray(v) && v.length === FAVS.length && v.every(favOk)) return v; } catch (e) {}
+    return FAVS;
+  };
+  const keyOf = (f) => CUSTOM.exec(f)?.[1] ?? [...f].map((c) => c.codePointAt(0).toString(16).padStart(4, "0")).join("-");
+  const favName = (f) => CUSTOM.test(f) ? `:${f.split(";")[0]}:` : f;
+  const favFace = (f) => { const m = CUSTOM.exec(f); return m ? Object.assign(el("img"), { src: `/emoji/${m[2]}`, alt: favName(f) }) : document.createTextNode(f); };
+  const bare = (s) => s.replace(/\uFE0F/g, "");
+  // An emoji already under the message reacts with that chip's own key, mine first: Teams keys 👍 `like` or `yes`.
+  const chipOf = (r, f) => {
+    const same = (r.reactions || []).filter((x) => CUSTOM.test(f) ? x.key === keyOf(f) : bare(x.emoji) === bare(f));
+    return same.find((x) => x.mine) || same[0];
+  };
+  const react = (r, f, toggle) => {
+    const x = chipOf(r, f);
+    send({ react: thread, msg: r.id, key: x ? x.key : keyOf(f), remove: !!(toggle && x?.mine) }) || ($err.textContent = "offline, not sent");
+  };
   const QUOTE_MAX = 10;
   let quotes = [];  // [{id, name, line}] quoted by the next send, in the order picked
 
@@ -470,11 +500,9 @@
       const line = el("div", "reacts");
       const people = r.reactions.map((x) => `${x.emoji} — ${(x.people || []).join(", ") || x.count}`).join("\n");
       for (const x of r.reactions) {
-        // `react` refuses keys outside messages.EMOJI: those chips only show the count.
-        const active = !readOnly && Object.hasOwn(EMOJI, x.key);
-        const chip = el(active ? "button" : "span", x.mine ? "mine" : null, `${x.emoji} ${x.count}`);
+        const chip = el(readOnly ? "span" : "button", x.mine ? "mine" : null, `${x.emoji} ${x.count}`);
         chip.title = people;
-        if (active) {
+        if (!readOnly) {
           chip.setAttribute("aria-label", `${x.emoji} ${x.count}, ${x.mine ? "remove" : "add"}`);
           chip.onclick = () => readOnly || send({ react: thread, msg: r.id, key: x.key, remove: x.mine }) || ($err.textContent = "offline, not sent");
         }
@@ -488,16 +516,19 @@
     if (!r.deleted) {
       // Where `send` takes a quote: a text-type message (`editable`, whoever wrote it) with a sender.
       if (r.editable && r.from) button("reply", "↩", "reply with quote", () => addQuote(r, node));
-      const picker = el("span", "picker");
+      const picker = el("span", "picker"), anyEmoji = el("button", "more", "…");
       picker.hidden = true;
-      for (const key of PICKER) {
-        const emoji = EMOJI[key], mine = (r.reactions || []).some((x) => x.key === key && x.mine);
-        const b = el("button", mine ? "mine" : null, emoji);
-        b.dataset.key = key; b.title = mine ? `remove ${key}` : key; b.setAttribute("aria-label", b.title);
-        b.onclick = () => { picker.hidden = true; send({ react: thread, msg: r.id, key, remove: mine }) || ($err.textContent = "offline, not sent"); };
-        picker.append(b);
-      }
-      button("react", "☺", "react", () => { picker.hidden = !picker.hidden; });
+      anyEmoji.title = "react with any emoji"; anyEmoji.setAttribute("aria-label", anyEmoji.title);
+      anyEmoji.onclick = () => { picker.hidden = true; openSearch(actions, (f) => { react(r, f, false); node.focus(); }, () => node.focus()); };
+      // Filled on open: the favorites may have changed since the message was drawn.
+      const fillPicker = () => picker.replaceChildren(...favs().map((f) => {
+        const mine = !!chipOf(r, f)?.mine, b = el("button", mine ? "mine" : null);
+        b.append(favFace(f));
+        b.dataset.fav = f; b.title = mine ? `remove ${favName(f)}` : favName(f); b.setAttribute("aria-label", b.title);
+        b.onclick = () => { picker.hidden = true; react(r, f, true); };
+        return b;
+      }), anyEmoji);
+      button("react", "☺", "react", () => { fillPicker(); picker.hidden = !picker.hidden; });
       actions.append(picker);
       node.addEventListener("mouseleave", () => { picker.hidden = true; });
       node.addEventListener("keydown", (e) => { if (e.key === "Escape") picker.hidden = true; });
@@ -915,6 +946,32 @@
     input: $reply, pop: $pop, send: (o) => send(o), chat: () => thread, edited: () => edited(), above: true,
     put: (text, from, to) => put(text, from, to, from + text.length, from + text.length),
   });
+  // One `:emoji` search (spec 012's completion) for the ⚙ slots and the picker's "…"; `onEmoji` takes the pick.
+  const $esearch = el("span", "esearch"), $eq = el("input"), $epop = el("div");
+  $epop.id = "epop"; $epop.hidden = true;
+  $eq.placeholder = ":emoji"; $eq.setAttribute("aria-label", "search an emoji");
+  $esearch.append($eq, $epop);
+  let onEmoji = null, onEscape = null;
+  const closeSearch = () => { onEmoji = onEscape = null; esearch.close(); $esearch.remove(); };
+  const esearch = completion({
+    input: $eq, pop: $epop, send: (o) => send(o), chat: () => thread, edited: () => {}, above: false,
+    put: (text, from, to, it) => {
+      const f = it.custom ? `${it.key} ${it.custom}` : it.char, done = onEmoji, back = onEscape;
+      closeSearch();
+      if (favOk(f)) done?.(f);
+      else { back?.(); $err.textContent = "this emoji can't be used as a reaction"; }
+    },
+  });
+  const openSearch = (where, pick, escape) => {
+    where.append($esearch);
+    onEmoji = pick; onEscape = escape;
+    $eq.value = ":"; esearch.reset(); $eq.focus();
+  };
+  $eq.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.stopPropagation(); const back = onEscape; closeSearch(); back?.(); }
+    else if (esearch.key(e)) { e.preventDefault(); e.stopPropagation(); }
+  });
+  $eq.addEventListener("blur", () => setTimeout(() => { if (document.activeElement !== $eq) closeSearch(); }));
   const imgs = imageQueue({ input: $reply, box: document.getElementById("imgs"), chat: () => thread, busy: (id) => sending.has(id), error: (id, text) => noteFor(id, text) });
   const UNSURE = "no answer from Teams: it may have gone out · Enter checks the chat before sending again";
 
@@ -1317,7 +1374,7 @@
       else if ("follow" in m) onFollow(m);
       else if ("history" in m) onHistory(m);
       else if ("search" in m) onSearch(m);
-      else if ("complete" in m) complete.answered(m);
+      else if ("complete" in m) { complete.answered(m); esearch.answered(m); }
       else if ("preview" in m) onPreview(m);
       // Acks name the thread; a relayed `edit` frame carries a record.
       else if (typeof m.edit === "string" || "react" in m || "delete" in m) onAction(m);
@@ -1384,7 +1441,36 @@
       saveDraft();
       location.replace(here());
     });
-    menu.append(themes, dbox, nav);
+    // Reactions (spec 016): a slot click replaces it through the emoji search, the arrows move the slot chosen.
+    const rbox = el("div"), slots = el("div", "favs"), tools = el("div", "favtools");
+    const left = el("button", null, "◀"), right = el("button", null, "▶"), reset = el("button", null, "Reset");
+    let chosen = -1;
+    const drawFavs = () => {
+      const list = favs();
+      slots.replaceChildren(...list.map((f, i) => {
+        const b = el("button", i === chosen ? "on" : null);
+        b.append(favFace(f));
+        b.title = `${favName(f)}: replace`; b.setAttribute("aria-label", `slot ${i + 1}, ${b.title}`);
+        b.setAttribute("aria-pressed", String(i === chosen));
+        b.onclick = () => {
+          chosen = i; drawFavs();
+          const back = () => slots.children[i]?.focus();
+          openSearch(rbox, (g) => { const l = [...favs()]; l[i] = g; save(l); back(); }, back);
+        };
+        return b;
+      }));
+      left.disabled = chosen <= 0; right.disabled = chosen < 0 || chosen >= list.length - 1;
+    };
+    const save = (list) => { keep("reactions", JSON.stringify(list)); drawFavs(); };
+    const move = (d) => { const l = [...favs()]; [l[chosen], l[chosen + d]] = [l[chosen + d], l[chosen]]; chosen += d; save(l); };
+    left.title = "move the chosen slot left"; right.title = "move the chosen slot right"; reset.title = "back to the default reactions";
+    for (const b of [left, right, reset]) b.setAttribute("aria-label", b.title);
+    left.onclick = () => move(-1); right.onclick = () => move(1);
+    reset.onclick = () => { keep("reactions", null); chosen = -1; drawFavs(); };
+    tools.append(left, right, reset);
+    rbox.append(el("h3", null, "Reactions"), slots, tools);
+    drawFavs();
+    menu.append(themes, dbox, nav, rbox);
     $cog.append(menu);
   };
   const closeCog = (focus) => { cogOpen = false; renderCog(); if (focus) $gear.focus(); };

@@ -17,4 +17,4 @@
 | [013](013-reaction-tooltips.md) | Reaction tooltips with all emotions and participants | shipped |
 | [014](014-media-types.md) | Choose which media types are downloaded (`--media`) | shipped |
 | [015](015-presence.md) | Presence on avatars | approved |
-| [016](016-custom-reactions.md) | Custom reaction picker (favorites + any emoji) | approved |
+| [016](016-custom-reactions.md) | Custom reaction picker (favorites + any emoji) | shipped |
