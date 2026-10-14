@@ -145,12 +145,14 @@ async def _image(client: httpx.AsyncClient, skype_token: str, document_id: str, 
 
 
 class EmojiCache:
-    """The organisation's custom emojis for the composer: {name: AMS object id}, refreshed in the
-    background, and their images served from the local cache."""
+    """The organisation's custom emojis for the composer: {name: AMS object id} and {name: reaction key},
+    refreshed in the background, and their images served from the local cache."""
 
     def __init__(self, directory: Directory | None) -> None:
         self.directory = directory
         self.names: dict[str, str] = {}  # empty until fetched
+        # Teams' emoticon id: its tail need not be the image's documentId.
+        self.keys: dict[str, str] = {}
         self._failed: dict[str, float] = {}  # image id → when its download failed
         self._downloads: dict[str, asyncio.Task[Path | None]] = {}  # image id → download in flight
 
@@ -169,7 +171,7 @@ class EmojiCache:
             if self.directory is not None:
                 try:
                     settings, token = self.directory.settings, self.directory.skype_token
-                    self.names = await asyncio.to_thread(_custom_names, settings, token)
+                    self.names, self.keys = await asyncio.to_thread(_custom_set, settings, token)
                     log.info("custom_emojis_loaded", count=len(self.names))
                     wait = retry
                 except Exception as exc:  # noqa: BLE001 — the built-in set still completes
@@ -213,13 +215,19 @@ class EmojiCache:
             del self._failed[next(iter(self._failed))]  # oldest first
 
 
-def _custom_names(settings: Settings, skype_token: str) -> dict[str, str]:
-    """{name: AMS object id} of the names the composer expands. Blocking: worker thread."""
+def _custom_set(settings: Settings, skype_token: str) -> tuple[dict[str, str], dict[str, str]]:
+    """({name: AMS object id}, {name: reaction key}) of the names the composer expands. Blocking: worker
+    thread."""
     csa_token = token_source(settings).csa_token()
     if not csa_token:
         raise RuntimeError("no chat-service token (run `miniteams login`)")
-    found = ids_by_name(rows(fetch_metadata(settings, skype_token, csa_token)))
-    return {name: oid for name, oid in found.items() if EMOJI_NAME_RE.fullmatch(name)}
+    found = rows(fetch_metadata(settings, skype_token, csa_token))
+    names = {name: oid for name, oid in ids_by_name(found).items() if EMOJI_NAME_RE.fullmatch(name)}
+    keys: dict[str, str] = {}
+    for r in found:  # the row ids_by_name took: the first with an image id
+        if r["name"] in names and (r["document_id"] or r["key"].partition(";")[2]):
+            keys.setdefault(r["name"], r["key"])
+    return names, keys
 
 
 def _cached_body(cache: Path, path: Path) -> tuple[bytes, str] | None:

@@ -191,7 +191,7 @@
   };
 
   // `:` / `@` completion (spec 012) on `input`, its list in `pop`. The pages differ only in the hooks:
-  // `chat()` the chat the text goes to, `put(text, from, to)` the insertion, `edited()` after it, and
+  // `chat()` the chat the text goes to, `put(text, from, to, item)` the insertion, `edited()` after it, and
   // `above`, the list above the caret line (composer at the window's bottom) rather than under it.
   // The server answers {complete, q, items}; only the answer to the latest question counts, an older
   // one arriving late would list the wrong names.
@@ -230,7 +230,7 @@
       pop.setAttribute("aria-label", comp.kind === "emoji" ? "emoji" : "members");
       pop.replaceChildren(...comp.items.map((it, i) => {
         const o = el("div");
-        o.id = "pop-" + i; o.setAttribute("role", "option"); o.setAttribute("aria-selected", String(i === comp.active));
+        o.id = `${pop.id}-${i}`; o.setAttribute("role", "option"); o.setAttribute("aria-selected", String(i === comp.active));
         if (comp.kind === "emoji") {
           // Images only from our own /emoji/ route: the item comes over the socket, the page trusts no URL.
           const own = it.custom && /^\/emoji\/[\w-]+$/.test(it.src || "");
@@ -240,11 +240,11 @@
         o.onclick = () => { const t = word(); if (t && t.q === comp.q) { comp.active = i; insert(t); } };
         return o;
       }));
-      input.setAttribute("aria-activedescendant", "pop-" + comp.active);
+      input.setAttribute("aria-activedescendant", `${pop.id}-${comp.active}`);
       const [x, y, h] = caret();
       pop.style.top = input.offsetTop - input.scrollTop + (above ? y - pop.offsetHeight : y + h) + "px";
       pop.style.left = input.offsetLeft + Math.max(0, Math.min(x, input.offsetWidth - pop.offsetWidth)) + "px";
-      document.getElementById("pop-" + comp.active).scrollIntoView({ block: "nearest" });
+      document.getElementById(`${pop.id}-${comp.active}`).scrollIntoView({ block: "nearest" });
     };
     const close = () => { clearTimeout(timer); want = null; comp = null; render(); };
     const lookup = () => {
@@ -284,7 +284,7 @@
       }
       close();
       if (member) dismissed = t.start;  // `@everyone ` + the next word must not ask `everyone t`…
-      put(text, t.start, input.selectionStart);
+      put(text, t.start, input.selectionStart, it);
       if (member) picked.set(chat(), mentions(input.value));
       edited();
     };

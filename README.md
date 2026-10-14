@@ -162,7 +162,12 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
     message.
   - Widget: inline formatting.
   - Chat page: bold, italic, strike, code, lists, quotes through a toolbar or Ctrl+B / Ctrl+I, plus a preview of the message as posted.
-- **Messages**: hover for actions: reply with a quote, react (Teams' 6 default reactions plus 🙏 and 🙃), edit and delete your own. Only chips of the 10 keys the page's `react` verb accepts (`messages.EMOJI`, `yes`/`no` included) toggle; others show their count.
+- **Messages**: hover for actions: reply with a quote, react, edit and delete your own. The picker shows 8 favorites
+  (default: Teams' 6 reactions plus 🙏 and 🙃) and `…`, which reacts with any emoji found by `:name`, the org's custom ones
+  included. Set the favorites in ⚙ **Reactions**: click a slot to replace it, ◀ ▶ move the chosen slot, `Reset`; kept
+  in this browser's `localStorage`. An emoji goes as Teams' name for it (`praying`) when it has one, else as its hex key
+  (`1f98a_foxface`); a custom one as its `<name>;<id>` key. An emoji already under the message reacts with that
+  chip's key, mine first. Every reaction chip toggles yours.
   Hover any reaction chip to see all the message's reactions, grouped by emoji with their participants.
   Native skin tones (`yes-tone1` → 👍🏻 through `yes-tone5` → 👍🏿) are preserved on supported emoji.
   Cards from bots and apps are rendered; runs of deleted messages are folded.

@@ -54,7 +54,7 @@ _TYPE_MARKERS = {
 }
 _THREAD_RE = re.compile(r"/conversations/([^/]+)")
 
-# These are also the reaction keys accepted for sending.
+# Teams' names for its default reactions, first name of an emoji first.
 EMOJI = {
     "like": "👍",
     "heart": "❤️",
@@ -137,22 +137,69 @@ def _reaction_base(key: str) -> str:
     if name in SHORTCODES:
         return SHORTCODES[name]
     codes, sep, _ = key.partition("_")
-    if sep and re.fullmatch(r"[0-9a-fA-F]{4,6}(?:-[0-9a-fA-F]{4,6}){0,15}", codes):
-        points = [int(code, 16) for code in codes.split("-")]
-        # Reject controls, surrogates, unassigned, format (bidi) and line/paragraph separators from
-        # remote keys; emoji sequences need the ZWJ and tag format characters.
-        if all(
-            point <= 0x10FFFF
-            and (
-                unicodedata.category(chr(point)) not in ("Cc", "Cs", "Cn", "Cf", "Zl", "Zp")
-                or point == 0x200D
-                or 0xE0020 <= point <= 0xE007F
-            )
-            for point in points
-        ):
-            return "".join(chr(point) for point in points)
+    if sep and (chars := _code_points(codes)):
+        return chars
     # Custom org reactions carry `;<id>` after their name.
     return f":{key.partition(';')[0]}:"
+
+
+def _code_points(codes: str) -> str | None:
+    """`1f9d1-200d-1f4bb` → its characters; None for anything a remote key must not carry."""
+    if not re.fullmatch(r"[0-9a-fA-F]{4,6}(?:-[0-9a-fA-F]{4,6}){0,15}", codes):
+        return None
+    points = [int(code, 16) for code in codes.split("-")]
+    # Reject controls, surrogates, unassigned, format (bidi) and line/paragraph separators from
+    # remote keys; emoji sequences need the ZWJ and tag format characters.
+    if all(
+        point <= 0x10FFFF
+        and (
+            unicodedata.category(chr(point)) not in ("Cc", "Cs", "Cn", "Cf", "Zl", "Zp")
+            or point == 0x200D
+            or 0xE0020 <= point <= 0xE007F
+        )
+        for point in points
+    ):
+        return "".join(chr(point) for point in points)
+    return None
+
+
+# Character (no U+FE0F) → Teams' name for it; EMOJI first, so 👍 is `like`, not `yes`.
+_TEAMS_NAMES = {
+    char.replace("\ufe0f", ""): name
+    for name, char in reversed([*EMOJI.items(), *((a, SHORTCODES[t]) for a, t in _REACTION_ALIASES.items())])
+}
+
+REACTION_KEY_MAX = 200
+# Disjoint by their first character: Teams names start with a letter, Unicode keys with a digit.
+_TEAMS_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9]{0,63}(?:-tone[1-5])?")
+_UNICODE_KEY_RE = re.compile(
+    r"(?P<codes>[0-9][0-9a-fA-F]{3,5}(?:-[0-9a-fA-F]{4,6}){0,15})(?:_\w+)?", re.ASCII
+)
+_CUSTOM_KEY_RE = re.compile(r"[A-Za-z0-9_+-]{1,64};[\w-]{1,128}", re.ASCII)  # compose.EMOJI_NAME_RE;<AMS id>
+
+
+def reaction_key(key: str) -> str | None:
+    """The key to send for `key` (spec 016): a Teams name, a Unicode key or a custom `<name>;<id>` as
+    given; bare code points (`1f64f`) become Teams' name for them (`praying`) or `<hex>_<unicode name>`
+    (`1f98a_foxface`, Teams' own form). None for anything else."""
+    if len(key) > REACTION_KEY_MAX:
+        return None
+    if _TEAMS_NAME_RE.fullmatch(key) or _CUSTOM_KEY_RE.fullmatch(key):
+        return key
+    if not (m := _UNICODE_KEY_RE.fullmatch(key)) or not (chars := _code_points(m["codes"])):
+        return None
+    if m["codes"] != key:
+        return key
+    if name := _TEAMS_NAMES.get(chars.replace("\ufe0f", "")):
+        return name
+    # Teams' keys leave out a final presentation selector (`2665_blackheartsuit` for ♥️).
+    chars = chars.removesuffix("\ufe0f")
+    words = re.sub(
+        r"[^a-z0-9]", "", "".join(unicodedata.name(c, "") for c in chars if c not in "\u200d\ufe0f").lower()
+    )
+    if not words:
+        return None
+    return "-".join(f"{ord(c):04x}" for c in chars) + "_" + words
 
 
 def _gunzip_b64(data: str) -> str:

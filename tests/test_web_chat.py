@@ -28,6 +28,7 @@ from miniteams import web as W
 from miniteams.archive_store import ChatStore, Index, Page, find_chat_dir
 from miniteams.config import Settings
 from miniteams.directory import Directory
+from miniteams.messages import REACTION_KEY_MAX
 
 T = "19:aaaa@thread.v2"  # archived, not on the board
 B = "19:bbbb@thread.v2"  # on the board, not archived
@@ -1617,8 +1618,8 @@ async def test_react_adds_and_removes_one_of_the_accepted_keys(
         request = {"react": T, "msg": "3", "key": key, "remove": False}
         assert (await act_board.chat.act_answer(ws, "react", request))["ok"]
     for request, error in (
-        ({"key": "1f525_fire"}, "invalid reaction"),
-        ({"key": "Like"}, "invalid reaction"),
+        ({"key": "<b>"}, "invalid reaction"),
+        ({"key": "like "}, "invalid reaction"),
         ({"key": ["like"]}, "invalid reaction"),
         ({"key": "like", "remove": "yes"}, "invalid reaction"),
         ({"key": "like", "msg": "../1"}, "invalid message"),
@@ -2188,6 +2189,57 @@ def test_parse_send_types_a_valid_verb_and_names_the_first_refusal() -> None:
         assert CV.parse_send({"send": T, "text": "hi", **extra}) == reason, extra
 
 
+def test_react_accepts_the_three_key_shapes_and_sends_teams_keys() -> None:
+    """016-AC2, 016-AC3, 016-AC4: Teams names (toned too), Unicode keys and custom keys pass as given;
+    bare code points become Teams' name or its `<hex>_<name>` key; anything else is refused."""
+
+    def sent(key: Any) -> str:
+        request = CV.parse_act("react", {"react": T, "msg": "1", "key": key})
+        return request.key if isinstance(request, CV.ActRequest) else request
+
+    custom = "party-parrot;0-wus-d1-0123456789abcdef0123456789abcdef"
+    for key in (
+        "like",
+        "yes-tone1",
+        "whew",
+        "starMSER",
+        "1f525_fire",
+        "1f9d1-200d-1f4bb_technologist",
+        custom,
+    ):
+        assert sent(key) == key
+    for key, teams in (
+        ("1f64f", "praying"),  # 🙏
+        ("2764-fe0f", "heart"),  # ❤️, its presentation selector left out of the lookup
+        ("1f44d", "like"),  # not `yes`
+        ("1f643", "upsidedownface"),
+        ("1f680", "launch"),  # a _REACTION_ALIASES name
+        ("1f98a", "1f98a_foxface"),  # 🦊: no Teams name
+        ("2665-fe0f", "2665_blackheartsuit"),  # a final U+FE0F dropped, as Teams' own keys do
+    ):
+        assert sent(key) == teams, key
+    for key in (
+        "<img src=x>",
+        "like<b>",
+        'like"',
+        "like tone",
+        "a;",
+        ";0-abc",
+        "name;id;more",
+        "1f64f_",
+        "d800-0041",  # starts with a letter: not a Unicode key, and not a name
+        "0000",  # a control
+        "200d",  # a lone joiner: no name to send
+        "1f64f_" + "x" * REACTION_KEY_MAX,
+        "a" * 65,
+        "x;" + "a" * 129,
+        "",
+        None,
+        7,
+    ):
+        assert sent(key) == "invalid reaction", key
+
+
 def test_parse_act_checks_what_each_action_needs() -> None:
     assert CV.parse_act("react", {"react": T, "msg": "1", "key": "like"}) == CV.ActRequest(
         "react", T, "1", "like"
@@ -2199,7 +2251,7 @@ def test_parse_act_checks_what_each_action_needs() -> None:
     for action, extra, reason in (
         ("delete", {"msg": "1a"}, "invalid message"),
         ("delete", {"msg": 1}, "invalid message"),
-        ("react", {"key": "nope"}, "invalid reaction"),
+        ("react", {"key": "no pe"}, "invalid reaction"),
         ("react", {"key": "like", "remove": "yes"}, "invalid reaction"),
         ("edit", {"text": ""}, "empty message"),
     ):
