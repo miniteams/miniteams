@@ -1,11 +1,13 @@
 """Identity + reaction-state caches (pure)."""
 
 import asyncio
+import json
 from typing import Any
 
 import httpx
 
 from miniteams import directory as directory_mod
+from miniteams.config import Settings
 from miniteams.directory import Directory, _mri_from_userlink, is_app
 
 
@@ -22,6 +24,20 @@ def test_name_for_uses_cache_then_strips_prefix(directory: Directory) -> None:
     directory.note_name("8:orgid:guid", "Alice")
     assert directory.name_for("8:orgid:guid") == "Alice"
     assert directory.name_for("8:orgid:unknown") == "unknown"
+
+
+def test_contact_url_shares_the_mri_cache(directory: Directory) -> None:
+    contact = "https://{}.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:guid"
+    directory.note_name(contact.format("fr"), "Alice")
+    assert directory.name_for("8:orgid:guid") == "Alice"
+    assert directory.name_for(contact.format("apac")) == "Alice"  # another region's host
+
+
+def test_load_drops_contact_url_keys(settings: Settings) -> None:
+    contact = "https://fr.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:guid"
+    settings.cache_dir.mkdir(parents=True)
+    (settings.cache_dir / "names.json").write_text(json.dumps({"8:orgid:guid": "Alice", contact: "Alice"}))
+    assert Directory(settings)._names == {"8:orgid:guid": "Alice"}
 
 
 def test_note_name_ignores_empty(directory: Directory) -> None:
