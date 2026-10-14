@@ -155,6 +155,11 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   picked members are notified; a mention needs a non-word character before `@`, and two members with the same name map
   in the order they were picked). Messages are limited to 28 KB.
   - Backspace after a picked full-name mention shortens it to the first name while keeping its recipient.
+  - Paste images (PNG, JPEG, GIF, WebP; up to 8, 10 MiB each, 40 MiB in all): thumbnails per chat, click to preview,
+    × to drop; Enter sends them after the text, or alone. They upload to Teams only on send and live in the page:
+    a reload drops them, the text draft stays. A failed or unanswered send may have gone out: until the page reloads,
+    retrying the unchanged draft looks for it in the chat before posting again; an edited draft goes out as a new
+    message.
   - Widget: inline formatting.
   - Chat page: bold, italic, strike, code, lists, quotes through a toolbar or Ctrl+B / Ctrl+I, plus a preview of the message as posted.
 - **Messages**: hover for actions: reply with a quote, react (Teams' 6 default reactions plus 🙏 and 🙃), edit and delete your own. Only chips of the 10 keys the page's `react` verb accepts (`messages.EMOJI`, `yes`/`no` included) toggle; others show their count.

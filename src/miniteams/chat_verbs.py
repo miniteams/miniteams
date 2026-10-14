@@ -17,6 +17,7 @@ import re
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Coroutine
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import unquote
 
+import httpx
 import structlog
 from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import ConnectionClosed
@@ -36,6 +38,7 @@ from .dump import epoch_seconds, fetch_history
 from .emoji_table import SHORTCODES
 from .emojis import EmojiCache
 from .http import failure
+from .images import MAX_IMAGE_BYTES, MAX_IMAGES, MAX_TOTAL_BYTES, check_batch, check_dimensions
 from .messages import (
     EMOJI,
     TEXT_TYPES,
@@ -51,7 +54,7 @@ from .messages import (
     snippet,
 )
 from .render import cards_html, media_url, sanitize
-from .send import delete_message, edit_message, message_html, react, send_message, too_long
+from .send import attach_images, delete_message, edit_message, message_html, react, send_message, too_long
 
 log = structlog.get_logger()
 
@@ -92,10 +95,26 @@ _DEADLINES: dict[IoKind, float] = {
 }
 _LOOKUP_PAGE = 20  # API messages read ending at an older message the latest page lacks
 _FORMATS = ("inline", "full")
+_FRAMES_WAIT = 30.0  # seconds a send's image frames may take to follow it
+_ECHO_WAIT = 15.0  # seconds an unanswered send waits for its own echo before saying it may have gone out
+_UPLOAD_DRAFTS = 16  # drafts whose uploaded objects are kept for a retry (each a few ids)
+# Raised once the request may have reached Teams: a blind resend could post it twice (no dedup, spec 012 5a).
+_UNSURE_ERRORS = (
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+)
+UNSURE = "no answer from Teams: the message may have gone out"
+_BLOCK_RE = re.compile(r"<(?:p|div|ul|ol|pre|blockquote|h\d)\b")
 # The page may not load the asyncgw URL (it needs the skype token): previews point at /emoji/<id>.
 _ASYNCGW_SRC_RE = re.compile(
     r'src="https://[^./"]+\.asyncgw\.teams\.microsoft\.com/v1/objects/([\w-]+)/views/imgt2_anim"', re.ASCII
 )
+
+
+type _Incoming = tuple[tuple[int, ...], list[bytes], asyncio.Future[list[bytes]]]
 
 
 class ArchiveUnavailable(Exception):
@@ -283,6 +302,9 @@ class SendRequest:
     quote: tuple[str, ...] = ()
     mentions: tuple[dict[str, Any], ...] = ()  # {name, mri, everyone?}, shapes checked
     full: bool = False
+    images: tuple[int, ...] = ()  # byte sizes of the binary frames that follow, in order
+    cmid: str = ""  # the page's clientmessageid, kept across the retries of one draft
+    check: bool = False  # a retry after an unsure send: post only if the chat lacks `cmid`
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,12 +368,42 @@ def _format(value: Any) -> bool | None:
     return value == "full" if value in _FORMATS else None
 
 
+def _image_sizes(images: Any) -> tuple[int, ...] | str:
+    """`images` ([{w, h, size}], browser-measured) → the frame sizes; the bytes are checked again."""
+    if not isinstance(images, list) or not all(isinstance(i, dict) for i in images):
+        return "invalid images"
+    if len(images) > MAX_IMAGES:
+        return f"at most {MAX_IMAGES} images per message"
+    try:
+        for image in images:
+            check_dimensions(image.get("w"), image.get("h"))
+    except ValueError as exc:
+        return str(exc)
+    sizes = [image.get("size") for image in images]
+    if not all(type(size) is int and 0 < size for size in sizes):
+        return "invalid images"
+    if any(size > MAX_IMAGE_BYTES for size in sizes):
+        return f"an image is over {MAX_IMAGE_BYTES >> 20} MiB"
+    if sum(sizes) > MAX_TOTAL_BYTES:
+        return f"images are over {MAX_TOTAL_BYTES >> 20} MiB in total"
+    return tuple(sizes)
+
+
 def parse_send(verb: dict[str, Any]) -> SendRequest | str:
     thread, text = verb.get("send"), verb.get("text")
     if not isinstance(thread, str):
         return "unknown chat"
-    if error := _text_error(text):
+    images = _image_sizes([] if verb.get("images") is None else verb["images"])
+    if isinstance(images, str):
+        return images
+    # Images alone are a message: the text may then be empty.
+    if not (images and isinstance(text, str) and not text.strip()) and (error := _text_error(text)):
         return error
+    cmid, check = verb.get("cmid", ""), verb.get("check", False)
+    if not (cmid == "" or isinstance(cmid, str) and MSG_ID_RE.fullmatch(cmid)) or not isinstance(check, bool):
+        return "invalid message id"
+    if check and not cmid:
+        return "invalid message id"
     quote = [] if verb.get("quote") is None else verb["quote"]
     if not isinstance(quote, list):
         return "invalid quote"
@@ -364,7 +416,7 @@ def parse_send(verb: dict[str, Any]) -> SendRequest | str:
         return "invalid mention"
     if (full := _format(verb.get("format"))) is None:
         return "invalid format"
-    return SendRequest(thread, str(text), tuple(quote), tuple(mentions), full)
+    return SendRequest(thread, str(text), tuple(quote), tuple(mentions), full, images, cmid, check)
 
 
 def parse_act(action: Action, verb: dict[str, Any]) -> ActRequest | str:
@@ -547,6 +599,14 @@ class ChatVerbs:
         self._history_busy: set[ServerConnection] = set()  # sockets with a history answer pending
         self._action_busy: set[ServerConnection] = set()  # sockets with a message action pending
         self._search_busy: set[ServerConnection] = set()  # sockets with a search pending
+        # socket → (frame sizes, frames so far, their future): the image send waiting for its frames
+        self._incoming: dict[ServerConnection, _Incoming] = {}
+        # (thread, cmid) → digest → object ids: a retry of the draft reuses what it already uploaded
+        self._uploads: OrderedDict[tuple[str, str], dict[str, list[str]]] = OrderedDict()
+        # (thread, cmid) being sent: a retry must not race its own first try
+        self._inflight: set[tuple[str, str]] = set()
+        # (thread, cmid) → set once its message comes back on the stream
+        self._echoes: dict[tuple[str, str], asyncio.Event] = {}
 
     # --- socket wiring ---
 
@@ -587,7 +647,11 @@ class ChatVerbs:
 
     async def _on_send(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
         # A send can take the whole HTTP timeout: the page's other verbs must not queue behind it.
-        sent = functools.partial(self.send_answer, ws, verb)
+        request = parse_send(verb)
+        frames = (
+            self._expect(ws, request.images) if isinstance(request, SendRequest) and request.images else None
+        )
+        sent = functools.partial(self.send_answer, ws, verb, frames)
         # Quotes cost a lookup: they count as a message action.
         head = _head_send(verb)
         if verb.get("quote"):
@@ -622,11 +686,80 @@ class ChatVerbs:
 
     # --- answers: parse, run, head ---
 
-    async def send_answer(self, ws: ServerConnection | None, verb: dict[str, Any]) -> dict[str, Any]:
+    async def send_answer(
+        self,
+        ws: ServerConnection | None,
+        verb: dict[str, Any],
+        frames: Awaitable[list[bytes]] | None = None,
+    ) -> dict[str, Any]:
         # Only the sending page learns the outcome; every page sees the echoed message.
         request = parse_send(verb)
-        error = request if isinstance(request, str) else await self.send(request, ws)
-        return {**_head_send(verb), **({"error": error} if error else {"ok": True})}
+        error = request if isinstance(request, str) else None
+        blobs: list[bytes] = []
+        if isinstance(request, SendRequest) and request.images:
+            try:
+                assert frames is not None  # _on_send pairs every image send with its frames
+                blobs = await asyncio.wait_for(frames, _FRAMES_WAIT)
+            except TimeoutError:
+                if ws is not None:
+                    self._drop_frames(ws, frames)  # partial blobs freed; a late frame finds nothing
+                error = "images did not arrive"
+            except ValueError as exc:
+                error = str(exc)
+        if isinstance(request, SendRequest) and error is None:
+            error = await self.send(request, ws, blobs)
+        if not error:
+            return {**_head_send(verb), "ok": True}
+        return {**_head_send(verb), "error": error, **({"unsure": True} if error == UNSURE else {})}
+
+    # --- image frames: binary socket messages following their `send`, in order ---
+
+    def _expect(self, ws: ServerConnection, sizes: tuple[int, ...]) -> asyncio.Future[list[bytes]]:
+        """The frames `sizes` announces, as they arrive on `ws`; an earlier send still short of its own
+        fails, so a frame never lands in the wrong message."""
+        self._fail_frames(ws, "images missing")
+        future: asyncio.Future[list[bytes]] = asyncio.get_running_loop().create_future()
+        self._incoming[ws] = (sizes, [], future)
+        return future
+
+    def frame(self, ws: ServerConnection, data: bytes) -> None:
+        """One binary message of `ws`: the next image of its pending send."""
+        pending = self._incoming.get(ws)
+        if pending is None:
+            log.debug("ws_frame_ignored", size=len(data))
+            return
+        sizes, blobs, future = pending
+        if future.done():  # its send gave up waiting (cancelled): the frame is late, not the next one
+            del self._incoming[ws]
+            log.debug("ws_frame_ignored", size=len(data))
+            return
+        if len(data) != sizes[len(blobs)]:
+            self._fail_frames(ws, "image size mismatch")
+            return
+        blobs.append(data)
+        if len(blobs) == len(sizes):
+            del self._incoming[ws]
+            future.set_result(blobs)
+
+    def _fail_frames(self, ws: ServerConnection, reason: str) -> None:
+        pending = self._incoming.pop(ws, None)
+        if pending is not None and not pending[2].done():
+            pending[2].set_exception(ValueError(reason))
+
+    def _drop_frames(self, ws: ServerConnection, future: object) -> None:
+        if (pending := self._incoming.get(ws)) is not None and pending[2] is future:
+            del self._incoming[ws]
+
+    def forget(self, ws: ServerConnection) -> None:
+        """A closed socket: its send waiting for frames is dropped, nothing uploaded."""
+        pending = self._incoming.pop(ws, None)
+        if pending is not None:
+            pending[2].cancel()
+
+    def echoed(self, thread_id: str, cmid: str) -> None:
+        """A message came back on the live stream: a send unsure of its outcome learns it went out."""
+        if event := self._echoes.get((thread_id, cmid)):
+            event.set()
 
     async def act_answer(
         self, ws: ServerConnection | None, action: Action, verb: dict[str, Any]
@@ -667,16 +800,35 @@ class ChatVerbs:
 
     # --- verbs ---
 
-    async def send(self, request: SendRequest, ws: ServerConnection | None = None) -> str | None:
+    async def send(
+        self, request: SendRequest, ws: ServerConnection | None = None, blobs: list[bytes] | None = None
+    ) -> str | None:
         """Post the text to the chat as me, after one Reply block per quoted id, with the mentions and
-        markdown (spec 012). Returns the refusal/failure reason, None once Teams accepted it.
+        markdown (spec 012), then `blobs` (the images, in order). Returns the refusal/failure reason
+        (UNSURE when Teams may have it anyway), None once Teams accepted it.
 
         The row is left alone: the Trouter echo of the sent message updates it like any other."""
-        thread_id = request.thread
+        thread_id, cmid = request.thread, request.cmid
         if not self.scope(ws, thread_id):
             return "unknown chat"
         if self.directory is None:
             return "not connected"
+        key = (thread_id, cmid)
+        if cmid:
+            if key in self._inflight:
+                return "still sending: try again in a moment"
+            self._inflight.add(key)  # before any await: a retry must not slip in during the roster fetch
+        try:
+            error = await self._send(request, blobs or [])
+        finally:
+            self._inflight.discard(key)
+        if error is None:
+            self._uploads.pop(key, None)
+        return error
+
+    async def _send(self, request: SendRequest, blobs: list[bytes]) -> str | None:
+        assert self.directory is not None
+        thread_id, cmid = request.thread, request.cmid
         mentions = list(request.mentions)
         if mentions:
             members = await self._members(thread_id)
@@ -696,7 +848,10 @@ class ChatVerbs:
             return str(exc)
         text = request.text
         try:
+            if request.check and await self._already_sent(thread_id, cmid):
+                return None
             extra: dict[str, Any] = {}
+            quoted = ""
             if request.quote:
                 quote = list(request.quote)
                 copies = await self._server_copies(thread_id, quote)
@@ -706,22 +861,93 @@ class ChatVerbs:
                     not copies[q].get("from") or copies[q].get("messagetype") not in TEXT_TYPES for q in quote
                 ):
                     return "cannot quote this message"
-                content = "".join(self._reply_quote(copies[q]) for q in quote) + content
-            if too_long(content, is_html=True):
-                return "message too long"
+                quoted = "".join(self._reply_quote(copies[q]) for q in quote)
+            if blobs:
+                # Text first, then the images; inline text gets its own paragraph, as the CLI sends it.
+                body = content if not content.strip() or _BLOCK_RE.search(content) else f"<p>{content}</p>"
+                body = body if body.strip() else ""
+                files = [
+                    (f"image.{image.kind}", blob)
+                    for image, blob in zip(check_batch(blobs), blobs, strict=True)
+                ]
+                content = await asyncio.to_thread(
+                    attach_images,
+                    settings,
+                    self.directory.skype_token,
+                    thread_id,
+                    quoted + body,
+                    files,
+                    self._draft_uploads(thread_id, cmid),
+                )
+            else:
+                content = quoted + content
+                if too_long(content, is_html=True):
+                    return "message too long"
             # Plain text keeps today's call: send_message escapes it itself, to the same bytes.
-            if request.quote or props or content != message_html(text, False):
+            if quoted or blobs or props or content != message_html(text, False):
                 text, extra["is_html"] = content, True
             if props:
                 extra["properties"] = props
-            await asyncio.to_thread(
-                send_message, settings, self.directory.skype_token, thread_id, text, self.me_name, **extra
-            )
+            if cmid:
+                extra["client_message_id"] = cmid
+            return await self._post(thread_id, cmid, text, extra)
         except Exception as exc:  # noqa: BLE001 — a failed send must not drop the socket
-            reason = failure(exc)
-            log.warning("send_failed", thread=thread_id, error=reason, error_type=type(exc).__name__)
-            return reason
+            error = failure(exc)
+            log.warning("send_failed", thread=thread_id, error=error, error_type=type(exc).__name__)
+            return error
+
+    async def _post(self, thread_id: str, cmid: str, text: str, extra: dict[str, Any]) -> str | None:
+        """send_message; a request lost after it may have reached Teams waits for the message's own
+        echo, and is never sent again from here."""
+        assert self.directory is not None
+        key = (thread_id, cmid)
+        echo = self._echoes[key] = asyncio.Event()
+        try:
+            await asyncio.to_thread(
+                send_message,
+                self.directory.settings,
+                self.directory.skype_token,
+                thread_id,
+                text,
+                self.me_name,
+                **extra,
+            )
+        except _UNSURE_ERRORS as exc:
+            if cmid:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(echo.wait(), _ECHO_WAIT)
+            log.warning("send_unsure", thread=thread_id, echoed=echo.is_set(), error_type=type(exc).__name__)
+            return None if echo.is_set() else UNSURE
+        finally:
+            if self._echoes.get(key) is echo:
+                del self._echoes[key]
         return None
+
+    async def _already_sent(self, thread_id: str, cmid: str) -> bool:
+        """Whether the chat's latest messages hold my `cmid` (the API, read-only: the archive may lag)."""
+        assert self.directory is not None
+        settings, token = self.directory.settings, self.directory.skype_token
+        try:
+            page = await asyncio.to_thread(fetch_history, settings, token, thread_id, _CHAT_PAGE, 1)
+        except Exception as exc:
+            raise RuntimeError(f"could not check whether it went out: {failure(exc)}") from exc
+        found = any(
+            str(m.get("clientmessageid") or "") == cmid and is_me(str(m.get("from") or ""), self.me)
+            for m in page
+        )
+        log.info("send_checked", thread=thread_id, clientmessageid=cmid, found=found)
+        return found
+
+    def _draft_uploads(self, thread_id: str, cmid: str) -> dict[str, list[str]]:
+        """The objects a previous try of this draft uploaded (digest → ids); none without a cmid."""
+        if not cmid:
+            return {}
+        key = (thread_id, cmid)
+        uploads = self._uploads.setdefault(key, {})
+        self._uploads.move_to_end(key)
+        while len(self._uploads) > _UPLOAD_DRAFTS:
+            self._uploads.popitem(last=False)
+        return uploads
 
     async def act(self, request: ActRequest, ws: ServerConnection | None = None) -> str | None:
         """`react`, `edit`, `delete` on one message of a chat `send` may post to."""

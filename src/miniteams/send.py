@@ -11,9 +11,11 @@ the SkPy client: PUT the message id with `skypeeditedid` set to it — confirmed
 `delete_message` was captured from the Teams web client.
 """
 
+import hashlib
 import html
 import re
 import time
+from collections import Counter
 from typing import Any, NoReturn
 from urllib.parse import quote, unquote
 
@@ -158,6 +160,36 @@ def upload_image(settings: Settings, skype_token: str, thread_id: str, data: byt
     return object_id
 
 
+def attach_images(
+    settings: Settings,
+    skype_token: str,
+    thread_id: str,
+    body: str,
+    images: list[tuple[str, bytes]],
+    cache: dict[str, list[str]] | None = None,
+) -> str:
+    """`body` (HTML) followed by `images` ((filename, bytes), in order) in one paragraph, uploaded.
+
+    Every image is validated before the first upload, so a bad one uploads nothing. `cache` (sha256 →
+    AMS object ids, one per occurrence) is read and filled: a retry reuses the objects a failed
+    attempt already made, and the same picture twice in one message still gets two objects."""
+    sniffed = check_batch([data for _, data in images])
+    # Longest possible id as a stand-in: the real block can only be shorter, so nothing uploads in vain.
+    widest = images_html(settings.asyncgw_host, [("0" * MAX_OBJECT_ID, image) for image in sniffed])
+    if too_long(body + widest, is_html=True):
+        raise ValueError("message too long for Teams once the images are added")
+    cache = {} if cache is None else cache
+    uploaded, seen = [], Counter[str]()
+    for (filename, data), image in zip(images, sniffed, strict=True):
+        digest = hashlib.sha256(data).hexdigest()
+        objects, nth = cache.setdefault(digest, []), seen[digest]
+        seen[digest] += 1
+        if len(objects) == nth:
+            objects.append(upload_image(settings, skype_token, thread_id, data, filename))
+        uploaded.append((objects[nth], image))
+    return body + images_html(settings.asyncgw_host, uploaded)
+
+
 def send_images(
     settings: Settings,
     skype_token: str,
@@ -169,22 +201,11 @@ def send_images(
     is_html: bool = False,
     client_message_id: str | None = None,
 ) -> dict[str, Any]:
-    """One message: `text` first, then `images` ((filename, bytes), in order) in one paragraph.
-
-    Every image is validated before the first upload, so a bad one sends nothing."""
-    sniffed = check_batch([data for _, data in images])
+    """One message: `text` first, then `images` ((filename, bytes), in order) in one paragraph."""
     body = message_html(text, is_html)
     if body and not is_html:
         body = f"<p>{body}</p>"
-    # Longest possible id as a stand-in: the real block can only be shorter, so nothing uploads in vain.
-    widest = images_html(settings.asyncgw_host, [("0" * MAX_OBJECT_ID, image) for image in sniffed])
-    if too_long(body + widest, is_html=True):
-        raise ValueError("message too long for Teams once the images are added")
-    uploaded = [
-        (upload_image(settings, skype_token, thread_id, data, filename), image)
-        for (filename, data), image in zip(images, sniffed, strict=True)
-    ]
-    content = body + images_html(settings.asyncgw_host, uploaded)
+    content = attach_images(settings, skype_token, thread_id, body, images)
     return send_message(
         settings,
         skype_token,

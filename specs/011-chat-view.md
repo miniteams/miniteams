@@ -459,6 +459,25 @@ receipts prove nothing.
    the verified snapshot/reconnect behaviour. **DoD**: acceptance tests and pre-commit pass,
    and the indicator agrees with native Teams on a controlled conversation.
 
+### Spike findings (2026-10-13)
+
+Evidence: `misc/presence-spike/README.md`, fixture `receipts-result.json`.
+
+- **Live event** on the shared Trouter socket (`/messaging`): `NewMessage` with messagetype
+  `ThreadActivity/MemberConsumptionHorizonUpdate`; `content` is a JSON string
+  `{"user": <mri>, "consumptionhorizon": "<msgId>;<readAtMs>;<clientMsgId>", "messageVisibilityTime", "version"}`;
+  chat = `conversationLink` tail; no resource id. Boundary = `msgId` (compare numerically); our own
+  reads never come this way. 60 min: 4 events, 2 chats, monotonic.
+- **Snapshot found**: `GET https://<chat host>/v1/threads/<id>/consumptionhorizons` → 200,
+  `consumptionhorizons: [{id: <mri>, consumptionhorizon, messageVisibilityTime}]` for every member
+  with a receipt (peer + me in a real 1:1; both members in the group test chat). Absent member =
+  unknown. `/v1/users/ME/conversations/<id>/consumptionhorizons` 404; `…/properties` 405; thread and
+  conversation views carry only our own horizon.
+- **Design consequences**: on chat open and on every reconnect/gap, one GET reconciles the open
+  chat; live events update it after. Persistence is not needed for correctness (the snapshot
+  rebuilds it); the SQLite cache only saves the first paint and must merge with max(msgId). No
+  Graph, no write call. Self-chat (test "1:1") has no peer: use a real 1:1 for the controlled check.
+
 ### Decisions (grill, babs, 2026-10-13)
 
 - The spike reuses the presence harness (`misc/presence-spike/probe.py`, a receipts mode): a
