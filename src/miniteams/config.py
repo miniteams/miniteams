@@ -10,6 +10,7 @@ import contextlib
 import os
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -18,6 +19,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 def _default_config_dir() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME")
     return (Path(base) if base else Path.home() / ".config") / "miniteams"
+
+
+def _default_launch_file(data: dict[str, Any]) -> Path:
+    # Snap Chromium cannot read hidden paths under ~: its own data dir is the one it can open.
+    config_dir: Path = data["config_dir"]
+    snap = Path.home() / "snap" / "chromium"
+    if config_dir == _default_config_dir() and snap.is_dir():
+        return snap / "common" / "miniteams" / "open.html"
+    return config_dir / "open.html"
 
 
 def _default_cache_dir() -> Path:
@@ -109,9 +119,7 @@ class Settings(BaseSettings):
     endpoint_suffix: str = ""
     cache_dir: Path = Field(default_factory=_default_cache_dir)  # regenerable downloads
     # `web` writes the launch token here as a page to open by file://, keeping it out of argv.
-    launch_file: Path = Field(
-        default_factory=lambda data: data["config_dir"] / "open.html", validate_default=True
-    )
+    launch_file: Path = Field(default_factory=_default_launch_file, validate_default=True)
 
     @field_validator("launch_file")
     @classmethod

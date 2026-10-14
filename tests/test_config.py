@@ -79,6 +79,19 @@ def test_launch_file_defaults_under_config_dir_and_is_absolute(tmp_path: Path, m
     assert Settings(tenant_id="t").launch_file == Path.home() / "x.html"
 
 
+def test_launch_file_defaults_to_the_snap_chromium_dir_when_there_is_one(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MINITEAMS_LAUNCH_FILE", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    plain = tmp_path / ".config" / "miniteams" / "open.html"
+    assert Settings(tenant_id="t").launch_file == plain
+    (tmp_path / "snap" / "chromium").mkdir(parents=True)
+    assert Settings(tenant_id="t").launch_file == tmp_path / "snap/chromium/common/miniteams/open.html"
+    custom = tmp_path / "cfg"  # a chosen config dir keeps its own launch file
+    assert Settings(tenant_id="t", config_dir=custom).launch_file == custom / "open.html"
+
+
 def test_write_private_replaces_atomically_owner_only(tmp_path: Path) -> None:
     target = tmp_path / "new" / "f"
     old = os.umask(0)
