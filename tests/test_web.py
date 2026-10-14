@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 import pytest
+import structlog.testing
 import websockets
 from conftest import board_socket, cookie_header, wait
 from test_web_chat import _relayed, _send
@@ -351,6 +352,8 @@ async def test_open_row_launches_opener_or_browser_without_marking_seen(
     launched: list[tuple[str, ...]] = []
 
     class _Proc:
+        stderr = None
+
         async def wait(self) -> int:
             return 0
 
@@ -375,6 +378,24 @@ async def test_open_row_launches_opener_or_browser_without_marking_seen(
     plain = W.Board(dict(rows), opener=None)
     assert await plain.open_row("t") is False and json.loads(plain.payload())["opener"] is False
     assert await plain.open_row("t", "web") is False and json.loads(plain.payload())["browser"] is False
+
+
+async def test_a_failing_opener_is_logged_with_its_stderr() -> None:
+    rows = {"t": {"id": "t", "last_activity": "2026-09-15T10:00:00Z", "last_id": "42", "seen_at": None}}
+    fail = ["sh", "-c", 'echo "Error: no DISPLAY environment variable specified" >&2; exit 3', "sh"]
+    board = W.Board(rows, opener=fail, browser=["sh", "-c", "echo chatter >&2", "sh"])
+    with structlog.testing.capture_logs() as logs:
+        assert await board.open_row("t") is True
+        assert await board.open_row("t", "web") is True
+        for _ in range(300):
+            if any(e["event"] == "opener_exit" for e in logs):
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.1)  # the browser's own exit would have logged by now
+    exits = [e for e in logs if e["event"] == "opener_exit"]
+    assert len(exits) == 1, exits  # rc 0 stays quiet, whatever it printed
+    assert exits[0]["rc"] == 3 and exits[0]["opener"] == "sh"
+    assert exits[0]["stderr"] == "Error: no DISPLAY environment variable specified"
 
 
 async def test_open_row_survives_missing_opener_binary(settings: Settings) -> None:
