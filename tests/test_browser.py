@@ -307,6 +307,23 @@ async def test_reconnect_keeps_the_readers_place(board: W.Board, chat: Pages) ->
     assert await page.evaluate("window.__same") == 1  # reconnected, not reloaded
 
 
+async def test_a_growing_composer_pushes_the_chat_up(board: W.Board, chat: Pages) -> None:
+    """A multi-line draft shrinks the list from below: what the reader saw at its bottom stays in view."""
+    page = await chat.open(_chat(L), viewport={"width": 700, "height": 400})
+    await _handled(page, "history")
+    gap = f"(l => l.scrollHeight - l.scrollTop - l.clientHeight)({_LIST})"
+    height = f"{_LIST}.clientHeight"
+    for scroll in ("l.scrollHeight", "l.scrollHeight / 2"):
+        await page.locator("#reply").fill("")
+        await page.evaluate(
+            f"(l => {{ l.scrollTop = {scroll}; l.dispatchEvent(new Event('scroll')); }})({_LIST})"
+        )
+        before, tall = await page.evaluate(gap), await page.evaluate(height)
+        await page.locator("#reply").fill("1\n2\n3\n4\n5")
+        await page.wait_for_function(f"{height} < {tall} - 40")
+        await page.wait_for_function(f"Math.abs({gap} - {before}) < 2")
+
+
 async def test_edit_during_the_history_read_is_applied_after_it(
     board: W.Board, chat: Pages, monkeypatch: pytest.MonkeyPatch
 ) -> None:

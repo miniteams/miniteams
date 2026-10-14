@@ -489,6 +489,13 @@
     hist.filled = side + at;
     requestHistory(side, at);
   };
+  // The composer, quotes or pasted images grow from below: the list keeps its bottom edge, not its top.
+  let listH = $list.clientHeight;
+  new ResizeObserver(() => {
+    const h = $list.clientHeight;
+    if (listH && h) $list.scrollTop += listH - h;
+    listH = h;
+  }).observe($list);
   const toBottom = () => { $list.scrollTop = $list.scrollHeight; hist.stick = !hist.newer; if (hist.stick) hist.unseen = 0; showLatest(); };
   const byId = (id) => $msgs.querySelector(`[data-id="${CSS.escape(id)}"]`);
   // The reader's place as a message and its offset, not pixels: pages above it change the pixels.
