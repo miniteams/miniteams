@@ -208,6 +208,17 @@ async def test_a_system_line_shows_who_and_its_time(board: W.Board, chat: Pages)
     assert await when.inner_text() == await page.locator(".msg:not(.system) .when").first.inner_text()
 
 
+async def test_times_read_24h_whatever_the_locale(board: W.Board, chat: Pages) -> None:
+    """The widget runs Chromium in en-US: a 15:04 message must not read "03:04 PM"."""
+    page = await chat.open(_chat(T), locale="en-US", timezone_id="UTC")
+    await _handled(page, "history")
+    await board.on_event(_event("NewMessage", T, **_m("4", "2026-09-15T15:04:00.000Z", "late")))
+    when = page.locator('[data-id="4"] .when')
+    await when.wait_for()
+    text = await when.inner_text()
+    assert text.endswith("15:04") and "M" not in text.upper().replace("SEP", ""), text
+
+
 async def test_composer_keys_success_and_failure(
     chat: Pages, sent: list[tuple[str, str]], monkeypatch: pytest.MonkeyPatch
 ) -> None:

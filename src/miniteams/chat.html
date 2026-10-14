@@ -519,7 +519,7 @@
   const fmtTime = (iso) => {
     const d = new Date(iso);
     if (isNaN(d)) return "";
-    const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
     return d.toDateString() === new Date().toDateString() ? hm : d.toLocaleDateString([], { day: "numeric", month: "short", year: d.getFullYear() === new Date().getFullYear() ? undefined : "numeric" }) + " " + hm;
   };
 

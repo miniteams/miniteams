@@ -49,6 +49,8 @@ _TYPE_MARKERS = {
     "RichText/Media_LocalRecording": "🎥 recording",
     "ThreadActivity/AddMember": "👥 member added",
     "ThreadActivity/DeleteMember": "👥 member removed",
+    "ThreadActivity/MemberJoined": "👥 member joined",
+    "ThreadActivity/MemberLeft": "👥 member left",
     "ThreadActivity/TopicUpdate": "✎ renamed",
     "ThreadActivity/MemberConsumptionHorizonUpdate": "👁 read marker",
     "Event/Call": "📞 call started",
@@ -60,6 +62,8 @@ _ACTIVITY_ROOTS = {
     "ThreadActivity/DeleteMember": "<deletemember>",
     "ThreadActivity/TopicUpdate": "<topicupdate>",
 }
+# Meeting chats: JSON, the people in `members`; `initiator` is never one of them.
+_MEMBER_EVENTS = {"ThreadActivity/MemberJoined", "ThreadActivity/MemberLeft"}
 _THREAD_RE = re.compile(r"/conversations/([^/]+)")
 
 # Teams' names for its default reactions, first name of an emoji first.
@@ -305,7 +309,10 @@ class Activity(NamedTuple):
 
 
 def parse_activity(msgtype: str, content: str) -> Activity | None:
-    """The people and topic of an AddMember, DeleteMember or TopicUpdate; None when malformed."""
+    """The people and topic of an AddMember, DeleteMember, MemberJoined, MemberLeft or TopicUpdate;
+    None when malformed."""
+    if msgtype in _MEMBER_EVENTS:
+        return _parse_member_event(content)
     root = _ACTIVITY_ROOTS.get(msgtype)
     if root is None or not content.lstrip().lower().startswith(root):
         return None
@@ -331,6 +338,20 @@ def parse_activity(msgtype: str, content: str) -> Activity | None:
     return Activity(initiator, tuple(targets), value, names)
 
 
+def _parse_member_event(content: str) -> Activity | None:
+    try:
+        data = json.loads(content)
+    except ValueError:
+        return None
+    members = data.get("members") if isinstance(data, dict) else None
+    people = [m for m in members if isinstance(m, dict) and m.get("id")] if isinstance(members, list) else []
+    if not people:
+        return None
+    names = {str(m["id"]): str(m["friendlyname"]) for m in people if m.get("friendlyname")}
+    # No initiator: the line never shows it, so name_activity must not look it up.
+    return Activity("", tuple(str(m["id"]) for m in people), "", names)
+
+
 def activity_line(msgtype: str, activity: Activity, me: str, name_for: Callable[[str], str] | None) -> str:
     """The plain-text line a system message shows: "👥 Ann added Bob, Carl", "👥 Bob left"…"""
 
@@ -339,6 +360,9 @@ def activity_line(msgtype: str, activity: Activity, me: str, name_for: Callable[
             return "You"
         return activity.names.get(mri) or (name_for(mri) if name_for else "someone")
 
+    if msgtype in _MEMBER_EVENTS:
+        joined = msgtype == "ThreadActivity/MemberJoined"
+        return f"👥 {', '.join(map(who, activity.targets))} {'joined' if joined else 'left'}"
     actor = who(activity.initiator)
     if msgtype == "ThreadActivity/TopicUpdate":
         return f"✎ {actor} renamed the chat to «{activity.value}»"
