@@ -977,9 +977,11 @@
     // A newer chat.html on the server (restart, edit): this page is stale, reload it.
     if (m.page) { if (pageVersion && m.page !== pageVersion) { saveDraft(); location.reload(); return; } pageVersion = m.page; }
     hist.followFailed = false;
+    // Who already types when the follow lands (open, switch, reconnect): frames only carry changes.
+    typing.clear(); for (const n of m.typing || []) typing.add(n); renderTyping();
     retry.reset();  // not on open: a socket whose follow fails must keep backing off
     readOnly = !!m.read_only;
-    $reply.disabled = readOnly || sending.has(thread);
+    $reply.disabled = readOnly;
     $reply.placeholder = readOnly ? "read-only chat" : PLACEHOLDER;
     document.body.classList.toggle("readonly", readOnly);
     opener = !!m.opener;
@@ -998,9 +1000,6 @@
   const setSending = (id, on) => {
     if (on) sending.add(id); else sending.delete(id);
     imgs.render();
-    if (id !== thread) return;
-    $reply.disabled = on || readOnly;
-    if (!on) $reply.focus();
   };
   // What each chat left behind (split): composer text, quotes, open editors, the error line.
   const drafts = new Map();
@@ -1012,6 +1011,12 @@
   };
   // Drafts (text and quotes) survive the reload a newer chat.html triggers.
   const saveDraft = () => {
+    // A reload ends the send queues: what they still hold joins its chat's draft, never lost.
+    for (const [t, q] of outbox) {
+      const rest = q.list.splice(0).map((e) => e.verb.text), d = drafts.get(t) || { text: "", quotes: [], editing: [], err: "" };
+      if (t === thread) $reply.value = [$reply.value, ...rest].filter(Boolean).join("\n");
+      else if (rest.length) drafts.set(t, { ...d, text: [d.text, ...rest].filter(Boolean).join("\n") });
+    }
     stash();
     for (const [t, d] of drafts) {
       if (t !== thread && !d.text && !d.quotes.length) continue;
@@ -1043,20 +1048,52 @@
     if (id === thread) { $err.textContent = text; return; }
     drafts.set(id, { text: "", quotes: [], editing: [], ...drafts.get(id), err: text });
   };
-  const submit = () => {
-    const text = $reply.value;
-    if ((!text.trim() && !imgs.list(thread).length && !imgs.adding()) || sending.has(thread)) return;
-    const verb = { send: thread, text, mentions: complete.mentions(text), format: "full", ...(quotes.length ? { quote: quotes.map((qt) => qt.id) } : {}) };
-    if (!(ws && ws.readyState === 1)) { $err.textContent = "offline, not sent"; return; }
-    const id = thread;
-    imgs.send(ws, id, verb).then((sent) => {
-      if (sent || !sending.has(id)) return;
+  // Enter empties the composer at once; a chat's messages go out one at a time, in order. A failure
+  // pauses that chat's queue and puts the message back in the box ahead of any newer draft: Enter
+  // retries it (checked when unchanged), Enter on an emptied box drops it; the queued ones follow.
+  const outbox = new Map();  // chat id → { list: [{ verb, quotes, images }], paused }
+  const pump = (id) => {
+    const q = outbox.get(id);
+    if (!q || q.paused || sending.has(id) || !q.list.length) return;
+    const e = q.list[0];
+    setSending(id, true);
+    e.images.then((items) => imgs.send(q.list[0] === e && sending.has(id) ? ws : null, id, e.verb, items)).then((sent) => {
+      if (sent || !sending.has(id) || q.list[0] !== e) return;
+      q.list.shift();
       if (!(id === thread ? $err.textContent : drafts.get(id)?.err)) noteFor(id, "nothing to send");  // a refused image keeps its reason
       setSending(id, false);
+      pump(id);
     });
+  };
+  const failed = (id, text) => {
+    const q = outbox.get(id), e = q.list.shift(), mine = id === thread;
+    imgs.settled(id, { ok: false });
+    q.paused = true;
+    const d = mine ? { text: $reply.value, quotes } : drafts.get(id) || { text: "", quotes: [] };
+    const back = d.text ? e.verb.text + "\n" + d.text : e.verb.text;
+    const qs = [...e.quotes, ...d.quotes.filter((qt) => !e.quotes.some((x) => x.id === qt.id))].slice(0, QUOTE_MAX);
+    complete.restore([...e.verb.mentions, ...complete.mentions(d.text, id)], id);
+    if (mine) { $reply.value = back; grow(); quotes = qs; renderQuotes(); $reply.focus(); }
+    else drafts.set(id, { editing: [], err: "", ...drafts.get(id), text: back, quotes: qs });
+    noteFor(id, text + (q.list.length ? ` · ${q.list.length} more queued after it` : ""));
+    setSending(id, false);
+  };
+  const submit = () => {
+    const id = thread, text = $reply.value, q = outbox.get(id) || { list: [], paused: false };
+    const empty = !text.trim() && !imgs.list(id).length && !imgs.adding();
+    if (empty && !q.paused) return;
+    if (!(ws && ws.readyState === 1)) { $err.textContent = "offline, not sent"; return; }
+    if (!empty) {
+      const verb = { send: id, text, mentions: complete.mentions(text), format: "full", ...(quotes.length ? { quote: quotes.map((qt) => qt.id) } : {}) };
+      const e = { verb, quotes, images: imgs.take(id) };
+      if (q.paused) q.list.unshift(e); else q.list.push(e);  // a paused queue's head is the box
+      $reply.value = ""; grow(); quotes = []; renderQuotes(); complete.forget(id);
+    }
+    q.paused = false;
+    outbox.set(id, q);
     $err.textContent = "";
     hideView();
-    setSending(thread, true);
+    pump(id);
   };
 
   const $pop = document.getElementById("pop");
@@ -1178,16 +1215,11 @@
   };
   const onSent = (m) => {
     if (!sending.has(m.sent)) return;
-    if (m.ok) complete.forget(m.sent);
+    if (!m.ok) { failed(m.sent, m.unsure ? UNSURE : why(m.error) || "not sent"); return; }
+    outbox.get(m.sent).list.shift();
     imgs.settled(m.sent, m);
-    if (m.unsure) m.error = UNSURE;
-    if (m.sent !== thread) {
-      const d = drafts.get(m.sent);
-      if (!m.ok) noteFor(m.sent, why(m.error) || "not sent");
-      else if (d) Object.assign(d, { text: "", quotes: [], err: "" });
-    } else if (m.ok) { $reply.value = ""; grow(); $err.textContent = ""; quotes = []; renderQuotes(); }
-    else $err.textContent = why(m.error) || "not sent";
     setSending(m.sent, false);
+    pump(m.sent);
   };
 
   // --- chatnav=split: the board's list beside the chat (row rules in ui.js) ---
@@ -1374,7 +1406,7 @@
     reset();
     complete.reset(); hideView();
     unstash();
-    $reply.disabled = readOnly || sending.has(thread);
+    $reply.disabled = readOnly;
     imgs.render();
     const row = rows.find((r) => r.id === id);
     $label.textContent = row ? rowTitle(row) : id;
@@ -1528,7 +1560,7 @@
       if (asked) hideView();  // its answer died with the socket: no pressed button over an empty box
       asked = 0;
       // No ack will come: the message may or may not have gone out.
-      for (const id of [...sending]) { noteFor(id, "connection lost: Enter checks the chat before sending again"); setSending(id, false); }
+      for (const id of [...sending]) failed(id, "connection lost: Enter checks the chat before sending again");
       for (const box of $msgs.querySelectorAll(".editor[data-saving]")) {
         delete box.dataset.saving;
         box.nextElementSibling.textContent = "connection lost: check the message before saving again";

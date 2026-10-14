@@ -339,6 +339,35 @@ async def test_a_growing_composer_pushes_the_chat_up(board: W.Board, chat: Pages
         await page.wait_for_function(f"Math.abs({gap} - {before}) < 2")
 
 
+async def test_typed_lines_keep_the_last_message_above_the_composer(chat: Pages) -> None:
+    """A reader at the bottom typing six lines still sees the last message whole, above the footer; a
+    reader scrolled up keeps what was at the list's bottom edge."""
+    page = await chat.open(_chat(L), viewport={"width": 700, "height": 500})
+    await _handled(page, "history")
+    box = page.locator("#reply")
+    last = """() => { const l = document.getElementById('list').getBoundingClientRect(),
+      n = document.querySelector('#msgs').lastElementChild.getBoundingClientRect(),
+      f = document.querySelector('footer').getBoundingClientRect();
+      return n.bottom <= l.bottom + 1 && n.bottom <= f.top; }"""
+    gap = f"(l => l.scrollHeight - l.scrollTop - l.clientHeight)({_LIST})"
+    await page.wait_for_function(f"{gap} < 2")
+    for i in range(6):
+        if i:
+            await box.press("Shift+Enter")
+        await box.press_sequentially(f"line {i}")
+        await rendered(page)
+        assert await page.evaluate(f"{gap} < 2") and await page.evaluate(last), i
+    await box.fill("")
+    await rendered(page)
+    await _scroll(page, "l.scrollHeight / 3")
+    await rendered(page)
+    before = await page.evaluate(gap)
+    for i in range(6):
+        await box.press("Shift+Enter")
+        await rendered(page)
+        assert abs(await page.evaluate(gap) - before) < 2, i
+
+
 async def test_a_reaction_keeps_a_reader_at_the_bottom(board: W.Board, chat: Pages) -> None:
     """A reaction grows its message, the last one or one above: a reader at the bottom stays there."""
     page = await chat.open(_chat(L), viewport={"width": 700, "height": 400})
@@ -1696,6 +1725,25 @@ async def test_split_shows_the_list_and_switches_in_place(board: W.Board, split:
     await page.go_forward()
     await _handled(page, "history", since)
     assert (await _ids(page))[-1] == "39"
+
+
+async def test_who_types_shows_on_the_page_as_on_its_row(board: W.Board, split: Pages) -> None:
+    """011-AC7: someone already typing when the page opens, switches or reconnects shows there as on the
+    row; the TTL, without ClearTyping, clears both."""
+    board.typing_ttl = 5
+    for tid in (T, L):
+        await board.on_event(_event("NewMessage", tid, messagetype="Control/Typing"))
+    shown = "document.getElementById('typing').textContent.includes('Ann Lee')"
+    on_row = f"document.querySelector('#rows [data-id=\"{L}\"] .prev.typing')?.textContent.includes('Ann')"
+    page = await _open_split(split)
+    await until(page, f"{shown} && {on_row}")
+    await _switch(page, L)
+    await until(page, shown)
+    since = await _frames(page)
+    await _drop(board)
+    await _handled(page, "follow", since)
+    await until(page, shown)
+    await until(page, f"!{shown} && !document.querySelector('#rows .prev.typing')", tries=800)
 
 
 async def test_split_setting_is_read_from_storage(split: Pages) -> None:

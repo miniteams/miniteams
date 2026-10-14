@@ -825,6 +825,8 @@ class Board:
             "opener": self.opener is not None,
             "page": page_version("chat.html"),  # an open tab reloads when chat.html changed
             "read_only": not in_scope(thread_id),  # `send` refuses channels: no composer for them
+            # Live frames only say what changes: who already types is in the timers, board row or not.
+            "typing": [n for tid, n in self._typing_timers if tid == thread_id and n != _YOU],
         }
 
     async def _forward(
