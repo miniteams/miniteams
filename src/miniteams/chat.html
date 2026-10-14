@@ -202,6 +202,7 @@
   .html .card summary { cursor: pointer; color: var(--accent); font-size: 12.5px; }
   .msg.system { display: block; text-align: center; color: var(--faint); font-size: 12.5px; padding: 2px 8px; }
   .msg.system .html { display: inline; }
+  .msg.system .when { margin-left: 6px; }
   .actions { display: none; position: absolute; right: 8px; top: -10px; background: var(--panel); border: 1px solid var(--line);
     border-radius: 8px; box-shadow: var(--shadow); padding: 2px; }
   /* A click focuses the message itself (not focus-visible): no bar pinned. Not `:has(:focus-visible)`:
@@ -502,7 +503,7 @@
     const body = el("div", "body");
     if (r.deleted) body.append(el("div", "html", "message deleted"));
     else { const h = el("div", "html"); h.dir = "auto"; h.innerHTML = r.html || ""; body.append(h); }
-    if (sys) { node.append(body); node.title = r.at; return node; }
+    if (sys) { body.append(Object.assign(el("span", "when", fmtTime(r.at)), { title: r.at })); node.append(body); node.title = r.at; return node; }
     node.tabIndex = 0;  // keyboard users reach the actions through focus-visible
     const name = r.name || (r.me ? "You" : "?");
     const av = el("div", "av", initials(name));

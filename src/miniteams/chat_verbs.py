@@ -41,6 +41,7 @@ from .http import failure
 from .images import MAX_IMAGE_BYTES, MAX_IMAGES, MAX_TOTAL_BYTES, check_batch, check_dimensions
 from .messages import (
     TEXT_TYPES,
+    activity_line,
     fold,
     is_activity,
     is_deleted,
@@ -49,6 +50,7 @@ from .messages import (
     json_list,
     mention_kind,
     message_text,
+    parse_activity,
     reaction_emoji,
     reaction_key,
     snippet,
@@ -93,6 +95,7 @@ _DEADLINES: dict[IoKind, float] = {
     "dir": 3.0,
     "relay": 5.0,
 }
+_ACTIVITY = "_activity"  # record key: a system line's (msgtype, Activity), until named
 _LOOKUP_PAGE = 20  # API messages read ending at an older message the latest page lacks
 _FORMATS = ("inline", "full")
 _FRAMES_WAIT = 30.0  # seconds a send's image frames may take to follow it
@@ -241,7 +244,10 @@ def chat_record(
     mri = str(message.get("from") or "").rsplit("/", 1)[-1]
     deleted = is_deleted(props)
     body = ""
-    if not deleted:
+    activity = None if deleted or kind != "system" else parse_activity(msgtype, content)
+    if activity:
+        body = html.escape(activity_line(msgtype, activity, me, name_for))
+    elif not deleted:
         if msgtype == "RichText/Html":
             mentions = {
                 str(m.get("itemid")): str(m.get("mri") or "")
@@ -289,7 +295,20 @@ def chat_record(
         "deleted": deleted,
         "reactions": reactions,
         "mentions": mention_kind(message, me),
-    }
+    } | ({_ACTIVITY: (msgtype, activity)} if activity else {})
+
+
+async def name_activity(records: list[dict[str, Any]], directory: Directory | None, me: str) -> None:
+    """Resolve the people of the records' system lines the directory lacks, then reword the lines.
+    Pops `_ACTIVITY`: it never goes on the wire."""
+    pending = [(record, record.pop(_ACTIVITY)) for record in records if _ACTIVITY in record]
+    if not pending or directory is None:
+        return
+    # resolve() skips cached MRIs (negatives too): no request once the names are known.
+    people = [m for _, (_, a) in pending for m in (a.initiator, *a.targets) if m not in a.names]
+    await directory.resolve([m for m in people if not is_me(m, me)])
+    for record, (msgtype, activity) in pending:
+        record["html"] = html.escape(activity_line(msgtype, activity, me, directory.name_for))
 
 
 # --- wire parsers: the page's dict → a typed request, or the refusal it is answered ---
@@ -776,7 +795,9 @@ class ChatVerbs:
         if isinstance(request, str):
             return {**head, "error": request}
         try:
-            return {**head, **await self.history(request)}
+            page = await self.history(request)
+            await name_activity(page.get("messages") or [], self.directory, self.me)
+            return {**head, **page}
         except ArchiveUnavailable:
             return {**head, "error": "archive unavailable"}
 

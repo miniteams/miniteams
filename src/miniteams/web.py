@@ -62,6 +62,7 @@ from .chat_verbs import (
     close_archive_pool,
     index_label,
     io,
+    name_activity,
     stuck_archive_threads,
 )
 from .chats import fetch_conversations, is_meeting, is_private, last_activity
@@ -841,6 +842,7 @@ class Board:
         if msgtype.startswith("Control/") or msgtype in _SILENT_TYPES:
             return
         record = await self._record(resource, thread_id, media)
+        await name_activity([record], self.directory, self.me)
         if "content" not in resource:
             del record["html"]  # a partial update (reaction): the page keeps the body it has
         if resource_type == "NewMessage" and not is_activity(msgtype):
