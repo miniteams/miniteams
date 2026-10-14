@@ -9,6 +9,33 @@
   const initials = (name) => { const w = name.split(/[ ,]+/).filter((x) => /\p{L}/u.test(x));
     return ((w[0] || "?")[0] + ((w[1] || "")[0] || "")).toUpperCase(); };
 
+  // Presence (spec 015): mri → {availability, activity, confirmed} from the server's `presence` frames.
+  // Anyone missing is unknown: no dot, never Offline. An avatar opts in with `data-pmri`.
+  let presence = new Map();
+  const PRESENCE = { Available: "ok", AvailableIdle: "ok", Busy: "busy", BusyIdle: "busy", DoNotDisturb: "dnd",
+    Away: "away", BeRightBack: "away", Offline: "off" };
+  const words = (s) => s.replace(/(?<=.)(?=[A-Z])/g, " ").toLowerCase().replace(/^./, (c) => c.toUpperCase());
+  const presenceLabel = (p) => {
+    const a = words(p.availability), x = words(p.activity);
+    return (x && x !== a ? `${a} · ${x}` : a) + (p.confirmed ? "" : " (unconfirmed)");
+  };
+  const presenceDot = (av) => {
+    av.querySelector(":scope > .pres")?.remove();
+    av.removeAttribute("title");
+    const p = presence.get(av.dataset.pmri), cls = p && typeof p.availability === "string" && Object.hasOwn(PRESENCE, p.availability) && PRESENCE[p.availability];
+    if (!cls) return av;
+    const dot = el("span", "pres " + cls + (p.confirmed ? "" : " unsure"));
+    av.title = presenceLabel({ ...p, activity: typeof p.activity === "string" ? p.activity : "" });
+    dot.setAttribute("role", "img"); dot.setAttribute("aria-label", av.title);
+    av.append(dot);
+    return av;
+  };
+  // Every avatar of a person changes at once, without rebuilding the lists.
+  const paintPresence = (map) => {
+    presence = new Map(map && typeof map === "object" && !Array.isArray(map) ? Object.entries(map) : []);
+    document.querySelectorAll("[data-pmri]").forEach(presenceDot);
+  };
+
   // The `mt` cookie authenticates the handshake: it survives a server restart, so a redial needs nothing else.
   const wsUrl = (path) => (location.protocol === "https:" ? "wss://" : "ws://") + location.host + path;
   // A launch URL's `#<token>` buys the cookie once; it leaves the address bar at once, spent or not.

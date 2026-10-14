@@ -2860,4 +2860,5 @@ def test_the_board_takes_every_chat_verb_from_chat_verbs(board: W.Board) -> None
         "board",
         "follow",
         "open",
+        "authors",  # spec 015: a chat page's authors, for their presence
     ]

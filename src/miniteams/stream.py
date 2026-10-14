@@ -25,7 +25,8 @@ from ._io import force_blocking_stdout
 from .auth import AuthExpired, TokenSource, cache_stamp, token_source
 from .config import Settings
 from .directory import Directory
-from .messages import decode_event, emit_raw_delivery, emit_raw_named, handle_delivery
+from .messages import _decode_body, decode_event, emit_raw_delivery, emit_raw_named, handle_delivery
+from .presence import PATHS as PRESENCE_PATHS
 from .skype import exchange_skype_token
 from .trouter import common_query, get_or_create_epid, handshake, trouter_info
 
@@ -44,6 +45,8 @@ _CONNECT_FLOOD = 30.0  # seconds after registration in which a message_loss is t
 EventHook = Callable[[dict[str, Any]], Awaitable[None]]  # receives each decoded EventMessage
 GapHook = Callable[[str], Awaitable[None]]  # events may have been missed; arg = reason
 AliveHook = Callable[[], Awaitable[None]]  # the socket is up: at connect and on every keepalive
+SessionHook = Callable[[str, str], Awaitable[None]]  # (endpoint id, surl) of a registered socket
+PresenceHook = Callable[[dict[str, Any]], Awaitable[None]]  # a decoded presence delivery body
 
 
 def _correlation_vector() -> str:
@@ -67,6 +70,8 @@ class TrouterClient:
         on_event: EventHook | None = None,
         on_gap: GapHook | None = None,
         on_alive: AliveHook | None = None,
+        on_session: SessionHook | None = None,
+        on_presence: PresenceHook | None = None,
     ) -> None:
         self.settings = settings
         self.aad = aad
@@ -81,6 +86,8 @@ class TrouterClient:
         self.on_event = on_event  # set → events go to the hook instead of stdout
         self.on_gap = on_gap
         self.on_alive = on_alive
+        self.on_session = on_session
+        self.on_presence = on_presence
         self._loss_etag: str | None = None  # `messaging` etag of the last message_loss seen
         self._count = 0
         self._last_register = 0.0
@@ -195,6 +202,11 @@ class TrouterClient:
         await self._register()
         if self.on_gap is not None:
             await self.on_gap("connected")  # whatever happened while disconnected is unknown
+        if self.on_session is not None:
+            try:
+                await self.on_session(self.epid, self.info["surl"])
+            except Exception as exc:  # noqa: BLE001 — presence must not drop the chat socket
+                log.warning("session_hook_failed", error=str(exc), error_type=type(exc).__name__)
         await self._alive()
         self._tasks = [
             asyncio.create_task(self._ping_loop()),
@@ -252,6 +264,11 @@ class TrouterClient:
         await self._ws.send(f"3:::{ack}")
         if self.raw:
             await emit_raw_delivery(req)  # every endpoint, decoded, no filtering
+        elif self.on_presence is not None and str(req.get("url") or "").endswith(PRESENCE_PATHS):
+            try:
+                await self.on_presence(_decode_body(req) or {})
+            except Exception as exc:  # noqa: BLE001 — a bad presence frame must not drop the socket
+                log.warning("presence_hook_failed", error=str(exc), error_type=type(exc).__name__)
         elif self.on_event is not None:
             obj = decode_event(req)
             if obj is None:
@@ -358,6 +375,8 @@ async def run_forever(
     epid: str | None = None,
     prompt: bool = True,
     wait_for_login: bool = False,
+    on_session: SessionHook | None = None,
+    on_presence: PresenceHook | None = None,
 ) -> None:
     """Re-establish a full session on every disconnect.
 
@@ -405,6 +424,8 @@ async def run_forever(
                     on_event,
                     on_gap,
                     on_alive,
+                    on_session=on_session,
+                    on_presence=on_presence,
                 ).run()
             finally:
                 refresher.cancel()

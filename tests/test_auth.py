@@ -382,3 +382,11 @@ def test_self_mri_from_access_token() -> None:
     assert A.self_mri(jwt({"oid": "abc-123", "upn": "x"})) == "8:orgid:abc-123"
     assert A.self_mri(jwt({"upn": "x"})) == ""
     assert A.self_mri("not.a-jwt") == "" and A.self_mri("") == ""
+
+
+def test_msal_app_has_a_request_timeout(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A half-open connection must not hang the token thread holding the shared lock."""
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(A.msal, "PublicClientApplication", lambda *a, **kw: seen.update(kw))
+    A._app("cid", settings, msal.SerializableTokenCache())
+    assert seen["timeout"] == (5, 15)

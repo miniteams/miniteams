@@ -81,7 +81,10 @@ def _build_cache(settings: Settings) -> tuple[msal.SerializableTokenCache, Path]
 def _app(
     client_id: str, settings: Settings, cache: msal.SerializableTokenCache
 ) -> msal.PublicClientApplication:
-    return msal.PublicClientApplication(client_id, authority=settings.authority, token_cache=cache)
+    # (connect, read) seconds: MSAL waits forever by default; a half-open socket would hold the token lock.
+    return msal.PublicClientApplication(
+        client_id, authority=settings.authority, token_cache=cache, timeout=(5, 15)
+    )
 
 
 def _device_code_flow(app: msal.PublicClientApplication, scopes: list[str]) -> dict[str, Any]:
@@ -299,6 +302,11 @@ class TokenSource:
         """Silent chat-service aggregator token (FOCI, no consent), e.g. for custom emojis.
         Returns None if unavailable (never prompts)."""
         return self._silent_scope("https://chatsvcagg.teams.microsoft.com/.default")
+
+    def presence_token(self) -> str | None:
+        """Silent native presence token (FOCI, no consent): snapshots and subscriptions, never Graph.
+        Returns None if unavailable (never prompts)."""
+        return self._silent_scope("https://presence.teams.microsoft.com/.default")
 
     def _silent_scope(self, scope: str) -> str | None:
         with self._lock:
