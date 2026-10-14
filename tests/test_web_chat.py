@@ -1263,6 +1263,8 @@ def launched(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
     calls: list[tuple[str, ...]] = []
 
     class _Proc:
+        stderr = None
+
         async def wait(self) -> int:
             return 0
 
@@ -1370,6 +1372,8 @@ async def test_open_chat_runs_the_browser_on_our_own_chat_page(
     launched: list[tuple[str, ...]] = []
 
     class _Proc:
+        stderr = None
+
         async def wait(self) -> int:
             return 0
 
@@ -1407,6 +1411,8 @@ async def test_open_chat_carries_the_split_setting(
     launched: list[tuple[str, ...]] = []
 
     class _Proc:
+        stderr = None
+
         async def wait(self) -> int:
             return 0
 

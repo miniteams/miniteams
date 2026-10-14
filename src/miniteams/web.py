@@ -564,6 +564,17 @@ def save_bind(settings: Settings, host: str, port: int, token: str) -> None:
     write_private(settings.config_dir / "web.json", json.dumps({"host": host, "port": port, "token": token}))
 
 
+async def _reap(proc: asyncio.subprocess.Process, opener: str) -> None:
+    """Wait for an opener; a failing one is logged with the end of its stderr (else it fails silently)."""
+    tail = b""
+    if proc.stderr is not None:
+        # Drained as it comes: a browser started here may live for hours and must never block on a full pipe.
+        while chunk := await proc.stderr.read(4096):
+            tail = (tail + chunk)[-2000:]
+    if rc := await proc.wait():
+        log.warning("opener_exit", opener=opener, rc=rc, stderr=tail.decode(errors="replace").strip())
+
+
 def launch_page(host: str, port: int, token: str) -> str:
     url = html.escape(f"http://{netloc(host, port)}/#{token}")
     return f'<!doctype html><meta http-equiv="refresh" content="0;url={url}"><a href="{url}">miniteams</a>\n'
@@ -1209,13 +1220,13 @@ class Board:
                 url,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
             )
         except OSError as exc:
             log.warning("opener_failed", opener=argv[0], error=str(exc))
             return False
-        asyncio.get_running_loop().create_task(proc.wait())  # reap; xdg-open returns at once
+        asyncio.get_running_loop().create_task(_reap(proc, argv[0]))
         log.info("opened", thread=thread_id, target=target)
         return True
 
