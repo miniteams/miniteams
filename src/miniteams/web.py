@@ -1525,6 +1525,9 @@ async def _process_request(
         resp = ws.respond(HTTPStatus.NO_CONTENT, "")
         _set_cookie(resp, board.secret)
         return resp
+    if path == "/favicon.svg":  # fetched before /auth sets the cookie, and public anyway
+        headers = {"Content-Type": "image/svg+xml", "Cache-Control": "max-age=86400"}
+        return _respond(ws, _page_path("favicon.svg").read_bytes(), headers | _FILE_HEADERS)
     page_route = path == "/" or path.startswith("/chat/")
     authorized = _authorized(request, board.secret)
     if not (authorized or page_route):

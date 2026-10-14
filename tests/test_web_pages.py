@@ -356,6 +356,26 @@ async def test_pages_are_served_without_the_cookie(settings: Settings) -> None:
         assert (await client.get(f"http://{host}/chat/unknown", headers=_cookie(board))).status_code == 404
 
 
+async def test_favicon_is_served_without_the_cookie(settings: Settings) -> None:
+    board = _board()
+    async with _served(board, settings) as host, httpx.AsyncClient() as client:
+        for path in ("/", f"/chat/{quote(B, safe='')}"):
+            assert '<link rel="icon" href="/favicon.svg">' in (await client.get(f"http://{host}{path}")).text
+        got = await client.get(f"http://{host}/favicon.svg")
+        assert (got.status_code, got.headers["content-type"]) == (200, "image/svg+xml")
+        assert got.text.startswith("<svg") and "set-cookie" not in got.headers
+        assert (
+            await client.get(f"http://{host}/favicon.svg", headers={"Host": "evil.example"})
+        ).status_code == 404
+
+
+def test_favicon_is_the_logo() -> None:
+    assert (
+        W._page_path("favicon.svg").read_bytes()
+        == (Path(__file__).parents[1] / "docs/assets/logo.svg").read_bytes()
+    )
+
+
 async def test_a_page_load_refreshes_the_cookie(settings: Settings) -> None:
     """L3: every authorised page load re-issues the cookie, so it expires a year after the last use."""
     board = _board()

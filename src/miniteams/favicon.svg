@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="miniteams">
+  <rect width="512" height="512" rx="112" fill="#171a21"/>
+  <path d="M152 112H360a56 56 0 0 1 56 56V296a56 56 0 0 1-56 56H236L160 420V352h-8a56 56 0 0 1-56-56V168a56 56 0 0 1 56-56Z"
+        fill="#8b96ff" stroke="#8b96ff" stroke-width="12" stroke-linejoin="round"/>
+  <g fill="none" stroke="#0f1115" stroke-width="32" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M168 180l64 52-64 52"/>
+    <path d="M268 284h76"/>
+  </g>
+</svg>
