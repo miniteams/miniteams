@@ -181,6 +181,11 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   Hover any reaction chip to see all the message's reactions, grouped by emoji with their participants.
   Native skin tones (`yes-tone1` → 👍🏻 through `yes-tone5` → 👍🏿) are preserved on supported emoji.
   Cards from bots and apps are rendered; runs of deleted messages are folded.
+- **Read receipts** (spec 011): each member's small avatar sits under the newest message they read, whoever wrote it.
+  More than 3 readers on one message show 3 avatars and `+N`; hover lists every reader. Your own reads and an author's
+  read of their own message are not shown. A member without a receipt (disabled, unsupported, not read yet) shows
+  nothing, never "unread". Kept live from Teams' receipt events on `web`'s Trouter socket, reconciled by one read-only
+  GET on chat open and after every reconnect; cached in the presence file so a reopened chat paints at once.
 - **Browsing**: infinite scroll both ways, "↓ latest" when away from the bottom, header search, Open in Teams.
 - **Archive**: history and search read the archive under `--data-dir`. Without one the page shows the latest API page only
   and search is off.

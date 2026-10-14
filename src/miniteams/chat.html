@@ -237,6 +237,11 @@
   .quote span { flex: 1; }
   .quote button { border: 0; background: transparent; cursor: pointer; color: var(--dim); border-radius: 4px; }
   .quote button:hover { color: var(--hot); }
+  /* Read receipts (spec 011): the readers' small avatars under the newest message each one read. */
+  .reads { display: flex; justify-content: flex-end; align-items: center; margin-top: 2px; }
+  .reads .ra { width: 16px; height: 16px; border-radius: 50%; display: grid; place-items: center; font-size: 7.5px; font-weight: 650;
+    color: #fff; box-shadow: 0 0 0 1.5px var(--bg); }
+  .reads .more { font-size: 11px; color: var(--dim); margin-left: 3px; }
   /* Avatars off: no avatar column, the same rhythm as the widget's compact mode. */
   body.compact .msg { grid-template-columns: minmax(0, 1fr); }
   body.compact .av { display: none; }
@@ -501,7 +506,7 @@
     node.tabIndex = 0;  // keyboard users reach the actions through focus-visible
     const name = r.name || (r.me ? "You" : "?");
     const av = el("div", "av", initials(name));
-    av.style.background = `linear-gradient(135deg, hsl(${hue(r.from || name)} 62% 58%), hsl(${(hue(r.from || name) + 40) % 360} 62% 48%))`;
+    av.style.background = avatarBg(r.from || name);
     if (r.from) { av.dataset.pmri = r.from.toLowerCase(); presenceDot(av); authorsSoon(); }
     const head = el("div", "head");
     head.append(Object.assign(el("b", null, name), { dir: "auto" }), Object.assign(el("span", "when", fmtTime(r.at)), { title: r.at }));
@@ -654,6 +659,37 @@
     close();
   };
 
+  const avatarBg = (key) => `linear-gradient(135deg, hsl(${hue(key)} 62% 58%), hsl(${(hue(key) + 40) % 360} 62% 48%))`;
+  // Read receipts (spec 011): member → {id, name}, the newest message id they read. Absent = unknown: nothing shown.
+  let receipts = {};
+  const READS_SHOWN = 3;
+  const paintReceipts = () => {
+    for (const old of $msgs.querySelectorAll(".reads")) old.remove();
+    const nodes = [...$msgs.children].filter((n) => !n.classList.contains("folded") && /^\d+$/.test(n.dataset.id));
+    const at = new Map();
+    for (const [mri, r] of Object.entries(receipts)) {
+      const h = Number(r && r.id);
+      // Detached below the newest page: the message they reached may not be on screen.
+      if (hist.newer && nodes.length && h > Number(nodes.at(-1).dataset.id)) continue;
+      const node = nodes.findLast((n) => Number(n.dataset.id) <= h);
+      if (!node || node.dataset.from.toLowerCase() === mri) continue;  // an author's read of their own message says nothing
+      if (!at.has(node)) at.set(node, []);
+      at.get(node).push({ mri, name: typeof r.name === "string" && r.name ? r.name : "?" });
+    }
+    for (const [node, readers] of at) {
+      const box = el("div", "reads"), extra = readers.length > READS_SHOWN ? readers.length - READS_SHOWN : 0;
+      box.title = readers.map((p) => p.name).join("\n");
+      box.setAttribute("role", "img"); box.setAttribute("aria-label", "Read by " + readers.map((p) => p.name).join(", "));
+      for (const p of readers.slice(0, readers.length - extra)) {
+        const a = el("span", "ra", initials(p.name));
+        a.style.background = avatarBg(p.mri);
+        box.append(a);
+      }
+      if (extra) box.append(el("span", "more", `+${extra}`));
+      node.querySelector(":scope > .body").append(box);
+    }
+  };
+
   // Consecutive messages from one sender within 5 minutes share one avatar and name.
   const regroup = () => {
     fold();
@@ -665,6 +701,7 @@
       n.classList.toggle("cont", cont);
       prev = n;
     }
+    paintReceipts();
   };
 
   // A page that replaces the screen: the latest one, a jump, a reconnect.
@@ -1240,6 +1277,7 @@
   // A chat's whole screen state goes; its draft, quotes and open editors wait in `drafts`.
   const reset = () => {
     resetNav("switch");
+    receipts = {};
     typing.clear(); renderTyping();
     $msgs.replaceChildren(); $note.hidden = false; $note.className = ""; $note.textContent = "loading…";
     closeHits(); $find.value = "";
@@ -1384,7 +1422,13 @@
       if (m.presence) { paintPresence(m.presence); return; }
       // Relayed frames name their chat: those of a chat left since (split) are dropped.
       if ("thread" in m && m.thread !== thread) return;
-      if ("gap" in m) { if (m.gap === thread) resync(); }  // no `thread` key: a gap of a chat left is ignored here
+      if ("receipts" in m) {
+        const was = hist.stick;  // the avatar row grows the last message: keep the newest reader in view
+        receipts = m.receipts && typeof m.receipts === "object" ? m.receipts : {};
+        paintReceipts();
+        if (was) toBottom();
+      }
+      else if ("gap" in m) { if (m.gap === thread) resync(); }  // no `thread` key: a gap of a chat left is ignored here
       else if ("follow" in m) onFollow(m);
       else if ("history" in m) onHistory(m);
       else if ("search" in m) onSearch(m);

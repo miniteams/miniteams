@@ -50,7 +50,16 @@ CREATE TABLE IF NOT EXISTS presence (
     confirmed_until_ms INTEGER NOT NULL,
     PRIMARY KEY (tenant_id, mri)
 );
+CREATE TABLE IF NOT EXISTS horizons (
+    tenant_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    mri TEXT NOT NULL,
+    msg_id INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (tenant_id, thread_id, mri)
+);
 """
+_HORIZONS_MAX = 5000  # read receipts kept (spec 011), newest updates first
 
 
 def person(mri: Any) -> str:
@@ -107,7 +116,8 @@ class State:
 
 
 class Cache:
-    """Latest state per (tenant, mri) on local disk; the web process is its only writer."""
+    """Latest state per (tenant, mri), and read receipts (spec 011), on local disk; the web process is its
+    only writer."""
 
     def __init__(self, path: Path, tenant: str) -> None:
         path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -158,6 +168,31 @@ class Cache:
         with self.db:
             self.db.executemany(
                 "DELETE FROM presence WHERE tenant_id = ? AND mri = ?", [(self.tenant, m) for m in mris]
+            )
+
+    def horizons(self, thread_id: str) -> dict[str, int]:
+        """Read receipts of a chat (spec 011): member → id of the newest message they read."""
+        rows = self.db.execute(
+            "SELECT mri, msg_id FROM horizons WHERE tenant_id = ? AND thread_id = ?", (self.tenant, thread_id)
+        )
+        return dict(rows)
+
+    def save_horizons(self, thread_id: str, found: dict[str, int], now: float) -> None:
+        with self.db:
+            # Only a newer horizon writes: a late, replayed or unchanged one keeps the row and its age.
+            written = self.db.executemany(
+                """INSERT INTO horizons VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(tenant_id, thread_id, mri) DO UPDATE SET
+                msg_id = excluded.msg_id, updated_at_ms = excluded.updated_at_ms
+                WHERE excluded.msg_id > msg_id""",
+                [(self.tenant, thread_id, mri, at, int(now * 1000)) for mri, at in found.items()],
+            ).rowcount
+            if not written:
+                return
+            self.db.execute(
+                "DELETE FROM horizons WHERE tenant_id = ? AND rowid NOT IN (SELECT rowid FROM horizons"
+                " WHERE tenant_id = ? ORDER BY updated_at_ms DESC LIMIT ?)",
+                (self.tenant, self.tenant, _HORIZONS_MAX),
             )
 
     def close(self) -> None:

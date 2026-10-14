@@ -501,7 +501,9 @@ async def test_restart_shows_cached_states_unconfirmed_until_the_first_callback(
     columns = {c for (_, c, *_) in db.db.execute("PRAGMA table_info(presence)")}
     assert columns == {"tenant_id", "mri", "availability", "activity", "observed_at_ms", "confirmed_until_ms"}
     tables = [t for (t,) in db.db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
-    assert tables == ["presence"]
+    assert tables == ["presence", "horizons"]  # read receipts (spec 011): no names either
+    columns = {c for (_, c, *_) in db.db.execute("PRAGMA table_info(horizons)")}
+    assert columns == {"tenant_id", "thread_id", "mri", "msg_id", "updated_at_ms"}
     db.close()
 
 
