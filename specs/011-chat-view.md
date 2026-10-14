@@ -439,14 +439,14 @@ receipts prove nothing.
 
 ### Acceptance criteria
 
-- [ ] A read-only native spike identifies an actual recipient receipt and its message boundary,
+- [x] A read-only native spike identifies an actual recipient receipt and its message boundary,
       confirms snapshot/reconnect behaviour and records a sanitized fixture. No Graph API.
-- [ ] An outgoing message shows Seen only with a confirmed recipient read; hovering lists
+- [x] An outgoing message shows Seen only with a confirmed recipient read; hovering lists
       confirmed readers by name. Group partial counts do not imply everyone has read.
-- [ ] Live receipt updates refresh the indicator without changing message time, chat ordering,
+- [x] Live receipt updates refresh the indicator without changing message time, chat ordering,
       unread counters or local seen state. Out-of-order events never regress a confirmed receipt.
-- [ ] Missing, disabled, unsupported or malformed receipts show no false Seen or Unread claim.
-- [ ] Reconnection reconciles native state; tests cover 1:1, partial group reads, unknown state,
+- [x] Missing, disabled, unsupported or malformed receipts show no false Seen or Unread claim.
+- [x] Reconnection reconciles native state; tests cover 1:1, partial group reads, unknown state,
       recipient identity and unrelated activity events.
 
 ### Phases and data impact
@@ -458,6 +458,10 @@ receipts prove nothing.
    **Data model impact**: proposed latest horizon per tenant/chat/recipient; storage choice follows
    the verified snapshot/reconnect behaviour. **DoD**: acceptance tests and pre-commit pass,
    and the indicator agrees with native Teams on a controlled conversation.
+   **Done (2026-10-14)**: `receipts.py`, a `horizons` table in the presence cache, avatars on the
+   chat page ("Seen" = a reader's avatar, per the Element X decision). Live, GET only, on the
+   test group chat: snapshot 200, 2 members, ours left out, 1 reader shown, the cached paint
+   identical after a restart. The side-by-side look against the Teams client is left to babs.
 
 ### Spike findings (2026-10-13)
 

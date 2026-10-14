@@ -82,6 +82,8 @@ from .messages import (
     thread_of,
 )
 from .presence import Presence, dm_peer, open_cache, person
+from .receipts import EVENT as RECEIPT_EVENT
+from .receipts import Receipts
 from .send import mark_read
 from .stream import run_forever
 
@@ -107,7 +109,7 @@ _TYPING_TTL = 10.0  # seconds; Teams does not always send ClearTyping
 _SCRIPT_RE = re.compile(r"<script>(.*?)</script>", re.DOTALL)
 # Thread activity that changes the label (topic, member count): drop the cached thread info.
 # Someone reading a chat is not activity: bumping the row on it would defeat "seen".
-_SILENT_TYPES = {"ThreadActivity/MemberConsumptionHorizonUpdate"}
+_SILENT_TYPES = {RECEIPT_EVENT}
 _RELABEL_TYPES = {"ThreadActivity/TopicUpdate", "ThreadActivity/AddMember", "ThreadActivity/DeleteMember"}
 MAX_FRAME = MAX_IMAGE_BYTES + (1 << 20)  # one pasted image per binary frame, plus room for a long JSON verb
 _BIND_ATTEMPTS = 3  # redraws when the persisted port turns out taken
@@ -632,6 +634,7 @@ class Board:
         self._dropped: dict[str, int] = {}  # thread → relays dropped since the queue filled (one stall)
         self._media_down_until = 0.0  # monotonic; relayed records skip the media folder until then
         self.presence: Presence | None = None  # set by run(); None = no dots
+        self.receipts: Receipts | None = None  # set by run(); None = no read receipts
         self._authors: dict[ServerConnection, list[str]] = {}  # chat socket → authors it shows
         self.emojis = EmojiCache(directory)
         self.chat = ChatVerbs(directory, self.emojis, self._scope, me, self.me_name, data_dir)
@@ -786,6 +789,9 @@ class Board:
         if chat_dir is None and thread_id not in self.rows:
             return {"follow": thread_id, "error": "unknown chat"}
         self._follows[ws] = (thread_id, chat_dir / "media" if chat_dir else None)
+        if self.receipts is not None:
+            self.receipts.retain({tid for tid, _ in self._follows.values()})
+            self.receipts.open(thread_id)
         row = self.rows.get(thread_id)
         label = str(row.get("label") or "") if row else await self.archived_label(thread_id)
         if not label and chat_dir is not None:  # a channel, or a chat the seed lacks: the index names it
@@ -912,6 +918,8 @@ class Board:
         )
         msgtype = str(resource.get("messagetype") or "")
         log.debug("web_event", thread=thread_id, resource_type=resource_type, messagetype=msgtype)
+        if msgtype == RECEIPT_EVENT and self.receipts is not None:
+            self.receipts.on_event(thread_id, resource)
         await self._board_event(thread_id, resource_type, resource, msgtype)
         if any(tid == thread_id for tid, _ in self._follows.values()):
             # Queued, not awaited: a record globs the (NFS) media folder, the shared stream must not wait.
@@ -930,6 +938,15 @@ class Board:
                 # Once per stall: the page knows its view has a hole (a message, a typing clear).
                 self._gap(thread_id)
             self._dropped[thread_id] = self._dropped.get(thread_id, 0) + 1
+
+    def _receipts_frame(self, thread_id: str, frame: dict[str, Any]) -> None:
+        # Not queued: each frame is the full set, and a stalled relay must not hold it back.
+        broadcast(self._followers(thread_id), json.dumps({**frame, "thread": thread_id}, ensure_ascii=False))
+
+    async def on_gap(self, reason: str) -> None:
+        """Trouter reconnected or dropped events: the followed chats' receipts are snapshotted again."""
+        if self.receipts is not None:
+            self.receipts.resync()
 
     def _gap(self, thread_id: str) -> None:
         broadcast(self._followers(thread_id), json.dumps({"gap": thread_id}, ensure_ascii=False))
@@ -1265,6 +1282,8 @@ class Board:
         finally:
             self.clients.discard(ws)
             self._follows.pop(ws, None)
+            if self.receipts is not None:
+                self.receipts.retain({tid for tid, _ in self._follows.values()})
             self.chat.forget(ws)
             if self._authors.pop(ws, None) is not None:
                 self._follow_presence()
@@ -1658,13 +1677,15 @@ async def run(
             seed_stamp=stamp,
         )
         log.info("web_seeded", rows=len(board.rows), seeded=len(seed), limit=cap, me=bool(me))
+        cache = open_cache(settings)
         presence = board.presence = Presence(
             settings,
             # Lazy: building the MSAL app discovers its authority online.
             lambda: token_source(settings).presence_token(),
             board.broadcast_presence,
-            open_cache(settings),
+            cache,
         )
+        receipts = board.receipts = Receipts(directory, me, board._receipts_frame, cache)
         renewals = asyncio.create_task(presence.run())
         board._follow_presence()  # the seeded rows' peers, before any event moves a row
         # The stream waits out a dead login (see run_forever) and returns only on failure: a page that
@@ -1682,6 +1703,7 @@ async def run(
                 directory=directory,
                 epid_name="endpoint_id-web",
                 wait_for_login=True,  # a `miniteams login` elsewhere brings the widget back
+                on_gap=board.on_gap,
                 on_session=presence.on_session,
                 on_presence=presence.on_presence,
             )
@@ -1699,6 +1721,7 @@ async def run(
             emojis.cancel()
             renewals.cancel()
             board.close()
+            await receipts.close()  # before the presence close: that one closes the shared cache
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(presence.close(), 5)  # unsubscribe; a hung post must not hold the exit
     finally:
