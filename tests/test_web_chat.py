@@ -1109,6 +1109,26 @@ async def test_own_typing_is_never_relayed(board: W.Board, settings: Settings) -
         await _silent(ws)
 
 
+async def test_follow_answers_who_already_types(
+    quiet_directory: Directory, data_dir: Path, settings: Settings
+) -> None:
+    """011-AC7: a page following mid-typing gets the typers the row shows, and their expiry."""
+    rows = {B: {"id": B, "label": "B", "last_activity": _at(1), "last_id": "1", "typing": []}}
+    board = W.Board(rows, quiet_directory, me=ME, data_dir=data_dir, typing_ttl=0.5)
+    mine = {"from": f"https://h/v1/users/ME/contacts/{ME}", "imdisplayname": "Me Myself"}
+    async with _served(board, settings), _connect(board) as ws:
+        await ws.recv()
+        await board.on_event(_event("NewMessage", B, messagetype="Control/Typing"))
+        await board.on_event(_event("NewMessage", B, messagetype="Control/Typing", **mine))
+        assert "Ann Lee" in board.rows[B]["typing"]
+        await ws.send(json.dumps({"follow": T}))
+        assert (await _frame(ws))["typing"] == []  # another chat's typers stay there
+        await ws.send(json.dumps({"follow": B}))
+        assert (await _frame(ws))["typing"] == ["Ann Lee"]  # my own typing is not news to the page
+        assert await _frame(ws) == {"typing": "Ann Lee", "on": False, "thread": B}  # TTL, no ClearTyping
+        assert board.rows[B]["typing"] == []
+
+
 async def test_typing_expiry_off_the_board_does_not_rebroadcast(
     quiet_directory: Directory, data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1234,6 +1254,7 @@ async def test_chat_socket_never_receives_the_board(board: W.Board, settings: Se
             "opener": False,
             "page": W.page_version("chat.html"),
             "read_only": False,
+            "typing": [],
         }
         assert len(board.clients) == 1
         board.broadcast()

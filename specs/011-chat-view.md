@@ -78,7 +78,8 @@ click opens Teams web (2026-10-14 decision).
   then forwards `NewMessage`, `MessageUpdate` (edit, delete, reactions) and typing events for that
   thread as `{"msg": record}`, `{"edit": record}`, `{"typing": name, "on": bool}` to that socket (one
   frame per person, off on ClearTyping, on that person's next message, or after the board's typing
-  TTL; my own typing is never relayed). New
+  TTL; my own typing is never relayed). The `follow` answer carries `typing`: who already types,
+  so open, split switch and reconnect show what the row shows. New
   messages append when the latest page is loaded (else they only bump the "↓ latest" count); the
   page sticks to the bottom only when already there.
 - **Search and jump.** A search field in the header: verb `{"search": "<thread>", "q": text}` runs
@@ -87,8 +88,9 @@ click opens Teams web (2026-10-14 decision).
   without archive answers `{"search": id, "error": "no archive for this chat"}`. Clicking a hit
   asks `history` `around` its time and highlights the message. (A date picker was dropped: see
   Decisions.)
-- **Composer.** Same textarea rules as spec 006 (Enter sends, Shift+Enter newline, in-flight lock,
-  error under the field, draft kept on failure), reusing the `send` verb. The server accepts
+- **Composer.** Same textarea rules as spec 006 (Enter sends, Shift+Enter newline, error under the
+  field, draft kept on failure), reusing the `send` verb; no in-flight lock, sends queue per chat
+  (spec 012 Decisions). The server accepts
   `send` for a followed thread even when it is not on the board (archived-only chats), as long as it
   is a private, group or meeting chat: a team channel is refused (a post there reaches the whole team).
 - **Message actions**, on hover of a message, like Teams:
@@ -422,6 +424,10 @@ None.
   (`MINITEAMS_ASYNCGW_HOST` overrides it; per-region wiring waits for a check of the authz
   response); at exit, threads stuck on a dead mount do not hold the process.
 - Ctrl/⌘ click = middle click (touchpads); Shift click opens Teams web (babs, 2026-10-14).
+- The page's typing line matches the row (babs, 2026-10-14): live frames only carry changes, so the
+  `follow` answer lists the current typers (TTL timers, my own left out); expiry clears both.
+- A growing composer never covers the last message (babs, 2026-10-14): the list shrinks from below,
+  a reader at the bottom stays there, any other keeps the list's bottom edge.
 
 ## Recipient read receipts amendment (validated 2026-10-13, spike first)
 

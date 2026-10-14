@@ -367,9 +367,9 @@
       return all.filter((m, i) => all.slice(i + 1).filter((n) => n.name === m.name).length < (count.get(m.name) || 0));
     };
     // Picks saved across a reload: data from sessionStorage, checked like any input.
-    const restore = (list) => {
+    const restore = (list, id = chat()) => {
       const ok = list.filter((m) => m && typeof m.name === "string" && typeof m.mri === "string" && [undefined, true].includes(m.everyone));
-      picked.set(chat(), ok.map(pick));
+      picked.set(id, ok.map(pick));
     };
     // A sent text empties the composer without an input event: its dismissed word must not outlive it.
     const forget = (id) => { picked.delete(id); if (id === chat()) dismissed = -1; };
@@ -385,7 +385,7 @@
   // `busy(id)` its send awaits an answer.
   const IMG_MAX = 8, IMG_BYTES = 10 << 20, IMG_TOTAL = 40 << 20, IMG_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
   const imageQueue = ({ input, box, chat, error, busy }) => {
-    const queues = new Map(), tries = new Map();  // tries: chat id → its draft's last attempt
+    const queues = new Map(), tries = new Map(), flight = new Map();  // tries: chat id → its draft's last attempt
     let chain = Promise.resolve(), adding = 0, last = 0, shown = null;
     const list = (id = chat()) => queues.get(id) || [];
     const view = el("dialog", "imgview"), big = el("img"), bar = el("div"), shut = el("button", null, "Close"), del = el("button", null, "Remove");
@@ -454,28 +454,41 @@
     // first (Teams does not dedupe, and any failure may hide a posted message); an edited draft is a
     // new message, so an edit is never swallowed by the check. Waits for images still being measured;
     // false when nothing is left to send (every pasted image refused), for the page to settle.
-    const send = async (ws, id, verb) => {
-      await chain;
-      if (ws.readyState !== 1) return true;  // closed meanwhile: the page's onclose already said so
-      const items = list(id);
+    // `taken`: the images `take` detached at Enter (chat page); a failure puts them back in front.
+    const send = async (ws, id, verb, taken) => {
+      if (!taken) await chain;
+      if (ws?.readyState !== 1) {  // closed meanwhile, or (null) failed before it went: the page said so
+        if (taken) { queues.set(id, [...taken, ...list(id)]); render(); }
+        return true;
+      }
+      const items = taken || list(id);
       if (!items.length && !verb.text.trim()) return false;
       const json = JSON.stringify(verb), prev = tries.get(id);
       const same = !!prev && prev.json === json;  // images added or removed already dropped the attempt
       const cmid = same ? prev.cmid : String(last = Math.max(Date.now(), last + 1));
       tries.set(id, { cmid, json });
+      flight.set(id, { cmid, json, taken });
       ws.send(JSON.stringify({ ...verb, cmid, ...(same ? { check: true } : {}),
         ...(items.length ? { images: items.map((it) => ({ w: it.w, h: it.h, size: it.file.size })) } : {}) }));
       for (const it of items) ws.send(it.file);
       return true;
     };
-    // Success drops the chat's images (its composer is locked while it sends, so they are the ones sent).
+    // Success drops the images sent: the taken ones, else the chat's (the widget locks its composer while
+    // it sends). A failure re-arms the retry: a next message typed meanwhile must not cost it its check.
     const settled = (id, m) => {
+      const f = flight.get(id);
+      flight.delete(id);
       if (m.ok) {
         tries.delete(id);
-        for (const it of list(id)) URL.revokeObjectURL(it.url);
-        queues.delete(id);
+        for (const it of f?.taken || list(id)) URL.revokeObjectURL(it.url);
+        if (!f?.taken) queues.delete(id);
+      } else if (f) {
+        tries.set(id, { cmid: f.cmid, json: f.json });
+        if (f.taken) queues.set(id, [...f.taken, ...list(id)]);
       }
       render();
     };
-    return { list, send, settled, render, adding: () => adding > 0 };
+    // The chat's images, once those pasted before this call are measured, detached for one message.
+    const take = (id) => chain.then(() => { const items = list(id); queues.delete(id); render(); return items; });
+    return { list, send, settled, take, render, adding: () => adding > 0 };
   };

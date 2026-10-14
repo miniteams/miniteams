@@ -423,7 +423,7 @@ async def test_picks_stay_with_their_chat_across_a_split_switch_and_clear_only_o
     fake.fail = True
     await box.press("Enter")
     await wait(lambda: len(fake.of("send")) == 2)
-    await until(page, "!document.getElementById('reply').disabled")
+    await until(page, "document.getElementById('err').textContent === 'boom'")
     fake.fail = False
     await box.press("Enter")
     await wait(lambda: len(fake.of("send")) == 3)

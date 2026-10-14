@@ -398,16 +398,15 @@ async def _edit_after_unsure(fake: Any, page: Page) -> None:
     await _paste(page, png(3, 2), png(4, 2))
     await _thumbs(page, 2)
     await box.press("Enter")
-    await until(page, "!document.getElementById('reply').disabled")
-    assert await _err(page).inner_text() == SHOWN
+    await _error_is(page, SHOWN)  # the failure answered: text and images are back
     await box.press_sequentially(" again")
     await box.press("Enter")
     await wait(lambda: len(fake.of("send")) == 2)
-    await until(page, "!document.getElementById('reply').disabled")
+    await _error_is(page, SHOWN)
     await page.locator(".imgs .rm").first.click()
     await box.press("Enter")
     await wait(lambda: len(fake.of("send")) == 3)
-    await until(page, "!document.getElementById('reply').disabled")
+    await _error_is(page, SHOWN)
     await _paste(page, png(5, 2))
     await _thumbs(page, 2)
     await box.press("Enter")
@@ -504,7 +503,7 @@ async def _retype_after_unsure(fake: Any, page: Page) -> None:
     fake.replies = [{"error": UNSURE, "unsure": True}]
     await box.press_sequentially("same")
     await box.press("Enter")
-    await until(page, "!document.getElementById('reply').disabled")
+    await _error_is(page, SHOWN)
     await box.press("Control+a")
     await box.press("Backspace")
     await box.press_sequentially("same")
@@ -561,3 +560,74 @@ async def test_a_paste_that_throws_does_not_block_later_sends(widget: Any) -> No
     await box.press("Enter")
     await wait(lambda: len(widget.of("send")) == 1)
     assert widget.of("send")[0]["text"] == "hi" and "images" not in widget.of("send")[0]
+
+
+# --- chat page: a burst of sends (012) ---
+
+
+async def _burst(page: Page, *texts: str) -> None:
+    box = page.locator("#reply")
+    for text in texts:
+        await box.press_sequentially(text)
+        await box.press("Enter")
+
+
+async def test_a_burst_of_enters_queues_in_order_from_a_usable_box(pages: Pages) -> None:
+    """012: Enter empties the box at once, which stays usable; later messages queue, one in flight per
+    chat, each with its own id and images, sent in order as the acks come."""
+    fake = Chat(replies=[None] * 3)
+    page = await open_chat(pages, fake, init=FREED)
+    box = page.locator("#reply")
+    await box.focus()
+    await _burst(page, "one")
+    await _paste(page, png(4, 2))
+    await _thumbs(page, 1)
+    await _burst(page, "two", "three")
+    assert await box.input_value() == "" and not await box.is_disabled()
+    await _thumbs(page, 0)
+    await fake.settled(50)
+    assert [v["text"] for v in fake.of("send")] == ["one"]
+    fake.send({"sent": T, "ok": True})
+    await wait(lambda: len(fake.of("send")) == 2)
+    fake.send({"sent": T, "ok": True})
+    await wait(lambda: len(fake.of("send")) == 3)
+    fake.send({"sent": T, "ok": True})
+    await fake.settled(50)
+    sent = fake.of("send")
+    assert [v["text"] for v in sent] == ["one", "two", "three"]
+    assert ["images" in v for v in sent] == [False, True, False] and fake.frames == [png(4, 2)]
+    assert len(set(fake.cmids)) == 3 and all("check" not in v for v in sent)
+
+
+@pytest.mark.parametrize("retry", [True, False], ids=["retried", "dropped"])
+async def test_a_failure_in_a_burst_comes_back_and_holds_the_rest(pages: Pages, retry: bool) -> None:
+    """012: a failed message returns to the box and the ones queued behind it wait: Enter retries it
+    (checked, same id), or drops it from an emptied box; then the rest goes, in order."""
+    fake = Chat(replies=[None] * 3)
+    page = await open_chat(pages, fake, init=FREED)
+    box = page.locator("#reply")
+    await box.focus()
+    await _burst(page, "one", "two", "three")
+    fake.send({"sent": T, "ok": True})
+    await wait(lambda: len(fake.of("send")) == 2)
+    await box.press_sequentially("x")  # typed and erased while "two" is out: its retry keeps the check
+    await box.press("Backspace")
+    fake.send({"sent": T, "error": "boom"})
+    await _error_is(page, "boom · 1 more queued after it")
+    assert await box.input_value() == "two"
+    await fake.settled(50)
+    assert len(fake.of("send")) == 2
+    if not retry:
+        await box.press("Control+a")
+        await box.press("Backspace")
+    await box.press("Enter")
+    if retry:
+        await wait(lambda: len(fake.of("send")) == 3)
+        fake.send({"sent": T, "ok": True})
+    await wait(lambda: len(fake.of("send")) == (4 if retry else 3))
+    await fake.settled(50)
+    sent = fake.of("send")
+    assert [v["text"] for v in sent] == (["one", "two", "two", "three"] if retry else ["one", "two", "three"])
+    assert [v.get("check", False) for v in sent] == ([False, False, True, False] if retry else [False] * 3)
+    assert len(set(fake.cmids)) == 3
+    assert await _err(page).inner_text() == "" and await box.input_value() == ""

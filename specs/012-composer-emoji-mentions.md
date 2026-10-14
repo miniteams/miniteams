@@ -292,6 +292,14 @@ None.
   read-only) and sends, reusing the id, only if it is absent (babs, 2026-10-13, after the 5a dedup
   proof).
 - Both composers, the widget in a compact layout; may be switched off from usage (babs, 2026-10-13).
+- Chat page burst sends (babs, 2026-10-14): Enter empties the box at once and it stays usable.
+  - Messages queue per chat, one in flight (AC23's "never twice concurrently"), each with its own id
+    and the images pasted before its Enter; the next goes on the ack.
+  - A failure (error, unsure, lost socket) pauses that chat's queue and puts the message back in the
+    box, ahead of any newer draft; the queued ones wait, the error line counts them.
+  - Enter retries it (unchanged: same id, checked); Enter on an emptied box drops it. Then the rest
+    goes, in order: nothing is sent past a failure.
+  - A reload folds what the queue still holds into the draft. The widget keeps its in-flight lock.
 
 - Shortened mentions use the first whitespace-separated word of the existing display name.
   Highlighting remains in the sent message; the textarea stays plain text.
