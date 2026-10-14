@@ -20,7 +20,8 @@ opens a new tab on `/chat/<thread>` served by the same `miniteams web` process (
 `chatnav`, adds a chat picker at `/?nav=chat` and a split list beside the chat): the conversation's
 history, newest at the bottom, rendered like Teams (bold, links, lists, quotes, emoji, images from
 the archive), followed live, with the same composer as the widget at the bottom. Reply there,
-Enter sends. Ctrl click and plain click keep their current behaviour.
+Enter sends. Plain click keeps its behaviour; Ctrl/⌘ click does what middle click does, Shift
+click opens Teams web (2026-10-14 decision).
 
 ## Scope
 
@@ -118,7 +119,7 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
   browser under `chatnav`, values `list` (default) and `split`; the chat page reads the same key.
   - `list`: the chat page's ◀ goes to `/?nav=chat`, the board in navigation mode: a plain click on a
     row opens `/chat/<id>` in the same tab, a middle click opens it in a new tab (through
-    `--browser` when set, as the middle-click setting does), Ctrl click opens Teams as today. The
+    `--browser` when set, as the middle-click setting does), Shift click opens Teams. The
     widget opened on `/` without `nav` is unchanged.
   - `split`: `/chat/<id>` shows the conversation list on the left (same rows, tabs, seen and mute
     state as the board, kept live) and the chat on the right. A click on a row switches the chat in
@@ -159,7 +160,7 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
 - Fetching images that are not in the archive (would need the skype token on the page).
 - Message history for threads the archive does not hold beyond one API page.
 - Emoji completion and `@` mentions in the composer (spec 012).
-- Changing what plain click or Ctrl click do.
+- Changing what plain click does.
 
 ## Acceptance criteria
 
@@ -167,7 +168,9 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
       true}` when `--browser` is set and the server runs `--browser` on `http://<bind>/chat/<encoded
       id>` (changed by the 2026-10-12 decision: plus `#<launch token>`); without `--browser` it opens a new tab on `/chat/<encoded id>` and sends no verb; with the setting at `teams` (default) the
       behaviour of today is unchanged (`open`+`web` when `--browser` is set, else the plain link).
-- [x] **AC2** Ctrl click and plain click are unchanged whatever the setting.
+- [x] **AC2** Plain click is unchanged whatever the setting; Ctrl/⌘ click does what middle click does
+      (both settings, nav mode, the chat page's list), Shift click opens Teams web (changed by the
+      2026-10-14 decision).
 - [x] **AC3** `GET /chat/<id>` returns the chat page for a thread on the board or in the archive,
       404 otherwise (changed by the 2026-10-12 decision: 404 only with the cookie, without it every
       `/chat/<id>` gets the empty shell); `GET /media/<id>/<file>` returns the file for an existing archived asset, 404
@@ -221,7 +224,7 @@ Enter sends. Ctrl click and plain click keep their current behaviour.
       the deep link on that message id.
 - [x] **AC20** With `chatnav` at `list`, the chat page's ◀ opens `/?nav=chat`; there a plain click
       on a row opens that chat in the same tab, a middle click opens it in a new tab (through
-      `--browser` when set), Ctrl click is unchanged; `/` without `nav` behaves as before.
+      `--browser` when set), Ctrl/⌘ click too, Shift click opens Teams; `/` without `nav` behaves as before.
 - [x] **AC21** With `chatnav` at `split`, `/chat/<id>` shows the live conversation list beside the
       chat; clicking another row follows that thread, shows its history and changes the URL
       without a page load; browser Back returns to the previous chat.
@@ -414,6 +417,7 @@ None.
 - Known limits after the fix round: the custom emoji host defaults to the fr-prod region
   (`MINITEAMS_ASYNCGW_HOST` overrides it; per-region wiring waits for a check of the authz
   response); at exit, threads stuck on a dead mount do not hold the process.
+- Ctrl/⌘ click = middle click (touchpads); Shift click opens Teams web (babs, 2026-10-14).
 
 ## Recipient read receipts amendment (validated 2026-10-13, spike first)
 

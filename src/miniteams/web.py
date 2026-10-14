@@ -626,7 +626,7 @@ class Board:
         self.muted_path = muted_path
         self.opener = opener  # argv the deep link is appended to; None = the page follows its link
         self.open_scheme = open_scheme
-        self.browser = browser  # argv for the https link on Ctrl/middle click; None = page's own browser
+        self.browser = browser  # argv for the https link on Shift/Ctrl/middle click; None = own browser
         self.base_url = ""  # http://host:port, set once bound: `chat` opens point back at us
         self.secret = ""  # the `mt` cookie every route needs: serve_board loads it, routes read it here
         self.token = secrets.token_urlsafe(24)  # single use: `/auth` trades it for the cookie

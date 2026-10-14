@@ -107,8 +107,8 @@ URL stays bookmarkable; `--bind` overrides it and refuses anything but loopback 
 need the auth cookie, see *First launch*. Clicking a row opens the chat at its last message through `--opener` (default `xdg-open`
 on an `msteams://` deep link, i.e. the desktop client; `--open-scheme https` for Teams web,
 `--opener none` to let the page follow its plain https link); opening does not mark the row
-seen. Ctrl/middle click opens the https link, through `--browser firefox` when set, else in the
-page's own browser (middle click can open the chat page instead, see the ⚙ setting below). `xdg-open` only works when the `msteams` handler's `.desktop` entry passes the
+seen. Middle or Ctrl/⌘ click opens the https link (or the chat page, see the ⚙ setting below), Shift click the
+https link; through `--browser firefox` when set, else in the page's own browser. `xdg-open` only works when the `msteams` handler's `.desktop` entry passes the
 URL along (`Exec=… %u`); otherwise point `--opener` at the client binary, e.g.
 `--opener "/path/to/teams-for-linux --no-sandbox"`. Hovering a preview cut by the row width shows the whole message (up to 1000 characters).
 Hovering (or tabbing into) a row shows `✎`, `👁` (mark read in Teams) and `⋯`, a menu with **✓ Mark seen** and
@@ -157,10 +157,10 @@ terminal and it reconnects within seconds (it watches the token cache file).
 
 A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings are per browser (`localStorage`).
 
-- **Middle click** (widget ⚙): `Teams web` (default) or `Chat here`, which opens the chat page through `--browser` when set,
+- **Middle click**, Ctrl/⌘ click alike (widget ⚙): `Teams web` (default) or `Chat here`, which opens the chat page through `--browser` when set,
   else in a new tab. The same `--browser` serves chat pages opened from the widget.
 - **`/?nav=chat`**: the board as a chat picker; the chat page's ◀ goes there. Click opens the chat in the same tab,
-  middle click in a new one, Ctrl click opens Teams.
+  middle or Ctrl/⌘ click in a new one, Shift click opens Teams.
 - **Chat navigation** (⚙, on the widget and on the chat page): `List` (default) or `Split`. `Split` shows the list on the
   chat page's left instead of ◀: a click switches chats in place (Back returns), each chat keeps its draft and quotes.
   The widget adds `?chatnav=split` to the chat URLs it opens, so a page in another browser follows the setting.
