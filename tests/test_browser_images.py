@@ -272,8 +272,7 @@ async def test_a_failed_send_keeps_everything_and_retries_with_the_same_id(widge
     await _paste(page, png())
     await _thumbs(page, 1)
     await box.press("Enter")
-    await until(page, "!document.getElementById('reply').disabled")
-    assert await _err(page).inner_text() == "Teams answered 403"
+    await _error_is(page, "Teams answered 403")
     assert await box.input_value() == "hi"
     await _thumbs(page, 1)
     await box.press("Enter")
@@ -283,52 +282,60 @@ async def test_a_failed_send_keeps_everything_and_retries_with_the_same_id(widge
 
 
 async def test_an_unsure_send_spins_and_the_retry_asks_for_a_check(widget: Any) -> None:
-    """012-AC23: while unanswered the composer spins and refuses a second send; an unsure answer says
-    so, and the manual retry asks the server to look for the same id first."""
+    """012-AC23, 017-AC1: while unanswered the composer spins, its box empty and usable; Enter on it
+    sends nothing more; an unsure answer says so, and the manual retry asks the server to look for the
+    same id first. An image pasted during a send is the next message's: it stays removable."""
     page, box = widget.page, widget.page.locator("#reply")
-    widget.replies = [None]
+    widget.replies = [None, None]
     await _paste(page, png())
     await _thumbs(page, 1)
     await box.press("Enter")
     await until(page, "document.querySelector('.imgs').classList.contains('busy')")
     assert await page.locator(".imgs .temp").inner_text() == "sending…"
-    assert await box.is_disabled() and await page.locator(".imgs .rm").is_disabled()
-    await page.locator(".imgs .open").click()  # the preview opens, its Remove locked and looking it
-    remove = page.locator("dialog.imgview").get_by_text("Remove")
-    assert await remove.is_disabled()
-    assert await remove.evaluate("e => getComputedStyle(e).opacity") == "0.5"
-    await page.keyboard.press("Escape")
-    await page.evaluate(
-        "document.getElementById('reply').dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter'}))"
-    )
+    assert not await box.is_disabled() and await box.input_value() == ""
+    await _thumbs(page, 0)
+    await box.press("Enter")
     await widget.settled()
     assert len(widget.of("send")) == 1
     widget.send({"sent": T, "error": UNSURE, "unsure": True})
-    await until(page, "!document.getElementById('reply').disabled")
-    assert await _err(page).inner_text() == SHOWN
+    await _error_is(page, SHOWN)
     await _thumbs(page, 1)
     await box.press("Enter")
     await wait(lambda: len(widget.of("send")) == 2)
     assert widget.of("send")[1]["check"] is True and widget.cmids[0] == widget.cmids[1]
+    await _paste(page, png(3, 2))
+    await _thumbs(page, 1)
+    assert await page.locator(".imgs .rm").is_enabled()
+    await page.locator(".imgs .open").click()
+    remove = page.locator("dialog.imgview").get_by_text("Remove")
+    assert await remove.is_enabled()
+    await remove.click()
+    await _thumbs(page, 0)
 
 
 async def test_a_lost_socket_mid_send_arms_the_check(pages: Pages) -> None:
-    """012-AC23: no answer will come once the socket drops: the retry checks first, never blindly."""
+    """012-AC23, 017-AC13 (supersedes the manual retry): no answer will come once the socket drops: the
+    message goes back to the queue, no error, the box untouched; once the socket is back it goes again
+    with its id and the check, never blindly, then the queued one."""
     fake = Widget(replies=[None])
     page = await _open_widget(pages, fake)
     box = page.locator("#reply")
-    await box.press_sequentially("hi")
-    await box.press("Enter")
+    for text in ("hi", "two"):
+        await box.press_sequentially(text)
+        await box.press("Enter")
+    await box.press_sequentially("next")
     await wait(lambda: len(fake.of("send")) == 1)
     await fake.ws.close()
-    await until(page, "!document.getElementById('reply').disabled")
-    assert "checks the chat" in await _err(page).inner_text()
+    await until(page, "window.__ws.readyState === 3")
+    assert await _err(page).inner_text() == "" and await box.input_value() == "next"
     await until(page, "window.__ws.readyState === 1", tries=500)
-    await page.wait_for_selector("a.name")
-    await page.locator("button.reply").dispatch_event("click")
-    await page.locator("#reply").press("Enter")
-    await wait(lambda: len(fake.of("send")) == 2)
-    assert fake.of("send")[1]["check"] is True and fake.cmids[0] == fake.cmids[1]
+    await wait(lambda: len(fake.of("send")) == 3)
+    await fake.settled(50)
+    sent = fake.of("send")
+    assert [v["text"] for v in sent] == ["hi", "hi", "two"]
+    assert [v.get("check", False) for v in sent] == [False, True, False]
+    assert fake.cmids[0] == fake.cmids[1] != fake.cmids[2]
+    assert await box.input_value() == "next"
     await pages.close()
 
 
@@ -447,8 +454,6 @@ async def _paste_then_enter(fake: Any, page: Page) -> None:
     await wait(lambda: len(fake.frames) == 1)
     assert fake.of("send")[0]["images"] == [{"w": 3, "h": 2, "size": len(png(3, 2))}]
     await until(page, "document.querySelectorAll('.imgs .thumb').length === 0")
-    if await page.locator("#reply").count() == 0:  # the widget closes its composer once sent
-        await page.locator("button.reply").dispatch_event("click")
     await page.evaluate(PASTE_ENTER, [[[png(4, 2).hex(), "image/png", 0]], ""])  # no text: the image alone
     await wait(lambda: len(fake.frames) == 2)
     assert fake.of("send")[1]["text"] == "" and fake.frames[1] == png(4, 2)
@@ -478,8 +483,6 @@ async def test_after_a_success_the_same_text_is_a_new_message(widget: Any) -> No
     await page.locator("#reply").press_sequentially("ok")
     await page.locator("#reply").press("Enter")
     await wait(lambda: len(widget.of("send")) == 1)
-    await page.wait_for_selector("#reply", state="detached")  # sent: the widget closes its composer
-    await page.locator("button.reply").dispatch_event("click")
     await page.locator("#reply").press_sequentially("ok")
     await page.locator("#reply").press("Enter")
     await wait(lambda: len(widget.of("send")) == 2)

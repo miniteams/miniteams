@@ -334,7 +334,7 @@
 </div>
 <script>
 (() => {
-  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn rowActions completion imageQueue
+  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn rowActions completion imageQueue sendQueue
   /* ui.js */
   let thread = null;
   try { thread = decodeURIComponent(location.pathname.slice("/chat/".length)); } catch (e) {}
@@ -403,7 +403,6 @@
       case "fallback": hist.restore = null; break;  // a reconnect's anchor failed: the latest page instead
     }
   };
-  const sending = new Set();  // chats whose send awaits its ack (split: one per chat)
   const split = pref("chatnav") === "split";
   const LIVE_MAX = 600;  // messages kept on screen at the bottom (and buffered while detached)
   const EDGE = 150;  // px from the top or bottom that loads the next page
@@ -976,6 +975,7 @@
     if (m.error) { hist.followFailed = true; $note.hidden = false; $note.className = "err"; $note.textContent = m.error; return; }
     // A newer chat.html on the server (restart, edit): this page is stale, reload it.
     if (m.page) { if (pageVersion && m.page !== pageVersion) { saveDraft(); location.reload(); return; } pageVersion = m.page; }
+    sends.wake();  // only now: a page about to reload must not resend first
     hist.followFailed = false;
     // Who already types when the follow lands (open, switch, reconnect): frames only carry changes.
     typing.clear(); for (const n of m.typing || []) typing.add(n); renderTyping();
@@ -1003,10 +1003,6 @@
     $list.scrollTop = top;
   };
   let readOnly = false;
-  const setSending = (id, on) => {
-    if (on) sending.add(id); else sending.delete(id);
-    imgs.render();
-  };
   // What each chat left behind (split): composer text, quotes, open editors, the error line.
   const drafts = new Map();
   const stash = () => {
@@ -1015,91 +1011,85 @@
     const d = { text: $reply.value, quotes, editing, err: $err.textContent };
     if (d.text || quotes.length || editing.length || d.err) drafts.set(thread, d); else drafts.delete(thread);
   };
-  // Drafts (text and quotes) survive the reload a newer chat.html triggers.
+  // Drafts (text and quotes) and the send queues survive a reload, a newer chat.html's or the user's (F5).
+  let left = false;
   const saveDraft = () => {
-    // A reload ends the send queues: what they still hold joins its chat's draft, never lost.
-    for (const [t, q] of outbox) {
-      const rest = q.list.splice(0).map((e) => e.verb.text), d = drafts.get(t) || { text: "", quotes: [], editing: [], err: "" };
-      if (t === thread) $reply.value = [$reply.value, ...rest].filter(Boolean).join("\n");
-      else if (rest.length) drafts.set(t, { ...d, text: [d.text, ...rest].filter(Boolean).join("\n") });
-    }
+    if (left) return;  // once: the version reload saves, then its pagehide would again
+    left = true;
+    sends.save();
     stash();
     for (const [t, d] of drafts) {
       if (t !== thread && !d.text && !d.quotes.length) continue;
-      try { sessionStorage.setItem("draft:" + t, JSON.stringify({ text: d.text, quotes: d.quotes, picked: complete.mentions(d.text, t) })); } catch (e) {}
+      const record = { text: d.text, quotes: d.quotes, picked: complete.mentions(d.text, t), sent: imgs.attempt(t) };
+      try { sessionStorage.setItem("draft:" + t, JSON.stringify(record)); } catch (e) {}
     }
   };
+  addEventListener("pagehide", (e) => { if (!e.persisted) saveDraft(); });
   const takeDraft = (t) => {
     let d = null;
     try { d = sessionStorage.getItem("draft:" + t); sessionStorage.removeItem("draft:" + t); } catch (e) { return null; }
     if (d == null) return null;
     // A page from before the quotes saved the bare text.
-    try { const o = JSON.parse(d); if (o && typeof o.text === "string") return o; } catch (e) {}
+    try {
+      const o = JSON.parse(d);
+      if (o && typeof o.text === "string") return { ...o, quotes: (Array.isArray(o.quotes) ? o.quotes : []).filter((qt) => qt && typeof qt.id === "string").slice(0, QUOTE_MAX)
+        .map((qt) => ({ id: qt.id, name: String(qt.name ?? ""), line: String(qt.line ?? "") })) };
+    } catch (e) {}
     return { text: d, quotes: [] };
   };
+  // A chat's draft, the one in memory or else the one a reload stored: anything merging into it starts
+  // there. A stored one hands its picks and attempt over at once: merged picks or a newer failed attempt
+  // must not be replaced by stale ones later.
+  const draftOf = (id) => {
+    const d = !drafts.has(id) && takeDraft(id);
+    if (d) {
+      if (Array.isArray(d.picked)) complete.restore(d.picked, id);
+      imgs.arm(id, d.sent);
+      delete d.picked; delete d.sent;
+      drafts.set(id, d);
+    }
+    return drafts.get(id);
+  };
   const unstash = () => {
-    const d = drafts.get(thread) || takeDraft(thread) || { text: "", quotes: [] };
+    const d = draftOf(thread) || { text: "", quotes: [] };
     drafts.delete(thread);
     $reply.value = d.text; grow();
-    quotes = (Array.isArray(d.quotes) ? d.quotes : []).filter((qt) => qt && typeof qt.id === "string").slice(0, QUOTE_MAX)
-      .map((qt) => ({ id: qt.id, name: String(qt.name ?? ""), line: String(qt.line ?? "") }));
+    quotes = [...d.quotes];
     renderQuotes();
-    // Only a draft from sessionStorage carries its picks: in memory they never left the completion.
-    if (Array.isArray(d.picked)) complete.restore(d.picked);
     carry = d.editing?.length ? d.editing : null;
     $err.textContent = d.err || "";
   };
   // A message for another chat than the one shown: its line waits in that chat's draft.
   const noteFor = (id, text) => {
     if (id === thread) { $err.textContent = text; return; }
-    drafts.set(id, { text: "", quotes: [], editing: [], ...drafts.get(id), err: text });
+    drafts.set(id, { text: "", quotes: [], editing: [], ...draftOf(id), err: text });
   };
-  // Enter empties the composer at once; a chat's messages go out one at a time, in order. A failure
-  // pauses that chat's queue and puts the message back in the box ahead of any newer draft: Enter
-  // retries it (checked when unchanged), Enter on an emptied box drops it; the queued ones follow.
-  const outbox = new Map();  // chat id → { list: [{ verb, quotes, images }], paused }
-  const pump = (id) => {
-    const q = outbox.get(id);
-    if (!q || q.paused || sending.has(id) || !q.list.length) return;
-    const e = q.list[0];
-    setSending(id, true);
-    e.images.then((items) => imgs.send(q.list[0] === e && sending.has(id) ? ws : null, id, e.verb, items)).then((sent) => {
-      if (sent || !sending.has(id) || q.list[0] !== e) return;
-      q.list.shift();
-      if (!(id === thread ? $err.textContent : drafts.get(id)?.err)) noteFor(id, "nothing to send");  // a refused image keeps its reason
-      setSending(id, false);
-      pump(id);
-    });
-  };
-  const failed = (id, text) => {
-    const q = outbox.get(id), e = q.list.shift(), mine = id === thread;
-    imgs.settled(id, { ok: false });
-    q.paused = true;
-    const d = mine ? { text: $reply.value, quotes } : drafts.get(id) || { text: "", quotes: [] };
-    const back = d.text ? e.verb.text + "\n" + d.text : e.verb.text;
+  // Enter empties the composer at once; a chat's messages go out one at a time, in order (sendQueue).
+  // A failure puts the message back in the box ahead of any newer draft and the chat's queue waits:
+  // Enter retries it (checked when unchanged), Enter on an emptied box drops it; the queued ones follow.
+  const failed = (id, e, text) => {
+    sends.discard(id, e);
+    const mine = id === thread, d = mine ? { text: $reply.value, quotes } : draftOf(id) || { text: "", quotes: [] };
+    const back = d.text ? e.verb.text + "\n" + d.text : e.verb.text, more = sends.list(id).length;
     const qs = [...e.quotes, ...d.quotes.filter((qt) => !e.quotes.some((x) => x.id === qt.id))].slice(0, QUOTE_MAX);
     complete.restore([...e.verb.mentions, ...complete.mentions(d.text, id)], id);
     if (mine) { $reply.value = back; grow(); quotes = qs; renderQuotes(); $reply.focus(); }
     else drafts.set(id, { editing: [], err: "", ...drafts.get(id), text: back, quotes: qs });
-    noteFor(id, text + (q.list.length ? ` · ${q.list.length} more queued after it` : ""));
-    setSending(id, false);
+    noteFor(id, text + (more ? ` · ${more} more queued after it` : ""));
   };
   const submit = () => {
-    const id = thread, text = $reply.value, q = outbox.get(id) || { list: [], paused: false };
+    const id = thread, text = $reply.value, held = sends.paused(id);
     const empty = !text.trim() && !imgs.list(id).length && !imgs.adding();
-    if (empty && !q.paused) return;
+    if (empty && !held) return;
     if (!(ws && ws.readyState === 1)) { $err.textContent = "offline, not sent"; return; }
     if (!empty) {
       const verb = { send: id, text, mentions: complete.mentions(text), format: "full", ...(quotes.length ? { quote: quotes.map((qt) => qt.id) } : {}) };
-      const e = { verb, quotes, images: imgs.take(id) };
-      if (q.paused) q.list.unshift(e); else q.list.push(e);  // a paused queue's head is the box
+      sends.push(id, { verb, quotes }, held);  // a paused queue's head is the box
       $reply.value = ""; grow(); quotes = []; renderQuotes(); complete.forget(id);
     }
-    q.paused = false;
-    outbox.set(id, q);
     $err.textContent = "";
     hideView();
-    pump(id);
+    sends.resume(id);
   };
 
   const $pop = document.getElementById("pop");
@@ -1141,7 +1131,11 @@
     else if (esearch.key(e)) { e.preventDefault(); e.stopPropagation(); }
   });
   $eq.addEventListener("blur", () => setTimeout(() => { if (document.activeElement !== $eq) closeSearch(); }));
-  const imgs = imageQueue({ input: $reply, box: document.getElementById("imgs"), chat: () => thread, busy: (id) => sending.has(id), error: (id, text) => noteFor(id, text) });
+  const imgs = imageQueue({ input: $reply, box: document.getElementById("imgs"), chat: () => thread, busy: (id) => sends.busy(id), error: (id, text) => noteFor(id, text) });
+  const sends = sendQueue({
+    imgs, socket: () => ws, failed, changed: () => imgs.render(), note: noteFor,
+    nothing: (id) => { if (!(id === thread ? $err.textContent : draftOf(id)?.err)) noteFor(id, "nothing to send"); },  // a refused image keeps its reason
+  });
   const UNSURE = "no answer from Teams: it may have gone out · Enter checks the chat before sending again";
 
   // Toolbar (spec 012, full format): markers around the selection, or around the caret to type into.
@@ -1219,14 +1213,7 @@
     e.preventDefault();
     submit();
   };
-  const onSent = (m) => {
-    if (!sending.has(m.sent)) return;
-    if (!m.ok) { failed(m.sent, m.unsure ? UNSURE : why(m.error) || "not sent"); return; }
-    outbox.get(m.sent).list.shift();
-    imgs.settled(m.sent, m);
-    setSending(m.sent, false);
-    pump(m.sent);
-  };
+  const onSent = (m) => { if (m.ok) sends.done(m.sent); else sends.fail(m.sent, m.unsure ? UNSURE : why(m.error) || "not sent"); };
 
   // --- chatnav=split: the board's list beside the chat (row rules in ui.js) ---
   const $side = document.getElementById("side"), $rows = document.getElementById("rows"), $tabs = document.getElementById("tabs"),
@@ -1565,8 +1552,7 @@
       typing.clear(); renderTyping();
       if (asked) hideView();  // its answer died with the socket: no pressed button over an empty box
       asked = 0;
-      // No ack will come: the message may or may not have gone out.
-      for (const id of [...sending]) failed(id, "connection lost: Enter checks the chat before sending again");
+      sends.lost();
       for (const box of $msgs.querySelectorAll(".editor[data-saving]")) {
         delete box.dataset.saving;
         box.nextElementSibling.textContent = "connection lost: check the message before saving again";
@@ -1663,6 +1649,7 @@
     return;
   }
   unstash();
+  sends.load(split ? null : [thread]);  // other chats' queues stay stored, for the widget that queued them
   if (split) startSplit();
   signIn.then(connect);
   $reply.focus();

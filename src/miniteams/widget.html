@@ -113,7 +113,7 @@
 <div id="spin" class="spin" hidden title="loading the live list…"></div>
 <script>
 (() => {
-  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn rowActions completion imageQueue
+  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn rowActions completion imageQueue sendQueue
   /* ui.js */
   const $rows = document.getElementById("rows"), $empty = document.getElementById("empty"),
         $status = document.getElementById("status"), $tabs = document.getElementById("tabs"),
@@ -133,9 +133,9 @@
   const chatPage = (id) => "/chat/" + encodeURIComponent(id) + (chatnav === "split" ? "?chatnav=split" : "");
   // The chat page's ◀ lands here: rows open our chat page instead of Teams.
   const nav = q.get("nav") === "chat";
-  // Quick reply: one composer element; drafts live per chat until the page reloads.
+  // Quick reply: one composer element; drafts live per chat, and survive a reload (a newer widget.html, F5).
   let replyTo = "";
-  const drafts = new Map(), sending = new Set(), errors = new Map();
+  const drafts = new Map(), errors = new Map(), DRAFT = "reply:";
 
   const glyph = { group: "👥", meeting: "📅" };
   const send = (obj) => { if (!(ws && ws.readyState === 1)) return false; ws.send(JSON.stringify(obj)); return true; };
@@ -240,7 +240,6 @@
     for (const n of [...$rows.children]) if (n !== $composer) n.remove();
     if (at < 0) { $composer.remove(); $rows.append(...items); }
     else { if (!$composer.isConnected) $rows.append($composer); $composer.before(...items.slice(0, at + 1)); $composer.after(...items.slice(at + 1)); }
-    $reply.disabled = sending.has(replyTo);
     imgs.render();
     $err.textContent = errors.get(replyTo) || "";
     if (fk) focusIn($rows.querySelector(`li[data-id="${CSS.escape(fid)}"]`), fk);
@@ -262,11 +261,50 @@
     put: (text, from, to) => $reply.setRangeText(text, from, to, "end"),
   });
   const imgs = imageQueue({
-    input: $reply, box: $imgs, chat: () => replyTo, busy: (id) => sending.has(id),
+    input: $reply, box: $imgs, chat: () => replyTo, busy: (id) => sends.busy(id),
     error: (id, text) => { errors.set(id, text); render(); },
+  });
+  // A failure puts the message back in the box ahead of any newer draft and the chat's queue waits:
+  // Enter retries it (checked when unchanged), Enter on an emptied box drops it; the queued ones follow.
+  const failed = (id, e, text) => {
+    sends.discard(id, e);
+    const d = id === replyTo ? $reply.value : drafts.get(id) || "", back = d ? e.verb.text + "\n" + d : e.verb.text, more = sends.list(id).length;
+    complete.restore([...e.verb.mentions, ...complete.mentions(d, id)], id);
+    drafts.set(id, back);
+    if (id === replyTo) { $reply.value = back; grow(); }
+    errors.set(id, text + (more ? ` · ${more} more queued after it` : ""));
+  };
+  const sends = sendQueue({
+    imgs, socket: () => ws, failed, changed: () => render(),
+    nothing: (id) => { if (!errors.has(id)) errors.set(id, "nothing to send"); },  // a refused image keeps its own reason
+    note: (id, text) => errors.set(id, text),
   });
   const UNSURE = "no answer from Teams: it may have gone out · Enter checks the chat before sending again";
 
+  let left = false;
+  const saveDraft = () => {
+    if (left) return;  // once: the version reload saves, then its pagehide would again
+    left = true;
+    sends.save();
+    for (const [id, text] of drafts) {
+      const record = { text, picked: complete.mentions(text, id), sent: imgs.attempt(id) };
+      try { if (text) sessionStorage.setItem(DRAFT + id, JSON.stringify(record)); } catch (e) {}
+    }
+  };
+  addEventListener("pagehide", (e) => { if (!e.persisted) saveDraft(); });
+  // Data from sessionStorage, checked like any input.
+  try {
+    for (const k of Object.keys(sessionStorage)) {
+      if (!k.startsWith(DRAFT)) continue;
+      const id = k.slice(DRAFT.length), d = JSON.parse(sessionStorage.getItem(k));
+      sessionStorage.removeItem(k);
+      if (typeof d?.text !== "string") continue;
+      drafts.set(id, d.text);
+      if (Array.isArray(d.picked)) complete.restore(d.picked, id);
+      imgs.arm(id, d.sent);
+    }
+  } catch (e) {}
+  sends.load();
   const openReply = (id) => {
     replyTo = sel = id;
     $reply.value = drafts.get(id) || "";
@@ -278,19 +316,18 @@
     $reply.setSelectionRange($reply.value.length, $reply.value.length);
   };
   const closeReply = () => { replyTo = ""; complete.close(); render(); $q.focus(); };
-  // A failed send re-enables the field: give it the focus back unless the user moved on.
-  const refocus = (id) => { if (replyTo === id && $composer.isConnected && document.activeElement === document.body) $reply.focus(); };
+  // Enter empties the box at once and the reply stays open; the chat's messages go out one at a time.
   const submit = () => {
-    const id = replyTo, text = $reply.value;
-    if ((!text.trim() && !imgs.list(id).length && !imgs.adding()) || sending.has(id)) return;
+    const id = replyTo, text = $reply.value, held = sends.paused(id);
+    const empty = !text.trim() && !imgs.list(id).length && !imgs.adding();
+    if (empty && !held) return;
     if (!(ws && ws.readyState === 1)) { errors.set(id, "offline, not sent"); render(); return; }
-    sending.add(id); errors.delete(id);
-    imgs.send(ws, id, { send: id, text, mentions: complete.mentions(text), format: "inline" }).then((sent) => {
-      if (sent || !sending.delete(id)) return;
-      if (!errors.has(id)) errors.set(id, "nothing to send");  // a refused image keeps its own reason
-      render(); refocus(id);
-    });
-    render();
+    if (!empty) {
+      sends.push(id, { verb: { send: id, text, mentions: complete.mentions(text), format: "inline" } }, held);  // a paused queue's head is the box
+      $reply.value = ""; drafts.delete(id); grow(); complete.forget(id);
+    }
+    errors.delete(id);
+    sends.resume(id);
   };
   $reply.oninput = edited;
   // Teams' keys: Enter sends, Shift+Enter breaks the line (Ctrl+Enter sends too).
@@ -338,7 +375,8 @@
     ws.onmessage = (e) => {
       const msg = JSON.parse(e.data);
       // A newer widget.html on the server (restart, edit): this page is stale, reload it.
-      if (msg.page) { if (pageVersion && msg.page !== pageVersion) { location.reload(); return; } pageVersion = msg.page; }
+      // Sends resume only past this check: a page about to reload must not resend first.
+      if (msg.page) { if (pageVersion && msg.page !== pageVersion) { saveDraft(); location.reload(); return; } pageVersion = msg.page; sends.wake(); }
       if ("opener" in msg) opener = !!msg.opener;
       if ("browser" in msg) browser = !!msg.browser;
       if ("me" in msg) meName = msg.me || "";
@@ -346,20 +384,11 @@
       if (msg.rows) { rows = msg.rows; render(); }
       if (msg.presence) paintPresence(msg.presence);
       if (msg.complete) complete.answered(msg);
-      if (msg.sent) {
-        sending.delete(msg.sent);
-        imgs.settled(msg.sent, msg);
-        if (msg.ok) {
-          drafts.delete(msg.sent); errors.delete(msg.sent); complete.forget(msg.sent);
-          if (replyTo === msg.sent) { $reply.value = ""; closeReply(); } else render();
-        } else { errors.set(msg.sent, msg.unsure ? UNSURE : msg.error || "not sent"); render(); refocus(msg.sent); }
-      }
+      if (msg.sent) { if (msg.ok) sends.done(msg.sent); else sends.fail(msg.sent, msg.unsure ? UNSURE : msg.error || "not sent"); }
     };
     ws.onclose = () => {
       $status.title = "disconnected"; $status.classList.add("off");
-      // No ack will come for these: the message may or may not have gone out.
-      for (const id of sending) errors.set(id, "connection lost: Enter checks the chat before sending again");
-      if (sending.size) { const id = replyTo; sending.clear(); render(); refocus(id); }
+      sends.lost();
       setTimeout(connect, retry.next());  // server restarts → page recovers alone
     };
   };

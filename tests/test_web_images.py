@@ -441,11 +441,8 @@ async def test_a_frame_for_a_cancelled_wait_is_ignored(board: W.Board) -> None:
     assert board.chat._incoming == {}
 
 
-async def test_a_retry_during_the_roster_fetch_is_refused(
-    board: W.Board, teams: Teams, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """012-AC23: the draft is marked in flight before the first await: a checked retry arriving while
-    the roster is fetched cannot post it a second time."""
+def _gated(board: W.Board, monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
+    """The roster fetch waits on the returned event: the first try of a mentioning draft stays in flight."""
     gate = asyncio.Event()
 
     async def slow_members(thread_id: str) -> list[dict[str, Any]]:
@@ -453,16 +450,75 @@ async def test_a_retry_during_the_roster_fetch_is_refused(
         return [{"mri": "8:orgid:ann", "name": "Ann Lee"}]
 
     monkeypatch.setattr(board.chat, "_members", slow_members)
-    mention = {"name": "Ann Lee", "mri": "8:orgid:ann"}
-    first = asyncio.create_task(
-        _answer(board, {"send": B, "text": "@Ann Lee hi", "mentions": [mention], "cmid": "42"})
-    )
+    return gate
+
+
+MENTION = {"name": "Ann Lee", "mri": "8:orgid:ann"}
+FIRST = {"send": B, "text": "@Ann Lee hi", "mentions": [MENTION], "cmid": "42"}
+RETRY = {**FIRST, "check": True}
+
+
+async def test_a_checked_retry_during_the_roster_fetch_shares_its_outcome(
+    board: W.Board, teams: Teams, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """012-AC23, 017-AC13: the draft is marked in flight before the first await: a checked retry
+    arriving meanwhile (a page resending after a reconnect) awaits the first try and answers its
+    outcome; one post, no check of its own."""
+    gate = _gated(board, monkeypatch)
+    first = asyncio.create_task(_answer(board, FIRST))
     await asyncio.sleep(0.05)
-    retry = {"send": B, "text": "@Ann Lee hi", "cmid": "42", "check": True}
-    assert await _answer(board, retry) == {"sent": B, "error": "still sending: try again in a moment"}
+    retry = asyncio.create_task(_answer(board, RETRY))
+    await asyncio.sleep(0.05)
+    assert not retry.done()
+    gate.set()
+    assert await first == await retry == {"sent": B, "ok": True}
+    assert len(teams.sends) == 1 and teams.history_calls == 0
+    assert board.chat._inflight == {}
+
+
+async def test_a_checked_retry_shares_the_first_tries_failure(
+    board: W.Board, teams: Teams, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """017-AC13: the first try fails: the checked retry waiting on it answers the same failure."""
+    gate = _gated(board, monkeypatch)
+    teams.fail_send = RuntimeError("boom")
+    first = asyncio.create_task(_answer(board, FIRST))
+    await asyncio.sleep(0.05)
+    retry = asyncio.create_task(_answer(board, RETRY))
+    await asyncio.sleep(0.05)
+    gate.set()
+    assert await first == await retry == {"sent": B, "error": "boom"}
+    assert len(teams.sends) == 1 and board.chat._inflight == {}
+
+
+async def test_a_cancelled_retry_leaves_the_first_try_alone(
+    board: W.Board, teams: Teams, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """017-AC13: the waiting retry cancelled (its socket gone): the first try still posts and answers."""
+    gate = _gated(board, monkeypatch)
+    first = asyncio.create_task(_answer(board, FIRST))
+    await asyncio.sleep(0.05)
+    retry = asyncio.create_task(_answer(board, RETRY))
+    await asyncio.sleep(0.05)
+    retry.cancel()
     gate.set()
     assert await first == {"sent": B, "ok": True}
-    assert len(teams.sends) == 1 and teams.history_calls == 0
+    assert len(teams.sends) == 1 and board.chat._inflight == {}
+
+
+async def test_a_cancelled_first_try_leaves_its_retry_unsure(
+    board: W.Board, teams: Teams, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """017-AC13: the first try cancelled (shutdown): the waiting retry still gets an answer, unsure,
+    and the draft is no longer marked in flight."""
+    _gated(board, monkeypatch)
+    first = asyncio.create_task(_answer(board, FIRST))
+    await asyncio.sleep(0.05)
+    retry = asyncio.create_task(_answer(board, RETRY))
+    await asyncio.sleep(0.05)
+    first.cancel()
+    assert await retry == {"sent": B, "error": CV.UNSURE, "unsure": True}
+    assert teams.sends == [] and board.chat._inflight == {}
 
 
 async def test_an_echo_in_another_chat_does_not_settle(

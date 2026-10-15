@@ -625,8 +625,8 @@ class ChatVerbs:
         self._incoming: dict[ServerConnection, _Incoming] = {}
         # (thread, cmid) → digest → object ids: a retry of the draft reuses what it already uploaded
         self._uploads: OrderedDict[tuple[str, str], dict[str, list[str]]] = OrderedDict()
-        # (thread, cmid) being sent: a retry must not race its own first try
-        self._inflight: set[tuple[str, str]] = set()
+        # (thread, cmid) being sent → its outcome: a retry must not race its own first try
+        self._inflight: dict[tuple[str, str], asyncio.Future[str | None]] = {}
         # (thread, cmid) → set once its message comes back on the stream
         self._echoes: dict[tuple[str, str], asyncio.Event] = {}
 
@@ -838,14 +838,25 @@ class ChatVerbs:
         if self.directory is None:
             return "not connected"
         key = (thread_id, cmid)
-        if cmid:
-            if key in self._inflight:
+        running = self._inflight.get(key) if cmid else None
+        if running is not None:
+            if not request.check:
                 return "still sending: try again in a moment"
-            self._inflight.add(key)  # before any await: a retry must not slip in during the roster fetch
+            # A page resending after a reconnect: the first try's outcome is this one's, never a second post.
+            # Shielded: this waiter cancelled must not cancel the outcome the first try still owes.
+            return await asyncio.shield(running)
+        outcome: asyncio.Future[str | None] = asyncio.get_running_loop().create_future()
+        if cmid:
+            self._inflight[key] = (
+                outcome  # before any await: a retry must not slip in during the roster fetch
+            )
+        error: str | None = UNSURE  # cancelled mid-send: it may have gone out
         try:
             error = await self._send(request, blobs or [])
         finally:
-            self._inflight.discard(key)
+            if self._inflight.get(key) is outcome:
+                del self._inflight[key]
+            outcome.set_result(error)
         if error is None:
             self._uploads.pop(key, None)
         return error

@@ -186,11 +186,10 @@ async def test_a_removed_mention_is_not_sent_and_picks_survive_a_failure_only(fa
     await box.fill("@Ann Lee only")
     fake.fail = True
     await box.press("Enter")
-    await page.wait_for_function("!document.getElementById('reply').disabled")
+    await page.wait_for_function("document.querySelector('.composer small').textContent === 'boom'")
     fake.fail = False
     await box.press("Enter")
-    await page.wait_for_selector("#reply", state="detached")
-    await page.locator("button.reply").dispatch_event("click")
+    await wait(lambda: len(fake.of("send")) == 2)
     await box.fill("@Ann Lee again")
     await box.press("Enter")
     await wait(lambda: len(fake.of("send")) == 3)
