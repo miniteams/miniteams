@@ -437,6 +437,28 @@ async def test_row_keys_move_the_tab_stop_and_enter_switches(split: Split) -> No
     assert await _focused(page) == "#reply"
 
 
+@pytest.mark.parametrize("how", ["row", "filter"])
+async def test_enter_on_the_open_chat_focuses_the_composer(split: Split, how: str) -> None:
+    """Enter on the chat already shown lands in its composer, as a switch does, without refollowing."""
+    page = await split.open()
+    current = await page.locator("#rows li.cur").get_attribute("data-id")
+    follows = len(split.fake.follows())
+    if how == "row":
+        await page.locator("#rows li.cur .name").focus()
+    else:  # Ctrl+K, then ↓ from the filter down to the open chat's row
+        await page.keyboard.press("Control+k")
+        sel = "(n => n && n.dataset.id)(document.querySelector('#rows li.sel'))"
+        for _ in range(await page.locator("#rows li").count()):
+            if await page.evaluate(sel) == current:
+                break
+            await page.keyboard.press("ArrowDown")
+        assert await page.locator("#rows li.sel").get_attribute("data-id") == current
+        assert await _focused(page) == "#filter"
+    await page.keyboard.press("Enter")
+    await until(page, "document.activeElement && document.activeElement.id === 'reply'")
+    assert len(split.fake.follows()) == follows
+
+
 async def test_menu_folds_the_docked_list_and_remembers(split: Split) -> None:
     """011-AC29: above 700 px ☰ folds and unfolds the docked list (separator included), with
     aria-expanded, saved as `chatnav_fold`."""
