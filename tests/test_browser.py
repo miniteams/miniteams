@@ -219,6 +219,7 @@ async def test_times_read_24h_whatever_the_locale(board: W.Board, chat: Pages) -
     assert text.endswith("15:04") and "M" not in text.upper().replace("SEP", ""), text
 
 
+@pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
 async def test_a_message_image_opens_full_size(board: W.Board, chat: Pages) -> None:
     """A click on a message image opens it in a modal; Escape or a click closes it."""
     page = await chat.open(_chat(T))
@@ -320,6 +321,7 @@ async def test_reconnect_keeps_the_readers_place(board: W.Board, chat: Pages) ->
     assert await page.evaluate("window.__same") == 1  # reconnected, not reloaded
 
 
+@pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
 async def test_a_growing_composer_pushes_the_chat_up(board: W.Board, chat: Pages) -> None:
     """A multi-line draft shrinks the list from below: what the reader saw at its bottom stays in view."""
     page = await chat.open(_chat(L), viewport={"width": 700, "height": 400})
@@ -368,6 +370,21 @@ async def test_typed_lines_keep_the_last_message_above_the_composer(chat: Pages)
         assert abs(await page.evaluate(gap) - before) < 2, i
 
 
+@pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
+async def test_typing_keeps_a_reader_at_the_bottom(board: W.Board, chat: Pages) -> None:
+    """Each key, new line or deletion leaves a reader at the bottom: Firefox clamped the list's scroll
+    while the composer measured itself, and the chat slid under it on the first key of a new line."""
+    page = await chat.open(_chat(L), viewport={"width": 700, "height": 400})
+    await _handled(page, "history")
+    await page.locator("#reply").click()
+    gap = f"(l => l.scrollHeight - l.scrollTop - l.clientHeight)({_LIST})"
+    for key in ("a", "Shift+Enter", "b", "c", "Shift+Enter", "d", "Backspace", "Backspace", "Backspace"):
+        await page.keyboard.press(key)
+        await page.evaluate("new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
+        assert await page.evaluate(gap) < 2, key
+
+
+@pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
 async def test_a_reaction_keeps_a_reader_at_the_bottom(board: W.Board, chat: Pages) -> None:
     """A reaction grows its message, the last one or one above: a reader at the bottom stays there."""
     page = await chat.open(_chat(L), viewport={"width": 700, "height": 400})
