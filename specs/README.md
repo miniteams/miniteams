@@ -19,3 +19,4 @@
 | [015](015-presence.md) | Presence on avatars | shipped |
 | [016](016-custom-reactions.md) | Custom reaction picker (favorites + any emoji) | shipped |
 | [017](017-visible-send-queue.md) | Visible send queue, burst sends from the widget | shipped |
+| [019](019-edit-composer-parity.md) | Editing a message works like composing one | in progress |
