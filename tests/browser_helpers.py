@@ -23,7 +23,14 @@ if os.environ.get("CI", "").lower() not in ("1", "true"):
         pytest.skip(f"{CHROME} missing", allow_module_level=True)
 
 from conftest import auth_cookie, wait  # noqa: E402
-from playwright.async_api import Browser, BrowserContext, Page, Route, async_playwright  # noqa: E402
+from playwright.async_api import (  # noqa: E402
+    Browser,
+    BrowserContext,
+    Error,
+    Page,
+    Route,
+    async_playwright,
+)
 
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
@@ -141,20 +148,30 @@ def _uncapped() -> Iterator[None]:
 
 
 @pytest.fixture
-async def pages() -> AsyncIterator[Pages]:
+async def pages(request: pytest.FixtureRequest) -> AsyncIterator[Pages]:
+    """Chrome; `@pytest.mark.parametrize("pages", ["firefox"], indirect=True)` adds playwright's Firefox."""
+    engine = getattr(request, "param", "chromium")
     with _uncapped():
         driver = async_playwright()
         p = await driver.__aenter__()
-    browser = None
+    browser, found = None, None
     try:
-        browser = await p.chromium.launch(executable_path=str(CHROME), headless=True)
+        if engine == "firefox":
+            try:
+                browser = await p.firefox.launch(headless=True)
+            except Error:
+                if os.environ.get("CI", "").lower() in ("1", "true"):
+                    raise
+                pytest.skip("run `uv run --with playwright playwright install firefox`")
+        else:
+            browser = await p.chromium.launch(executable_path=str(CHROME), headless=True)
         found = Pages(browser)
         yield found
     finally:
         if browser is not None:
             await browser.close()
         await driver.__aexit__(None, None, None)
-    assert found.errors == []
+    assert found is None or found.errors == []
 
 
 def row(

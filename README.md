@@ -280,5 +280,6 @@ live browser session. `MINITEAMS_ASYNCGW_HOST` sets the custom emoji host (defau
 ```sh
 uv run ruff check . && uv run mypy src && uv run pytest
 uv run --with playwright pytest tests/test_browser*.py   # opt-in headless Chrome; skipped without playwright, fails under CI=1
+uv run --with playwright playwright install firefox     # scroll and typing tests also run in Firefox; skipped without it
 pre-commit run --all-files
 ```

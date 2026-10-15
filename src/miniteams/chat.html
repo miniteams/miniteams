@@ -995,7 +995,13 @@
   const PLACEHOLDER = $reply.placeholder;
 
   // Teams' keys (spec 006): Enter sends, Shift+Enter breaks the line, Ctrl+Enter sends too.
-  const grow = () => { $reply.style.height = "auto"; $reply.style.height = $reply.scrollHeight + 2 + "px"; };
+  // Measuring at height auto lays the list out taller for a moment: Firefox clamps its scroll then.
+  const grow = () => {
+    const top = $list.scrollTop;
+    $reply.style.height = "auto";
+    $reply.style.height = $reply.scrollHeight + 2 + "px";
+    $list.scrollTop = top;
+  };
   let readOnly = false;
   const setSending = (id, on) => {
     if (on) sending.add(id); else sending.delete(id);
