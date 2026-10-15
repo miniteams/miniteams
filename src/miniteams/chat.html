@@ -1404,7 +1404,7 @@
   };
   const switchTo = (id, push) => {
     closeSide();
-    if (id === thread) return;
+    if (id === thread) { $reply.focus(); return; }
     sel = "";
     stash();
     if (push) history.pushState(null, "", chatPath(id) + location.search);
