@@ -221,6 +221,26 @@ async def test_times_read_24h_whatever_the_locale(board: W.Board, chat: Pages) -
 
 
 @pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
+async def test_a_tall_image_keeps_its_aspect_ratio(board: W.Board, chat: Pages) -> None:
+    """An image carrying Teams' width/height attributes and taller than the height cap shrinks
+    whole: the cap must not squash it to the attribute's width."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    ratio = await page.evaluate(
+        """async () => {
+          const c = Object.assign(document.createElement("canvas"), { width: 300, height: 900 });
+          const url = URL.createObjectURL(await new Promise((r) => c.toBlob(r)));
+          const img = Object.assign(document.createElement("img"), { src: url, width: 300, height: 900 });
+          document.querySelector('[data-id="2"] .html').append(img);
+          await img.decode();
+          const b = img.getBoundingClientRect();
+          return [b.width / b.height, b.height];
+        }"""
+    )
+    assert abs(ratio[0] - 300 / 900) < 0.02 and ratio[1] <= 360, ratio
+
+
+@pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
 async def test_a_message_image_opens_full_size(board: W.Board, chat: Pages) -> None:
     """A click on a message image opens it in a modal; Escape or a click closes it."""
     page = await chat.open(_chat(T))
