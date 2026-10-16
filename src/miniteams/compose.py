@@ -19,7 +19,8 @@ EMOJI_NAME_RE = re.compile(r"[A-Za-z0-9_+-]{1,64}")  # what `:name:` expands
 
 _MENTION = "http://schema.skype.com/Mention"
 _CUSTOM_EMOJI = "http://schema.skype.com/CustomEmoji"
-_SPECIAL_RE = re.compile(r"[`\[*_~]|https?://")
+_SPECIAL_RE = re.compile(r"[\\`\[*_~]|https?://")
+ESCAPABLE = frozenset("\\*_~`[")  # `\x` gives a literal x; `\\` only where a lone `\` would escape
 _RUN_RE = re.compile(r"\*+|_+|~+")
 _URL_RE = re.compile(r"https?://[^\s<>\"'`]+")
 _ORDERED_RE = re.compile(r"\d{1,9}\. ")
@@ -37,10 +38,20 @@ def _word(ch: str) -> bool:
     return ch.isalnum() or ch == "_"
 
 
-def _inline(line: str, on_text: OnText) -> str:
-    """One line of inline markup; `on_text` renders the plain runs between spans.
+def _escaped(line: str, i: int) -> bool:
+    """Whether `line[i]` follows an odd run of backslashes."""
+    back = i
+    while back and line[back - 1] == "\\":
+        back -= 1
+    return (i - back) % 2 == 1
 
-    Recursion stays shallow: a span's content cannot hold its own marker (the nearest one closes it).
+
+def _inline(line: str, on_text: OnText, lead: bool = False, after: str = "") -> str:
+    """One line of inline markup; `on_text` renders the plain runs between spans. `lead`: a full-mode
+    text line, where `\\` before a block marker is one backslash; `after`: what follows a span's content.
+
+    Recursion stays shallow: a span's content cannot hold its own unescaped marker (the nearest one
+    closes it).
     """
     find = line.find
     # Past the last `]` or `)` a link cannot close: an unclosed `[`/`(` run must not re-scan to the end.
@@ -52,6 +63,10 @@ def _inline(line: str, on_text: OnText) -> str:
         if (i and _word(line[i - 1])) or start >= len(line) or line[start].isspace():
             return -1
         end = find(marker, start)
+        # An escaped closer is text: look past it (`*a\*b*`). Linear: an unescaped candidate ends the
+        # search, so each escaped one costs only its own backslash run.
+        while end > start and _escaped(line, end):
+            end = find(marker, end + 1)
         after = end + len(marker)
         if end <= start or line[end - 1].isspace() or (after < len(line) and _word(line[after])):
             return -1
@@ -71,6 +86,16 @@ def _inline(line: str, on_text: OnText) -> str:
             end = find("`", i + 1)
             if end > i + 1:
                 hit = f"<code>{html.escape(line[i + 1 : end])}</code>", end + 1
+        elif ch == "\\":
+            nxt = line[i + 1 : i + 2]
+            # `\\srv\share` stays as typed: a backslash pair collapses only before what it would escape.
+            if nxt == "\\":
+                if (line[i + 2 : i + 3] or after) in ESCAPABLE or (
+                    lead and not i and _literal(line[1:]) != line[1:]
+                ):
+                    hit = nxt, i + 2
+            elif nxt in ESCAPABLE:  # none of them needs HTML escaping
+                hit = nxt, i + 2
         elif ch == "[":
             close = find("]", i + 1) if i < last_close else -1
             if (
@@ -95,7 +120,7 @@ def _inline(line: str, on_text: OnText) -> str:
                     # Flushed before the span's content: mentions are numbered and paired in text order.
                     out.append(on_text(line[flushed:i]))
                     flushed = i
-                    inner = _inline(line[i + len(marker) : end], on_text)
+                    inner = _inline(line[i + len(marker) : end], on_text, after=marker[0])
                     hit = f"<{tag}>{inner}</{tag}>", end + len(marker)
                     break
             else:
@@ -109,6 +134,16 @@ def _inline(line: str, on_text: OnText) -> str:
         i = flushed = hit[1]
     out.append(on_text(line[flushed:]))
     return "".join(out)
+
+
+def _literal(line: str) -> str:
+    """`line` without the `\\` that keeps its leading block marker (`- `, `* `, `> `, `1. `) literal."""
+    rest = line[1:]
+    if line.startswith("\\") and (
+        rest.startswith(("- ", "* ", "> ")) or rest == ">" or _ORDERED_RE.match(rest)
+    ):
+        return rest
+    return line
 
 
 def _blocks(text: str, on_text: OnText) -> str:
@@ -133,10 +168,15 @@ def _blocks(text: str, on_text: OnText) -> str:
             continue
         for tag, marker in kinds:
             if marker(line):
-                items: list[str] = []
-                while i < len(lines) and (cut := marker(lines[i])):
-                    items.append(_inline(lines[i][cut:], on_text))
-                    i += 1
+                run: list[tuple[str, int]] = []
+                end = i
+                while end < len(lines) and (cut := marker(lines[end])):
+                    run.append((lines[end], cut))
+                    end += 1
+                if tag == "blockquote" and all(len(text) == cut for text, cut in run):
+                    continue  # `>` alone is what was typed, not an empty quote
+                items = [_inline(text[cut:], on_text) for text, cut in run]
+                i = end
                 if tag == "blockquote":
                     out.append(f"<blockquote>{'<br>'.join(items)}</blockquote>")
                 else:
@@ -144,7 +184,7 @@ def _blocks(text: str, on_text: OnText) -> str:
                 after_text = False
                 break
         else:
-            out.append(("<br>" if after_text else "") + _inline(line, on_text))
+            out.append(("<br>" if after_text else "") + _inline(_literal(line), on_text, lead=True))
             after_text = True
             i += 1
     return "".join(out)
@@ -173,6 +213,7 @@ def compose_html(
     to its last; `emojis`: custom name → AMS object id. `@Name` matches when `@` starts a word and
     the name is followed by the end or a non-word character; names are tried longest first,
     case-sensitive, so `@Ann Lee` wins over `@Ann`. Code, link labels and URLs are never expanded.
+    A backslash makes ESCAPABLE characters literal, and in full mode a leading block marker (spec 019).
 
     Trusts every `mri` as given: the caller checks each against the thread roster (the thread id
     for everyone). More than MAX_MENTIONS entries or a name past MAX_NAME raises ValueError.

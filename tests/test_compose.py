@@ -319,6 +319,120 @@ def test_input_is_capped() -> None:
         compose_html("x" * (compose.MAX_TEXT + 1), [], {})
 
 
+# --- backslash escapes (spec 019) ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("full", [False, True])
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (r"\*a\*", "*a*"),
+        (r"\*\*b\*\*", "**b**"),
+        (r"\_c\_", "_c_"),
+        (r"\~\~d\~\~", "~~d~~"),
+        (r"\`e\`", "`e`"),
+        (r"\[f](https://x.test)", "[f](https://x.test)"),
+        (r"\\\*", "\\*"),
+        (r"\\`x`", "\\<code>x</code>"),
+        (r"\\*g*", "\\<i>g</i>"),
+        (r"2\*3*4 *x\*", "2*3*4 *x*"),
+        (r"*a\*b*", "<i>a*b</i>"),
+        (r"_c\_ d_ **e\** f**", "<i>c_ d</i> <b>e** f</b>"),
+        (r"*x\\*", "<i>x\\</i>"),
+    ],
+)
+def test_each_escape_gives_the_literal_character(text: str, expected: str, full: bool) -> None:
+    r"""019-AC5: `\*`, `\_`, `\~`, `` \` ``, `\[` are the character itself, in both formats; `\\` is one
+    backslash before one of those."""
+    assert _md(text, full) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (r"\- a", "- a"),
+        (r"\* a", "* a"),
+        (r"\> a", "&gt; a"),
+        ("\\>", "&gt;"),
+        (r"\1. a", "1. a"),
+        (r"\123456789. a", "123456789. a"),
+        ("x\n\\- a\n\\2. b", "x<br>- a<br>2. b"),
+        (r"\\- a", "\\- a"),
+    ],
+)
+def test_a_leading_backslash_keeps_a_block_marker_literal(text: str, expected: str) -> None:
+    r"""019-AC5: in full format, `\` before `- `, `* `, `> `, `1. ` at a line start makes the line text,
+    no list or quote; `\\` there is one backslash before the marker."""
+    assert _md(text, True) == expected
+
+
+@pytest.mark.parametrize("text", [r"\- a", r"\> a", r"\1. a", r"\\- a"])
+def test_inline_format_has_no_line_start_escape(text: str) -> None:
+    r"""019-AC5: the widget's inline format has no block markers: a leading `\` stays as typed."""
+    assert _md(text, False) == html.escape(text)
+
+
+@pytest.mark.parametrize("full", [False, True])
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (r"\\srv\share\_tmp", r"\\srv\share_tmp"),
+        (r"\\srv\share", r"\\srv\share"),
+        (r"grep \*\.py", r"grep *\.py"),
+        (r"^\d+\s\\w$", r"^\d+\s\\w$"),
+        (r"C:\\", r"C:\\"),
+    ],
+)
+def test_paths_and_regexes_keep_their_backslashes(text: str, expected: str, full: bool) -> None:
+    r"""019-AC5: a UNC path or a regex posts as typed but for the listed escapes (`\_`, `\*`)."""
+    assert _md(text, full) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [r"\a", r"C:\path\to", "end\\", r"a \- b", r"\-a", r"\1.a", r"\:fire:", r"\@x", "\\\n"],
+)
+def test_a_backslash_before_anything_else_stays(text: str) -> None:
+    """019-AC5: only the listed characters (and a leading block marker) are escapable."""
+    assert _md(text, True) == html.escape(text).replace("\n", "<br>").replace("\\:fire:", "\\🔥")
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (">", "&gt;"),
+        ("> ", "&gt; "),
+        (">\n>", "&gt;<br>&gt;"),
+        ("a\n>\nb", "a<br>&gt;<br>b"),
+        ("> a\n>\n> b", "<blockquote>a<br><br>b</blockquote>"),
+        ("> \n> a", "<blockquote><br>a</blockquote>"),
+    ],
+)
+def test_a_quote_with_nothing_in_it_is_the_text_typed(text: str, expected: str) -> None:
+    """019-AC5: `>` alone is what the user typed, never an empty quote; a blank line inside a quote stays."""
+    assert _md(text, True) == expected
+
+
+def test_escapes_are_not_read_inside_code_link_labels_or_urls() -> None:
+    """019-AC5: code, a link's label and a bare URL keep their backslashes."""
+    assert _md(r"`a\*b` [l\*](https://x.test) https://x.test/a\_b", True) == (
+        '<code>a\\*b</code> <a href="https://x.test">l\\*</a> https://x.test/a\\_b'
+    )
+
+
+def test_escaped_list_line_ends_a_list_and_quotes_keep_their_backslash() -> None:
+    r"""019-AC5: an escaped line between list items splits the list; inside a quote `\- ` is plain text."""
+    assert _md("- a\n\\- b\n- c\n> \\- q", True) == (
+        "<ul><li>a</li></ul>- b<ul><li>c</li></ul><blockquote>\\- q</blockquote>"
+    )
+
+
+def test_an_escape_keeps_a_mention_or_emoji_from_expanding_across_it() -> None:
+    """019-AC5: the escaped character is never part of a `:name:` or an `@Name`."""
+    html_, props = compose_html(r"@Ann\_Lee :a\_b:", [{"name": "Ann_Lee", "mri": "m"}], {"a_b": "x"})
+    assert (html_, props) == ("@Ann_Lee :a_b:", None)
+
+
 def _best_ms(fn: Callable[[], object]) -> float:
     gc.disable()
     try:
@@ -332,7 +446,7 @@ def _best_ms(fn: Callable[[], object]) -> float:
     return min(runs) * 1000
 
 
-HOSTILE = [*"*_~`[", "**a", "[x](", ":a", "@A ", "a*", "[(", "x https://h.t/"]
+HOSTILE = [*"*_~`[\\", "\\*", "*a\\*", "**a\\**", "**a", "[x](", ":a", "@A ", "a*", "[(", "x https://h.t/"]
 
 
 @pytest.mark.parametrize("unit", HOSTILE)

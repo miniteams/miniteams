@@ -1,6 +1,6 @@
 # 019 — Editing a message works like composing one
 
-**Status**: approved
+**Status**: in progress
 **Requested by**: babs
 **Date**: 2026-10-16
 
@@ -118,6 +118,23 @@ None.
 
 ## Decisions
 
+- `<p></p>` and a paragraph's last `<br>` are no line; `<p><br></p>` and `<p>&nbsp;</p>` are one
+  blank line each — because an empty block renders nothing (887 editable archived messages hold one,
+  mostly editor leftovers between paragraphs or after code).
+
+- Markup with no visible effect reads as transparent: a span whose only attribute is
+  `style="font-size:inherit"`, the Teams client's `<div itemprop="copy-paste-block">` paste wrapper,
+  layout whitespace before a line's first text; Teams-client links (`itemtype` exactly
+  `…/HyperLink`) become plain links on save — because a sample of the user's own messages showed
+  these on otherwise editable messages (268 → 306 of 317 editable; the rest are out of scope).
+
+- An edit's `properties` (mentions) are merged by Teams, not replaced — verified live on the test chat
+  (2026-10-16): reactions survive an edit with mentions, and an edit without any drops the old ones.
+- A Teams-client message's `<p>`/`<div>` paragraphs read as lines; saving it turns paragraph breaks
+  into line breaks — because otherwise most messages written in Teams could not be edited here.
+- `strong`/`em`/`del` read as bold/italic/strike, an animated emoji as its unicode character (it
+  loses the animation on save), a link whose text is its URL as a bare URL.
+
 - Grill answers, 2026-10-16: non-reproducible message → not editable, with the reason and "Open in
   Teams" (Q1); trailing images kept and removable (Q2); reply quotes kept and removable (Q3);
   original mentions kept without the roster check, verified against the server's copy (Q4);
@@ -127,5 +144,14 @@ None.
 - The conversion runs on the server, next to `compose_html` — because both sides of the round-trip
   live there and are unit-testable, and the server has to judge "reproducible" anyway to refuse a
   forged edit.
-- Kept quotes and images are named by position in the server's copy, never sent as HTML by the page
-  — because the page must not be able to inject markup into a saved message.
+- Kept quotes and images are named by a stable key from the server's copy (a quote by its Reply
+  block's `itemid`, an image by its AMS object id), never sent as HTML by the page — because the page
+  must not inject markup, and positions would point at other blocks after an edit elsewhere; a key the
+  copy no longer holds is refused ("the message changed since it was opened: reopen it").
+- Line-start escapes (`\- `, `\> `, `\1. `) apply in the chat page's full format only; the widget's
+  inline format has no block markers, so a leading `\- ` there posts as typed. `\\` collapses only
+  before an escapable character or a line-start marker, so `\\srv\share` posts as typed.
+  A line that is only `\>` keeps its `>` literal (a bare `>` before a `> ` line would open a quote);
+  backslashes inside `code`, link labels and URLs stay as typed.
+- A code block carrying its language (`<pre class="language-…">`) is refused: composition cannot
+  write the language.

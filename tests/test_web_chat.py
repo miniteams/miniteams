@@ -447,6 +447,7 @@ def test_record_fields() -> None:
         "html": "<p>hi <b>you</b></p>",
         "edited": True,
         "deleted": False,
+        "edittime": "1789466500000",
         "reactions": [],
         "mentions": None,
         "cmid": "",

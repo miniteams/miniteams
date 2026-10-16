@@ -170,6 +170,10 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
 - **Composer** (also the widget's quick reply): completes `:emoji` and `@member` (`@everyone` on group chats, not 1:1;
   picked members are notified; a mention needs a non-word character before `@`, and two members with the same name map
   in the order they were picked). Messages are limited to 28 KB.
+  - A backslash keeps markup literal: `\*` `\_` `\~` `` \` `` `\[`, and on the chat page a line starting `\- ` `\* `
+    `\> ` `\1. ` (or a line that is only `\>`); `\\` is one backslash before another backslash or one of those, or
+    (chat page) before a line-start marker; any other backslash stays as typed (`\\srv\share`), and backslashes
+    inside `code`, link labels and URLs stay as typed.
   - Enter empties the box at once: sends queue one at a time per chat, in order. Queued sends survive a reload or a
     dropped connection and go out in order, an unanswered one checked (their pasted images do not survive a reload).
     A chat page in list mode sends only its own chat's: other chats' wait for the widget (◀) or their own page.
