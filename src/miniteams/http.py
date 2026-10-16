@@ -16,7 +16,7 @@ import structlog
 log = structlog.get_logger()
 
 _MAX_RETRIES = 5
-_MAX_BACKOFF = 30.0  # ceiling for the exponential fallback when no Retry-After is given
+_MAX_BACKOFF = 30.0  # ceiling for the exponential backoff, which a longer Retry-After overrides
 
 
 def failure(exc: Exception) -> str:
@@ -29,8 +29,11 @@ def failure(exc: Exception) -> str:
 
 
 def _retry_delay(resp: httpx.Response, attempt: int) -> float:
+    # Retry-After is a floor: after its first wait Teams answers `Retry-After: 0` while the
+    # conversation's 15-per-10s quota is still full, and taking it literally burns every retry.
     header = resp.headers.get("Retry-After", "")
-    return float(header) if header.isdigit() else min(2.0**attempt, _MAX_BACKOFF)
+    backoff = min(2.0**attempt, _MAX_BACKOFF)
+    return max(float(header), backoff) if header.isdigit() else backoff
 
 
 def get_with_retry(

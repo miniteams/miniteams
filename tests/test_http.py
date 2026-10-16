@@ -35,6 +35,15 @@ def test_retries_on_429_then_succeeds() -> None:
     assert slept == [3.0]  # honored Retry-After
 
 
+def test_retry_after_is_a_floor_under_the_backoff() -> None:
+    """Teams' `Retry-After: 0` after a first wait must not burn the retries inside the quota window."""
+    slept: list[float] = []
+    zero = [_Resp(429, {"Retry-After": "0"}) for _ in range(3)]
+    client = _Client([_Resp(429, {"Retry-After": "8"}), *zero, _Resp(200)])
+    get_with_retry(client, "u", sleep=slept.append)  # type: ignore[arg-type]
+    assert slept == [8.0, 2.0, 4.0, 8.0]
+
+
 def test_exponential_backoff_without_retry_after() -> None:
     slept: list[float] = []
     client = _Client([_Resp(429), _Resp(429), _Resp(200)])
@@ -85,6 +94,17 @@ async def test_async_retries_on_429_and_passes_kwargs_through() -> None:
     # The retry must re-send the same query/auth, or the second attempt fetches a different thing.
     assert client.kwargs[1]["params"] == {"format": "json"}
     assert client.kwargs[1]["headers"] == {"Authorization": "Bearer x"}
+
+
+async def test_async_retry_after_is_a_floor_under_the_backoff() -> None:
+    slept: list[float] = []
+
+    async def sleep(d: float) -> None:
+        slept.append(d)
+
+    client = _AsyncClient([_Resp(429, {"Retry-After": "8"}), _Resp(429, {"Retry-After": "0"}), _Resp(200)])
+    await aget_with_retry(client, "u", sleep=sleep)  # type: ignore[arg-type]
+    assert slept == [8.0, 2.0]
 
 
 async def test_async_raises_after_max_retries() -> None:
