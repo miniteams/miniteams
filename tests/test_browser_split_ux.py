@@ -95,8 +95,8 @@ class Split:
             self.fake,
             f"{ORIGIN}/chat/{quote(_id(at), safe='')}{query}",
             PAGE,
-            page_route=re.compile(r"^http://127\.0\.0\.1:9/chat/[^/]+$"),
-            ws_route=re.compile(r"^ws://127\.0\.0\.1:9/ws\?chat$"),
+            page_route=re.compile(r"^http://127\.0\.0\.1:8/chat/[^/]+$"),
+            ws_route=re.compile(r"^ws://127\.0\.0\.1:8/ws\?chat$"),
             headers=headers,
             **ctx,
         )

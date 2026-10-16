@@ -465,6 +465,17 @@ def test_both_pages_inline_one_copy_of_the_shared_files(name: str) -> None:
         assert not re.search(rf"^  (?:const|let) {found[1]}\b", raw, re.M), (name, found[1])
 
 
+@pytest.mark.parametrize("name", ["widget.html", "chat.html"])
+def test_both_pages_send_through_the_one_queue(name: str) -> None:
+    """017-AC9: the send queue lives in ui.js; each page builds it once and keeps no outbox, pump or
+    direct image send of its own."""
+    ui_js = W._page_path("ui.js").read_text(encoding="utf-8")
+    raw = W._page_path(name).read_text(encoding="utf-8")
+    assert re.search(r"^  const sendQueue = ", ui_js, re.M)
+    assert len(re.findall(r"\bsendQueue\(", raw)) == 1, name
+    assert not re.search(r"\b(?:outbox|pump)\b|\bimgs\.send\(", raw), name
+
+
 def _copy_package(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     for name in ("widget.html", "chat.html", "ui.js", "ui.css"):
         (tmp_path / name).write_bytes(W._page_path(name).read_bytes())

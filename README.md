@@ -119,8 +119,8 @@ where ⋯ → ↺ Unseen undoes it. A message that @mentions you gets a blue str
 or read the chat in Teams after the mention. The `@` tab lists mentioned rows, **Unread** follows Teams' own
 read marker. Mute takes a chat out of Inbox whatever lands on it (listed under **Muted** until ⋯ → 🔔 Unmute; mentions still
 surface; state in `muted.json`). `✎` (or `r` on the row selected with the arrow keys, `Tab` from the filter) opens
-a reply box under the row: Enter sends it to the chat as you, Shift+Enter adds a line, Escape closes it and keeps
-the draft until the page reloads; a failed send keeps the text and shows why. The ⚙ menu picks the theme (system by default), hides avatars for a denser list, and sets
+a reply box under the row: Enter sends it to the chat as you and keeps the box open, Shift+Enter adds a line,
+Escape closes it and keeps the draft; a failed send stays in its queue line with why (sending: see *Composer*). The ⚙ menu picks the theme (system by default), hides avatars for a denser list, and sets
 **Middle click** and **Chat navigation** (see *Chat page*). The
 Teams session expired (refresh token dead): `web` logs `auth_expired` and waits; run `miniteams login` in another
 terminal and it reconnects within seconds (it watches the token cache file).
@@ -170,12 +170,22 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
 - **Composer** (also the widget's quick reply): completes `:emoji` and `@member` (`@everyone` on group chats, not 1:1;
   picked members are notified; a mention needs a non-word character before `@`, and two members with the same name map
   in the order they were picked). Messages are limited to 28 KB.
+  - Enter empties the box at once: sends queue one at a time per chat, in order. Queued sends survive a reload or a
+    dropped connection and go out in order, an unanswered one checked (their pasted images do not survive a reload).
+    A chat page in list mode sends only its own chat's: other chats' wait for the widget (◀) or their own page.
+  - The queue shows: greyed bubbles after the chat page's last message (`queued`, `sending…`, `sent` (acknowledged,
+    waiting for Teams' echo), `failed` with its reason, `paused`), each replaced by the message once Teams echoes it;
+    one line per message under the widget's reply, gone once sent. A failed send stays in the queue, even across a
+    reload, the box untouched, the messages behind it `paused`: ↻ retries it, ✕ drops it, ✎ moves it into an empty box
+    or edits it in place (Enter resends, Escape cancels). On the chat page a failed message Teams echoes counts as
+    sent and the rest goes on (the widget sees no echo: ↻ checks and finds it); a `sent` bubble whose echo never
+    comes leaves after 30 s.
   - Backspace after a picked full-name mention shortens it to the first name while keeping its recipient.
   - Paste images (PNG, JPEG, GIF, WebP; up to 8, 10 MiB each, 40 MiB in all): thumbnails per chat, click to preview,
     × to drop; Enter sends them after the text, or alone. They upload to Teams only on send and live in the page:
-    a reload drops them, the text draft stays. A failed or unanswered send may have gone out: until the page reloads,
-    retrying the unchanged draft looks for it in the chat before posting again; an edited draft goes out as a new
-    message.
+    a reload drops them, the text draft stays. A failed or unanswered send may have gone out: ↻, or the unchanged
+    message sent again, even after a reload, looks for it in the chat before posting again; an edited one goes out
+    as a new message.
   - Widget: inline formatting.
   - Chat page: bold, italic, strike, code, lists, quotes through a toolbar or Ctrl+B / Ctrl+I, plus a preview of the message as posted.
 - **Messages**: hover for actions: reply with a quote, react, edit and delete your own. The picker shows 8 favorites

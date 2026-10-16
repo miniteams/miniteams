@@ -90,6 +90,14 @@
   #reply:disabled { opacity: .6; }
   .composer small { display: block; color: var(--hot); font-size: 12px; margin-top: 2px; }
   li.composer .imgs { --thumb: 32px; margin: 4px 0 0; gap: 8px; }
+  /* The open reply's send queue (spec 017): a truncated line per message. Contained: a long line must
+     not widen the list's grid column. */
+  .qlines { contain: inline-size; }
+  .qlines .q { display: flex; align-items: baseline; gap: 6px; font-size: 12.5px; margin-top: 2px; }
+  .qlines .qtext { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* A long reason (its whole text in the title) must leave the message room. */
+  .qlines .qstate { max-width: 35%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .qlines textarea { flex: 1; }
   #empty { padding: 2em; text-align: center; color: var(--dim); }
   /* Still filling in from the live listing: the rows on screen come from the local archive. */
   .spin { position: fixed; right: 14px; bottom: 14px; width: 16px; height: 16px; border-radius: 50%;
@@ -113,7 +121,7 @@
 <div id="spin" class="spin" hidden title="loading the live list…"></div>
 <script>
 (() => {
-  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn rowActions completion imageQueue
+  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn rowActions completion imageQueue sendQueue
   /* ui.js */
   const $rows = document.getElementById("rows"), $empty = document.getElementById("empty"),
         $status = document.getElementById("status"), $tabs = document.getElementById("tabs"),
@@ -133,9 +141,9 @@
   const chatPage = (id) => "/chat/" + encodeURIComponent(id) + (chatnav === "split" ? "?chatnav=split" : "");
   // The chat page's ◀ lands here: rows open our chat page instead of Teams.
   const nav = q.get("nav") === "chat";
-  // Quick reply: one composer element; drafts live per chat until the page reloads.
+  // Quick reply: one composer element; drafts live per chat, and survive a reload (a newer widget.html, F5).
   let replyTo = "";
-  const drafts = new Map(), sending = new Set(), errors = new Map();
+  const drafts = new Map(), errors = new Map(), DRAFT = "reply:";
 
   const glyph = { group: "👥", meeting: "📅" };
   const send = (obj) => { if (!(ws && ws.readyState === 1)) return false; ws.send(JSON.stringify(obj)); return true; };
@@ -240,8 +248,8 @@
     for (const n of [...$rows.children]) if (n !== $composer) n.remove();
     if (at < 0) { $composer.remove(); $rows.append(...items); }
     else { if (!$composer.isConnected) $rows.append($composer); $composer.before(...items.slice(0, at + 1)); $composer.after(...items.slice(at + 1)); }
-    $reply.disabled = sending.has(replyTo);
     imgs.render();
+    sends.draw($lines, replyTo, sends.list(replyTo));
     $err.textContent = errors.get(replyTo) || "";
     if (fk) focusIn($rows.querySelector(`li[data-id="${CSS.escape(fid)}"]`), fk);
     $empty.textContent = query ? "no chat matches" : "nothing yet";
@@ -249,11 +257,11 @@
   };
 
   const actions = rowActions($rows, () => render(), send);
-  const $composer = el("li", "composer"), $reply = el("textarea"), $err = el("small"), $pop = el("div"), $imgs = el("div", "imgs");
+  const $composer = el("li", "composer"), $reply = el("textarea"), $err = el("small"), $pop = el("div"), $imgs = el("div", "imgs"), $lines = el("div", "qlines");
   $reply.id = "reply"; $reply.rows = 1; $reply.placeholder = "reply · Enter sends, Shift+Enter new line";
   $reply.setAttribute("aria-label", "reply");
   $pop.id = "pop"; $pop.hidden = true;
-  $composer.append($reply, $pop, $imgs, $err);
+  $composer.append($reply, $pop, $imgs, $err, $lines);
   const grow = () => { $reply.style.height = "auto"; $reply.style.height = $reply.scrollHeight + 2 + "px"; };
   const edited = () => { drafts.set(replyTo, $reply.value); grow(); };
 
@@ -262,11 +270,45 @@
     put: (text, from, to) => $reply.setRangeText(text, from, to, "end"),
   });
   const imgs = imageQueue({
-    input: $reply, box: $imgs, chat: () => replyTo, busy: (id) => sending.has(id),
+    input: $reply, box: $imgs, chat: () => replyTo, busy: (id) => sends.busy(id),
     error: (id, text) => { errors.set(id, text); render(); },
   });
-  const UNSURE = "no answer from Teams: it may have gone out · Enter checks the chat before sending again";
+  const sends = sendQueue({
+    imgs, socket: () => ws, changed: () => render(),
+    nothing: (id) => { if (!errors.has(id)) errors.set(id, "nothing to send"); },  // a refused image keeps its own reason
+    note: (id, text) => errors.set(id, text),
+    edit: (id, e) => {
+      if (id !== replyTo || $reply.value || imgs.list(id).length || imgs.adding()) return false;
+      $reply.value = e.verb.text; drafts.set(id, e.verb.text); grow(); complete.restore(e.verb.mentions, id); $reply.focus();
+      return true;
+    },
+  });
+  const UNSURE = "no answer from Teams: it may have gone out · ↻ checks the chat before sending again";
 
+  let left = false;
+  const saveDraft = () => {
+    if (left) return;  // once: the version reload saves, then its pagehide would again
+    left = true;
+    sends.save();
+    for (const [id, text] of drafts) {
+      const record = { text, picked: complete.mentions(text, id), sent: imgs.again(id) };
+      try { if (text) sessionStorage.setItem(DRAFT + id, JSON.stringify(record)); } catch (e) {}
+    }
+  };
+  addEventListener("pagehide", (e) => { if (!e.persisted) saveDraft(); });
+  // Data from sessionStorage, checked like any input.
+  try {
+    for (const k of Object.keys(sessionStorage)) {
+      if (!k.startsWith(DRAFT)) continue;
+      const id = k.slice(DRAFT.length), d = JSON.parse(sessionStorage.getItem(k));
+      sessionStorage.removeItem(k);
+      if (typeof d?.text !== "string") continue;
+      drafts.set(id, d.text);
+      if (Array.isArray(d.picked)) complete.restore(d.picked, id);
+      imgs.arm(id, d.sent);  // a failed message taken back with ✎: sent unchanged, it is a retry
+    }
+  } catch (e) {}
+  sends.load();
   const openReply = (id) => {
     replyTo = sel = id;
     $reply.value = drafts.get(id) || "";
@@ -278,19 +320,19 @@
     $reply.setSelectionRange($reply.value.length, $reply.value.length);
   };
   const closeReply = () => { replyTo = ""; complete.close(); render(); $q.focus(); };
-  // A failed send re-enables the field: give it the focus back unless the user moved on.
-  const refocus = (id) => { if (replyTo === id && $composer.isConnected && document.activeElement === document.body) $reply.focus(); };
+  // Enter empties the box at once and the reply stays open; the chat's messages go out one at a time. A
+  // failure stays in the queue, its line's ↻ ✎ ✕ decide; a message sent meanwhile waits behind it.
   const submit = () => {
-    const id = replyTo, text = $reply.value;
-    if ((!text.trim() && !imgs.list(id).length && !imgs.adding()) || sending.has(id)) return;
+    const id = replyTo, text = $reply.value, held = sends.held(id);
+    const empty = !text.trim() && !imgs.list(id).length && !imgs.adding();
+    if (empty && !held) return;
     if (!(ws && ws.readyState === 1)) { errors.set(id, "offline, not sent"); render(); return; }
-    sending.add(id); errors.delete(id);
-    imgs.send(ws, id, { send: id, text, mentions: complete.mentions(text), format: "inline" }).then((sent) => {
-      if (sent || !sending.delete(id)) return;
-      if (!errors.has(id)) errors.set(id, "nothing to send");  // a refused image keeps its own reason
-      render(); refocus(id);
-    });
-    render();
+    if (!empty) {
+      sends.push(id, { verb: { send: id, text, mentions: complete.mentions(text), format: "inline" } }, held);  // a failed message edited in the box goes back to its place
+      $reply.value = ""; drafts.delete(id); grow(); complete.forget(id);
+    }
+    errors.delete(id);
+    sends.resume(id);
   };
   $reply.oninput = edited;
   // Teams' keys: Enter sends, Shift+Enter breaks the line (Ctrl+Enter sends too).
@@ -338,7 +380,8 @@
     ws.onmessage = (e) => {
       const msg = JSON.parse(e.data);
       // A newer widget.html on the server (restart, edit): this page is stale, reload it.
-      if (msg.page) { if (pageVersion && msg.page !== pageVersion) { location.reload(); return; } pageVersion = msg.page; }
+      // Sends resume only past this check: a page about to reload must not resend first.
+      if (msg.page) { if (pageVersion && msg.page !== pageVersion) { saveDraft(); location.reload(); return; } pageVersion = msg.page; sends.wake(); }
       if ("opener" in msg) opener = !!msg.opener;
       if ("browser" in msg) browser = !!msg.browser;
       if ("me" in msg) meName = msg.me || "";
@@ -346,20 +389,11 @@
       if (msg.rows) { rows = msg.rows; render(); }
       if (msg.presence) paintPresence(msg.presence);
       if (msg.complete) complete.answered(msg);
-      if (msg.sent) {
-        sending.delete(msg.sent);
-        imgs.settled(msg.sent, msg);
-        if (msg.ok) {
-          drafts.delete(msg.sent); errors.delete(msg.sent); complete.forget(msg.sent);
-          if (replyTo === msg.sent) { $reply.value = ""; closeReply(); } else render();
-        } else { errors.set(msg.sent, msg.unsure ? UNSURE : msg.error || "not sent"); render(); refocus(msg.sent); }
-      }
+      if (msg.sent) { if (msg.ok) sends.done(msg.sent); else sends.fail(msg.sent, msg.unsure ? UNSURE : msg.error || "not sent"); }
     };
     ws.onclose = () => {
       $status.title = "disconnected"; $status.classList.add("off");
-      // No ack will come for these: the message may or may not have gone out.
-      for (const id of sending) errors.set(id, "connection lost: Enter checks the chat before sending again");
-      if (sending.size) { const id = replyTo; sending.clear(); render(); refocus(id); }
+      sends.lost();
       setTimeout(connect, retry.next());  // server restarts → page recovers alone
     };
   };
