@@ -376,11 +376,13 @@
     source: "archive", target: null, restore: null,  // target: a jump's {at, id}; restore: a reconnect's anchor
     aroundAt: "",  // the one `around` page still wanted: an answer for another is stale
     stick: true,
+    read: true,  // a `read` owed to Teams (spec 020): the chat opened, or someone wrote, since the last one
     // The edge `fill` last asked: asked again, it would bring nothing again. A new screen clears it, so
     // it only stops two identical asks in a row.
     filled: "",
     unfolded: new Set(),  // members of the runs the reader opened: a run grows at either end
     busy: 0,  // `busy` answers in a row to history asks
+    retries: new Map(),  // their retry timers by key: a navigation drops them with their keys, its own ask wins
   });
   let hist = newHist();
   // The archive behind the stream (an answer's `behind`, the id it lacks): the latest page is asked
@@ -405,6 +407,8 @@
   // The one place a navigation in progress is dropped or redirected, per entry point.
   const resetNav = (entry, to = null) => {
     clearTimeout(lag.ask); hist.catchUp = false;  // the navigation's own ask tells whether the archive lags
+    for (const [k, r] of hist.retries) { clearTimeout(r); hist.pending.delete(k); }
+    hist.retries.clear();
     switch (entry) {
       case "switch": hist = newHist(); settle(true); break;
       case "open": hist.pending.clear(); Object.assign(hist, { restore: to, target: null, aroundAt: "" }); break;  // asks died with the old socket, or a gap superseded them
@@ -476,6 +480,37 @@
   $teams.onclick = () => openTeams(hist.newer ? "" : lastId());
 
   const near = (px = 40) => $list.scrollHeight - $list.scrollTop - $list.clientHeight < px;
+  // Spec 020. `read` has no answer: one per second per chat, the rest collapsed into one trailing send,
+  // gated again when due: the reader may have left the chat or the window meanwhile.
+  const READ_MS = 1000, readAt = new Map(), readLater = new Map();
+  const autoOn = () => pref("autoread") !== "0";
+  const sendRead = (t) => {
+    if (readLater.has(t)) return true;
+    const wait = (readAt.get(t) || 0) + READ_MS - Date.now();
+    if (wait > 0) {
+      readLater.set(t, setTimeout(() => { readLater.delete(t); if (t === thread) { hist.read = true; autoRead(); } }, wait));
+      return true;
+    }
+    if (!autoOn() || !send({ read: t })) return false;
+    readAt.set(t, Date.now());
+    return true;
+  };
+  // Only what the reader is shown: the newest message in view, the window visible and focused. A page
+  // that replaces the screen (a reconnect, a jump) or the archive's lag is awaited: the screen may lack
+  // what the row has, and the server marks read up to the row's last message.
+  const autoRead = () => {
+    if (!hist.read || !hist.loaded || hist.newer || replacing() || lag.id || readOnly || !near()) return;
+    if (document.visibilityState !== "visible" || !document.hasFocus()) return;
+    if (sendRead(thread)) hist.read = false;
+  };
+  // A page's message from someone else, newer than the screen's: it came while the socket was down, or
+  // the archive lagged. Older ones (scrolling up, a jump) were there before the read marker.
+  const owed = (messages) => {
+    const last = lastAt();
+    if (messages.some((r) => !r.me && !hist.records.has(r.id) && r.at > last)) hist.read = true;
+  };
+  document.addEventListener("visibilitychange", () => autoRead());
+  addEventListener("focus", () => autoRead());
   const showLatest = () => {
     $outq.hidden = hist.newer || !$outq.children.length;  // after the chat's last message, which a jump hides
     $latest.hidden = !hist.newer && near();
@@ -499,6 +534,7 @@
     if (hist.stick) hist.unseen = 0;
     showLatest();
     more();
+    autoRead();
   });
   // A page shorter than the list never scrolls: ask the next one without waiting for a scroll.
   const fill = () => {
@@ -883,6 +919,7 @@
     carry = null;
     hist.older = !!more.older; hist.newer = !!more.newer;
     hist.filled = "";
+    owed(messages);
     hist.records.clear();
     for (const r of messages) hist.records.set(r.id, r);
     if (!hist.newer) {  // landed while the page was read, or while detached
@@ -914,6 +951,7 @@
   // A page next to the screen: older above with the visible message kept in place, newer below.
   const addPage = (messages, above) => {
     const a = above && anchor();
+    owed(messages);
     const nodes = messages.filter((r) => !hist.records.has(r.id)).map((r) => { hist.records.set(r.id, r); return renderMessage(r); });
     if (above) $msgs.prepend(...nodes); else $msgs.append(...nodes);
     if (!above && !hist.newer) {  // reached the latest message: what arrived while detached follows it
@@ -940,6 +978,7 @@
   };
 
   const append = (r) => {
+    if (!r.me && !hist.records.has(r.id)) hist.read = true;
     if (hist.newer || replacing()) {
       if (!hist.live.some((x) => x.id === r.id)) hist.live.push(r);
       if (hist.live.length > LIVE_MAX) hist.live.shift();
@@ -953,11 +992,13 @@
     $note.hidden = true;
     if (was) { trim(); toBottom(); } else { hist.unseen++; showLatest(); }
     if (r.id === lag.id) settle();
+    autoRead();
   };
   // A latest page asked again while the archive lagged: what it adds goes in by time, the screen and
   // the reader's place stay.
   const merge = (messages) => {
     const was = hist.stick, first = firstAt();
+    owed(messages);
     let added = 0;
     for (const r of messages) {
       if (hist.records.has(r.id) || (hist.older && r.at < first)) continue;  // above the screen: scrolling up reads it
@@ -989,9 +1030,9 @@
   };
 
   // History is keyed on its cursor, which the answer echoes: one request per cursor in flight.
-  const requestHistory = (side = "before", at = "") => {
+  const requestHistory = (side = "before", at = "", again = false) => {
     const key = at ? side + ":" + at : "";
-    if (hist.pending.has(key)) return;
+    if (hist.pending.has(key) && !again) return;
     if (!send({ history: thread, [side]: at || null })) return;
     hist.pending.add(key);
     if (!at && !hist.newer) { hist.live = []; hist.liveEdits = []; }  // attached: what came before is on screen
@@ -1000,15 +1041,17 @@
   const onHistory = (m) => {
     if (m.history !== thread) return;  // asked before a switch
     const side = ["after", "around"].find((k) => k in m) || "before", at = m[side] || "";
-    hist.pending.delete(at ? side + ":" + at : "");
+    const key = at ? side + ":" + at : "";
+    hist.pending.delete(key);
     if (side === "around" && at !== hist.aroundAt) return;  // a later jump (or the latest page) replaced it
     if (m.error === "busy" && hist.busy < BUSY_TRIES) {
       hist.busy++;
-      const t = thread;
-      setTimeout(() => t === thread && requestHistory(side, at), BUSY_RETRY_MS);
+      hist.pending.add(key);  // still asked until the retry: `replacing()` holds the auto read through the gap
+      hist.retries.set(key, setTimeout(() => { hist.retries.delete(key); requestHistory(side, at, true); }, BUSY_RETRY_MS));
       return;
     }
     hist.busy = 0;
+    queueMicrotask(autoRead);  // once handled, on any path: the answer may end what held an owed read back
     const catchUp = !at && hist.catchUp;
     if (!at) hist.catchUp = false;
     // Detached since: the way back to the latest page asks again.
@@ -1017,6 +1060,7 @@
     if (side === "around") hist.aroundAt = "";
     if (m.error) {
       if (side === "around" && hist.restore) { resetNav("fallback"); requestHistory(); return; }
+      if (lag.id && !hist.newer) behind(lag.id);  // the catch-up this navigation dropped: asked again
       if (side !== "before" && at) { $err.textContent = (side === "around" ? "jump: " : "history: ") + m.error; hist.target = null; return; }
       if (hist.followFailed) return;  // its error says more than this one
       $note.hidden = false; $note.className = "err";
@@ -1679,6 +1723,10 @@
     sw.type = "checkbox"; sw.checked = pref("avatars") !== "0";
     sw.onchange = () => { choose("avatars", sw.checked ? "1" : "0"); applyPrefs(); renderRows(); };
     lab.append(sw); dbox.append(el("h3", null, "Display"), lab);
+    const tbox = el("div"), rlab = el("label", null, "Mark read in Teams when shown"), rsw = el("input", "switch");
+    rsw.type = "checkbox"; rsw.checked = autoOn();
+    rsw.onchange = () => { choose("autoread", rsw.checked ? "1" : "0"); autoRead(); };
+    rlab.append(rsw); tbox.append(el("h3", null, "Teams"), rlab);
     const nav = segOf("Chat navigation", [["list", "List"], ["split", "Split"]], split ? "split" : "list", (k) => {
       keep("chatnav", k); q.delete("chatnav");
       saveDraft();
@@ -1713,7 +1761,7 @@
     tools.append(left, right, reset);
     rbox.append(el("h3", null, "Reactions"), slots, tools);
     drawFavs();
-    menu.append(themes, dbox, nav, rbox);
+    menu.append(themes, dbox, tbox, nav, rbox);
     $cog.append(menu);
   };
   const closeCog = (focus) => { cogOpen = false; renderCog(); if (focus) $gear.focus(); };

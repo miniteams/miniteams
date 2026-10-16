@@ -167,6 +167,9 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   - Drag the list's edge to resize (or focus it: ←/→, Home/End, Enter or double click resets); width and fold are kept per browser.
   - ☰ folds the list, or opens it over the chat below 700px.
   - Ctrl+K jumps to the list's filter: ↑/↓ pick a row, Enter opens it. Seen and Muted sit behind ⋯ in a narrow list.
+- **Mark read in Teams when shown** (⚙, on by default): a chat opened, and each message from someone else landing in
+  it, marks it read in Teams once the window is visible, focused and at the latest message, and the archive has caught
+  up (no "loading latest messages…"); one `read` a second per chat, the last one sent only if all that still holds.
 - **Composer** (also the widget's quick reply): completes `:emoji` and `@member` (`@everyone` on group chats, not 1:1;
   picked members are notified; a mention needs a non-word character before `@`, and two members with the same name map
   in the order they were picked). Messages are limited to 28 KB.
