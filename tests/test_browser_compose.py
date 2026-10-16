@@ -23,12 +23,14 @@ from browser_helpers import (  # skips without playwright
     POP_ASK_MS,
     Pages,
     T,
+    act,
     closed,
     open_fake,
     past,
     pick_namesakes,
     pick_out_of_order,
     pick_then_glue,
+    queue_is,
     rendered,
     row,
     shows,
@@ -81,7 +83,7 @@ async def _open(pages: Pages, board: Fake) -> None:
         ORIGIN + "/",
         PAGE,
         page_route=ORIGIN + "/",
-        ws_route=re.compile(r"^ws://127\.0\.0\.1:9/ws$"),
+        ws_route=re.compile(r"^ws://127\.0\.0\.1:8/ws$"),
     )
     await page.wait_for_selector("a.name")
     await page.locator("button.reply").dispatch_event("click")
@@ -175,8 +177,8 @@ async def test_backspace_leaves_everyone_and_single_word_mentions_as_normal_text
 
 
 async def test_a_removed_mention_is_not_sent_and_picks_survive_a_failure_only(fake: Fake) -> None:
-    """012-AC8: a pick whose `@Name` left the text is not sent; the picks survive a failed send and
-    clear on a successful one."""
+    """012-AC8, 017-AC6: a pick whose `@Name` left the text is not sent; a failed send keeps its picks
+    (↻ sends them again), a sent one clears them."""
     page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
     for prefix in ("ann", "bob"):
         await box.press_sequentially("@" + prefix)
@@ -186,9 +188,9 @@ async def test_a_removed_mention_is_not_sent_and_picks_survive_a_failure_only(fa
     await box.fill("@Ann Lee only")
     fake.fail = True
     await box.press("Enter")
-    await page.wait_for_function("document.querySelector('.composer small').textContent === 'boom'")
+    await queue_is(page, ("@Ann Lee only", "failed: boom"))
     fake.fail = False
-    await box.press("Enter")
+    await act(page, "retry")
     await wait(lambda: len(fake.of("send")) == 2)
     await box.fill("@Ann Lee again")
     await box.press("Enter")

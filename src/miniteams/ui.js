@@ -385,7 +385,7 @@
   // `busy(id)` its send awaits an answer (the images shown are the next message's, never locked).
   const IMG_MAX = 8, IMG_BYTES = 10 << 20, IMG_TOTAL = 40 << 20, IMG_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
   const imageQueue = ({ input, box, chat, error, busy }) => {
-    const queues = new Map(), tries = new Map(), flight = new Map();  // tries: chat id → its draft's last attempt
+    const queues = new Map(), flight = new Map(), kept = new Map();  // kept: chat id → the attempt of a failed message edited in the composer
     let chain = Promise.resolve(), adding = 0, last = 0, shown = null;
     const list = (id = chat()) => queues.get(id) || [];
     const view = el("dialog", "imgview"), big = el("img"), bar = el("div"), shut = el("button", null, "Close"), del = el("button", null, "Remove");
@@ -398,7 +398,7 @@
       if (shown?.[1] === it) view.close();
       URL.revokeObjectURL(it.url);
       queues.set(id, list(id).filter((x) => x !== it));
-      tries.delete(id);
+      kept.delete(id);
       render();
     };
     del.onclick = () => { if (shown) remove(...shown); };
@@ -434,7 +434,7 @@
         try {
           const [w, h] = await measure(url);
           queues.set(id, [...list(id), { file, url, w, h }]);
-          tries.delete(id);
+          kept.delete(id);
         } catch (e) { URL.revokeObjectURL(url); error(id, "unsupported image: PNG, JPEG, GIF or WebP only"); }
         render();
       }
@@ -446,72 +446,60 @@
       e.preventDefault();
       add(chat(), files);
     });
-    // Any edit makes the draft a new message: a later identical text must not be looked up as the old one.
-    input.addEventListener("input", () => tries.delete(chat()));
+    // Any edit makes the composer's message a new one: an identical text must not be looked up as the old one.
+    input.addEventListener("input", () => kept.delete(chat()));
     addEventListener("pagehide", (e) => { if (!e.persisted) for (const q of queues.values()) for (const it of q) URL.revokeObjectURL(it.url); });
     // The send verb for `id` gets its images and a message id, then each image follows as one binary
-    // frame, in order. A retry of the very same draft keeps its id and asks the server to look for it
-    // first (Teams does not dedupe, and any failure may hide a posted message); an edited draft is a
-    // new message, so an edit is never swallowed by the check. False when nothing is left to send
-    // (every pasted image refused), for the page to settle.
-    // `items`: the images `take` detached at Enter; a failure puts them back in front. `sent`: the
-    // attempt a queued message brought across a reload or a dropped socket, which no edit of the composer
-    // may drop.
+    // frame, in order. `sent`: the queued message's last attempt; the very same message again keeps its
+    // id and asks the server to look for it first (Teams does not dedupe, and any failure may hide a
+    // posted message); an edited one is a new message, so an edit is never swallowed by the check. False
+    // when nothing is left to send (every pasted image refused), for the page to settle.
     const send = async (ws, id, verb, items, sent) => {
       if (ws?.readyState !== 1) return true;  // closing: the page's `lost` requeues the message, images included
       if (!items.length && !verb.text.trim()) return false;
-      const json = JSON.stringify(verb), prev = sent || tries.get(id);
-      const same = !!prev && prev.json === json;  // images added or removed already dropped the attempt
-      const cmid = same ? prev.cmid : String(last = Math.max(Date.now(), last + 1));
-      tries.set(id, { cmid, json });
+      const json = JSON.stringify(verb), same = sent?.json === json;  // images added or removed already dropped the attempt
+      const cmid = same ? sent.cmid : String(last = Math.max(Date.now(), last + 1));
       flight.set(id, { cmid, json, items });
       ws.send(JSON.stringify({ ...verb, cmid, ...(same ? { check: true } : {}),
         ...(items.length ? { images: items.map((it) => ({ w: it.w, h: it.h, size: it.file.size })) } : {}) }));
       for (const it of items) ws.send(it.file);
       return true;
     };
-    // Success drops the images sent. A failure re-arms the retry: a next message typed meanwhile must
-    // not cost it its check.
-    const settled = (id, m) => {
-      const f = flight.get(id);
+    // Success drops the images sent.
+    const settled = (id) => {
+      for (const it of flight.get(id)?.items || []) URL.revokeObjectURL(it.url);
       flight.delete(id);
-      if (m.ok) {
-        tries.delete(id);
-        for (const it of f?.items || []) URL.revokeObjectURL(it.url);
-      } else if (f) {
-        tries.set(id, { cmid: f.cmid, json: f.json });
-        queues.set(id, [...f.items, ...list(id)]);
-      }
       render();
     };
     // The chat's images, once those pasted before this call are measured, detached for one message.
-    const take = (id) => chain.then(() => { const items = list(id); queues.delete(id); render(); return items; });
-    // A dropped socket: the send in flight, its attempt and images, handed back to its queued message.
+    const take = (id) => { kept.delete(id); return chain.then(() => { const items = list(id); queues.delete(id); render(); return items; }); };
+    // A failed message edited in the composer: its images go back in front of any pasted since, its
+    // attempt is kept until the composer changes (`again`): sent unchanged, it is a retry.
+    const back = (id, items, sent) => { queues.set(id, [...items, ...list(id)]); if (sent) kept.set(id, sent); render(); };
+    // A failure or a dropped socket: the send in flight, its attempt and images, handed back to its queued message.
     const recall = (id) => { const f = flight.get(id); flight.delete(id); return f; };
-    // The attempt a reload must keep: the send in flight (`flying`, saved with its queued message), else
-    // the draft's failed one (a restart drops the socket first), saved with the draft. Re-armed after the
-    // reload, the same text sent again is a retry (same id, checked), never a duplicate.
-    const attempt = (id, flying) => {
-      const f = flying ? flight.get(id) : !flight.has(id) && tries.get(id);
-      return f ? { cmid: f.cmid, json: f.json } : undefined;
-    };
-    // Data from sessionStorage.
-    const arm = (id, t) => { if (!tries.has(id) && /^\d+$/.test(t?.cmid) && typeof t.json === "string") tries.set(id, { cmid: t.cmid, json: t.json }); };  // a live attempt is newer
-    return { list, send, settled, take, render, attempt, arm, recall, adding: () => adding > 0 };
+    // The send in flight: a reload keeps its attempt with its queued message.
+    const attempt = (id) => { const f = flight.get(id); return f ? { cmid: f.cmid, json: f.json } : undefined; };
+    // A stored draft's kept attempt (data from sessionStorage), checked like any input.
+    const arm = (id, t) => { if (/^\d+$/.test(t?.cmid) && typeof t.json === "string") kept.set(id, { cmid: t.cmid, json: t.json }); };
+    return { list, send, settled, take, back, again: (id) => kept.get(id), arm, render, attempt, recall, adding: () => adding > 0 };
   };
 
   // Burst sends (spec 017): per chat, one message in flight, the rest in send order. `push` takes the
   // chat's images (`imgs.take`) with the item's verb; the page reports the server's answer with `done` /
-  // `fail`. A failure pauses the chat's queue with its item still at the head, `failed`; the page's
-  // `failed(id, item, text)` decides what becomes of it. Other hooks: `socket()` the live socket,
-  // `nothing(id)` an item with nothing to send (every image refused), `changed(id)` any change, to redraw,
-  // `note(id, text)` a word for the chat's error line. Item states: queued, sending, failed, paused
-  // (queued behind a failure). The queues survive a reload in sessionStorage (`save` / `load`), images aside.
-  const sendQueue = ({ imgs, socket, failed, nothing, changed, note }) => {
+  // `fail`. A failure pauses the chat's queue with its item still at the head, `failed`, until ↻ `retry`,
+  // ✎ `edit` or ✕ `discard` (`draw` shows the items and their buttons). Hooks: `socket()` the live
+  // socket, `nothing(id)` an item with nothing to send (every image refused), `changed(id)` any change,
+  // to redraw, `note(id, text)` a word for the chat's error line, `edit(id, item)` true when the page took
+  // the item into its empty composer (else it is edited in place), `acked(id, item)` an item sent. Item
+  // states: queued, sending, failed, paused (queued behind a failure or an edit). The queues survive a
+  // reload in sessionStorage (`save` / `load`), images aside.
+  const sendQueue = ({ imgs, socket, nothing, changed, note, edit: took, acked = () => {} }) => {
     const queues = new Map();  // chat id → { list: [{ verb, images, state, …page fields }], paused }
     const of = (id) => { let q = queues.get(id); if (!q) queues.set(id, q = { list: [], paused: false }); return q; };
     const list = (id) => queues.get(id)?.list || [];
     const busy = (id) => list(id)[0]?.state === "sending";
+    const failed = (id) => list(id).some((e) => e.state === "failed");
     const pump = (id) => {
       const q = of(id), e = q.list[0];
       if (q.paused || !e || e.state === "sending" || socket()?.readyState !== 1) return;  // offline: `wake` resumes
@@ -520,30 +508,41 @@
       const go = e.go = {}, mine = () => e.go === go && e.state === "sending" && q.list[0] === e;
       e.state = "sending"; changed(id);
       e.images.then((items) => !mine() || imgs.send(socket(), id, e.verb, items, e.sent)).then((sent) => {
+        if (sent && mine()) e.cmid = imgs.attempt(id)?.cmid ?? e.cmid;  // the chat page matches Teams' echo on it
         if (sent || !mine()) return;
         q.list.shift(); nothing(id); changed(id); pump(id);
       });
     };
+    // `front`: the message edited in the composer goes back to its place. Unchanged, it keeps its attempt.
     const push = (id, item, front = false) => {
-      const q = of(id), pics = imgs.list(id).length > 0 || imgs.adding();
+      const q = of(id), pics = imgs.list(id).length > 0 || imgs.adding(), was = !imgs.adding() && imgs.again(id);
       const e = { ...item, pics, images: imgs.take(id), state: q.paused ? "paused" : "queued" };
+      if (was && was.json === JSON.stringify(item.verb)) Object.assign(e, { sent: was, cmid: was.cmid });  // its echo may be on screen
       if (front) q.list.unshift(e); else q.list.push(e);
       changed(id);
     };
+    // A failed item waits for its own action: nothing behind it goes first.
     const resume = (id) => {
       const q = of(id);
+      if (failed(id)) { changed(id); return; }
       q.paused = false;
       for (const e of q.list) if (e.state === "paused") e.state = "queued";
       changed(id); pump(id);
     };
-    const done = (id) => { if (!busy(id)) return; of(id).list.shift(); imgs.settled(id, { ok: true }); changed(id); pump(id); };
+    const done = (id) => {
+      if (!busy(id)) return;
+      const e = of(id).list.shift();
+      imgs.settled(id); acked(id, e); changed(id); pump(id);
+    };
+    // The send in flight, its attempt and images, back on its item: sent again, it goes with its id and the check.
+    const hold = (id, e) => { const f = imgs.recall(id); if (f) Object.assign(e, { sent: { cmid: f.cmid, json: f.json }, images: Promise.resolve(f.items) }); };
     const fail = (id, text) => {
       if (!busy(id)) return;
       const q = of(id), e = q.list[0];
-      e.state = "failed"; q.paused = true;
+      hold(id, e);
+      Object.assign(e, { state: "failed", why: text });
+      q.paused = true;
       for (const x of q.list.slice(1)) x.state = "paused";
-      imgs.settled(id, { ok: false });
-      failed(id, e, text);
       changed(id);
     };
     // No answer will come once the socket drops, and the message may have gone out: it waits at the head,
@@ -552,21 +551,84 @@
       for (const [id, q] of queues) {
         const e = q.list[0];
         if (e?.state !== "sending") continue;
-        const f = imgs.recall(id);
+        hold(id, e);
         e.state = "queued";
-        if (f) Object.assign(e, { sent: { cmid: f.cmid, json: f.json }, images: Promise.resolve(f.items) });
         changed(id);
       }
     };
-    const discard = (id, e) => { const q = of(id); q.list = q.list.filter((x) => x !== e); changed(id); };
+    const retry = (id, e) => { e.state = "queued"; e.editing = undefined; resume(id); };
+    const discard = (id, e) => {
+      const q = of(id);
+      q.list = q.list.filter((x) => x !== e);
+      e.images.then((items) => { for (const it of items) URL.revokeObjectURL(it.url); });
+      resume(id);
+    };
     const wake = () => { for (const id of [...queues.keys()]) pump(id); };
+    // Into the page's empty composer, its images too: the queue stays paused until the composer sends it
+    // (back at its place) or Enter on the emptied box drops it. Else an editor in the item.
+    const edit = (id, e) => {
+      const q = of(id);
+      if (!took(id, e)) { e.editing = e.verb.text; changed(id); return; }
+      q.list = q.list.filter((x) => x !== e);
+      e.images.then((items) => imgs.back(id, items, e.sent));
+      changed(id);
+    };
+    // An edit sent from the item: a changed text is a new message (its old id's echo is not its own), an
+    // unchanged one a retry.
+    const resend = (id, e, text) => { if (text !== e.verb.text) { e.verb = { ...e.verb, text }; e.cmid = undefined; } retry(id, e); };
+    const LABEL = { queued: "queued", sending: "sending…", paused: "paused", sent: "sent" };
+    const button = (label, title, act) => {
+      const b = el("button", null, label);
+      b.title = title; b.setAttribute("aria-label", title); b.onclick = act;
+      return b;
+    };
+    // One node per item, kept across redraws: an edit in progress keeps its text and focus. Plain text only.
+    const look = (id, e) => {
+      if (!e.node) {
+        const acts = el("span", "qacts");
+        acts.append(button("↻", "retry", () => retry(id, e)), button("✎", "edit", () => edit(id, e)), button("✕", "discard", () => discard(id, e)));
+        e.node = el("div", "q");
+        e.node.append(Object.assign(el("div", "qtext"), { dir: "auto" }), el("span", "qstate"), acts);
+      }
+      const [text, label, acts, open] = [".qtext", ".qstate", ".qacts", "textarea"].map((k) => e.node.querySelector(k));
+      e.node.className = "q " + e.state;
+      text.textContent = e.verb.text || "🖼";
+      label.textContent = label.title = e.state === "failed" ? "failed: " + e.why : LABEL[e.state];
+      acts.hidden = e.state !== "failed" || e.editing !== undefined;
+      text.hidden = e.editing !== undefined;
+      if (e.editing === undefined) open?.remove();
+      else if (!open) {
+        const box = Object.assign(el("textarea"), { value: e.editing, rows: Math.min(8, e.editing.split("\n").length) });
+        box.setAttribute("aria-label", "edit the failed message");
+        box.oninput = () => { e.editing = box.value; };
+        // Its redraw may drop the item (echoed meanwhile on the chat page): the focus goes to the composer then.
+        const cancel = () => { e.editing = undefined; changed(id); (e.node.isConnected ? e.node.querySelector("button[title=edit]") : document.getElementById("reply")).focus(); };
+        // Enter on an emptied text without images: nothing to send, the edit is cancelled.
+        box.onkeydown = (ev) => {
+          if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); cancel(); return; }
+          if (ev.key !== "Enter" || ev.shiftKey || ev.isComposing || ev.keyCode === 229) return;
+          ev.preventDefault();
+          if (box.value.trim() || e.pics) resend(id, e, box.value); else cancel();
+        };
+        text.after(box);
+        box.focus();
+      }
+      return e.node;
+    };
+    // `items` in `box`, in order; nodes only move when the list changed around them.
+    const draw = (box, id, items) => {
+      const want = items.map((e) => look(id, e));
+      for (const n of [...box.children]) if (!want.includes(n)) n.remove();
+      want.forEach((n, i) => { if (box.children[i] !== n) box.insertBefore(n, box.children[i] || null); });
+    };
     // Before a reload: each chat's queue, in order; the message in flight keeps its attempt (it may have
-    // gone out), so it goes again with the same id and the check. Emptied: an answer arriving meanwhile is moot.
+    // gone out), so it goes again with the same id and the check; a failed one its reason. Emptied: an
+    // answer arriving meanwhile is moot.
     const KEY = "queue:";
     const save = () => {
       for (const [id, q] of queues) {
         const items = q.list.splice(0).map((e) => ({ verb: e.verb, quotes: e.quotes, pics: e.pics,
-          sent: e.state === "sending" ? imgs.attempt(id, true) : e.sent }));
+          sent: e.state === "sending" ? imgs.attempt(id) : e.sent, ...(e.state === "failed" ? { why: e.why } : {}) }));
         try { if (items.length) sessionStorage.setItem(KEY + id, JSON.stringify({ paused: q.paused, items })); } catch (e) {}
       }
       queues.clear();
@@ -596,13 +658,17 @@
           if (!it.verb.text.trim()) continue;
           const sent = /^\d+$/.test(it.sent?.cmid) && str(it.sent.json) ? { cmid: it.sent.cmid, json: it.sent.json } : undefined;
           const quotes = (Array.isArray(it.quotes) ? it.quotes : []).filter((qt) => str(qt?.id)).map((qt) => ({ id: qt.id, name: String(qt.name ?? ""), line: String(qt.line ?? "") }));
-          q.list.push({ verb: it.verb, quotes, sent, pics: false, images: Promise.resolve([]), state: q.paused ? "paused" : "queued" });
+          // A failed head waits for its ↻ ✎ ✕ again. `cmid`: its echo may land before the resend.
+          const why = q.paused && !q.list.length && str(it.why) ? it.why : undefined;
+          q.list.push({ verb: it.verb, quotes, sent, cmid: sent?.cmid, pics: false, images: Promise.resolve([]),
+            ...(why !== undefined ? { state: "failed", why } : { state: q.paused ? "paused" : "queued" }) });
         }
         if (!q.list.length) q.paused = false;
-        const notes = [...(pics ? [LOST] : []), ...(q.paused ? [`${q.list.length} queued: Enter sends them`] : [])];
+        const held = q.paused && !failed(id);
+        const notes = [...(pics ? [LOST] : []), ...(held ? [`${q.list.length} queued: Enter sends them`] : [])];
         if (notes.length) note(id, notes.join(" · "));
         changed(id);
       }
     };
-    return { list, busy, paused: (id) => !!queues.get(id)?.paused, push, resume, done, fail, lost, discard, wake, save, load };
+    return { list, busy, held: (id) => !!queues.get(id)?.paused && !failed(id), push, resume, done, fail, lost, discard, wake, save, load, draw };
   };

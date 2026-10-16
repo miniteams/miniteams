@@ -90,6 +90,14 @@
   #reply:disabled { opacity: .6; }
   .composer small { display: block; color: var(--hot); font-size: 12px; margin-top: 2px; }
   li.composer .imgs { --thumb: 32px; margin: 4px 0 0; gap: 8px; }
+  /* The open reply's send queue (spec 017): a truncated line per message. Contained: a long line must
+     not widen the list's grid column. */
+  .qlines { contain: inline-size; }
+  .qlines .q { display: flex; align-items: baseline; gap: 6px; font-size: 12.5px; margin-top: 2px; }
+  .qlines .qtext { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* A long reason (its whole text in the title) must leave the message room. */
+  .qlines .qstate { max-width: 35%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .qlines textarea { flex: 1; }
   #empty { padding: 2em; text-align: center; color: var(--dim); }
   /* Still filling in from the live listing: the rows on screen come from the local archive. */
   .spin { position: fixed; right: 14px; bottom: 14px; width: 16px; height: 16px; border-radius: 50%;
@@ -241,6 +249,7 @@
     if (at < 0) { $composer.remove(); $rows.append(...items); }
     else { if (!$composer.isConnected) $rows.append($composer); $composer.before(...items.slice(0, at + 1)); $composer.after(...items.slice(at + 1)); }
     imgs.render();
+    sends.draw($lines, replyTo, sends.list(replyTo));
     $err.textContent = errors.get(replyTo) || "";
     if (fk) focusIn($rows.querySelector(`li[data-id="${CSS.escape(fid)}"]`), fk);
     $empty.textContent = query ? "no chat matches" : "nothing yet";
@@ -248,11 +257,11 @@
   };
 
   const actions = rowActions($rows, () => render(), send);
-  const $composer = el("li", "composer"), $reply = el("textarea"), $err = el("small"), $pop = el("div"), $imgs = el("div", "imgs");
+  const $composer = el("li", "composer"), $reply = el("textarea"), $err = el("small"), $pop = el("div"), $imgs = el("div", "imgs"), $lines = el("div", "qlines");
   $reply.id = "reply"; $reply.rows = 1; $reply.placeholder = "reply · Enter sends, Shift+Enter new line";
   $reply.setAttribute("aria-label", "reply");
   $pop.id = "pop"; $pop.hidden = true;
-  $composer.append($reply, $pop, $imgs, $err);
+  $composer.append($reply, $pop, $imgs, $err, $lines);
   const grow = () => { $reply.style.height = "auto"; $reply.style.height = $reply.scrollHeight + 2 + "px"; };
   const edited = () => { drafts.set(replyTo, $reply.value); grow(); };
 
@@ -264,22 +273,17 @@
     input: $reply, box: $imgs, chat: () => replyTo, busy: (id) => sends.busy(id),
     error: (id, text) => { errors.set(id, text); render(); },
   });
-  // A failure puts the message back in the box ahead of any newer draft and the chat's queue waits:
-  // Enter retries it (checked when unchanged), Enter on an emptied box drops it; the queued ones follow.
-  const failed = (id, e, text) => {
-    sends.discard(id, e);
-    const d = id === replyTo ? $reply.value : drafts.get(id) || "", back = d ? e.verb.text + "\n" + d : e.verb.text, more = sends.list(id).length;
-    complete.restore([...e.verb.mentions, ...complete.mentions(d, id)], id);
-    drafts.set(id, back);
-    if (id === replyTo) { $reply.value = back; grow(); }
-    errors.set(id, text + (more ? ` · ${more} more queued after it` : ""));
-  };
   const sends = sendQueue({
-    imgs, socket: () => ws, failed, changed: () => render(),
+    imgs, socket: () => ws, changed: () => render(),
     nothing: (id) => { if (!errors.has(id)) errors.set(id, "nothing to send"); },  // a refused image keeps its own reason
     note: (id, text) => errors.set(id, text),
+    edit: (id, e) => {
+      if (id !== replyTo || $reply.value || imgs.list(id).length || imgs.adding()) return false;
+      $reply.value = e.verb.text; drafts.set(id, e.verb.text); grow(); complete.restore(e.verb.mentions, id); $reply.focus();
+      return true;
+    },
   });
-  const UNSURE = "no answer from Teams: it may have gone out · Enter checks the chat before sending again";
+  const UNSURE = "no answer from Teams: it may have gone out · ↻ checks the chat before sending again";
 
   let left = false;
   const saveDraft = () => {
@@ -287,7 +291,7 @@
     left = true;
     sends.save();
     for (const [id, text] of drafts) {
-      const record = { text, picked: complete.mentions(text, id), sent: imgs.attempt(id) };
+      const record = { text, picked: complete.mentions(text, id), sent: imgs.again(id) };
       try { if (text) sessionStorage.setItem(DRAFT + id, JSON.stringify(record)); } catch (e) {}
     }
   };
@@ -301,7 +305,7 @@
       if (typeof d?.text !== "string") continue;
       drafts.set(id, d.text);
       if (Array.isArray(d.picked)) complete.restore(d.picked, id);
-      imgs.arm(id, d.sent);
+      imgs.arm(id, d.sent);  // a failed message taken back with ✎: sent unchanged, it is a retry
     }
   } catch (e) {}
   sends.load();
@@ -316,14 +320,15 @@
     $reply.setSelectionRange($reply.value.length, $reply.value.length);
   };
   const closeReply = () => { replyTo = ""; complete.close(); render(); $q.focus(); };
-  // Enter empties the box at once and the reply stays open; the chat's messages go out one at a time.
+  // Enter empties the box at once and the reply stays open; the chat's messages go out one at a time. A
+  // failure stays in the queue, its line's ↻ ✎ ✕ decide; a message sent meanwhile waits behind it.
   const submit = () => {
-    const id = replyTo, text = $reply.value, held = sends.paused(id);
+    const id = replyTo, text = $reply.value, held = sends.held(id);
     const empty = !text.trim() && !imgs.list(id).length && !imgs.adding();
     if (empty && !held) return;
     if (!(ws && ws.readyState === 1)) { errors.set(id, "offline, not sent"); render(); return; }
     if (!empty) {
-      sends.push(id, { verb: { send: id, text, mentions: complete.mentions(text), format: "inline" } }, held);  // a paused queue's head is the box
+      sends.push(id, { verb: { send: id, text, mentions: complete.mentions(text), format: "inline" } }, held);  // a failed message edited in the box goes back to its place
       $reply.value = ""; drafts.delete(id); grow(); complete.forget(id);
     }
     errors.delete(id);

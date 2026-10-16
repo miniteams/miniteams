@@ -65,7 +65,8 @@ CONTRAST = """e => {
   const [hi, lo] = [lum(fg), lum(bg)].sort((x, y) => y - x);
   return (hi + 0.05) / (lo + 0.05);
 }"""
-ORIGIN = "http://127.0.0.1:9"  # fake pages: never dialled, every request on it is answered by a route
+# Fake pages: never dialled, every request on it is answered by a route. Not port 9: Firefox refuses it.
+ORIGIN = "http://127.0.0.1:8"
 POP_ASK_MS = 120  # the pages' completion debounce (POP_ASK_MS in ui.js)
 BARRIER = {"barrier": 1}
 DONE = {"done": 1}  # the fake's sentinel frame: the page handled every frame sent before it
@@ -200,6 +201,23 @@ async def until(page: Page, js: str, tries: int = 500) -> None:
             return
         await asyncio.sleep(0.01)
     raise AssertionError(f"{js} not true in {tries / 100:g} s")
+
+
+# The send queue as shown (spec 017): each item's text and label, in order.
+QUEUE = (
+    "JSON.stringify([...document.querySelectorAll('.q')]"
+    ".map((n) => [n.querySelector('.qtext').textContent, n.querySelector('.qstate').textContent]))"
+)
+
+
+async def queue_is(page: Page, *items: tuple[str, str]) -> None:
+    """The page's send queue shows `items`, (text, label) each, in order."""
+    await until(page, f"{QUEUE} === JSON.stringify({json.dumps([list(i) for i in items])})")
+
+
+async def act(page: Page, name: str) -> None:
+    """Clicks the failed item's `name` button (retry, edit, discard)."""
+    await page.locator(f".q.failed button[title={name}]").click()
 
 
 async def past(page: Page, ms: int) -> None:

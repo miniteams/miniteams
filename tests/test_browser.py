@@ -23,6 +23,7 @@ from browser_helpers import (  # skips without playwright
     Page,
     Pages,
     Route,
+    queue_is,
     rendered,
     row,
     until,
@@ -236,7 +237,8 @@ async def test_a_message_image_opens_full_size(board: W.Board, chat: Pages) -> N
 async def test_composer_keys_success_and_failure(
     chat: Pages, sent: list[tuple[str, str]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """011-AC8: Shift+Enter breaks the line, Enter sends once and clears; a failure keeps the text."""
+    """011-AC8, 017-AC3: Shift+Enter breaks the line, Enter sends once and clears; a failure keeps the
+    text in the queue, failed with its reason, the composer free."""
     page = await chat.open(_chat(T))
     await _handled(page, "follow")
     box = page.locator("#reply")
@@ -253,9 +255,8 @@ async def test_composer_keys_success_and_failure(
     monkeypatch.setattr(CV, "send_message", failing)
     await box.fill("keep me")
     await box.press("Control+Enter")
-    await page.wait_for_function("document.getElementById('err').textContent !== ''")
-    assert await box.input_value() == "keep me"
-    assert await page.locator("#err").inner_text() == "network error"
+    await queue_is(page, ("first line\nsecond", "sent"), ("keep me", "failed: network error"))
+    assert await box.input_value() == "" and await page.locator("#err").inner_text() == ""
     assert not await box.is_disabled()
 
 
@@ -1855,8 +1856,7 @@ async def test_split_busy_answers_say_why(split: Pages) -> None:
     await page.locator("#reply").fill("hold on")
     await page.locator("#reply").press("Enter")
     await _inject(page, [{"sent": T, "error": "busy"}])
-    assert await page.locator("#err").inner_text() == "another action is still running, try again"
-    assert await page.locator("#reply").input_value() == "hold on"
+    await queue_is(page, ("hold on", "failed: another action is still running, try again"))
     await _inject(page, [{"react": T, "msg": "1", "error": "busy"}])
     assert await page.locator("#err").inner_text() == "reaction: another action is still running, try again"
 

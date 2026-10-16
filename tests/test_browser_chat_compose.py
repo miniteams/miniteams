@@ -25,12 +25,14 @@ from browser_helpers import (  # skips without playwright
     Page,
     Pages,
     T,
+    act,
     closed,
     open_fake,
     past,
     pick_namesakes,
     pick_out_of_order,
     pick_then_glue,
+    queue_is,
     row,
     shows,
     until,
@@ -116,8 +118,8 @@ async def _open(
         fake,
         f"{ORIGIN}/chat/{quote(T, safe='')}{query}",
         PAGE,
-        page_route=re.compile(r"^http://127\.0\.0\.1:9/chat/[^/]+$"),
-        ws_route=re.compile(r"^ws://127\.0\.0\.1:9/ws\?chat$"),
+        page_route=re.compile(r"^http://127\.0\.0\.1:8/chat/[^/]+$"),
+        ws_route=re.compile(r"^ws://127\.0\.0\.1:8/ws\?chat$"),
         headers=headers,
         init=init,
     )
@@ -400,7 +402,7 @@ async def test_the_edit_in_place_editor_stays_plain(fake: Fake) -> None:
 
 async def test_picks_stay_with_their_chat_across_a_split_switch_and_clear_only_on_ok(pages: Pages) -> None:
     """012-AC8, 011-AC22: a pick made in T is not sent from L (nor its preview shown there); back in T it
-    is; a failed send keeps it, a successful one clears it."""
+    is; a failed send keeps it (↻ sends it again, 017-AC6), a successful one clears it."""
     fake = Fake()
     page = await _open(pages, fake, "?chatnav=split")
     box = page.locator("#reply")
@@ -423,9 +425,9 @@ async def test_picks_stay_with_their_chat_across_a_split_switch_and_clear_only_o
     fake.fail = True
     await box.press("Enter")
     await wait(lambda: len(fake.of("send")) == 2)
-    await until(page, "document.getElementById('err').textContent === 'boom'")
+    await queue_is(page, ("@Ann Lee ", "failed: boom"))
     fake.fail = False
-    await box.press("Enter")
+    await act(page, "retry")
     await wait(lambda: len(fake.of("send")) == 3)
     await until(page, "document.getElementById('reply').value === ''")
     await box.fill("@Ann Lee again")

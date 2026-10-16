@@ -449,7 +449,13 @@ def test_record_fields() -> None:
         "deleted": False,
         "reactions": [],
         "mentions": None,
+        "cmid": "",
     }
+
+
+def test_record_carries_its_clientmessageid() -> None:
+    """017-AC5: the page matches Teams' echo to its queued bubble on the message's clientmessageid."""
+    assert CV.chat_record(_m("7", _at(7), clientmessageid="1789466500123"), T, ME)["cmid"] == "1789466500123"
 
 
 def test_record_deleted_message_has_no_body() -> None:

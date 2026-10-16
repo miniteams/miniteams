@@ -13,7 +13,17 @@ from typing import Any
 
 import browser_helpers
 import pytest
-from browser_helpers import ORIGIN, Page, Pages, T, open_fake, until, wait  # skips without playwright
+from browser_helpers import (  # skips without playwright
+    ORIGIN,
+    Page,
+    Pages,
+    T,
+    act,
+    open_fake,
+    queue_is,
+    until,
+    wait,
+)
 from test_browser_chat_compose import Fake as ChatFake
 from test_browser_chat_compose import L
 from test_browser_chat_compose import _open as open_chat
@@ -48,9 +58,7 @@ PASTE = """([files, text]) => {
   return ev.defaultPrevented;
 }"""
 UNSURE = "no answer from Teams: the message may have gone out"
-SHOWN = (
-    "no answer from Teams: it may have gone out · Enter checks the chat before sending again"  # the page's
-)
+SHOWN = "no answer from Teams: it may have gone out · ↻ checks the chat before sending again"  # the page's
 
 
 def _replying(cls: type) -> type:
@@ -82,7 +90,7 @@ async def _open_widget(pages: Pages, fake: Any) -> Page:
         ORIGIN + "/",
         WIDGET,
         page_route=ORIGIN + "/",
-        ws_route=re.compile(r"^ws://127\.0\.0\.1:9/ws$"),
+        ws_route=re.compile(r"^ws://127\.0\.0\.1:8/ws$"),
         init=FREED,
     )
     await page.wait_for_selector("a.name")
@@ -263,28 +271,28 @@ async def test_limits_refuse_with_a_clear_error_and_keep_the_draft(widget: Any) 
 
 
 async def test_a_failed_send_keeps_everything_and_retries_with_the_same_id(widget: Any) -> None:
-    """012-AC23: a failure shows the reason and keeps text and images; Enter retries the same draft
-    (same message id, so the server reuses its uploads), with its images again, and asks for the check
-    (any failure may hide a posted message)."""
+    """012-AC23, 017-AC3, 017-AC6: a failure stays in the queue with its reason, its text and images, the
+    composer free; ↻ retries it (same message id, so the server reuses its uploads), with its images
+    again, and asks for the check (any failure may hide a posted message)."""
     page, box = widget.page, widget.page.locator("#reply")
     widget.replies = [{"error": "Teams answered 403"}]
     await box.press_sequentially("hi")
     await _paste(page, png())
     await _thumbs(page, 1)
     await box.press("Enter")
-    await _error_is(page, "Teams answered 403")
-    assert await box.input_value() == "hi"
-    await _thumbs(page, 1)
-    await box.press("Enter")
+    await queue_is(page, ("hi", "failed: Teams answered 403"))
+    assert await box.input_value() == ""
+    await _thumbs(page, 0)
+    await act(page, "retry")
     await wait(lambda: len(widget.of("send")) == 2 and len(widget.frames) == 2)
     assert widget.cmids[0] == widget.cmids[1]
     assert "check" not in widget.of("send")[0] and widget.of("send")[1]["check"] is True
 
 
 async def test_an_unsure_send_spins_and_the_retry_asks_for_a_check(widget: Any) -> None:
-    """012-AC23, 017-AC1: while unanswered the composer spins, its box empty and usable; Enter on it
-    sends nothing more; an unsure answer says so, and the manual retry asks the server to look for the
-    same id first. An image pasted during a send is the next message's: it stays removable."""
+    """012-AC23, 017-AC1, 017-AC6: while unanswered the composer spins, its box empty and usable; Enter
+    on it sends nothing more; an unsure answer says so, and ↻ asks the server to look for the same id
+    first. An image pasted during a send is the next message's: it stays removable."""
     page, box = widget.page, widget.page.locator("#reply")
     widget.replies = [None, None]
     await _paste(page, png())
@@ -298,9 +306,9 @@ async def test_an_unsure_send_spins_and_the_retry_asks_for_a_check(widget: Any) 
     await widget.settled()
     assert len(widget.of("send")) == 1
     widget.send({"sent": T, "error": UNSURE, "unsure": True})
-    await _error_is(page, SHOWN)
-    await _thumbs(page, 1)
-    await box.press("Enter")
+    await queue_is(page, ("🖼", "failed: " + SHOWN))
+    await _thumbs(page, 0)
+    await act(page, "retry")
     await wait(lambda: len(widget.of("send")) == 2)
     assert widget.of("send")[1]["check"] is True and widget.cmids[0] == widget.cmids[1]
     await _paste(page, png(3, 2))
@@ -397,27 +405,32 @@ async def test_chat_page_preview_and_image_only_send(pages: Pages) -> None:
 
 
 async def _edit_after_unsure(fake: Any, page: Page) -> None:
-    """An unsure answer, then the text edited (then an image removed, then one added): each Enter is a
-    new message (new id, no check), never swallowed by an "already sent"."""
+    """An unsure answer, then the message taken back into the empty composer (✎, 017-AC6) and its text
+    edited (then an image removed, then one added): each Enter is a new message (new id, no check),
+    never swallowed by an "already sent"."""
     box = page.locator("#reply")
     fake.replies = [{"error": UNSURE, "unsure": True}] * 3
     await box.press_sequentially("hi")
     await _paste(page, png(3, 2), png(4, 2))
     await _thumbs(page, 2)
     await box.press("Enter")
-    await _error_is(page, SHOWN)  # the failure answered: text and images are back
-    await box.press_sequentially(" again")
-    await box.press("Enter")
-    await wait(lambda: len(fake.of("send")) == 2)
-    await _error_is(page, SHOWN)
-    await page.locator(".imgs .rm").first.click()
-    await box.press("Enter")
-    await wait(lambda: len(fake.of("send")) == 3)
-    await _error_is(page, SHOWN)
-    await _paste(page, png(5, 2))
-    await _thumbs(page, 2)
-    await box.press("Enter")
-    await wait(lambda: len(fake.of("send")) == 4)
+    for text, n in (("hi", 1), ("hi again", 2), ("hi again", 3)):
+        await queue_is(page, (text, "failed: " + SHOWN))
+        await act(page, "edit")  # text and images back in the box
+        await until(page, f"document.getElementById('reply').value === {json.dumps(text)}")
+        if n == 1:
+            await _thumbs(page, 2)
+            await box.press_sequentially(" again")
+        elif n == 2:
+            await _thumbs(page, 2)
+            await page.locator(".imgs .rm").first.click()
+            await _thumbs(page, 1)
+        else:
+            await _thumbs(page, 1)
+            await _paste(page, png(5, 2))
+            await _thumbs(page, 2)
+        await box.press("Enter")
+        await wait(lambda n=n: len(fake.of("send")) == n + 1)
     sent = fake.of("send")
     assert [v["text"] for v in sent] == ["hi", "hi again", "hi again", "hi again"]
     assert [len(v["images"]) for v in sent] == [2, 2, 1, 2]
@@ -506,7 +519,9 @@ async def _retype_after_unsure(fake: Any, page: Page) -> None:
     fake.replies = [{"error": UNSURE, "unsure": True}]
     await box.press_sequentially("same")
     await box.press("Enter")
-    await _error_is(page, SHOWN)
+    await queue_is(page, ("same", "failed: " + SHOWN))
+    await act(page, "edit")
+    await until(page, "document.getElementById('reply').value === 'same'")
     await box.press("Control+a")
     await box.press("Backspace")
     await box.press_sequentially("same")
@@ -517,8 +532,9 @@ async def _retype_after_unsure(fake: Any, page: Page) -> None:
 
 
 async def test_a_cleared_and_retyped_draft_is_a_new_message(widget: Any) -> None:
-    """012-AC23: widget: an unsure send, the composer cleared, the same text typed again: a new message
-    (new id, no check), which the lookup would otherwise mistake for the first one and drop."""
+    """012-AC23, 017-AC6: widget: an unsure send taken back into the composer (✎), cleared, the same text
+    typed again: a new message (new id, no check), which the lookup would otherwise mistake for the
+    first one and drop."""
     await _retype_after_unsure(widget, widget.page)
 
 
@@ -600,37 +616,3 @@ async def test_a_burst_of_enters_queues_in_order_from_a_usable_box(pages: Pages)
     assert [v["text"] for v in sent] == ["one", "two", "three"]
     assert ["images" in v for v in sent] == [False, True, False] and fake.frames == [png(4, 2)]
     assert len(set(fake.cmids)) == 3 and all("check" not in v for v in sent)
-
-
-@pytest.mark.parametrize("retry", [True, False], ids=["retried", "dropped"])
-async def test_a_failure_in_a_burst_comes_back_and_holds_the_rest(pages: Pages, retry: bool) -> None:
-    """012: a failed message returns to the box and the ones queued behind it wait: Enter retries it
-    (checked, same id), or drops it from an emptied box; then the rest goes, in order."""
-    fake = Chat(replies=[None] * 3)
-    page = await open_chat(pages, fake, init=FREED)
-    box = page.locator("#reply")
-    await box.focus()
-    await _burst(page, "one", "two", "three")
-    fake.send({"sent": T, "ok": True})
-    await wait(lambda: len(fake.of("send")) == 2)
-    await box.press_sequentially("x")  # typed and erased while "two" is out: its retry keeps the check
-    await box.press("Backspace")
-    fake.send({"sent": T, "error": "boom"})
-    await _error_is(page, "boom · 1 more queued after it")
-    assert await box.input_value() == "two"
-    await fake.settled(50)
-    assert len(fake.of("send")) == 2
-    if not retry:
-        await box.press("Control+a")
-        await box.press("Backspace")
-    await box.press("Enter")
-    if retry:
-        await wait(lambda: len(fake.of("send")) == 3)
-        fake.send({"sent": T, "ok": True})
-    await wait(lambda: len(fake.of("send")) == (4 if retry else 3))
-    await fake.settled(50)
-    sent = fake.of("send")
-    assert [v["text"] for v in sent] == (["one", "two", "two", "three"] if retry else ["one", "two", "three"])
-    assert [v.get("check", False) for v in sent] == ([False, False, True, False] if retry else [False] * 3)
-    assert len(set(fake.cmids)) == 3
-    assert await _err(page).inner_text() == "" and await box.input_value() == ""

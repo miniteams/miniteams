@@ -296,6 +296,7 @@ def chat_record(
         "deleted": deleted,
         "reactions": reactions,
         "mentions": mention_kind(message, me),
+        "cmid": str(message.get("clientmessageid") or ""),  # the page swaps its queued bubble for this echo
     } | ({_ACTIVITY: (msgtype, activity)} if activity else {})
 
 
