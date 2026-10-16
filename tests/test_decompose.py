@@ -434,6 +434,23 @@ def test_what_compose_cannot_write_is_refused_with_its_reason(
     assert decompose(_msg(content, **props), EMOJIS) == reason
 
 
+def test_the_same_quote_or_image_twice_is_refused() -> None:
+    """019-AC6 + 019-AC7: the page keeps quotes and images by key; two under one key could not be removed one
+    at a time, so such a message is not editable here."""
+    quote = reply_quote(
+        {"id": "1", "from": "8:orgid:ann", "messagetype": "RichText/Html", "content": "<p>q</p>"}, "Ann"
+    )
+    other = reply_quote(
+        {"id": "2", "from": "8:orgid:ann", "messagetype": "RichText/Html", "content": "<p>q</p>"}, "Ann"
+    )
+    image = Image("png", 3, 2)
+    assert decompose(_msg(f"{quote}{quote}<p>x</p>"), EMOJIS) == "the same quote twice"
+    twice = images_html("gw.test", [("0-weu-d1-aaaa", image), ("0-weu-d1-aaaa", image)])
+    assert decompose(_msg(f"<p>x</p>{twice}"), EMOJIS) == "the same image twice"
+    distinct = images_html("gw.test", [("0-weu-d1-aaaa", image), ("0-weu-d1-bbbb", image)])
+    assert isinstance(decompose(_msg(f"{quote}{other}<p>x</p>{distinct}"), EMOJIS), Editable)
+
+
 @pytest.mark.parametrize("msgtype", ["RichText/Media_Card", "RichText/Media_GenericFile", "Event/Call"])
 def test_non_text_messages_are_refused(msgtype: str) -> None:
     """019-AC9: only text messages convert."""

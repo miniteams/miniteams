@@ -379,6 +379,96 @@
     return { mentions, restore, forget, answered, key, close, reset };
   };
 
+  // execCommand keeps the edit in the textarea's undo history (Ctrl+Z); setRangeText would not.
+  // Its `input` event runs the completion's lookup: an insert settles what it dismisses before calling.
+  const insertText = (input, text, a, b, selA, selB) => {
+    input.focus();
+    input.setSelectionRange(a, b);
+    if (!document.execCommand("insertText", false, text)) input.setRangeText(text, a, b);
+    input.setSelectionRange(selA, selB);
+  };
+
+  // The formatting bar (spec 012, full format) and its preview, the chat page's composer's and each
+  // editor's (spec 019): markers around the selection, or around the caret to type into. `bar` holds the
+  // [data-fmt] buttons and the [aria-pressed] preview toggle; `view` shows the server's rendering of what
+  // `send` would post (compose output, escaped by construction, emoji images on /emoji/). Hooks: `ask(text)`
+  // sends a preview ask (false offline), `edited()` after a change, `close()` the completion list. The
+  // server answers previews in the order asked: the page hands each answer to its bar (`answered`).
+  const MARK = { bold: "**", italic: "*", strike: "~~", code: "`" };
+  const formatBar = ({ input, bar, view, ask, edited, close }) => {
+    const put = (...a) => insertText(input, ...a);
+    const format = (fmt) => {
+      if (input.disabled || input.readOnly) return;
+      const v = input.value, a = input.selectionStart, b = input.selectionEnd, sel = v.slice(a, b);
+      if (fmt === "list" || fmt === "quote") {
+        // Whole lines: from the start of the first one to the end of the last (a trailing newline ends it).
+        const from = v.lastIndexOf("\n", a - 1) + 1, end = b > a && v[b - 1] === "\n" ? b - 1 : b;
+        const nl = v.indexOf("\n", end), to = nl < 0 ? v.length : nl;
+        const lines = v.slice(from, to).split("\n").map((l) => (fmt === "list" ? "- " : "> ") + l).join("\n");
+        put(lines, from, to, from, from + lines.length);
+      } else if (fmt === "code" && sel.includes("\n")) {
+        // A fence only opens and closes on a line of its own.
+        const pre = a && v[a - 1] !== "\n" ? "\n" : "", post = b < v.length && v[b] !== "\n" ? "\n" : "";
+        const text = pre + "```\n" + sel + "\n```" + post;
+        put(text, a, b, a, a + text.length);
+      } else if (!sel) {
+        const m = MARK[fmt];
+        put(m + m, a, b, a + m.length, a + m.length);
+      } else {
+        // The server never closes a marker across lines, nor one with a space inside it: each line gets
+        // its own pair, inside its list or quote prefix, around its text without the surrounding spaces.
+        const m = MARK[fmt], atLineStart = !a || v[a - 1] === "\n";
+        let inner = null;
+        const text = sel.split("\n").map((l, i) => {
+          const p = i || atLineStart ? /^\s*(?:(?:[-*]|\d+\.|>) +)*/.exec(l)[0] : "";
+          const [, lead, body, tail] = /^(\s*)(.*?)(\s*)$/.exec(l.slice(p.length));
+          if (!body) return l;
+          inner ??= [p.length + lead.length + m.length, body.length];
+          return p + lead + m + body + m + tail;
+        }).join("\n");
+        const one = inner && !sel.includes("\n");  // one line: its text stays selected, inside the markers
+        put(text, a, b, one ? a + inner[0] : a, one ? a + inner[0] + inner[1] : a + text.length);
+      }
+      close();
+      edited();
+    };
+    for (const btn of bar.querySelectorAll("[data-fmt]")) btn.onclick = () => format(btn.dataset.fmt);
+    const show = bar.querySelector("[aria-pressed]");
+    show.setAttribute("aria-pressed", "false");  // a bar copied from one showing its preview starts off
+    // Only the answer to the last ask, while on, shows.
+    let showing = false, asked = 0;
+    const hide = () => { showing = false; view.hidden = true; view.replaceChildren(); show.setAttribute("aria-pressed", "false"); };
+    const shown = (cls, fill) => { view.className = "view " + cls; fill(); view.hidden = false; };
+    show.onclick = () => {
+      if (showing) { hide(); return; }
+      showing = true;
+      show.setAttribute("aria-pressed", "true");
+      if (ask(input.value)) asked++;
+      else shown("err", () => { view.textContent = "offline, no preview"; });
+    };
+    const answered = (m) => {
+      asked = Math.max(0, asked - 1);
+      if (!showing || asked) return;  // toggled off, or a later ask (the text changed since) is pending
+      if (m.error) shown("err", () => { view.textContent = m.error; });
+      else shown("html", () => {
+        view.innerHTML = typeof m.preview === "string" ? m.preview : "";
+        // A link followed in place would replace the page and its drafts.
+        for (const a of view.querySelectorAll("a")) Object.assign(a, { target: "_blank", rel: "noopener" });
+      });
+    };
+    input.addEventListener("input", hide);  // a shown preview is of the text before the change
+    // Ctrl+B / Ctrl+I; true when the key was the bar's.
+    const key = (e) => {
+      const k = e.key.toLowerCase();
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || e.isComposing || e.keyCode === 229 || (k !== "b" && k !== "i")) return false;
+      e.preventDefault(); format(k === "b" ? "bold" : "italic");
+      return true;
+    };
+    // Its answer died with the socket: no pressed button over an empty box.
+    const lost = () => { if (asked) hide(); asked = 0; };
+    return { hide, answered, key, lost };
+  };
+
   // Pasted images (spec 012 phase 5): queued per chat in paste order, kept in memory only (a reload
   // loses them, the text draft stays), uploaded by the server only when sent. Limits mirror images.py;
   // the server checks the bytes again. Hooks: `chat()` the chat shown, `error(id, text)` a refusal,

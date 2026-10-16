@@ -587,6 +587,11 @@ def decompose(message: dict[str, Any], emojis: dict[str, str]) -> Editable | str
     try:
         quotes, start = _quotes(content)
         blocks, images = _read(content[start:], props, emojis)
+        # The page keeps quotes and images by key: two under one key could not be removed one at a time.
+        if len({q.key for q in quotes}) < len(quotes):
+            return "the same quote twice"
+        if len({image.key for image in images}) < len(images):
+            return "the same image twice"
         picks = _picks(blocks)
         for wide in (False, True):
             for italic in _ITALICS:

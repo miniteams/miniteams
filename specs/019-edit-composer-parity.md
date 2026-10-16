@@ -1,6 +1,6 @@
 # 019 — Editing a message works like composing one
 
-**Status**: in progress
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-10-16
 
@@ -60,30 +60,30 @@ miniteams cannot reproduce is not editable here, and says why.
 
 ## Acceptance criteria
 
-- [ ] **AC1** In the editor, `:` and `@` open the same completion as the composer, and a picked
+- [x] **AC1** In the editor, `:` and `@` open the same completion as the composer, and a picked
   mention is posted as a mention.
-- [ ] **AC2** In the editor, Ctrl+B / Ctrl+I and the mini bar's buttons format the selection; 👁
+- [x] **AC2** In the editor, Ctrl+B / Ctrl+I and the mini bar's buttons format the selection; 👁
   toggles a preview rendered like the composer's.
-- [ ] **AC3** Saving an edit posts HTML composed exactly as a send of the same text would be:
+- [x] **AC3** Saving an edit posts HTML composed exactly as a send of the same text would be:
   markdown rendered, `:shortcode:` emojis expanded, mentions as mentions.
-- [ ] **AC4** Opening the editor on a message posted by miniteams and saving it unchanged in text
+- [x] **AC4** Opening the editor on a message posted by miniteams and saving it unchanged in text
   gives back the same rendering: every element listed under Prefill round-trips.
-- [ ] **AC5** Characters typed literally (`2*3*4`, `[draft]`, a line starting `- `) survive an edit
+- [x] **AC5** Characters typed literally (`2*3*4`, `[draft]`, a line starting `- `) survive an edit
   untouched; in the composer, `\*` posts a literal `*`.
-- [ ] **AC6** A reply's quotes show above the editor and are kept on save; × removes one, and the
+- [x] **AC6** A reply's quotes show above the editor and are kept on save; × removes one, and the
   saved message no longer carries it.
-- [ ] **AC7** Images placed after the text show under the editor and are kept on save; × removes one,
+- [x] **AC7** Images placed after the text show under the editor and are kept on save; × removes one,
   and the saved message no longer carries it.
-- [ ] **AC8** A mention of someone who has left the chat, already in the message, survives an edit; a
+- [x] **AC8** A mention of someone who has left the chat, already in the message, survives an edit; a
   new mention of a non-member is refused like in a send; a mention not in the original copy but
   presented as kept is refused.
-- [ ] **AC9** A message holding a table, a heading, a nested list, underline, a card, an image inside
+- [x] **AC9** A message holding a table, a heading, a nested list, underline, a card, an image inside
   the text or a tag mention cannot be edited here: ✎ says which and offers "Open in Teams", and the
   server refuses such an edit on its own.
-- [ ] **AC10** A change of the message from elsewhere while it is edited shows "edited elsewhere at
+- [x] **AC10** A change of the message from elsewhere while it is edited shows "edited elsewhere at
   HH:MM" with "take that version", which reloads text, quotes and images; saving still replaces it.
-- [ ] **AC11** Enter with nothing changed closes the editor and sends nothing.
-- [ ] **AC12** Every text from the message (prefill, quotes, image alt, the blocking reason) is
+- [x] **AC11** Enter with nothing changed closes the editor and sends nothing.
+- [x] **AC12** Every text from the message (prefill, quotes, image alt, the blocking reason) is
   escaped: markup in a message never renders in the editor.
 
 ## Phases
@@ -117,6 +117,15 @@ message's editable form.
 None.
 
 ## Decisions
+
+- "Reopen" after a refusal keeps a text typed since opening, with its picks, and takes the copy's
+  current quotes and images; an untouched text takes the copy's — because the refusal (a kept
+  quote or image gone) says nothing against what was typed.
+  A reopen answered "not editable here" keeps a typed text read-only, to copy, with the reason and
+  "Open in Teams"; Escape closes it.
+
+- A message holding the same quote or the same image twice is not editable here — because kept items
+  are named by key, so one of the two could not be removed alone.
 
 - `<p></p>` and a paragraph's last `<br>` are no line; `<p><br></p>` and `<p>&nbsp;</p>` are one
   blank line each — because an empty block renders nothing (887 editable archived messages hold one,

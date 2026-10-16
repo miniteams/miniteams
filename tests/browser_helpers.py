@@ -231,12 +231,12 @@ async def rendered(page: Page) -> None:
     await page.evaluate("new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())))")
 
 
-async def shows(page: Page, expected: list[str]) -> None:
-    """The open list reads `expected`: an answer to an earlier prefix may show first."""
+async def shows(page: Page, expected: list[str], pop: str = "#pop") -> None:
+    """The open list (`pop`) reads `expected`: an answer to an earlier prefix may show first."""
     seen: list[str] = []
     for _ in range(500):
-        if not await page.locator("#pop").is_hidden():
-            seen = await page.locator("#pop [role=option]").all_text_contents()
+        if not await page.locator(pop).is_hidden():
+            seen = await page.locator(f"{pop} [role=option]").all_text_contents()
             if seen == expected:
                 return
         await asyncio.sleep(0.01)
