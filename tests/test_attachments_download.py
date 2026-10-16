@@ -1,10 +1,13 @@
 """Attachment download paths with a fake async httpx client."""
 
+import base64
 import hashlib
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx as _httpx
+import pytest
 
 from miniteams import attachments as A
 from miniteams.config import Settings
@@ -194,6 +197,26 @@ async def test_process_downloads_transcript(settings: Settings, monkeypatch) -> 
     assert any(n.startswith("[transcript:") and "→" in n for n in notes)
 
 
+class _AwaitedResp:
+    """`async with client.stream(...)` over a fake whose `get` is a coroutine."""
+
+    def __init__(self, pending: Any) -> None:
+        self._pending = pending
+
+    async def __aenter__(self) -> _Resp:
+        return await self._pending
+
+    async def __aexit__(self, *_: Any) -> bool:
+        return False
+
+
+class _StreamFromGet:
+    """SharePoint transcripts are streamed: serve `stream()` from the fake's `get()`."""
+
+    def stream(self, method: str, url: str, **kw: Any) -> _AwaitedResp:
+        return _AwaitedResp(self.get(url, **kw))  # type: ignore[attr-defined]
+
+
 SP = "https://contoso-my.sharepoint.com/personal/x/_api/v2.1/drives/b!abc/items/01ABC?foo=bar"
 REC_SP = (
     '<URIObject type="Video.2/CallRecording.1" uri="">'
@@ -209,7 +232,7 @@ def test_extract_pulls_sharepoint_transcript() -> None:
 async def test_process_downloads_sp_transcript_with_bearer(settings: Settings, monkeypatch) -> None:
     seen_auth = {}
 
-    class _C:
+    class _C(_StreamFromGet):
         async def __aenter__(self):
             return self
 
@@ -249,7 +272,7 @@ async def test_process_downloads_sp_transcript_with_bearer(settings: Settings, m
 async def test_process_sp_transcript_mislabelled_body_is_not_written(settings: Settings, monkeypatch) -> None:
     """A server ignoring `format` must not land VTT bytes under .json — the archive would lie."""
 
-    class _C:
+    class _C(_StreamFromGet):
         async def __aenter__(self):
             return self
 
@@ -285,7 +308,7 @@ async def test_process_sp_transcript_refetches_over_untagged_vtt(settings: Setti
     stale.write_bytes(b"WEBVTT\n\nuntagged")
     calls = []
 
-    class _C:
+    class _C(_StreamFromGet):
         async def __aenter__(self):
             return self
 
@@ -322,7 +345,7 @@ async def test_process_sp_transcript_both_renditions_denied_keeps_status(
 ) -> None:
     """Both renditions 403 → on_fail must receive the original error, status readable."""
 
-    class _C:
+    class _C(_StreamFromGet):
         async def __aenter__(self):
             return self
 
@@ -359,7 +382,7 @@ async def test_process_sp_transcript_both_renditions_denied_keeps_status(
 async def test_process_sp_transcript_partial_failure_is_reported(settings: Settings, monkeypatch) -> None:
     """One rendition denied while the other serves: swallowing it re-requests a dead URL forever."""
 
-    class _C:
+    class _C(_StreamFromGet):
         async def __aenter__(self):
             return self
 
@@ -395,7 +418,7 @@ async def test_process_sp_transcript_partial_failure_is_reported(settings: Setti
 async def test_process_sp_transcript_written_owner_only(settings: Settings, monkeypatch) -> None:
     """Named speaker turns for every participant: 0600, not umask-dependent 0644."""
 
-    class _C:
+    class _C(_StreamFromGet):
         async def __aenter__(self):
             return self
 
@@ -426,7 +449,7 @@ async def test_process_sp_transcript_written_owner_only(settings: Settings, monk
 async def test_process_sp_transcript_write_failure_leaves_no_part(settings: Settings, monkeypatch) -> None:
     """A truncated .part must not survive: a later run would trust it as a complete rendition."""
 
-    class _C:
+    class _C(_StreamFromGet):
         async def __aenter__(self):
             return self
 
@@ -437,16 +460,16 @@ async def test_process_sp_transcript_write_failure_leaves_no_part(settings: Sett
             return None
 
         async def get(self, url, headers=None, cookies=None, **kw):
-            return _Resp(content=b'{"entries":[]}', headers={"content-type": "application/json"})
+            ctype = "application/json" if (kw.get("params") or {}).get("format") else "text/vtt"
+            return _BoomResp(content=b'{"entries":[]}', headers={"content-type": ctype})
 
-    def _boom(self, data):
-        # ENOSPC mid-write: the bytes already on disk are what the cleanup has to remove.
-        with open(self, "wb") as fh:
-            fh.write(data[:4])
-        raise OSError(28, "No space left on device")
+    class _BoomResp(_Resp):
+        async def aiter_bytes(self, size: int = 65536):
+            # ENOSPC mid-write: the bytes already on disk are what the cleanup has to remove.
+            yield self.content[:4]
+            raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
-    monkeypatch.setattr(Path, "write_bytes", _boom)
     notes = await A.process(
         REC_SP,
         "RichText/Media_CallRecording",
@@ -459,11 +482,118 @@ async def test_process_sp_transcript_write_failure_leaves_no_part(settings: Sett
     assert notes == [f"[transcript(sp): {SP}]"]
 
 
+class _NoBodyResp(_Resp):
+    async def aiter_bytes(self, size: int = 65536):
+        raise AssertionError("body read before the content-type check")
+        yield b""
+
+
+async def test_sp_transcript_wrong_content_type_reads_no_body(settings: Settings) -> None:
+    class _C(_StreamFromGet):
+        async def get(self, url, headers=None, **kw):
+            return _NoBodyResp(content=b"\0" * 1024, headers={"content-type": "video/mp4"})
+
+    with pytest.raises(A._Refused, match="content-type"):
+        await A._download_sp_transcript(_C(), SP, "T", settings.media_dir)
+    assert not list(settings.media_dir.iterdir())
+
+
+async def test_sp_transcript_over_the_size_cap_stops_reading(settings: Settings, monkeypatch) -> None:
+    """A transcript URI pointing at a huge file: the read stops at the cap, nothing is kept."""
+    monkeypatch.setattr(A, "_SP_TRANSCRIPT_MAX", 100)
+    read: list[int] = []
+
+    class _Big(_Resp):
+        async def aiter_bytes(self, size: int = 65536):
+            for _ in range(1000):  # 40 kB in 40-byte chunks
+                read.append(40)
+                yield b"x" * 40
+
+    class _C(_StreamFromGet):
+        async def get(self, url, headers=None, **kw):
+            ctype = "application/json" if (kw.get("params") or {}).get("format") else "text/vtt"
+            return _Big(headers={"content-type": ctype})
+
+    with pytest.raises(A._Refused, match="size cap"):
+        await A._download_sp_transcript(_C(), SP, "T", settings.media_dir)
+    assert sum(read) <= 2 * 120  # each rendition stopped at its third chunk
+    assert not list(settings.media_dir.iterdir())
+
+
+async def test_sp_transcript_content_length_over_the_cap_reads_no_body(
+    settings: Settings, monkeypatch
+) -> None:
+    monkeypatch.setattr(A, "_SP_TRANSCRIPT_MAX", 100)
+
+    class _C(_StreamFromGet):
+        async def get(self, url, headers=None, **kw):
+            ctype = "application/json" if (kw.get("params") or {}).get("format") else "text/vtt"
+            return _NoBodyResp(headers={"content-type": ctype, "content-length": "101"})
+
+    failed: list[Exception] = []
+    with pytest.raises(A._Refused, match="size cap"):
+        await A._download_sp_transcript(
+            _C(), SP, "T", settings.media_dir, on_fail=lambda u, e: failed.append(e)
+        )
+    assert [getattr(e, "status", None) for e in failed] == [413, 413]
+    assert not list(settings.media_dir.iterdir())
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "br"])
+async def test_sp_transcript_compressed_anyway_reads_no_body(settings: Settings, encoding: str) -> None:
+    """The server ignored Accept-Encoding: httpx would inflate before the cap counts."""
+
+    class _C(_StreamFromGet):
+        async def get(self, url, headers=None, **kw):
+            ctype = "application/json" if (kw.get("params") or {}).get("format") else "text/vtt"
+            return _NoBodyResp(headers={"content-type": ctype, "content-encoding": encoding})
+
+    failed: list[Exception] = []
+    with pytest.raises(A._Refused, match="content-encoding"):
+        await A._download_sp_transcript(
+            _C(), SP, "T", settings.media_dir, on_fail=lambda u, e: failed.append(e)
+        )
+    assert [getattr(e, "status", None) for e in failed] == [415, 415]
+    assert not list(settings.media_dir.iterdir())
+
+
+async def test_sp_transcript_asks_for_an_uncompressed_body(settings: Settings) -> None:
+    """The cap counts wire bytes only if nothing is inflated behind it."""
+    sent: list[dict[str, str]] = []
+
+    class _C(_StreamFromGet):
+        async def get(self, url, headers=None, **kw):
+            sent.append(headers)
+            ctype = "application/json" if (kw.get("params") or {}).get("format") else "text/vtt"
+            return _Resp(content=b"{}", headers={"content-type": ctype})
+
+    await A._download_sp_transcript(_C(), SP, "T", settings.media_dir)
+    assert len(sent) == 2 and all(h["Accept-Encoding"] == "identity" for h in sent)
+
+
+async def test_sp_transcript_kept_under_the_escaped_uri_hash_is_not_refetched(settings: Settings) -> None:
+    """Older archives hashed the URI as written in the HTML (`&amp;`)."""
+    url = "https://contoso-my.sharepoint.com/personal/x/a&b/content?x=1"
+    legacy = (
+        "sp-" + hashlib.sha1(b"https://contoso-my.sharepoint.com/personal/x/a&amp;b/content").hexdigest()[:16]
+    )
+    settings.media_dir.mkdir(parents=True)
+    for ext in (".json", ".vtt"):
+        (settings.media_dir / f"{legacy}.transcript{ext}").write_bytes(b"kept")
+
+    class _C(_StreamFromGet):
+        async def get(self, url, headers=None, **kw):
+            raise AssertionError("an archived rendition must not be fetched again")
+
+    path = await A._download_sp_transcript(_C(), url, "T", settings.media_dir)
+    assert Path(path).name == f"{legacy}.transcript.json"
+
+
 async def test_process_sp_transcript_retries_on_429(settings: Settings, monkeypatch) -> None:
     """The download path must go through aget_with_retry, not a bare client.get."""
     codes = [429, 200]
 
-    class _C:
+    class _C(_StreamFromGet):
         async def __aenter__(self):
             return self
 
@@ -498,7 +628,7 @@ async def test_process_sp_transcript_skip_is_per_rendition(settings: Settings, m
     """A suppressed rendition must cost no request, while the other still downloads."""
     asked: list[dict] = []
 
-    class _C:
+    class _C(_StreamFromGet):
         async def __aenter__(self):
             return self
 
@@ -537,7 +667,7 @@ async def test_process_sp_transcript_all_suppressed_is_not_a_failure(settings: S
 
     monkeypatch.setattr(A, "log", _Log())
 
-    class _C:
+    class _C(_StreamFromGet):
         async def __aenter__(self):
             return self
 
@@ -585,7 +715,7 @@ def test_extract_sp_files_docs_only_no_video_no_folder() -> None:
     assert sp == ["https://c.sharepoint.com/:x:/r/sites/RD/Shared/z.xlsx?d=w1&web=1"]  # doc yes, :v:/:f: no
 
 
-async def test_process_downloads_sp_file_via_graph(settings: Settings, monkeypatch) -> None:
+async def test_process_downloads_sp_file_via_sharepoint_rest(settings: Settings, monkeypatch) -> None:
     class _C:
         async def __aenter__(self):
             return self
@@ -597,14 +727,14 @@ async def test_process_downloads_sp_file_via_graph(settings: Settings, monkeypat
             return None
 
         async def get(self, url, headers=None, **kw):
-            return _Resp(data={"name": "z.xlsx", "file": {"mimeType": "x"}})  # /driveItem
+            return _Resp(data={"Name": "z.xlsx"})  # GetFileByUrl
 
         def stream(self, method, url, headers=None, **kw):
             return _Resp(content=b"XLSXBYTES")  # /content — streamed to disk
 
     monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
     notes = await A.process(
-        FILE_A, "RichText/Html", "sk", settings.media_dir, download=True, graph_token=lambda: "GTOK"
+        FILE_A, "RichText/Html", "sk", settings.media_dir, download=True, sp_token=lambda host: "SPTOK"
     )
     assert (settings.media_dir / "z.xlsx").read_bytes() == b"XLSXBYTES"
     assert any(n.startswith("[file:") and "→" in n for n in notes)
@@ -624,7 +754,7 @@ async def test_process_sp_file_write_failure_leaves_no_part(settings: Settings, 
             return None
 
         async def get(self, url, headers=None, **kw):
-            return _Resp(data={"name": "z.xlsx", "file": {"mimeType": "x"}})  # /driveItem
+            return _Resp(data={"Name": "z.xlsx"})  # GetFileByUrl
 
         def stream(self, method, url, headers=None, **kw):
             return _BoomResp(content=b"XLSXBYTES")  # /content — dies mid-stream
@@ -636,7 +766,7 @@ async def test_process_sp_file_write_failure_leaves_no_part(settings: Settings, 
 
     monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
     notes = await A.process(
-        FILE_A, "RichText/Html", "sk", settings.media_dir, download=True, graph_token=lambda: "GTOK"
+        FILE_A, "RichText/Html", "sk", settings.media_dir, download=True, sp_token=lambda host: "SPTOK"
     )
     assert not list(settings.media_dir.glob("*.part"))
     assert not (settings.media_dir / "z.xlsx").exists()
@@ -655,8 +785,15 @@ async def test_process_sp_file_folder_is_ref_only(settings: Settings, monkeypatc
             return None
 
         async def get(self, url, headers=None, **kw):
+            if "GetFileByUrl" in url:
+                return _Resp(status_code=404)  # REST resolves files only
             return _Resp(data={"name": "Infras", "folder": {"childCount": 3}})  # no 'file' facet
 
+        def stream(self, method, url, headers=None, **kw):
+            streams.append(url)
+            return _Resp(content=b"ZIP")
+
+    streams: list[str] = []
     monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
     notes = await A.process(
         FOLDER_A.replace(":f:", ":x:"),
@@ -664,9 +801,247 @@ async def test_process_sp_file_folder_is_ref_only(settings: Settings, monkeypatc
         "sk",
         settings.media_dir,
         download=True,
-        graph_token=lambda: "GTOK",
+        sp_token=lambda host: "SPTOK",
     )
     assert any(n.startswith("[file(sp):") for n in notes)  # folder → not downloaded
+    assert streams == []
+
+
+class _SpClient:
+    """Records every SharePoint call; `meta(url)` answers the metadata GETs."""
+
+    def __init__(self, meta: Any) -> None:
+        self.meta, self.gets, self.streams, self.auth = meta, [], [], set()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def aclose(self):
+        return None
+
+    async def get(self, url, headers=None, **kw):
+        self.gets.append(url)
+        self.auth.add((headers or {}).get("Authorization"))
+        return self.meta(url)
+
+    def stream(self, method, url, headers=None, **kw):
+        self.streams.append(url)
+        self.auth.add((headers or {}).get("Authorization"))
+        return _Resp(content=b"BYTES")
+
+
+def _rest(site: str, url: str) -> str:
+    return f"{site}/_api/web/GetFileByUrl(@u)?@u=" + quote("'" + url.replace("'", "''") + "'", safe="")
+
+
+def _shares(host: str, url: str) -> str:
+    return (
+        f"{host}/_api/v2.0/shares/u!{base64.urlsafe_b64encode(url.encode()).decode().rstrip('=')}/driveItem"
+    )
+
+
+@pytest.mark.parametrize(
+    ("href", "site"),
+    [
+        # HTML-escaped query, as stored: the REST call carries the real URL
+        (
+            "https://c.sharepoint.com/:x:/r/sites/RD/Shared/z.xlsx?d=w1&amp;web=1",
+            "https://c.sharepoint.com/sites/RD",
+        ),
+        (
+            "https://c-my.sharepoint.com/:x:/g/personal/u_c_com/EAbc?e=x1",
+            "https://c-my.sharepoint.com/personal/u_c_com",
+        ),
+        ("https://c.sharepoint.com/:p:/s/Sales/EAbc?e=x1", "https://c.sharepoint.com/sites/Sales"),
+        (
+            "https://c.sharepoint.com/teams/Ops/Shared%20Documents/it's.docx",
+            "https://c.sharepoint.com/teams/Ops",
+        ),
+        ("https://c.sharepoint.com/:x:/g/EAbc", "https://c.sharepoint.com"),  # root site
+        ("https://c-my.sharepoint.com/:x:/p/u_c_com/EAbc", "https://c-my.sharepoint.com/personal/u_c_com"),
+    ],
+)
+async def test_sp_file_uses_sharepoint_rest_on_the_files_site(
+    settings: Settings, monkeypatch, href: str, site: str
+) -> None:
+    client = _SpClient(lambda url: _Resp(data={"Name": "z.xlsx"}))
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: client)
+    hosts: list[str] = []
+    notes = await A.process(
+        f'<a itemtype="http://schema.skype.com/HyperLink/Files" href="{href}">z</a>',
+        "RichText/Html",
+        "sk",
+        settings.media_dir,
+        download=True,
+        sp_token=lambda host: hosts.append(host) or f"SP-{host}",
+    )
+    url = href.replace("&amp;", "&")
+    host = url.split("/")[2]
+    assert hosts == [host]  # the bearer is the file host's own
+    assert client.gets == [_rest(site, url)]  # resolved by REST: no shares fallback
+    assert client.streams == [_rest(site, url).replace("(@u)?", "(@u)/$value?")]
+    assert client.auth == {f"Bearer SP-{host}"}
+    assert (settings.media_dir / "z.xlsx").read_bytes() == b"BYTES"
+    assert any(n.startswith("[file:") and "→" in n for n in notes)
+
+
+async def test_sp_file_share_link_falls_back_to_sharepoint_shares_on_the_same_host(
+    settings: Settings, monkeypatch
+) -> None:
+    url = "https://c-my.sharepoint.com/:x:/g/personal/u_c_com/EAbc?e=x1"
+    client = _SpClient(
+        lambda u: (
+            _Resp(status_code=404) if "GetFileByUrl" in u else _Resp(data={"name": "s.xlsx", "file": {}})
+        )
+    )
+    path = await A._download_sp_file(client, url, "SPTOK", settings.media_dir)
+    item = _shares("https://c-my.sharepoint.com", url)
+    assert client.gets == [_rest("https://c-my.sharepoint.com/personal/u_c_com", url), item]
+    assert client.streams == [f"{item}/content"]
+    assert path and Path(path).name == "s.xlsx"
+
+
+@pytest.mark.parametrize(("rest", "shares", "recorded"), [(404, 403, 403), (403, 404, 404), (500, 403, 403)])
+async def test_sp_file_failure_reports_the_fallback_status(
+    settings: Settings, monkeypatch, rest: int, shares: int, recorded: int
+) -> None:
+    """The denied-asset cache sees the last answer: 403 permanent, 404 backed off, as under Graph."""
+    client = _SpClient(lambda u: _Resp(status_code=rest if "GetFileByUrl" in u else shares))
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: client)
+    failed: list[tuple[str, int]] = []
+    notes = await A.process(
+        FILE_A,
+        "RichText/Html",
+        "sk",
+        settings.media_dir,
+        download=True,
+        sp_token=lambda host: "SPTOK",
+        on_fail=lambda u, exc: failed.append((u, exc.response.status_code)),  # type: ignore[attr-defined]
+    )
+    assert failed == [("https://c.sharepoint.com/:x:/r/sites/RD/Shared/z.xlsx?d=w1&web=1", recorded)]
+    assert client.streams == []
+    assert any(n.startswith("[file(sp):") for n in notes)
+
+
+async def test_sp_file_ref_only_without_sharepoint_token(settings: Settings, monkeypatch) -> None:
+    client = _SpClient(lambda u: _Resp(data={"Name": "z.xlsx"}))
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: client)
+    notes = await A.process(FILE_A, "RichText/Html", "sk", settings.media_dir, download=True)
+    assert client.gets == [] and any(n.startswith("[file(sp):") for n in notes)
+
+
+# Message HTML is written by any chat member: a SharePoint bearer goes to a tenant host or nowhere.
+_HOSTILE = [
+    "https://evil.example&sol;@contoso.sharepoint.com/:w:/r/x.docx",  # entity hides the userinfo
+    "https://evil.example/?q=sharepoint.com/:x:/r/z",  # "sharepoint.com" only in the query
+    "https://user@contoso.sharepoint.com/:x:/r/sites/a/z.xlsx",  # userinfo
+    "https://contoso.sharepoint.com:8443/:x:/r/sites/a/z.xlsx",  # port
+    "https://c\u00f6ntoso.sharepoint.com/:x:/r/sites/a/z.xlsx",  # IDN
+    "https://CONTOSO.sharepoint.com/:x:/r/sites/a/z.xlsx",  # uppercase
+    "https://contoso.sharepoint.com./:x:/r/sites/a/z.xlsx",  # trailing dot
+    "https://evil.example\\@contoso.sharepoint.com/:x:/r/sites/a/z.xlsx",  # backslash
+    "http://contoso.sharepoint.com/:x:/r/sites/a/z.xlsx",  # plain http
+    "https://contoso.sharepoint.com.evil.example/:x:/r/sites/a/z.xlsx",  # suffix
+    "https://contoso.sharepoint.com/:x:/r/sites/a/z&#9;.xlsx",  # tab: urlsplit drops it, httpx refuses
+    "https://contoso.sharepoint.com&#10;/:x:/r/sites/a/z.xlsx",  # newline after the host
+    " https://contoso.sharepoint.com/:x:/r/sites/a/z.xlsx",  # leading space
+    "https://contoso.sharepoint.com/:x:/r/sites/a/z\x7f.xlsx",  # DEL
+]
+
+
+@pytest.mark.parametrize("href", _HOSTILE)
+@pytest.mark.parametrize("kind", ["sp_file", "sp_transcript"])
+async def test_no_sharepoint_bearer_off_a_tenant_host(
+    settings: Settings, monkeypatch, href: str, kind: str
+) -> None:
+    content = (
+        f'<a itemtype="http://schema.skype.com/HyperLink/Files" href="{href}">z</a>'
+        if kind == "sp_file"
+        else f'<item type="onedriveForBusinessTranscript" uri="{href}" />'
+    )
+    assert [i["kind"] for i in A.extract(content, "RichText/Html")] == [kind]  # the gate is in process()
+    client = _SpClient(lambda u: _Resp(data={"Name": "z.xlsx"}))
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: client)
+    asked: list[str] = []
+    notes = await A.process(
+        content,
+        "RichText/Html",
+        "sk",
+        settings.media_dir,
+        download=True,
+        sp_token=lambda host: asked.append(host) or "SPTOK",
+    )
+    assert asked == [] and client.gets == [] and client.streams == []
+    assert len(notes) == 1 and "→" not in notes[0]
+
+
+@pytest.mark.parametrize("url", _HOSTILE)
+async def test_download_sp_file_refuses_a_foreign_host(settings: Settings, url: str) -> None:
+    client = _SpClient(lambda u: _Resp(data={"Name": "z.xlsx"}))
+    with pytest.raises(ValueError):
+        await A._download_sp_file(client, A.html.unescape(url), "SPTOK", settings.media_dir)
+    assert client.gets == [] and client.streams == []
+
+
+@pytest.mark.parametrize(
+    ("url", "host"),
+    [
+        ("https://contoso.sharepoint.com/sites/a/z.xlsx", "contoso.sharepoint.com"),
+        ("https://contoso-my.sharepoint.com/:x:/g/personal/u/E", "contoso-my.sharepoint.com"),
+        *((u, None) for u in _HOSTILE),
+        ("https://evil.example/@contoso.sharepoint.com/x", None),
+    ],
+)
+def test_sp_host(url: str, host: str | None) -> None:
+    assert A._sp_host(A.html.unescape(url)) == host
+
+
+_MALFORMED = [
+    "https://[x.sharepoint.com/:x:/r/z.xlsx",
+    "https://contoso.sharepoint.com\uff03@evil.example/:x:/r/z",
+]
+
+
+@pytest.mark.parametrize("bad", _MALFORMED)
+def test_malformed_links_are_not_hosts(bad: str) -> None:
+    assert A._sp_host(bad) is None
+    assert A._downloadable(bad.replace("sharepoint.com", "asyncgw.teams.microsoft.com")) is False
+
+
+@pytest.mark.parametrize("bad", _MALFORMED)
+async def test_a_malformed_link_keeps_the_messages_other_attachments(
+    settings: Settings, monkeypatch, bad: str
+) -> None:
+    def handler(url: str) -> _Resp:
+        return _Resp(content=b"PNGDATA", headers={"content-type": "image/png"})
+
+    _patch_client(monkeypatch, handler)
+    ams_bad = bad.replace("sharepoint.com", "asyncgw.teams.microsoft.com")
+    content = (
+        f'<a itemtype="http://schema.skype.com/HyperLink/Files" href="{bad}">x</a>'
+        f'<img itemtype="http://schema.skype.com/AMSImage" src="{ams_bad}">' + IMG
+    )
+    notes = await A.process(
+        content, "RichText/Html", "sk", settings.media_dir, download=True, sp_token=lambda h: "SPTOK"
+    )
+    assert (settings.media_dir / "o1.png").exists()
+    assert len(notes) == 3 and sum("→" in n for n in notes) == 1
+
+
+def test_extract_unescapes_sharepoint_urls_once() -> None:
+    href = "https://c.sharepoint.com/:x:/r/sites/RD/z.xlsx?d=w1&amp;web=1"
+    items = A.extract(
+        f'<a itemtype="http://schema.skype.com/HyperLink/Files" href="{href}">z</a>'
+        '<item type="onedriveForBusinessTranscript" uri="https://c.sharepoint.com/t?a=1&amp;b=2" />',
+        "RichText/Media_CallRecording",
+    )
+    assert {i["url"] for i in items} == {
+        "https://c.sharepoint.com/:x:/r/sites/RD/z.xlsx?d=w1&web=1",
+        "https://c.sharepoint.com/t?a=1&b=2",
+    }
 
 
 def test_extract_excludes_sharepoint_videos() -> None:
@@ -727,7 +1102,7 @@ async def test_process_ams_video_skipped_when_sp_copy_downloads(settings: Settin
             return None
 
         async def get(self, url, headers=None, **kw):
-            return _Resp(data={"name": "rec.mp4", "file": {"mimeType": "video/mp4"}})  # /driveItem
+            return _Resp(data={"Name": "rec.mp4"})  # GetFileByUrl
 
         def stream(self, method, url, headers=None, **kw):
             fetched.append(url)
@@ -740,7 +1115,7 @@ async def test_process_ams_video_skipped_when_sp_copy_downloads(settings: Settin
         "sk",
         settings.media_dir,
         download=True,
-        graph_token=lambda: "GTOK",
+        sp_token=lambda host: "SPTOK",
         media=A.DEFAULT_MEDIA | {"videos"},
     )
     assert (settings.media_dir / "rec.mp4").exists()  # durable SharePoint copy
@@ -760,7 +1135,7 @@ async def test_process_ams_video_fallback_when_sp_denied(settings: Settings, mon
         "sk",
         settings.media_dir,
         download=True,
-        graph_token=lambda: "GTOK",
+        sp_token=lambda host: "SPTOK",
         # SharePoint copy previously 403'd (block-download policy) → denied cache vetoes it.
         skip_url=lambda u: "sharepoint" in u,
         media=A.DEFAULT_MEDIA | {"videos"},
@@ -804,7 +1179,7 @@ async def test_process_ams_video_fallback_when_sp_fails(settings: Settings, monk
             return None
 
         async def get(self, url, headers=None, **kw):
-            return _Resp(status_code=403)  # /driveItem metadata denied
+            return _Resp(status_code=403)  # SharePoint metadata denied, REST and shares alike
 
         def stream(self, method, url, headers=None, **kw):
             assert url.endswith("/video")  # SP content is never reached; AMS is
@@ -817,7 +1192,7 @@ async def test_process_ams_video_fallback_when_sp_fails(settings: Settings, monk
         "sk",
         settings.media_dir,
         download=True,
-        graph_token=lambda: "GTOK",
+        sp_token=lambda host: "SPTOK",
         media=A.DEFAULT_MEDIA | {"videos"},
     )
     assert (settings.media_dir / "rec1.video.mp4").read_bytes() == b"MP4BYTES"
@@ -946,7 +1321,7 @@ async def test_concurrent_same_sp_file_downloads_once(settings: Settings, monkey
             return False
 
         async def get(self, url, headers=None, **kw):
-            return _Resp(data={"name": "rec.mp4", "file": {"mimeType": "video/mp4"}})
+            return _Resp(data={"Name": "rec.mp4"})
 
         def stream(self, method, url, headers=None, **kw):
             streams.append(url)
@@ -955,8 +1330,8 @@ async def test_concurrent_same_sp_file_downloads_once(settings: Settings, monkey
     client = _C()
     url = "https://c-my.sharepoint.com/:v:/g/personal/x/EQrec123"
     paths = await asyncio.gather(
-        A._download_sp_file(client, url, "GTOK", settings.media_dir),
-        A._download_sp_file(client, url, "GTOK", settings.media_dir),
+        A._download_sp_file(client, url, "SPTOK", settings.media_dir),
+        A._download_sp_file(client, url, "SPTOK", settings.media_dir),
     )
     assert len(streams) == 1  # one content fetch; the duplicate returned the cached file
     assert paths[0] == paths[1]
@@ -996,6 +1371,33 @@ def test_recording_files_pairs_video_and_transcripts(settings: Settings) -> None
     }
 
 
+def test_recording_files_finds_a_transcript_saved_from_an_escaped_uri(settings: Settings) -> None:
+    """The stem is hashed from the URL extract() stores and fetches: the unescaped one."""
+    settings.media_dir.mkdir(parents=True, exist_ok=True)
+    stem = "sp-" + hashlib.sha1(b"https://c-my.sharepoint.com/personal/x/a&b").hexdigest()[:16]
+    (settings.media_dir / f"{stem}.transcript.vtt").write_bytes(b"WEBVTT")
+    content = (
+        '<URIObject type="Video.2/CallRecording.1" uri="">'
+        '<item type="onedriveForBusinessTranscript" '
+        'uri="https://c-my.sharepoint.com/personal/x/a&amp;b?x=1" />'
+        "</URIObject>"
+    )
+    assert A.recording_files(content, settings.media_dir)["transcripts"] == [f"{stem}.transcript.vtt"]
+
+
+def test_recording_files_finds_a_transcript_saved_under_the_escaped_uri_hash(settings: Settings) -> None:
+    settings.media_dir.mkdir(parents=True, exist_ok=True)
+    stem = "sp-" + hashlib.sha1(b"https://c-my.sharepoint.com/personal/x/a&amp;b").hexdigest()[:16]
+    (settings.media_dir / f"{stem}.transcript.vtt").write_bytes(b"WEBVTT")
+    content = (
+        '<URIObject type="Video.2/CallRecording.1" uri="">'
+        '<item type="onedriveForBusinessTranscript" '
+        'uri="https://c-my.sharepoint.com/personal/x/a&amp;b?x=1" />'
+        "</URIObject>"
+    )
+    assert A.recording_files(content, settings.media_dir)["transcripts"] == [f"{stem}.transcript.vtt"]
+
+
 def test_recording_files_empty_when_nothing_on_disk(settings: Settings) -> None:
     settings.media_dir.mkdir(parents=True, exist_ok=True)
     content = (
@@ -1008,7 +1410,7 @@ def test_recording_files_empty_when_nothing_on_disk(settings: Settings) -> None:
 
 
 # --- 429 on a streamed content GET ------------------------------------------------------------
-# Graph and the AMS object host throttle bursts; the streamed paths must back off exactly like
+# SharePoint and the AMS object host throttle bursts; the streamed paths must back off exactly like
 # `aget_with_retry` does, or one throttled pass silently loses the file.
 
 
@@ -1017,7 +1419,7 @@ async def test_sp_file_content_429_is_retried(settings: Settings) -> None:
 
     class _C:
         async def get(self, url, headers=None, **kw):
-            return _Resp(data={"name": "rec.mp4", "file": {"mimeType": "video/mp4"}})
+            return _Resp(data={"Name": "rec.mp4"})
 
         def stream(self, method, url, headers=None, **kw):
             streams.append(url)
@@ -1025,7 +1427,7 @@ async def test_sp_file_content_429_is_retried(settings: Settings) -> None:
                 return _Resp(status_code=429, headers={"Retry-After": "0"})
             return _Resp(content=b"MP4", headers={"content-type": "video/mp4"})
 
-    path = await A._download_sp_file(_C(), _SP_VID, "GTOK", settings.media_dir)
+    path = await A._download_sp_file(_C(), _SP_VID, "SPTOK", settings.media_dir)
     assert len(streams) == 2
     assert Path(path).read_bytes() == b"MP4"
 

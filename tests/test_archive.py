@@ -231,7 +231,6 @@ async def test_media_downloaded_skipped_and_failure_nonfatal(
         download,
         client=None,
         sp_token=None,
-        graph_token=None,
         skip_url=None,
         on_fail=None,
         media=None,
@@ -358,6 +357,125 @@ def test_refreshing_token_reexchanges_before_expiry(settings: Settings, monkeypa
     clock["t"] += 600  # past expiry - margin (600 - 300)
     assert prov.token() == "sk2"  # re-minted
     assert len(exchanges) == 2
+
+
+def test_refreshing_token_remembers_a_refused_sharepoint_host(settings: Settings, monkeypatch) -> None:
+    """A host AAD refuses is not re-asked on every message of a pass, but is again after a while."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(AR.time, "monotonic", lambda: clock["t"])
+    asked: list[str] = []
+
+    class _Src:
+        def sharepoint_token(self, host: str) -> str | None:
+            asked.append(host)
+            return "tok" if host == "c.sharepoint.com" else None
+
+    prov = AR.RefreshingToken(settings, _Src())  # type: ignore[arg-type]
+    assert [prov.sharepoint_token("x.sharepoint.com") for _ in range(3)] == [None] * 3
+    assert [prov.sharepoint_token("c.sharepoint.com") for _ in range(2)] == ["tok"] * 2
+    assert asked == ["x.sharepoint.com", "c.sharepoint.com", "c.sharepoint.com"]  # successes not memoised
+    clock["t"] += AR.RefreshingToken._SP_REFUSED_TTL + 1
+    assert prov.sharepoint_token("x.sharepoint.com") is None
+    assert asked[-1] == "x.sharepoint.com"  # asked again once the memo expired
+
+
+def test_refreshing_token_memo_is_locked_and_aad_is_not(settings: Settings) -> None:
+    entered: list[int] = []
+
+    class _SpyLock:
+        def __init__(self) -> None:
+            self.held = False
+
+        def __enter__(self) -> None:
+            entered.append(1)
+            self.held = True
+
+        def __exit__(self, *_: Any) -> None:
+            self.held = False
+
+    class _Src:
+        def sharepoint_token(self, host: str) -> str | None:
+            assert not prov._lock.held  # type: ignore[attr-defined]  # AAD round trip outside the lock
+            return None
+
+    prov = AR.RefreshingToken(settings, _Src())  # type: ignore[arg-type]
+    prov._lock = _SpyLock()  # type: ignore[assignment]
+    assert prov.sharepoint_token("x.sharepoint.com") is None
+    assert len(entered) == 2  # memo read, then memo write
+    assert prov.sharepoint_token("x.sharepoint.com") is None
+    assert len(entered) == 3  # memo hit: read only
+
+
+@pytest.mark.parametrize(
+    ("headers", "status"),
+    [
+        ({"content-type": "text/vtt", "content-length": str(60 * 1024 * 1024)}, 413),  # over the cap
+        ({"content-type": "video/mp4"}, 415),  # not a transcript
+    ],
+)
+async def test_a_refused_transcript_is_denied(
+    settings: Settings, tmp_path, headers: dict[str, str], status: int
+) -> None:
+    """Otherwise the same oversized or mistyped URI is pulled again on every pass: an over-cap body
+    for good, a wrong type (maybe an error page served 200) on the 404 backoff ladder."""
+    from functools import partial
+
+    from miniteams import attachments as A
+
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, hdr: dict[str, str]) -> None:
+            self.headers = hdr
+
+        def raise_for_status(self) -> None:
+            return None
+
+        async def __aenter__(self) -> Any:
+            return self
+
+        async def __aexit__(self, *_: Any) -> bool:
+            return False
+
+        async def aiter_bytes(self, size: int = 65536) -> Any:
+            raise AssertionError("refused before any body byte")
+            yield b""
+
+    class _C:
+        def stream(self, method: str, url: str, **kw: Any) -> _Resp:
+            json = (kw.get("params") or {}).get("format") == "json"
+            return _Resp(
+                {**headers, "content-type": "application/json"} if json and status == 413 else headers
+            )
+
+    url = "https://c-my.sharepoint.com/personal/x/_api/v2.1/drives/b/items/01/content"
+    store = ChatStore(tmp_path / "data", C1)
+    try:
+        keys = [f"{url}#.json", f"{url}#.vtt"]
+        for attempt in (1, 2):
+            notes = await A.process(
+                f'<item type="onedriveForBusinessTranscript" uri="{url}" />',
+                "RichText/Media_CallRecording",
+                "sk",
+                store.media_dir,
+                download=True,
+                client=_C(),  # type: ignore[arg-type]
+                sp_token=lambda h: "T",
+                on_fail=partial(AR.record_asset_failure, store),
+            )
+            assert notes == [f"[transcript(sp): {url}]"]
+            rows = store._db.execute(
+                "SELECT url, status, attempts, retry_after FROM denied_assets ORDER BY url"
+            ).fetchall()
+            if status == 413:
+                assert rows == [(k, 413, 1, "") for k in keys]  # permanent
+                assert store.denied_urls("9999-12-31T00:00:00Z") == set(keys)
+                break
+            assert [r[:3] for r in rows] == [(k, 415, attempt) for k in keys]  # attempts grow
+            assert all(r[3] for r in rows)  # backed off, not permanent
+            assert store.denied_urls("9999-12-31T00:00:00Z") == set()
+    finally:
+        store.close()
 
 
 def _spy_log(monkeypatch) -> list[tuple[str, str, dict[str, Any]]]:
@@ -569,9 +687,6 @@ class _DyingToken:
     def sharepoint_token(self, host: str) -> str | None:
         return None
 
-    def graph_token(self) -> str | None:
-        return None
-
 
 async def test_archive_chat_returns_counts(settings: Settings, tmp_path, monkeypatch) -> None:
     api = _FakeApi({C1: [_msg("m1", "2026-07-01T09:00:00Z"), _msg("m2", "2026-07-01T10:00:00Z")]})
@@ -643,7 +758,6 @@ async def test_media_denied_cache_skips_and_records(settings: Settings, tmp_path
         download,
         client=None,
         sp_token=None,
-        graph_token=None,
         skip_url=None,
         on_fail=None,
         media=None,

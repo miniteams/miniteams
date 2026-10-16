@@ -293,11 +293,6 @@ class TokenSource:
         drafts store needs for writes. FOCI, no consent. Returns None if unavailable (never prompts)."""
         return self._silent_scope("https://ic3.teams.office.com/.default")
 
-    def graph_token(self) -> str | None:
-        """Silent Microsoft Graph token (FOCI, no consent). Used for the /shares API to fetch
-        SharePoint-hosted files shared into chats. Returns None if unavailable (never prompts)."""
-        return self._silent_scope("https://graph.microsoft.com/.default")
-
     def csa_token(self) -> str | None:
         """Silent chat-service aggregator token (FOCI, no consent), e.g. for custom emojis.
         Returns None if unavailable (never prompts)."""

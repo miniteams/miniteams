@@ -85,9 +85,6 @@ async def test_a_pass_stopped_by_a_dead_credential_leaves_no_heartbeat(settings:
         def sharepoint_token(self, host: str) -> None:
             return None
 
-        def graph_token(self) -> None:
-            return None
-
     data = tmp_path / "data"
     assert await AR.run_archive(settings, data, token_provider=_Dead()) is True
     meta = read_meta(data)

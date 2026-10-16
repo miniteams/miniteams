@@ -1,11 +1,11 @@
 """Spec 014: `--media` chooses which attachment types are downloaded (network faked end to end)."""
 
 import asyncio
-import base64
 import hashlib
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import httpx
 import pytest
@@ -74,22 +74,22 @@ class _Resp:
         yield self.content
 
 
-_GRAPH_NAMES = {"doc2": "doc2.docx", "doc1": "doc.docx", "rec1": "rec.mp4", "clip1": "clip.mp4"}
+_SP_NAMES = {"doc2": "doc2.docx", "doc1": "doc.docx", "rec1": "rec.mp4", "clip1": "clip.mp4"}
+_SP_REST = "/_api/web/GetFileByUrl(@u)"
 
 
 def _shared(url: str) -> str:
-    """The sharing URL behind a Graph /shares call, else the URL itself."""
-    if not url.startswith(A._GRAPH):
+    """The file URL behind a SharePoint REST `GetFileByUrl` call, else the URL itself."""
+    if _SP_REST not in url:
         return url
-    share = url.split("/shares/u!")[1].split("/")[0]
-    return base64.urlsafe_b64decode(share + "=" * (-len(share) % 4)).decode()
+    return unquote(url.split("@u=")[1]).strip("'")
 
 
 def _serve(url: str, params: dict[str, str] | None) -> _Resp:
-    if url.startswith(A._GRAPH):
-        name = _GRAPH_NAMES[_shared(url).rsplit("/", 1)[1]]
-        if url.endswith("/driveItem"):
-            return _Resp(data={"name": name, "file": {}})
+    if _SP_REST in url:
+        name = _SP_NAMES[_shared(url).rsplit("/", 1)[1]]
+        if "/$value" not in url:
+            return _Resp(data={"Name": name})
         return _Resp(f"bytes of {name}".encode())
     if url == SP_TR:
         fmt = (params or {}).get("format")
@@ -123,17 +123,14 @@ class _Client:
         self.fetched.append(url)
         return _serve(url, params)
 
-    def stream(self, method: str, url: str, **_: Any) -> _Resp:
+    def stream(self, method: str, url: str, params: dict[str, str] | None = None, **_: Any) -> _Resp:
         self.fetched.append(url)
-        return _serve(url, None)
+        return _serve(url, params)
 
 
 class _Tokens(AR.StaticToken):
     def sharepoint_token(self, host: str) -> str | None:
         return "SPTOK"
-
-    def graph_token(self) -> str | None:
-        return "GTOK"
 
 
 @pytest.fixture

@@ -10,12 +10,13 @@ whitelisted `api.asm.skype.com` / `*.asyncgw.teams.microsoft.com` hosts. Files n
 import asyncio
 import base64
 import hashlib
+import html
 import re
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 import structlog
@@ -60,7 +61,10 @@ def _attrs(tag: str) -> dict[str, str]:
 
 
 def _downloadable(url: str) -> bool:
-    host = urlsplit(url).hostname or ""
+    try:
+        host = urlsplit(url).hostname or ""
+    except ValueError:  # malformed link: ref-only, the message's other attachments still go
+        return False
     return bool(_OBJECT_HOST_RE.match(host))
 
 
@@ -74,6 +78,27 @@ def _safe_name(name: str) -> str:
     return Path(name).name or "file"
 
 
+# Tenant hosts only: a bearer for `<host>` is minted and sent to exactly this host. No userinfo, port,
+# uppercase, trailing dot or IDN form passes: the whole netloc is the host, for every URL parser.
+_SP_HOST_RE = re.compile(r"^[a-z0-9-]+(-my)?\.sharepoint\.com$")
+
+
+def _sp_host(url: str) -> str | None:
+    """The SharePoint host of `url` a bearer may go to, None for any other URL.
+
+    The only source of both the token host and the request host. Message HTML is written by any chat
+    member: `https://evil.example&sol;@x.sharepoint.com/` must never get a SharePoint bearer."""
+    # urlsplit drops whitespace and control characters that httpx rejects: the string checked must
+    # be the string fetched.
+    if url != url.strip() or not url.isprintable():
+        return None
+    try:
+        parts = urlsplit(url)
+    except ValueError:  # malformed link: ref-only, the message's other attachments still go
+        return None
+    return parts.netloc if parts.scheme == "https" and _SP_HOST_RE.match(parts.netloc) else None
+
+
 def _is_video_url(url: str) -> bool:
     return "/:v:/" in url.lower() or bool(_VIDEO_EXT.search(url))
 
@@ -85,7 +110,7 @@ _DURATION_RE = re.compile(r'duration="([^"]*)"')
 
 def recording_files(content: str, media_dir: Path) -> dict[str, Any]:
     """Manifest entry for one Media_CallRecording message: which of its video/transcript
-    files exist on disk. Filenames alone can't pair them (sp-<sha1> vs driveItem names) —
+    files exist on disk. Filenames alone can't pair them (sp-<sha1> vs file names) —
     this derives every candidate name from the message and keeps the ones present."""
     videos: list[str] = []
     transcripts: list[str] = []
@@ -99,8 +124,9 @@ def recording_files(content: str, media_dir: Path) -> dict[str, Any]:
         if not uri:
             continue
         if typ == "onedriveForBusinessTranscript":
-            stem = f"sp-{hashlib.sha1(uri.split('?')[0].encode()).hexdigest()[:16]}.transcript"
-            transcripts += _present(f"{stem}.*")
+            # Fetched from the unescaped URI; older archives hashed the raw attribute.
+            for stem in dict.fromkeys((_sp_stem(html.unescape(uri)), _sp_stem(uri))):
+                transcripts += _present(f"{stem}.*")
         elif typ == "amsTranscript":
             transcripts += _present(f"{object_id(uri)}.transcript.*")
         elif typ == "amsVideo":
@@ -140,7 +166,7 @@ def extract(content: str, msgtype: str, media: frozenset[str] = DEFAULT_MEDIA) -
     """Pull attachment references of the selected `media` types out of message content. No network.
 
     Videos (meeting recordings, shared video files) are GB-scale and left out of the default. The
-    durable SharePoint copy rides the `sp_file` Graph path; the fast-expiring AMS copy (`amsVideo`)
+    durable SharePoint copy rides the `sp_file` SharePoint path; the fast-expiring AMS copy (`amsVideo`)
     is emitted as a trailing `video` fallback: SharePoint blocks the file download of recordings
     owned by others ("block download" policy — streaming only), while the AMS object host still
     serves the bytes with the skype token."""
@@ -151,6 +177,10 @@ def extract(content: str, msgtype: str, media: frozenset[str] = DEFAULT_MEDIA) -
     ams_videos: list[str] = []
 
     def _add(kind: str, url: str, hint: str = "") -> None:
+        if kind.startswith("sp_"):
+            # Attribute values are HTML (`&amp;`): unescape once, so the URL stored, checked and
+            # fetched is one string.
+            url = html.unescape(url)
         if (kind, url) in seen:
             return
         # Seen even when deselected: the recording's Play <a> must not come back as a document.
@@ -177,11 +207,11 @@ def extract(content: str, msgtype: str, media: frozenset[str] = DEFAULT_MEDIA) -
         elif attrs.get("type") == "onedriveForBusinessTranscript" and attrs.get("uri"):
             _add("sp_transcript", attrs["uri"])
         elif attrs.get("type") == "onedriveForBusinessVideo" and attrs.get("uri"):
-            # recording on OneDrive: same Graph /shares path as docs
+            # recording on OneDrive: same SharePoint path as docs
             _add("sp_file", attrs["uri"], "onedriveForBusinessVideo")
         elif attrs.get("type") == "amsVideo" and attrs.get("uri"):
             ams_videos.append(attrs["uri"])
-    # SharePoint-hosted documents and videos shared into the chat — fetched via Graph. Folders
+    # SharePoint-hosted documents and videos shared into the chat — fetched from SharePoint. Folders
     # (:f:), sites and OneNote (:u:/:o:) are never single files.
     for tag in _A_RE.findall(content):
         attrs = _attrs(tag)
@@ -273,10 +303,25 @@ async def fetch_image(client: httpx.AsyncClient, token: str, url: str, media_dir
 # sub-cues with their own timings (~2.5x the entry count). Order matters — the JSON is the primary,
 # returned for the message annotation.
 _SP_RENDITIONS = (("json", ".json", "application/json"), ("", ".vtt", "text/vtt"))
+# Transcripts are text: a transcript URI any chat member wrote may point at a GB-scale file.
+_SP_TRANSCRIPT_MAX = 50 * 1024 * 1024
+
+
+def _sp_stem(url: str) -> str:
+    return f"sp-{hashlib.sha1(url.split('?')[0].encode()).hexdigest()[:16]}.transcript"
 
 
 class _AllSuppressed(Exception):
     """Every rendition is waiting out its backoff — nominal steady state, not a failure."""
+
+
+class _Refused(Exception):
+    """A body never kept: over the cap (413, denied for good) or of the wrong type or encoding (415,
+    backed off like a 404). `status` is the HTTP code that names the reason."""
+
+    def __init__(self, status: int, reason: str) -> None:
+        super().__init__(reason)
+        self.status = status
 
 
 async def _download_sp_transcript(
@@ -294,15 +339,31 @@ async def _download_sp_transcript(
     (for a since-deleted recording that VTT is the only copy left). Raises only when *both* fail —
     a rendition that fails on its own is still reported through `on_fail`, or a permanently denied
     one is silently re-requested on every archive pass forever."""
-    stem = f"sp-{hashlib.sha1(url.split('?')[0].encode()).hexdigest()[:16]}.transcript"
+    stem = _sp_stem(url)
+    # Older archives hashed the URI as written in the HTML: an entity before `?` gave another stem.
+    legacy = _sp_stem(html.escape(url.split("?")[0], quote=False))
     media_dir.mkdir(parents=True, exist_ok=True)
-    headers = {"Authorization": f"Bearer {bearer}", "Accept": "*/*"}
+    # identity: httpx inflates a whole compressed chunk at once, so a gzip bomb would blow past
+    # the cap in memory before it is counted. Uncompressed, wire bytes are the bytes counted.
+    headers = {"Authorization": f"Bearer {bearer}", "Accept": "*/*", "Accept-Encoding": "identity"}
     got: list[Path] = []
     failures: list[tuple[str, Exception]] = []
     for fmt, ext, ctype in _SP_RENDITIONS:
         dest = media_dir / f"{stem}{ext}"
         async with _serialized(str(dest)):
-            await _sp_rendition(client, url, headers, fmt, ext, ctype, dest, got, failures, skip_url)
+            await _sp_rendition(
+                client,
+                url,
+                headers,
+                fmt,
+                ext,
+                ctype,
+                dest,
+                media_dir / f"{legacy}{ext}",
+                got,
+                failures,
+                skip_url,
+            )
     # Report before raising: a total failure must still record BOTH renditions under their own key,
     # or the retry policy never sees them and every pass re-requests a dead URL.
     for ext, failure in failures:
@@ -324,29 +385,43 @@ async def _sp_rendition(
     ext: str,
     ctype: str,
     dest: Path,
+    legacy: Path,
     got: list[Path],
     failures: list[tuple[str, Exception]],
     skip_url: Callable[[str], bool] | None,
 ) -> None:
-    if dest.exists():
-        got.append(dest)
-        return
+    for kept in (dest, legacy):
+        if kept.exists():
+            got.append(kept)
+            return
     # Per-rendition cache key: one rendition permanently gone must never suppress the other.
     if skip_url and skip_url(f"{url}#{ext}"):
         return
     tmp = dest.with_name(f"{dest.name}.part")
     try:
-        resp = await aget_with_retry(
+        async with astream_with_retry(
             client,
             url,
             params={"format": fmt} if fmt else {},
             headers=headers,
             follow_redirects=True,
-        )
-        if (resp.headers.get("content-type") or "").split(";")[0] != ctype:
-            # Server ignored `format`: those bytes under this extension would mislabel them.
-            raise RuntimeError(f"unexpected content-type {resp.headers.get('content-type')!r}")
-        tmp.write_bytes(resp.content)  # transcripts are small text
+        ) as resp:
+            if (resp.headers.get("content-type") or "").split(";")[0] != ctype:
+                # Server ignored `format`: those bytes under this extension would mislabel them.
+                raise _Refused(415, f"unexpected content-type {resp.headers.get('content-type')!r}")
+            if resp.headers.get("content-encoding", "identity").lower() != "identity":
+                # Accept-Encoding ignored: httpx would inflate each chunk before it is counted.
+                raise _Refused(415, f"unexpected content-encoding {resp.headers.get('content-encoding')!r}")
+            length = resp.headers.get("content-length") or ""
+            if length.isdigit() and int(length) > _SP_TRANSCRIPT_MAX:
+                raise _Refused(413, "transcript over the size cap")
+            size = 0
+            with tmp.open("wb") as fh:
+                async for chunk in resp.aiter_bytes(65536):
+                    size += len(chunk)
+                    if size > _SP_TRANSCRIPT_MAX:
+                        raise _Refused(413, "transcript over the size cap")
+                    fh.write(chunk)
         tmp.rename(dest)
         # Named speaker turns for every participant: keep them owner-only, like the token cache.
         dest.chmod(0o600)
@@ -357,24 +432,58 @@ async def _sp_rendition(
     got.append(dest)
 
 
-_GRAPH = "https://graph.microsoft.com/v1.0"
+def _sp_web(path: str) -> str:
+    """Site path (`/sites/x`, `/teams/x`, `/personal/x`) of a SharePoint URL path, `""` for the root
+    site. Share-link prefixes (`/:x:/r/`, `/:x:/g/`, `/:x:/s/<site>/`, `/:x:/p/<user>/`) are dropped first."""
+    path = re.sub(r"^/:\w:/s/", "/sites/", path)
+    path = re.sub(r"^/:\w:/p/", "/personal/", path)
+    path = re.sub(r"^/:\w:/[rg]/", "/", path)
+    seg = path.split("/")
+    return "/".join(seg[:3]) if len(seg) > 2 and seg[1] in ("sites", "teams", "personal") else ""
 
 
-async def _download_sp_file(
-    client: httpx.AsyncClient, url: str, graph_bearer: str, media_dir: Path
-) -> str | None:
-    """Fetch a SharePoint/OneDrive shared document via the Graph /shares API.
+async def _sp_file_source(client: httpx.AsyncClient, url: str, hdr: dict[str, str]) -> tuple[str, str] | None:
+    """(file name, content URL) of a SharePoint document or share link, None for a non-file.
 
-    Returns the local path, or None when the share resolves to a non-file (folder/site/page).
-    Named by the driveItem's real filename; skip-if-exists on re-runs."""
-    # Graph share id: unpadded base64url of the sharing URL, prefixed "u!".
-    share = "u!" + base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
-    hdr = {"Authorization": f"Bearer {graph_bearer}"}
-    meta = await aget_with_retry(client, f"{_GRAPH}/shares/{share}/driveItem", headers=hdr)
-    info = meta.json()
+    SharePoint REST on the file's own host, never Graph: `GetFileByUrl` takes direct paths and share
+    links alike but only resolves them on the file's own site. A miss falls back to SharePoint's own
+    `/_api/v2.0/shares` API on the same host, which resolves the share links `GetFileByUrl` cannot.
+    The fallback's error is the one raised, so the denied-asset bookkeeping sees its status."""
+    sp_host = _sp_host(url)
+    if sp_host is None:
+        raise ValueError("not a SharePoint tenant URL")  # process() gates first; never send the bearer
+    host = f"https://{sp_host}"
+    parts = urlsplit(url)
+    at = quote("'" + url.replace("'", "''") + "'", safe="")
+    rest = f"{host}{_sp_web(parts.path)}/_api/web/GetFileByUrl(@u)"
+    try:
+        meta = await aget_with_retry(
+            client, f"{rest}?@u={at}", headers={**hdr, "Accept": "application/json;odata=nometadata"}
+        )
+        return str(meta.json().get("Name") or "file"), f"{rest}/$value?@u={at}"
+    except httpx.HTTPStatusError as exc:
+        log.debug("sp_rest_file_miss", url=url, status=exc.response.status_code)
+    # Share id: unpadded base64url of the sharing URL, prefixed "u!".
+    item = (
+        f"{host}/_api/v2.0/shares/u!{base64.urlsafe_b64encode(url.encode()).decode().rstrip('=')}/driveItem"
+    )
+    info = (await aget_with_retry(client, item, headers=hdr)).json()
     if "file" not in info:  # folder / notebook / list item — not a single downloadable file
         return None
-    name = _safe_name(str(info.get("name") or "file"))
+    return str(info.get("name") or "file"), f"{item}/content"
+
+
+async def _download_sp_file(client: httpx.AsyncClient, url: str, bearer: str, media_dir: Path) -> str | None:
+    """Fetch a SharePoint/OneDrive shared document with a SharePoint bearer for its host.
+
+    Returns the local path, or None when the share resolves to a non-file (folder/site/page).
+    Named by the file's real name; skip-if-exists on re-runs."""
+    hdr = {"Authorization": f"Bearer {bearer}"}
+    source = await _sp_file_source(client, url, hdr)
+    if source is None:
+        return None
+    name, content_url = source
+    name = _safe_name(name)
     dest = media_dir / name
     async with _serialized(str(dest)):
         if dest.exists():
@@ -384,9 +493,7 @@ async def _download_sp_file(
         try:
             # Streamed, not buffered: shared items include meeting recordings (GBs) — a whole-body
             # `.content` read would pin RSS by the full file size (see _stream_to).
-            async with astream_with_retry(
-                client, f"{_GRAPH}/shares/{share}/driveItem/content", headers=hdr, follow_redirects=True
-            ) as resp:
+            async with astream_with_retry(client, content_url, headers=hdr, follow_redirects=True) as resp:
                 with tmp.open("wb") as fh:
                     async for chunk in resp.aiter_bytes(65536):
                         fh.write(chunk)
@@ -456,7 +563,6 @@ async def process(
     download: bool,
     client: httpx.AsyncClient | None = None,
     sp_token: Callable[[str], str | None] | None = None,
-    graph_token: Callable[[], str | None] | None = None,
     skip_url: Callable[[str], bool] | None = None,
     on_fail: Callable[[str, Exception], None] | None = None,
     media: frozenset[str] = DEFAULT_MEDIA,
@@ -465,8 +571,8 @@ async def process(
 
     Pass `client` to reuse a shared connection pool (archive downloads thousands of attachments
     concurrently); when omitted a private client is opened for the call (live-stream path).
-    `sp_token(host)` supplies a SharePoint bearer for durable OneDrive transcripts; `graph_token()`
-    a Graph bearer for SharePoint-hosted shared documents. Without them those items are refs only.
+    `sp_token(host)` supplies a SharePoint bearer for the file's host, for durable OneDrive
+    transcripts and SharePoint-hosted shared documents. Without it those items are refs only.
     `skip_url(url)` vetoes a download (ref-only note, no network) — the archive's denied-asset
     cache; `on_fail(url, exc)` observes each failed download so callers can feed that cache.
     Only the `media` types are extracted: a deselected item is neither fetched nor annotated."""
@@ -504,7 +610,8 @@ async def process(
                     notes.append(f"[video: {url}]")
                 continue
             if kind == "sp_transcript":
-                bearer = sp_token(urlsplit(url).hostname or "") if (download and sp_token) else None
+                sp_host = _sp_host(url)
+                bearer = sp_token(sp_host) if (download and sp_token and sp_host) else None
                 if not bearer:
                     notes.append(f"[transcript(sp): {url}]")
                     continue
@@ -519,12 +626,13 @@ async def process(
                     notes.append(f"[transcript(sp): {url}]")
                 continue
             if kind == "sp_file":
-                gtok = graph_token() if (download and graph_token) else None
-                if not gtok:
+                sp_host = _sp_host(url)
+                bearer = sp_token(sp_host) if (download and sp_token and sp_host) else None
+                if not bearer:
                     notes.append(f"[file(sp): {url}]")
                     continue
                 try:
-                    fpath = await _download_sp_file(client, url, gtok, media_dir)
+                    fpath = await _download_sp_file(client, url, bearer, media_dir)
                     if fpath:
                         if _is_video_url(url):
                             # ponytail: message-global flag — one SP video success mutes every AMS

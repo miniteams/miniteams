@@ -616,9 +616,6 @@ class _Source:
     def sharepoint_token(self, host: str) -> None:
         return None
 
-    def graph_token(self) -> None:
-        return None
-
     def ic3_token(self) -> str | None:
         return "ic3" if self.state == "live" else None
 

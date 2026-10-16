@@ -38,7 +38,7 @@ log = structlog.get_logger()
 _PAGE_SIZE = 100
 _INTER_PAGE_DELAY = 0.2  # politeness pause between history pages (seconds)
 _MEDIA_CONCURRENCY = 8  # max concurrent attachment downloads per chat (429-friendly)
-# 404 backoff ladder, in hours. The last value is a standing cap, not a terminal state: a dead URL
+# 404/415 backoff ladder, in hours. The last value is a standing cap, not a terminal state: a dead URL
 # decays to one probe every two days (cheap), and a recording restored from backup is still picked up.
 _BACKOFF_HOURS = (1, 6, 12, 24, 48)
 
@@ -58,7 +58,6 @@ class TokenProvider(Protocol):
     def token(self) -> str: ...
     def bearer(self) -> str: ...
     def sharepoint_token(self, host: str) -> str | None: ...
-    def graph_token(self) -> str | None: ...
 
 
 class StaticToken:
@@ -76,9 +75,6 @@ class StaticToken:
     def sharepoint_token(self, host: str) -> str | None:
         return None
 
-    def graph_token(self) -> str | None:
-        return None
-
 
 class RefreshingToken:
     """Keeps the skype token + bearer live across a multi-hour run.
@@ -89,11 +85,13 @@ class RefreshingToken:
     """
 
     _MARGIN = 300.0  # re-mint this many seconds before the reported expiry
+    _SP_REFUSED_TTL = 3600.0
 
     def __init__(self, settings: Settings, source: TokenSource) -> None:
         self.settings, self.source = settings, source
         self._token = self._bearer = self.region = ""
         self._deadline = 0.0
+        self._sp_refused: dict[str, float] = {}  # host → monotonic time its refusal expires
         # `archive --live` calls it from the pass thread and the event loop: one re-mint, one pair.
         self._lock = threading.Lock()
 
@@ -118,10 +116,18 @@ class RefreshingToken:
             return self._bearer
 
     def sharepoint_token(self, host: str) -> str | None:
-        return self.source.sharepoint_token(host)
-
-    def graph_token(self) -> str | None:
-        return self.source.graph_token()
+        # A refused host costs a silent AAD round trip on the event loop for every message of every
+        # pass: remember the refusal for a while (not forever: `archive --live` never ends).
+        now = time.monotonic()
+        with self._lock:
+            if self._sp_refused.get(host, 0.0) > now:
+                return None
+        token = self.source.sharepoint_token(host)  # outside the lock: an AAD round trip
+        if token is None:
+            with self._lock:
+                self._sp_refused = {h: t for h, t in self._sp_refused.items() if t > now}
+                self._sp_refused[host] = now + self._SP_REFUSED_TTL
+        return token
 
 
 def _now_iso() -> str:
@@ -259,14 +265,18 @@ def _refresh_drafts(settings: Settings, skype_token: str, store: ChatStore, labe
 
 
 def record_asset_failure(store: ChatStore, key: str, exc: Exception) -> None:
-    """`attachments.process` on_fail hook: remember a 403 for good, back a 404 off."""
-    status = getattr(getattr(exc, "response", None), "status_code", None)
+    """`attachments.process` on_fail hook: remember a 403 or an over-cap body (413) for good, back a
+    404 or a wrong-type body (415) off."""
+    status = exc.status if isinstance(exc, attachments._Refused) else None
+    status = status or getattr(getattr(exc, "response", None), "status_code", None)
     now = _now_iso()
-    if status == 403:
-        store.mark_denied(key, 403, now)  # permanent: permission does not come back on its own
-    elif status == 404:
+    if status in (403, 413):
+        # permanent: permission does not come back on its own, nor does a file shrink
+        store.mark_denied(key, status, now)
+    elif status in (404, 415):
+        # a wrong type may be transient: an HTML error page served 200, a login page after a redirect
         attempts = store.denied_attempts(key) + 1
-        store.mark_denied(key, 404, now, attempts, _retry_after(attempts))
+        store.mark_denied(key, status, now, attempts, _retry_after(attempts))
 
 
 async def _download_media(
@@ -274,7 +284,6 @@ async def _download_media(
     skype_token: str,
     label: str,
     sp_token: Callable[[str], str | None] | None = None,
-    graph_token: Callable[[], str | None] | None = None,
     ignore_denied: bool = False,
     media: frozenset[str] = attachments.DEFAULT_MEDIA,
 ) -> int:
@@ -286,10 +295,11 @@ async def _download_media(
     requests to stay polite (429-friendly).
 
     Assets the archive gave up on are remembered in `denied_assets`, or the loop mode hammers them
-    every cycle. A 403 (deleted object, lost share permission) is permanent. A 404 backs off along
-    `_BACKOFF_HOURS` instead: it may just be a transcript still being generated, and a permanent
-    verdict would lose it. `ignore_denied` (--retry-assets) forces both; fresh failures are recorded
-    either way.
+    every cycle. A 403 (deleted object, lost share permission) and a 413 (transcript over the size
+    cap) are permanent. A 404 backs off along `_BACKOFF_HOURS` instead: it may just be a transcript
+    still being generated, and a permanent verdict would lose it; a 415 (transcript of the wrong
+    content type or encoding) backs off the same way. `ignore_denied` (--retry-assets) forces them all; fresh
+    failures are recorded either way.
     """
     targets: list[dict[str, Any]] = []
     recordings: list[dict[str, Any]] = []
@@ -329,7 +339,6 @@ async def _download_media(
                     download=True,
                     client=client,
                     sp_token=sp_token,
-                    graph_token=graph_token,
                     skip_url=_skip,
                     on_fail=partial(record_asset_failure, store),
                     media=media,
@@ -363,7 +372,7 @@ async def _download_media(
 def _write_recordings_manifest(store: ChatStore, recordings: list[dict[str, Any]]) -> None:
     """`media/recordings.json`: one entry per Media_CallRecording message, pairing the recording
     with its on-disk video/transcript files. Filenames alone can't link them (sp-<sha1> vs
-    driveItem names), so the pairing is derived from the messages and rewritten every media pass
+    file names), so the pairing is derived from the messages and rewritten every media pass
     — pure derived data, safe to regenerate."""
     entries = []
     for m in recordings:
@@ -409,7 +418,6 @@ async def archive_chat(
     assets_only: bool = False,
     retry_assets: bool = False,
     sp_token: Callable[[str], str | None] | None = None,
-    graph_token: Callable[[], str | None] | None = None,
     force: bool = False,
     floor: str | None = None,
 ) -> dict[str, int]:
@@ -428,7 +436,6 @@ async def archive_chat(
                     skype_token,
                     thread_id,
                     sp_token,
-                    graph_token,
                     ignore_denied=retry_assets,
                     media=media_types,
                 )
@@ -502,7 +509,6 @@ async def archive_chat(
                 skype_token,
                 label,
                 sp_token,
-                graph_token,
                 ignore_denied=retry_assets,
                 media=media_types,
             )
@@ -638,7 +644,6 @@ async def run_archive(
                     assets_only=assets_only,
                     retry_assets=retry_assets,
                     sp_token=token_provider.sharepoint_token,
-                    graph_token=token_provider.graph_token,
                     force=thread_id in force,
                     # --thread carries no activity: naming the chat is the request to recheck it.
                     floor=recheck_since
