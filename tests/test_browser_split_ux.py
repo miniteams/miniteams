@@ -844,7 +844,7 @@ async def test_settings_menu_keyboard_escape_and_outside_click(split: Split) -> 
     assert await _focused(narrow) == "#gear"
     assert await narrow.locator("#side").is_visible()
     await page.keyboard.press("Enter")
-    for _ in range(15):  # Light, Dark, the switch, List, Split, 8 reaction slots, Reset (no slot chosen), out
+    for _ in range(16):  # Light, Dark, 2 switches, List, Split, 8 reaction slots, Reset (no slot chosen), out
         await page.keyboard.press("Tab")
     await until(page, "!document.querySelector('#cog .menu')")
     await _settings(page)
@@ -888,7 +888,7 @@ async def test_row_read_sends_read_and_the_menu_sends_seen(split: Split) -> None
     assert await page.locator(".rowmenu").count() == 0
     await row.locator('[data-k="read"]').click()
     await split.fake.settled()
-    assert split.fake.of("read") == [{"read": _id(4)}]
+    assert split.fake.of("read") == [{"read": _id(2)}, {"read": _id(4)}]  # the open's own (spec 020), then 👁
     assert split.fake.of("seen") == [{"seen": _id(4), "at": split.fake.rows[4]["last_activity"]}]
 
 
@@ -998,5 +998,5 @@ async def test_a_held_click_elsewhere_is_not_lost_when_the_menu_closes(split: Sp
     await page.wait_for_timeout(120)
     await page.mouse.up()
     await split.fake.settled()
-    assert split.fake.of("read") == [{"read": _id(8)}]
+    assert split.fake.of("read") == [{"read": _id(2)}, {"read": _id(8)}]  # the open's own (spec 020), then 👁
     assert await page.locator(".rowmenu").count() == 0

@@ -1,6 +1,6 @@
 # 020 — Mark a chat read in Teams when it is shown
 
-**Status**: in progress
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-10-16
 
@@ -24,7 +24,8 @@ does.
 - **While shown.** A message from someone else arriving in the shown chat marks it read when the page
   is visible, the window has the focus and the newest message is in view; otherwise as soon as all
   three hold again (back to the window, back to the latest message).
-- **One request per burst.** Reads of one chat are coalesced (at most one in flight, one pending).
+- **One request per second.** At most one `read` per chat per second; further ones collapse into one
+  trailing send, which checks the conditions again when it fires.
 - **Same verb.** The existing `read` page verb (Teams' read marker up to the row's last message); no
   server change.
 
@@ -36,16 +37,19 @@ does.
 
 ## Acceptance criteria
 
-- [ ] **AC1** The ⚙ menu has "Mark read in Teams when shown", checked by default; unchecking it is
-  kept across a reload, and with it unchecked no `read` verb is ever sent.
-- [ ] **AC2** Opening a chat, by first load, a click, Enter in the list or Back/Forward, sends one
-  `read` for it once its history is shown.
-- [ ] **AC3** A message from someone else arriving in the shown chat sends `read` when the page is
+- [x] **AC1** The ⚙ menu has "Mark read in Teams when shown", checked by default; unchecking it is
+  kept across a reload, and with it unchecked no automatic `read` is sent (👁 still marks by hand).
+- [x] **AC2** Opening a chat, by first load, a click, Enter in the list or Back/Forward, sends one
+  `read` for it once its history is shown and the archive has caught up (no "loading latest
+  messages…").
+- [x] **AC3** A message from someone else arriving in the shown chat sends `read` when the page is
   visible, focused and the newest message is in view; a message of mine never triggers one.
-- [ ] **AC4** With the page hidden or unfocused, or the reader detached in older history, an arriving
+- [x] **AC4** With the page hidden or unfocused, or the reader detached in older history, an arriving
   message sends nothing; the `read` goes out as soon as the page is back in view, focused, at the
   latest message.
-- [ ] **AC5** A burst of messages sends at most one `read` in flight and one pending per chat.
+- [x] **AC5** A burst of messages sends at most one `read` per chat per second, the rest collapsed
+  into one trailing send that goes out only if the chat is still shown, visible, focused and at its
+  latest message.
 
 ## Phases
 
@@ -67,6 +71,10 @@ None.
 
 ## Decisions
 
+- No read while the archive lags — because the server marks read up to the row's last message, which
+  the page has not shown yet.
+- Coalescing by time, one per second with a trailing send — because the `read` verb gets no answer to
+  wait for.
 - On by default (user's call, 2026-10-16).
 - Triggers on open and on each arrival while in view (user's call): the Teams client's behaviour.
 - Only when the newest message is in view — because a reader scrolled back in history has not seen

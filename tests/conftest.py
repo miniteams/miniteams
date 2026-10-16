@@ -119,6 +119,15 @@ def _fresh_token_sources() -> Any:
 
 
 @pytest.fixture(autouse=True)
+def _browser_reads_stay_local(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A real chat page marks its chat read on open (spec 020): its `read` verb must not reach Teams."""
+    if request.node.get_closest_marker("browser"):
+        from miniteams import web
+
+        monkeypatch.setattr(web, "mark_read", lambda *args: None)
+
+
+@pytest.fixture(autouse=True)
 def _fresh_archive_pool() -> Iterator[None]:
     """Each test gets an open archive pool: the process closes it once, a test run many times."""
     from miniteams import chat_verbs
