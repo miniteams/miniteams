@@ -15,6 +15,7 @@ from urllib.parse import quote
 import browser_helpers
 import httpx
 import pytest
+import test_images
 import test_web_chat
 from browser_helpers import (  # skips without playwright
     CONTRAST,
@@ -403,6 +404,50 @@ async def test_typing_keeps_a_reader_at_the_bottom(board: W.Board, chat: Pages) 
         await page.keyboard.press(key)
         await page.evaluate("new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
         assert await page.evaluate(gap) < 2, key
+
+
+@pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
+async def test_images_loading_together_keep_a_reader_at_the_bottom(
+    board: W.Board, chat: Pages, data_dir: Path
+) -> None:
+    """Images finishing in one frame raise a scroll event (anchoring, our own toBottom) before the
+    ResizeObserver sees their growth: a reader at the bottom stays there, on open and on a switch back."""
+    thread = "19:imgs@thread.v2"
+    objs = [f"0-weu-d{i}-0123456789abcd{i:02d}" for i in range(1, 13)]
+    ams = '<p>pic</p><p><img itemtype="http://schema.skype.com/AMSImage" src="{}"></p>'
+    src = "https://eu-api.asm.skype.com/v1/objects/{}/views/imgo"
+    tail = [_m(str(90 + i), _at(90 + i), ams.format(src.format(o))) for i, o in enumerate(objs)]
+    _archive(data_dir, thread, [_m(str(i), _at(i), f"<p>x{i}</p>") for i in range(10, 60)] + tail)
+    chat_dir = find_chat_dir(data_dir, thread)
+    assert chat_dir is not None
+    sizes = [(800, 209), (438, 514), (300, 900), (640, 120)]  # wide, tall, capped, short: as stored
+    for i, o in enumerate(objs):
+        (chat_dir / "media" / f"{o}.png").write_bytes(test_images.png(*sizes[i % 4]))
+    release = asyncio.Event()
+
+    async def held(route: Route) -> None:
+        await release.wait()  # all at once: they finish in the same frame
+        await route.continue_()
+
+    async def prepare(context: BrowserContext) -> None:
+        await context.route("**/media/**", held)
+
+    gap = f"(l => l.scrollHeight - l.scrollTop - l.clientHeight)({_LIST})"
+    loaded = "[...document.querySelectorAll('#msgs .html img')].every((i) => i.complete && i.naturalWidth)"
+    page = await chat.open(_chat(thread), viewport={"width": 1200, "height": 800}, prepare=prepare)
+    await _handled(page, "history")
+    for again in (False, True):
+        if again:  # away and back: a fresh page of the same chat, its images held again
+            release.clear()
+            await page.goto(f"http://{chat.host}{_chat(L)}")
+            await _handled(page, "history")
+            await page.goto(f"http://{chat.host}{_chat(thread)}")
+            await _handled(page, "history")
+        await page.wait_for_function(f"{gap} < 2")
+        release.set()
+        await page.wait_for_function(loaded)
+        await page.evaluate("new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
+        assert await page.evaluate(gap) < 2, again
 
 
 @pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)

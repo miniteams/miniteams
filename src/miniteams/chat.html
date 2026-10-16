@@ -490,8 +490,12 @@
     if (hist.older && $list.scrollTop < EDGE) requestHistory("before", olderEdge());
     else if (hist.newer && near(EDGE)) requestHistory("after", newerEdge());
   };
+  // Images loading, scroll anchoring and toBottom only move the list down: only a scroll up leaves the bottom.
+  // (Their scroll event can land before the ResizeObserver has caught up with the growth.)
+  let lastTop = 0;
   $list.addEventListener("scroll", () => {
-    hist.stick = !hist.newer && near();
+    hist.stick = !hist.newer && (near() || (hist.stick && $list.scrollTop >= lastTop));
+    lastTop = $list.scrollTop;
     if (hist.stick) hist.unseen = 0;
     showLatest();
     more();
@@ -524,7 +528,7 @@
     if (img && !img.closest("a")) zoom(img);  // a linked image keeps its link
   });
   $zoom.onclick = () => $zoom.close();
-  const toBottom = () => { $list.scrollTop = $list.scrollHeight; hist.stick = !hist.newer; if (hist.stick) hist.unseen = 0; showLatest(); };
+  const toBottom = () => { $list.scrollTop = $list.scrollHeight; lastTop = $list.scrollTop; hist.stick = !hist.newer; if (hist.stick) hist.unseen = 0; showLatest(); };
   const byId = (id) => $msgs.querySelector(`[data-id="${CSS.escape(id)}"]`);
   // The reader's place as a message and its offset, not pixels: pages above it change the pixels.
   const anchor = () => {

@@ -8,7 +8,7 @@ import json
 import os
 import re
 import resource
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -108,7 +108,14 @@ class Pages:
         self.host = host
         self.cookie = auth_cookie(board)
 
-    async def open(self, path: str, *, csp: bool = False, **ctx: Any) -> Page:
+    async def open(
+        self,
+        path: str,
+        *,
+        csp: bool = False,
+        prepare: Callable[[BrowserContext], Awaitable[None]] | None = None,
+        **ctx: Any,
+    ) -> Page:
         """A page on `path` of the served board. wait_for_function evaluates, which the chat CSP
         forbids: contexts bypass it unless `csp` asks for the real policy."""
         context = await self.context(bypass_csp=not csp, **ctx)
@@ -116,6 +123,8 @@ class Pages:
             await context.add_cookies([self.cookie])  # type: ignore[list-item]
         await context.add_init_script(FRAMES)
         await context.route(re.compile(r"^(?!http://127\.0\.0\.1:)"), self._block)
+        if prepare:
+            await prepare(context)  # e.g. routes the test holds, set before the first request
         page = await context.new_page()
         self.watch(page)
         await page.goto(f"http://{self.host}{path}")
