@@ -274,9 +274,19 @@ def test_reply_quote_renders_with_its_author() -> None:
     )
     out = sanitize(quote, T)
     assert (
-        out == '<blockquote class="reply"><strong>Ann Lee</strong><p>question?</p></blockquote><p>answer</p>'
+        out == '<blockquote class="reply" data-msg="1700000000000"><strong>Ann Lee</strong>'
+        "<p>question?</p></blockquote><p>answer</p>"
     )
     assert ANN not in out
+
+
+@pytest.mark.parametrize("itemid", ["", "17x0", "1e3", "-1", "1 2", "1&quot;x", "\u0661\u0662", "\u00b2"])
+def test_reply_quote_keeps_only_a_numeric_message_id(itemid: str) -> None:
+    """021-AC1: the quoted message's id survives as `data-msg` only when it is ASCII digits."""
+    quote = '<blockquote itemtype="http://schema.skype.com/Reply" itemid="{}"><p>q</p></blockquote>'
+    assert sanitize(quote.format(itemid), T) == '<blockquote class="reply"><p>q</p></blockquote>'
+    expected = '<blockquote class="reply" data-msg="1760000000001"><p>q</p></blockquote>'
+    assert sanitize(quote.format("1760000000001"), T) == expected
 
 
 def test_archived_image_is_rewritten_to_media(media: Path) -> None:
@@ -332,7 +342,8 @@ def test_nested_divs_keep_lists_and_reply_quotes() -> None:
         '<ul><li>a</li><li><div>b</div></li></ul></div><h2 id="t">Title</h2><hr><h3 onclick="x">s</h3></div>'
     )
     assert sanitize(raw, T) == (
-        '<div><div><blockquote class="reply"><strong>Ann Lee</strong><p>q?</p></blockquote>'
+        '<div><div><blockquote class="reply" data-msg="1700000000000">'
+        "<strong>Ann Lee</strong><p>q?</p></blockquote>"
         "<ul><li>a</li><li><div>b</div></li></ul></div><h2>Title</h2><hr><h3>s</h3></div>"
     )
 

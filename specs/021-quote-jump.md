@@ -1,6 +1,6 @@
 # 021 — A reply's quote leads to the quoted message
 
-**Status**: in progress
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-10-16
 
@@ -30,13 +30,13 @@ it, loading the older history around it when it is not on screen, like a search 
 
 ## Acceptance criteria
 
-- [ ] **AC1** A rendered reply quote carries the quoted message's id; a non-numeric id is dropped.
-- [ ] **AC2** Clicking a quote whose message is on screen scrolls to it and highlights it, without a
+- [x] **AC1** A rendered reply quote carries the quoted message's id; a non-numeric id is dropped.
+- [x] **AC2** Clicking a quote whose message is on screen scrolls to it and highlights it, without a
   history request.
-- [ ] **AC3** Clicking a quote whose message is not loaded asks the history around it and highlights
+- [x] **AC3** Clicking a quote whose message is not loaded asks the history around it and highlights
   it once shown.
-- [ ] **AC4** Enter on a focused quote does the same as a click; the quote is reachable by Tab.
-- [ ] **AC5** A quote whose message cannot be found says "quoted message not found".
+- [x] **AC4** Enter on a focused quote does the same as a click; the quote is reachable by Tab.
+- [x] **AC5** A quote whose message cannot be found says "quoted message not found".
 
 ## Phases
 

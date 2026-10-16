@@ -218,6 +218,7 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   nothing, never "unread". Kept live from Teams' receipt events on `web`'s Trouter socket, reconciled by one read-only
   GET on chat open and after every reconnect; cached in the presence file so a reopened chat paints at once.
 - **Browsing**: infinite scroll both ways, "↓ latest" when away from the bottom, header search, Open in Teams.
+- **Reply quotes** (spec 021): click a quote (or Tab to it, Enter) to jump to the quoted message, loading the history around it; "quoted message not found" when it is gone.
 - **Archive**: history and search read the archive under `--data-dir`. Without one the page shows the latest API page only
   and search is off.
 
