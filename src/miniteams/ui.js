@@ -476,6 +476,10 @@
   const IMG_MAX = 8, IMG_BYTES = 10 << 20, IMG_TOTAL = 40 << 20, IMG_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
   const imageQueue = ({ input, box, chat, error, busy }) => {
     const queues = new Map(), flight = new Map(), kept = new Map();  // kept: chat id → the attempt of a failed message edited in the composer
+    // A refusal is about the images as they were: any change of them clears it, unless the page shows another error since.
+    const refused = new Map();
+    const refuse = (id, text) => { refused.set(id, text); error(id, text); };
+    const unrefuse = (id) => { const was = refused.get(id); if (was === undefined) return; refused.delete(id); error(id, "", was); };
     let chain = Promise.resolve(), adding = 0, last = 0, shown = null;
     const list = (id = chat()) => queues.get(id) || [];
     const view = el("dialog", "imgview"), big = el("img"), bar = el("div"), shut = el("button", null, "Close"), del = el("button", null, "Remove");
@@ -489,6 +493,7 @@
       URL.revokeObjectURL(it.url);
       queues.set(id, list(id).filter((x) => x !== it));
       kept.delete(id);
+      unrefuse(id);
       render();
     };
     del.onclick = () => { if (shown) remove(...shown); };
@@ -519,16 +524,17 @@
           : items.length >= IMG_MAX ? `at most ${IMG_MAX} images per message`
           : file.size > IMG_BYTES ? `an image is over ${IMG_BYTES >> 20} MiB`
           : total + file.size > IMG_TOTAL ? `images are over ${IMG_TOTAL >> 20} MiB in total` : "";
-        if (refusal) { error(id, refusal); continue; }
+        if (refusal) { refuse(id, refusal); continue; }
         const url = URL.createObjectURL(file);
         try {
           const [w, h] = await measure(url);
           queues.set(id, [...list(id), { file, url, w, h }]);
           kept.delete(id);
-        } catch (e) { URL.revokeObjectURL(url); error(id, "unsupported image: PNG, JPEG, GIF or WebP only"); }
+          unrefuse(id);
+        } catch (e) { URL.revokeObjectURL(url); refuse(id, "unsupported image: PNG, JPEG, GIF or WebP only"); }
         render();
       }
-    }).catch(() => error(id, "could not read the pasted image")).finally(() => { adding--; }); };
+    }).catch(() => refuse(id, "could not read the pasted image")).finally(() => { adding--; }); };
     // Files without text: a text paste that also carries a picture of itself (office suites) stays text.
     input.addEventListener("paste", (e) => {
       const files = [...(e.clipboardData?.files || [])];

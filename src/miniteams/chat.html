@@ -1235,7 +1235,10 @@
     else if (esearch.key(e)) { e.preventDefault(); e.stopPropagation(); }
   });
   $eq.addEventListener("blur", () => setTimeout(() => { if (document.activeElement !== $eq) closeSearch(); }));
-  const imgs = imageQueue({ input: $reply, box: document.getElementById("imgs"), chat: () => thread, busy: (id) => sends.busy(id), error: (id, text) => noteFor(id, text) });
+  const imgs = imageQueue({ input: $reply, box: document.getElementById("imgs"), chat: () => thread, busy: (id) => sends.busy(id), error: (id, text, was) => {
+    // `was`: clearing a refusal of ours, only if it is still the line shown.
+    if (was === undefined || (id === thread ? $err.textContent : draftOf(id)?.err ?? "") === was) noteFor(id, text);
+  } });
   const sends = sendQueue({
     imgs, socket: () => ws, changed: () => { imgs.render(); drawQueue(); }, note: noteFor,
     nothing: (id) => { if (!(id === thread ? $err.textContent : draftOf(id)?.err)) noteFor(id, "nothing to send"); },  // a refused image keeps its reason
