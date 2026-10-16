@@ -248,17 +248,20 @@ def edit_message(
     text: str,
     *,
     is_html: bool = False,
+    properties: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     url = (
         f"https://{settings.contacts_host}/v1/users/ME/conversations"
         f"/{quote(thread_id, safe='')}/messages/{quote(message_id, safe='')}"
     )
-    body = {
+    body: dict[str, Any] = {
         "content": message_html(text, is_html),
         "messagetype": "RichText/Html",
         "contenttype": "text",
         "skypeeditedid": message_id,
     }
+    if properties is not None:
+        body["properties"] = properties
     result = _check(_CLIENT.put(url, headers=_headers(skype_token, settings), json=body), "edit")
     log.info("message_edited", thread=thread_id, message_id=message_id, status=result["status"])
     return result

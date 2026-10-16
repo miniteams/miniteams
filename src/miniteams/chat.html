@@ -240,13 +240,19 @@
   .menu .favtools button { font-size: 12px; }
   .menu .favtools button:last-child { margin-left: auto; }
   body.readonly .actions [data-act]:not([data-act="teams"]) { display: none; }
-  /* innerText skips what is not displayed: an edit starts from the message without its quotes. */
+  /* innerText skips what is not displayed: a quote's line is the message without its own quotes. */
   .plain blockquote.reply, .plain .card { display: none; }
   .editor { display: block; width: 100%; resize: vertical; font: inherit; color: inherit; background: var(--panel);
     border: 1px solid var(--accent); border-radius: 8px; padding: 6px 8px; }
-  .edit-err { display: block; color: var(--hot); font-size: 12px; }
-  #quotes { display: flex; flex-direction: column; gap: 3px; margin-bottom: 4px; }
-  #quotes[hidden] { display: none; }
+  .editor[readonly] { opacity: .6; }
+  .editbox .tools { margin: 2px 0 0; }
+  .edit-err, .edit-note { display: block; color: var(--hot); font-size: 12px; }
+  .edit-note { color: var(--dim); }
+  .edit-note[hidden] { display: none; }
+  .blocked { color: var(--dim); font-size: 12px; }
+  button.link { border: 0; background: none; padding: 0; color: var(--accent); cursor: pointer; font-size: inherit; text-decoration: underline; }
+  #quotes, .editbox .quotes { display: flex; flex-direction: column; gap: 3px; margin-bottom: 4px; }
+  #quotes[hidden], .editbox .quotes[hidden] { display: none; }
   .quote { display: flex; align-items: center; gap: 6px; border-left: 3px solid var(--accent); background: var(--panel-2);
     border-radius: 0 6px 6px 0; padding: 2px 4px 2px 8px; font-size: 12.5px; color: var(--dim); }
   .quote b { color: var(--text); font-weight: 600; white-space: nowrap; }
@@ -266,17 +272,17 @@
 
   #typing { flex: none; min-height: 1.45em; padding: 0 20px; color: var(--typing); font-style: italic; font-size: 12.5px; }
   footer { flex: none; padding: 0 12px 10px; position: relative; }
-  #tools { display: flex; gap: 2px; margin-bottom: 4px; }
-  #tools button { border: 1px solid transparent; background: transparent; border-radius: 6px; min-width: 26px; padding: 0 6px;
+  .tools { display: flex; gap: 2px; margin-bottom: 4px; }
+  .tools button { border: 1px solid transparent; background: transparent; border-radius: 6px; min-width: 26px; padding: 0 6px;
     cursor: pointer; color: var(--dim); font-size: 12.5px; line-height: 22px; }
-  #tools button:hover { border-color: var(--line); color: var(--accent); }
-  #tools [aria-pressed=true] { background: var(--accent-soft); color: var(--accent); }
-  #tools .sep { flex: 1; }
+  .tools button:hover { border-color: var(--line); color: var(--accent); }
+  .tools [aria-pressed=true] { background: var(--accent-soft); color: var(--accent); }
+  .tools .sep { flex: 1; }
   body.readonly #tools, body.readonly #view { display: none; }
-  #view { margin-bottom: 4px; padding: 6px 10px; max-height: 40vh; overflow-y: auto; background: var(--panel);
+  .view { margin-bottom: 4px; padding: 6px 10px; max-height: 40vh; overflow-y: auto; background: var(--panel);
     border: 1px dashed var(--line); border-radius: 10px; }
-  #view[hidden] { display: none; }
-  #view.err { color: var(--hot); }
+  .view[hidden] { display: none; }
+  .view.err { color: var(--hot); }
   #reply { display: block; width: 100%; resize: none; max-height: calc(8lh + 14px); overflow-y: auto; font: inherit; color: inherit;
     background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
   #reply:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
@@ -318,8 +324,8 @@
 <dialog id="zoom" aria-label="image"><img alt=""></dialog>
 <div id="typing" aria-live="polite"></div>
 <footer>
-  <div id="view" class="html" hidden aria-label="preview"></div>
-  <div id="tools" role="toolbar" aria-label="formatting">
+  <div id="view" class="view html" hidden aria-label="preview"></div>
+  <div id="tools" class="tools" role="toolbar" aria-label="formatting">
     <button data-fmt="bold" title="bold (Ctrl+B)" aria-label="bold"><b>B</b></button>
     <button data-fmt="italic" title="italic (Ctrl+I)" aria-label="italic"><i>I</i></button>
     <button data-fmt="strike" title="strikethrough" aria-label="strikethrough"><s>S</s></button>
@@ -338,7 +344,7 @@
 </div>
 <script>
 (() => {
-  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn rowActions completion imageQueue sendQueue
+  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn rowActions completion insertText formatBar imageQueue sendQueue
   /* ui.js */
   let thread = null;
   try { thread = decodeURIComponent(location.pathname.slice("/chat/".length)); } catch (e) {}
@@ -512,11 +518,10 @@
   keepBottom.observe($outq);
   // A message image opens full size; Escape (native to <dialog>) or a click closes it.
   const $zoom = document.getElementById("zoom");
+  const zoom = (img) => { Object.assign($zoom.firstElementChild, { src: img.src, alt: img.alt }); $zoom.showModal(); };
   $msgs.addEventListener("click", (e) => {
     const img = e.target.closest(".html img:not(.emoji)");
-    if (!img || img.closest("a")) return;  // a linked image keeps its link
-    Object.assign($zoom.firstElementChild, { src: img.src, alt: img.alt });
-    $zoom.showModal();
+    if (img && !img.closest("a")) zoom(img);  // a linked image keeps its link
   });
   $zoom.onclick = () => $zoom.close();
   const toBottom = () => { $list.scrollTop = $list.scrollHeight; hist.stick = !hist.newer; if (hist.stick) hist.unseen = 0; showLatest(); };
@@ -544,10 +549,11 @@
     n.scrollIntoView({ block: t.id ? "center" : "start" });
   };
 
+  const clock = (d) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
   const fmtTime = (iso) => {
     const d = new Date(iso);
     if (isNaN(d)) return "";
-    const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+    const hm = clock(d);
     return d.toDateString() === new Date().toDateString() ? hm : d.toLocaleDateString([], { day: "numeric", month: "short", year: d.getFullYear() === new Date().getFullYear() ? undefined : "numeric" }) + " " + hm;
   };
 
@@ -617,7 +623,7 @@
     return node;
   };
 
-  // The rendered body as plain text, its reply quotes left out (they are lost on edit).
+  // The rendered body as plain text, its reply quotes left out: a quote's line.
   const plainOf = (node) => {
     const h = node.querySelector(".html");
     if (!h) return "";
@@ -627,15 +633,16 @@
     return text.trim();
   };
 
+  // A quote as the composer shows it: who and the first line, as text; ✕ calls `drop`.
+  const quoteChip = (key, name, line, drop) => {
+    const chip = el("div", "quote"), x = el("button", null, "✕");
+    chip.dataset.quote = key;
+    x.title = "drop this quote"; x.setAttribute("aria-label", x.title); x.onclick = drop;
+    chip.append(Object.assign(el("b", null, name), { dir: "auto" }), Object.assign(el("span", "truncate", line), { dir: "auto" }), x);
+    return chip;
+  };
   const renderQuotes = () => {
-    $quotes.replaceChildren(...quotes.map((qt, i) => {
-      const chip = el("div", "quote"), drop = el("button", null, "✕");
-      chip.dataset.quote = qt.id;
-      drop.title = "drop this quote"; drop.setAttribute("aria-label", drop.title);
-      drop.onclick = () => { quotes.splice(i, 1); renderQuotes(); };
-      chip.append(Object.assign(el("b", null, qt.name), { dir: "auto" }), Object.assign(el("span", "truncate", qt.line), { dir: "auto" }), drop);
-      return chip;
-    }));
+    $quotes.replaceChildren(...quotes.map((qt, i) => quoteChip(qt.id, qt.name, qt.line, () => { quotes.splice(i, 1); renderQuotes(); })));
     $quotes.hidden = !quotes.length;
   };
   const addQuote = (r, node) => {
@@ -646,47 +653,149 @@
     $reply.focus();
   };
 
-  const editorsOf = () => [...$msgs.querySelectorAll(".editor")].map((box) => ({ id: box.closest(".msg").dataset.id, text: box.value,
-    focused: box === document.activeElement, note: box.nextElementSibling?.textContent || "", saving: !!box.dataset.saving }));
+  const editorsOf = () => [...$msgs.querySelectorAll(".editbox")].map((w) => w.ed.snap());
   let carry = null;  // the editors a chat had open when left, reopened by its first page
 
-  // Edit in place: the body becomes a textarea; only the ack, a delete echo or Escape puts a message back.
+  // Edit in place (spec 019): the body becomes an editor like the composer, filled from the server's
+  // editable form of the message; only the ack, a delete echo or Escape puts the message back.
+  const CHANGED = "the message changed since it was opened: reopen it to edit";  // chat_verbs.CHANGED
   const rerender = (id) => {
     const node = $msgs.querySelector(`[data-id="${CSS.escape(id)}"]`), r = hist.records.get(id);
     if (node && r) { node.replaceWith(renderMessage(r)); regroup(); }
   };
-  const startEdit = (node, r, text = null, focus = true, note = "") => {
+  const linkBtn = (text, act) => Object.assign(el("button", "link", text), { onclick: act });
+  // Not editable here (a table, a card…): the reason, as text, and the way to edit it in Teams.
+  const blocked = (id, reason) => {
+    const line = el("div", "blocked", `can't edit here: ${reason} · `);
+    line.append(linkBtn("Open in Teams", () => openTeams(id)));
+    byId(id)?.querySelector(":scope > .body").append(line);
+  };
+  // The server's form, checked like any input: what the editor shows goes in as text only.
+  const formOf = (m) => ({ text: typeof m.text === "string" ? m.text : "", picks: Array.isArray(m.picks) ? m.picks : [],
+    edittime: String(m.edittime ?? ""),
+    quotes: (Array.isArray(m.quotes) ? m.quotes : []).filter((x) => typeof x?.key === "string").map((x) => ({ key: x.key, name: String(x.name ?? ""), line: String(x.line ?? "") })),
+    images: (Array.isArray(m.images) ? m.images : []).filter((x) => typeof x?.key === "string").map((x) => ({ key: x.key, src: String(x.src ?? ""), alt: String(x.alt ?? "") })) });
+  // `snap`: an editor restored (a page reload, a chat switch back) with what it held; else it opens.
+  const startEdit = (node, r, snap = null, focus = true) => {
     const h = node.querySelector(".html");
     if (!h || node.querySelector(".editor")) return;
-    const box = el("textarea", "editor"), err = el("small", "edit-err");
-    box.value = text ?? plainOf(node);
-    err.textContent = note;
-    box.rows = Math.min(8, box.value.split("\n").length);
+    node.querySelector(".blocked")?.remove();
+    const wrap = el("div", "editbox"), qs = el("div", "quotes"), box = el("textarea", "editor"), pics = el("div", "imgs"),
+      bar = $tools.cloneNode(true), view = el("div", "view html"), pop = el("div", "pop"), note = el("small", "edit-note"), err = el("small", "edit-err");
+    bar.removeAttribute("id");
+    const eye = bar.querySelector("[aria-pressed]");
+    eye.removeAttribute("id"); eye.textContent = "👁";
+    pop.id = "editpop-" + r.id;
+    pop.hidden = view.hidden = note.hidden = true;
+    box.setAttribute("aria-label", "edit the message");
+    const ed = wrap.ed = { form: null, quotes: [], images: [], tries: 0, failed: null, box };
+    const complete = completion({ input: box, pop, send: (o) => send(o), chat: () => thread, edited: () => fmt.hide(), above: false,
+      put: (text, from, to) => insertText(box, text, from, to, from + text.length, from + text.length) });
+    const fmt = formatBar({ input: box, bar, view, ask: (text) => askPreview(fmt, text), edited: () => fmt.hide(), close: () => complete.close() });
+    ed.complete = complete;
+    const fail = ed.fail = (text, again = false) => {
+      ed.failed = text ? { text, again } : null;
+      err.replaceChildren(...(text ? [text] : []), ...(again ? [" · ", linkBtn("reopen", () => reload(true))] : []));
+    };
+    const draw = () => {
+      qs.replaceChildren(...ed.quotes.map((qt) => quoteChip(qt.key, qt.name, qt.line, () => { ed.quotes = ed.quotes.filter((x) => x !== qt); draw(); box.focus(); })));
+      qs.hidden = !ed.quotes.length;
+      pics.replaceChildren(...ed.images.map((it, i) => {
+        const t = el("span", "thumb"), open = el("button", "open"), x = el("button", "rm", "×"), img = Object.assign(el("img"), { src: it.src, alt: it.alt || `image ${i + 1}` });
+        open.title = "preview"; open.append(img);
+        open.onclick = () => zoom(img);
+        x.title = "remove"; x.setAttribute("aria-label", `remove image ${i + 1}`);
+        x.onclick = () => { ed.images = ed.images.filter((y) => y !== it); draw(); box.focus(); };
+        t.append(open, x);
+        return t;
+      }));
+      pics.hidden = !ed.images.length;
+    };
+    const fill = (form, text = form.text, quotes = form.quotes, images = form.images, picks = form.picks) => {
+      Object.assign(ed, { form, quotes, images });
+      complete.restore(picks);
+      Object.assign(box, { readOnly: false, placeholder: "", value: text, rows: Math.min(8, text.split("\n").length) });
+      draw();
+    };
+    // The form again: "take that version" shows it as it is now; `keep` ("reopen" after a refusal, which
+    // means a kept quote or image is gone) takes its quotes and images but keeps a text typed meanwhile.
+    const load = (keep = false) => {
+      if (keep && ed.form) ed.keep = { from: ed.form.text, picks: complete.mentions(box.value) };
+      if (!keep) ed.keep = null;
+      Object.assign(ed, { form: null, quotes: [], images: [] });
+      Object.assign(box, { readOnly: true, placeholder: "loading…", ...(ed.keep ? {} : { value: "", rows: 1 }) });
+      fail(""); note.hidden = true; fmt.hide(); complete.close(); draw();
+      if (!send({ editable: thread, msg: r.id })) fail("offline, not opened", true);
+    };
+    const reload = (keep) => { load(keep); box.focus(); };  // its link is gone
+    ed.opened = (m) => {
+      if (m.error === "busy" && ed.tries < BUSY_TRIES) { ed.tries++; setTimeout(() => { if (box.isConnected && !ed.form) load(!!ed.keep); }, BUSY_RETRY_MS); return; }
+      ed.tries = 0;
+      if ("blocked" in m) {
+        // A text typed meanwhile stays, read-only, to copy: the reason on its error line, Escape closes.
+        if (ed.keep && box.value !== ed.keep.from) { ed.failed = null; err.replaceChildren(`can't edit here: ${m.blocked} · `, linkBtn("Open in Teams", () => openTeams(r.id))); return; }
+        rerender(r.id); blocked(r.id, String(m.blocked)); return;
+      }
+      if (!m.ok) { fail(why(m.error) || "not opened", true); return; }
+      const form = formOf(m), k = ed.keep;
+      ed.keep = null;
+      if (k && box.value !== k.from) fill(form, box.value, form.quotes, form.images, k.picks); else fill(form);
+      ed.elsewhere(hist.records.get(r.id));  // a change landed while it loaded
+    };
+    // A change made elsewhere since it opened (`edittime`, not a reaction): said, and reloadable. A record
+    // older than the form opened (its update relayed late) is not news.
+    ed.elsewhere = (rec) => {
+      if (!ed.form || box.dataset.saving || !(Number(rec?.edittime) > Number(ed.form.edittime || 0))) return;  // "" or no record: 0 / NaN, never newer
+      const d = new Date(Number(rec.edittime));
+      note.replaceChildren(`edited elsewhere${isNaN(d) ? "" : " at " + clock(d)} · `, linkBtn("take that version", () => reload(false)));
+      note.hidden = false;
+    };
+    ed.snap = () => ({ id: r.id, text: box.value, focused: box === document.activeElement, saving: !!box.dataset.saving, failed: ed.failed,
+      form: ed.form, quotes: ed.quotes, images: ed.images, picks: ed.form ? complete.mentions(box.value) : [], keep: ed.keep });
     box.onkeydown = (e) => {
+      if (complete.key(e)) { e.preventDefault(); return; }
+      if (fmt.key(e)) return;
       if (e.key === "Escape") { e.preventDefault(); rerender(r.id); return; }
       if (e.key !== "Enter" || e.shiftKey || e.isComposing || e.keyCode === 229) return;
       e.preventDefault();
-      if (box.dataset.saving) return;  // a flag, not `disabled`: Escape must still reach the field
-      if (!send({ edit: thread, msg: r.id, text: box.value })) { err.textContent = "offline, not saved"; return; }
-      err.textContent = ""; box.dataset.saving = "1";
+      if (box.dataset.saving || !ed.form) return;  // a flag, not `disabled`: Escape must still reach the field
+      const text = box.value, keep_quotes = ed.quotes.map((qt) => qt.key), keep_images = ed.images.map((it) => it.key);
+      // Teams would mark an untouched message edited: nothing to send.
+      if (text === ed.form.text && keep_quotes.length === ed.form.quotes.length && keep_images.length === ed.form.images.length) { rerender(r.id); return; }
+      if (!send({ edit: thread, msg: r.id, text, mentions: complete.mentions(text), keep_quotes, keep_images })) { fail("offline, not saved"); return; }
+      fail(""); box.dataset.saving = "1";
     };
-    h.replaceWith(box, err);
+    wrap.append(qs, box, pics, bar, view, pop, note, err);
+    h.replaceWith(wrap);
+    if (snap?.form) {
+      fill(snap.form, snap.text, snap.quotes, snap.images, snap.picks);
+      if (snap.failed) fail(snap.failed.text, snap.failed.again);
+      ed.elsewhere(r);
+    } else if (snap?.keep) { box.value = snap.text; ed.keep = snap.keep; load(true); }
+    else load();
     if (focus) box.focus();
   };
   // The server runs one action per socket: with chats switched mid-action, a second one can meet it.
   const why = (e) => e === "busy" ? "another action is still running, try again" : e;
+  const editorOf = (id) => byId(id || "")?.querySelector(".editbox")?.ed;
+  const onEditable = (m) => {
+    if (m.editable !== thread) return;  // asked before a switch: the stashed editor asks again
+    const ed = editorOf(m.msg);
+    if (ed && !ed.form) ed.opened(m);  // else closed, or filled by an answer before this one
+  };
   const onAction = (m) => {
     const tid = m.edit ?? m.react ?? m.delete, what = "react" in m ? "reaction: " : "delete" in m ? "delete: " : "edit: ";
     // A chat left since: its stashed editors start idle, so only a failure is worth keeping.
     if (tid !== thread) { if (m.error) noteFor(tid, what + why(m.error)); return; }
     if (m.edit !== undefined) {
-      const node = $msgs.querySelector(`[data-id="${CSS.escape(m.msg || "")}"]`), box = node?.querySelector(".editor");
+      const ed = editorOf(m.msg);
       // No editor waiting for it (cancelled, malformed id): only a failure is worth saying.
-      if (!box?.dataset.saving) { if (m.error) $err.textContent = "edit: " + why(m.error); return; }
-      delete box.dataset.saving;
+      if (!ed?.box.dataset.saving) { if (m.error) $err.textContent = "edit: " + why(m.error); return; }
+      delete ed.box.dataset.saving;
       if (m.ok) { rerender(m.msg); return; }
-      box.focus();
-      node.querySelector(".edit-err").textContent = why(m.error) || "not saved";
+      ed.box.focus();
+      ed.fail(why(m.error) || "not saved", m.error === CHANGED);
+      ed.elsewhere(hist.records.get(m.msg));  // skipped while it saved
       return;
     }
     if (m.error) $err.textContent = what + why(m.error);
@@ -783,7 +892,7 @@
     for (const r of edits) replace(r);
     for (const e of editing) {
       const node = $msgs.querySelector(`[data-id="${CSS.escape(e.id)}"]`), r = hist.records.get(e.id);
-      if (node && r && !r.deleted) startEdit(node, r, e.text, e.focused, e.note);
+      if (node && r && !r.deleted) startEdit(node, r, e, e.focused);
       else $err.textContent = "edit lost: the message is no longer shown";
     }
     $note.hidden = hist.records.size > 0;
@@ -869,7 +978,8 @@
     if (!old || !node) return;  // not on screen: the next page read carries it
     const merged = patch(old, r);
     hist.records.set(r.id, merged);
-    if (node.querySelector(".editor") && !merged.deleted) return;  // an edit in progress: shown once it ends
+    const ed = !merged.deleted && editorOf(r.id);
+    if (ed) { ed.elsewhere(merged); return; }  // an edit in progress: shown once it ends
     node.replaceWith(renderMessage(merged));
     regroup();
   };
@@ -1091,17 +1201,9 @@
   };
 
   const $pop = document.getElementById("pop");
-  // execCommand keeps the edit in the textarea's undo history (Ctrl+Z); setRangeText would not.
-  // Its `input` event runs the completion's lookup: an insert settles what it dismisses before calling.
-  const put = (text, a, b, selA, selB) => {
-    $reply.focus();
-    $reply.setSelectionRange(a, b);
-    if (!document.execCommand("insertText", false, text)) $reply.setRangeText(text, a, b);
-    $reply.setSelectionRange(selA, selB);
-  };
   const complete = completion({
     input: $reply, pop: $pop, send: (o) => send(o), chat: () => thread, edited: () => edited(), above: true,
-    put: (text, from, to) => put(text, from, to, from + text.length, from + text.length),
+    put: (text, from, to) => insertText($reply, text, from, to, from + text.length, from + text.length),
   });
   // One `:emoji` search (spec 012's completion) for the ⚙ slots and the picker's "…"; `onEmoji` takes the pick.
   const $esearch = el("span", "esearch"), $eq = el("input"), $epop = el("div");
@@ -1168,77 +1270,19 @@
     if (was) toBottom(); else showLatest();
   };
 
-  // Toolbar (spec 012, full format): markers around the selection, or around the caret to type into.
-  const MARK = { bold: "**", italic: "*", strike: "~~", code: "`" };
-  const format = (fmt) => {
-    if ($reply.disabled) return;
-    const v = $reply.value, a = $reply.selectionStart, b = $reply.selectionEnd, sel = v.slice(a, b);
-    if (fmt === "list" || fmt === "quote") {
-      // Whole lines: from the start of the first one to the end of the last (a trailing newline ends it).
-      const from = v.lastIndexOf("\n", a - 1) + 1, end = b > a && v[b - 1] === "\n" ? b - 1 : b;
-      const nl = v.indexOf("\n", end), to = nl < 0 ? v.length : nl;
-      const lines = v.slice(from, to).split("\n").map((l) => (fmt === "list" ? "- " : "> ") + l).join("\n");
-      put(lines, from, to, from, from + lines.length);
-    } else if (fmt === "code" && sel.includes("\n")) {
-      // A fence only opens and closes on a line of its own.
-      const pre = a && v[a - 1] !== "\n" ? "\n" : "", post = b < v.length && v[b] !== "\n" ? "\n" : "";
-      const text = pre + "```\n" + sel + "\n```" + post;
-      put(text, a, b, a, a + text.length);
-    } else if (!sel) {
-      const m = MARK[fmt];
-      put(m + m, a, b, a + m.length, a + m.length);
-    } else {
-      // The server never closes a marker across lines, nor one with a space inside it: each line gets
-      // its own pair, inside its list or quote prefix, around its text without the surrounding spaces.
-      const m = MARK[fmt], atLineStart = !a || v[a - 1] === "\n";
-      let inner = null;
-      const text = sel.split("\n").map((l, i) => {
-        const p = i || atLineStart ? /^\s*(?:(?:[-*]|\d+\.|>) +)*/.exec(l)[0] : "";
-        const [, lead, body, tail] = /^(\s*)(.*?)(\s*)$/.exec(l.slice(p.length));
-        if (!body) return l;
-        inner ??= [p.length + lead.length + m.length, body.length];
-        return p + lead + m + body + m + tail;
-      }).join("\n");
-      const one = inner && !sel.includes("\n");  // one line: its text stays selected, inside the markers
-      put(text, a, b, one ? a + inner[0] : a, one ? a + inner[0] + inner[1] : a + text.length);
-    }
-    complete.close();
-    edited();
-  };
-  const $tools = document.getElementById("tools");
-  for (const btn of $tools.querySelectorAll("[data-fmt]")) btn.onclick = () => format(btn.dataset.fmt);
-
-  // Preview: the server renders what `send` would post. Its HTML is compose output (escaped by
-  // construction, emoji images on /emoji/), the only markup besides the message bodies.
-  const $view = document.getElementById("view"), $show = document.getElementById("show");
-  // The server answers previews in the order asked: only the answer to the last ask, while on, shows.
-  let showing = false, asked = 0;
-  const hideView = () => { showing = false; $view.hidden = true; $view.replaceChildren(); $show.setAttribute("aria-pressed", "false"); };
-  $show.onclick = () => {
-    if (showing) { hideView(); return; }
-    showing = true;
-    $show.setAttribute("aria-pressed", "true");
-    if (send({ preview: $reply.value, format: "full" })) asked++;
-    else { $view.className = "err"; $view.textContent = "offline, no preview"; $view.hidden = false; }
-  };
-  const onPreview = (m) => {
-    asked = Math.max(0, asked - 1);
-    if (!showing || asked) return;  // toggled off, or a later ask (the text changed since) is pending
-    if (m.error) { $view.className = "err"; $view.textContent = m.error; }
-    else {
-      $view.className = "html"; $view.innerHTML = typeof m.preview === "string" ? m.preview : "";
-      // A link followed in place would replace the page and its drafts.
-      for (const a of $view.querySelectorAll("a")) Object.assign(a, { target: "_blank", rel: "noopener" });
-    }
-    $view.hidden = false;
-  };
-  const edited = () => { grow(); if (showing) hideView(); };
+  // Previews are answered in the order asked, each to the bar that asked (the composer's or an editor's).
+  const $tools = document.getElementById("tools"), asks = [];
+  const askPreview = (bar, text) => { if (!send({ preview: text, format: "full" })) return false; asks.push(bar); return true; };
+  const onPreview = (m) => asks.shift()?.answered(m);
+  const composeBar = formatBar({ input: $reply, bar: $tools, view: document.getElementById("view"), ask: (text) => askPreview(composeBar, text),
+    edited: () => edited(), close: () => complete.close() });
+  const hideView = () => composeBar.hide();
+  const edited = () => { grow(); hideView(); };
 
   $reply.oninput = edited;
   $reply.onkeydown = (e) => {
     if (complete.key(e)) { e.preventDefault(); return; }
-    const k = e.key.toLowerCase();
-    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && !e.isComposing && e.keyCode !== 229 && (k === "b" || k === "i")) { e.preventDefault(); format(k === "b" ? "bold" : "italic"); return; }
+    if (composeBar.key(e)) return;
     if (e.key !== "Enter" || e.shiftKey || e.isComposing || e.keyCode === 229) return;
     e.preventDefault();
     submit();
@@ -1565,8 +1609,9 @@
       else if ("follow" in m) onFollow(m);
       else if ("history" in m) onHistory(m);
       else if ("search" in m) onSearch(m);
-      else if ("complete" in m) { complete.answered(m); esearch.answered(m); }
+      else if ("complete" in m) { complete.answered(m); esearch.answered(m); for (const w of $msgs.querySelectorAll(".editbox")) w.ed.complete.answered(m); }
       else if ("preview" in m) onPreview(m);
+      else if ("editable" in m) onEditable(m);  // before `m.msg`: its answer names the message by id
       // Acks name the thread; a relayed `edit` frame carries a record.
       else if (typeof m.edit === "string" || "react" in m || "delete" in m) onAction(m);
       else if (m.msg) {
@@ -1580,12 +1625,13 @@
     ws.onclose = () => {
       $status.title = "disconnected"; $status.classList.add("off");
       typing.clear(); renderTyping();
-      if (asked) hideView();  // its answer died with the socket: no pressed button over an empty box
-      asked = 0;
+      for (const b of asks.splice(0)) b.lost();
       sends.lost();
       for (const box of $msgs.querySelectorAll(".editor[data-saving]")) {
         delete box.dataset.saving;
-        box.nextElementSibling.textContent = "connection lost: check the message before saving again";
+        const ed = box.closest(".editbox").ed;
+        ed.fail("connection lost: check the message before saving again");
+        ed.elsewhere(hist.records.get(box.closest(".msg").dataset.id));  // skipped while it saved
       }
       setTimeout(connect, retry.next());
     };

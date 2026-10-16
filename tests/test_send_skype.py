@@ -125,6 +125,22 @@ def test_edit_message_puts_with_skypeeditedid(settings: Settings, monkeypatch) -
     assert captured["json"]["content"] == "new <b>text</b>"
 
 
+def test_edit_message_carries_properties_only_when_given(settings: Settings, monkeypatch) -> None:
+    """019-AC3: an edit's mentions go in `properties` as a send's do; without them the body is unchanged."""
+    bodies: list[dict[str, Any]] = []
+
+    def fake_put(url: str, **kw: Any) -> _Resp:
+        bodies.append(kw["json"])
+        return _Resp({}, status=200)
+
+    monkeypatch.setattr(send._CLIENT, "put", fake_put)
+    props = {"mentions": '[{"itemid": 0}]'}
+    send.edit_message(settings, "sk", "48:notes", "1781920776714", "x", is_html=True)
+    send.edit_message(settings, "sk", "48:notes", "1781920776714", "x", is_html=True, properties=props)
+    assert "properties" not in bodies[0]
+    assert bodies[1] == {**bodies[0], "properties": props}
+
+
 def test_delete_message_sends_a_bare_delete(settings: Settings, monkeypatch) -> None:
     """011-AC14: DELETE on the message URL, no query, no body (the wire captured from Teams web)."""
     captured: dict[str, Any] = {}

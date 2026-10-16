@@ -636,27 +636,23 @@ async def test_edit_escape_cancels_enter_saves_errors_stay_inline(
     shows under the field with the text kept."""
     page = await chat.open(_chat(T))
     await _handled(page, "history")
-    await page.locator('[data-id="3"]').hover()
-    await _act(page, "3", "edit").click()
-    box = page.locator('[data-id="3"] .editor')
+    box = await _edit(page, "3")
     assert await box.input_value() == "mine"
     await page.locator("#reply").hover()
     assert await page.locator('[data-id="3"] .actions').is_hidden()  # no bar over an open editor
     await box.press("Escape")
     assert await page.locator('[data-id="3"] .editor').count() == 0
     assert await page.locator('[data-id="3"] .html').inner_text() == "mine"
-    await page.locator('[data-id="3"]').hover()
-    await _act(page, "3", "edit").click()
+    await _edit(page, "3")
     await box.fill("mine v2")
     await box.press("Shift+Enter")
     await box.press_sequentially("more")
     await box.press("Enter")
     await page.wait_for_selector('[data-id="3"] .html')  # the ack closes the editor
-    assert calls == [("edit", T, "3", "mine v2\nmore")]
+    assert calls == [_composed("mine v2\nmore")]
 
     monkeypatch.setattr(CV, "edit_message", _refused)
-    await page.locator('[data-id="3"]').hover()
-    await _act(page, "3", "edit").click()
+    await _edit(page, "3")
     await box.fill("kept")
     await box.press("Enter")
     await page.wait_for_function("document.querySelector('[data-id=\"3\"] .edit-err')?.textContent")
@@ -682,28 +678,72 @@ async def test_delete_asks_first(chat: Pages, calls: list[tuple[Any, ...]]) -> N
 _MINE = {"from": f"https://h/v1/users/ME/contacts/{ME}", "imdisplayname": "Me Self"}
 
 
-def _refused(*args: Any) -> None:
+def _refused(*args: Any, **kw: Any) -> None:
     request = httpx.Request("PUT", "https://x")
     raise httpx.HTTPStatusError("no", request=request, response=httpx.Response(403, request=request))
 
 
 async def _edit(page: Page, msg_id: str) -> Any:
+    """Open the editor on my message `msg_id`, once the server's editable form filled it (spec 019)."""
     await page.locator(f'[data-id="{msg_id}"]').hover()
     await _act(page, msg_id, "edit").click()
+    await page.wait_for_selector(f'[data-id="{msg_id}"] .editor:not([readonly])')
     return page.locator(f'[data-id="{msg_id}"] .editor')
 
 
-async def test_edit_starts_from_the_text_without_its_reply_quote(board: W.Board, chat: Pages) -> None:
-    """011-AC13: quotes are lost on edit: the field holds only what I wrote."""
+def _composed(text: str) -> tuple[str, str, str, str, dict[str, Any]]:
+    """The `edit` call a save of `text` makes (no mention, quote nor image): composed as a send."""
+    content, props = compose.compose_html(text, [], {}, full=True)
+    return ("edit", T, "3", content, {"is_html": True, "properties": props})
+
+
+# Every element the editor prefills (spec 019 Prefill), as the composer writes it.
+_RICH = "**b** _i_ ~~s~~ `c` [l](https://example.invalid/) @Ann Lee 😀\n- one\n- two\n> q"
+
+
+async def test_edit_round_trips_the_message_less_a_dropped_quote(
+    board: W.Board, chat: Pages, data_dir: Path, calls: list[tuple[Any, ...]]
+) -> None:
+    """019-AC4 + 019-AC6: the editor opens on the composer's markdown of the message, its mention picked,
+    its reply quote as a chip; ✕ drops the quote and the saved message is the same one without it."""
+    content, props = compose.compose_html(_RICH, [{"name": "Ann Lee", "mri": ANN}], {}, full=True)
+    assert props is not None
+    quote_html = compose.reply_quote(_m("1", _at(1), "<p>hello there</p>"), "Ann Lee")
+    _archive(data_dir, T, [_m("9", _at(9), quote_html + content, properties=props, **_MINE)])
     page = await chat.open(_chat(T))
     await _handled(page, "history")
-    body = (
-        compose.reply_quote(_m("1", _at(1), "<p>hello there</p>"), "Ann Lee")
-        + "<p>my answer</p><p>second</p>"
-    )
-    await board.on_event(_event("NewMessage", T, **_m("9", _at(9), body, **_MINE)))
-    await page.wait_for_selector('[data-id="9"] blockquote.reply')
-    assert await (await _edit(page, "9")).input_value() == "my answer\n\nsecond"
+    box = await _edit(page, "9")
+    assert await box.input_value() == _RICH
+    chip = page.locator('[data-id="9"] .editbox .quote')
+    assert await chip.all_inner_texts() == ["Ann Lee\nhello there\n✕"]
+    await chip.locator("button").click()
+    assert await chip.count() == 0
+    await box.press("Enter")
+    await page.wait_for_selector('[data-id="9"] .html')
+    assert calls == [("edit", T, "9", content, {"is_html": True, "properties": props})]
+
+
+async def test_a_message_that_cannot_be_edited_here_says_why(
+    board: W.Board, chat: Pages, calls: list[tuple[Any, ...]]
+) -> None:
+    """019-AC9: ✎ on a message miniteams cannot write back opens no editor: the reason shows on the
+    message with Open in Teams, and no edit is sent."""
+    page = await chat.open(_chat(K))
+    await _handled(page, "history")
+    assert "CARDTEXT" in await page.locator('[data-id="3"] .html .card').inner_text()
+    await page.locator('[data-id="3"]').hover()
+    await _act(page, "3", "edit").click()
+    line = page.locator('[data-id="3"] .blocked')
+    await line.wait_for()
+    assert await line.inner_text() == "can't edit here: a card · Open in Teams"
+    assert await page.locator(".editor").count() == 0
+    async with page.context.expect_page() as tab:
+        await line.locator("button", has_text="Open in Teams").click()
+    await (await tab.value).close()
+    await _until(chat.external, 1)
+    assert chat.external == [W.deep_link(K, "3")]
+    chat.external.clear()
+    assert calls == []
 
 
 async def test_live_frames_during_an_edit(board: W.Board, chat: Pages) -> None:
@@ -763,7 +803,7 @@ async def test_a_save_cut_by_a_reconnect_can_be_retried_and_the_composer_keeps_f
     entered, release = threading.Event(), threading.Event()
     saved: list[str] = []
 
-    def first_held(*args: Any) -> dict[str, Any]:
+    def first_held(*args: Any, **kw: Any) -> dict[str, Any]:
         saved.append(args[-1])
         if len(saved) == 1:
             entered.set()
@@ -790,7 +830,7 @@ async def test_a_save_cut_by_a_reconnect_can_be_retried_and_the_composer_keeps_f
     await box.fill("second try")
     await box.press("Enter")
     await page.wait_for_selector('[data-id="3"] .html')
-    assert saved == ["first try", "second try"]
+    assert saved == [_composed("first try")[3], _composed("second try")[3]]
 
 
 async def test_escape_during_a_save_then_its_failure_lands_on_the_composer_line(
@@ -799,7 +839,7 @@ async def test_escape_during_a_save_then_its_failure_lands_on_the_composer_line(
     """011-AC13: the field stays usable while saving; a failure with no editor left still shows."""
     entered, release = threading.Event(), threading.Event()
 
-    def held(*args: Any) -> None:
+    def held(*args: Any, **kw: Any) -> None:
         entered.set()
         release.wait(5)
         _refused()
@@ -1689,15 +1729,6 @@ async def test_reconnect_on_a_message_folded_meanwhile_keeps_the_place(
     await _handled(page, "history", since)
     assert await page.locator('[data-id="7"]').is_hidden()
     assert abs(await page.evaluate(_OFFSET, "6") - before) < 2
-
-
-async def test_editing_my_message_leaves_its_card_out(chat: Pages) -> None:
-    """011-AC13: the editor starts from my text only, not from the card the message carries."""
-    page = await chat.open(_chat(K))
-    await _handled(page, "history")
-    assert "CARDTEXT" in await page.locator('[data-id="3"] .html .card').inner_text()
-    box = await _edit(page, "3")
-    assert await box.input_value() == "hello"
 
 
 # --- split navigation (011 phase 6) ---

@@ -447,6 +447,7 @@ def test_record_fields() -> None:
         "html": "<p>hi <b>you</b></p>",
         "edited": True,
         "deleted": False,
+        "edittime": "1789466500000",
         "reactions": [],
         "mentions": None,
         "cmid": "",
@@ -1643,8 +1644,8 @@ def calls(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
         made.append(("react", thread_id, msg, key, remove))
         return {"status": 200}
 
-    def fake_edit(s: Any, token: str, thread_id: str, msg: str, text: str) -> dict[str, Any]:
-        made.append(("edit", thread_id, msg, text))
+    def fake_edit(s: Any, token: str, thread_id: str, msg: str, text: str, **kw: Any) -> dict[str, Any]:
+        made.append(("edit", thread_id, msg, text, *([kw] if kw else [])))  # kw: spec 019's composed edit
         return {"status": 200}
 
     def fake_delete(s: Any, token: str, thread_id: str, msg: str) -> dict[str, Any]:

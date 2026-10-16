@@ -170,6 +170,10 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
 - **Composer** (also the widget's quick reply): completes `:emoji` and `@member` (`@everyone` on group chats, not 1:1;
   picked members are notified; a mention needs a non-word character before `@`, and two members with the same name map
   in the order they were picked). Messages are limited to 28 KB.
+  - A backslash keeps markup literal: `\*` `\_` `\~` `` \` `` `\[`, and on the chat page a line starting `\- ` `\* `
+    `\> ` `\1. ` (or a line that is only `\>`); `\\` is one backslash before another backslash or one of those, or
+    (chat page) before a line-start marker; any other backslash stays as typed (`\\srv\share`), and backslashes
+    inside `code`, link labels and URLs stay as typed.
   - Enter empties the box at once: sends queue one at a time per chat, in order. Queued sends survive a reload or a
     dropped connection and go out in order, an unanswered one checked (their pasted images do not survive a reload).
     A chat page in list mode sends only its own chat's: other chats' wait for the widget (◀) or their own page.
@@ -197,6 +201,14 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   Hover any reaction chip to see all the message's reactions, grouped by emoji with their participants.
   Native skin tones (`yes-tone1` → 👍🏻 through `yes-tone5` → 👍🏿) are preserved on supported emoji.
   Cards from bots and apps are rendered; runs of deleted messages are folded.
+- **Editing** (✎, spec 019): the message turns into an editor like the composer: `:emoji` / `@member` completion,
+  Ctrl+B / Ctrl+I and a mini toolbar with a 👁 preview. It opens on the message's own markdown (formatting, links,
+  emojis, mentions kept as picked), its reply quotes above and its pasted images under it, each removable (✕ / ×),
+  none addable. Enter saves the message composed as a send, Shift+Enter breaks the line, Escape cancels; Enter with
+  nothing changed closes it without an edit (Teams would mark it edited). A message miniteams cannot write back
+  (table, heading, nested list, underline, card, image inside the text, tag mention…) opens no editor: it says why,
+  with Open in Teams. Edited in Teams meanwhile: "edited elsewhere at HH:MM", and "take that version" reloads it;
+  saving still replaces it. A message changed so that a kept quote or image is gone is refused: "reopen" loads it again, keeping a text typed meanwhile; a reopen answered "not editable here" keeps that text read-only, to copy, with the reason and Open in Teams (Escape closes it).
 - **Read receipts** (spec 011): each member's small avatar sits under the newest message they read, whoever wrote it.
   More than 3 readers on one message show 3 avatars and `+N`; hover lists every reader. Your own reads and an author's
   read of their own message are not shown. A member without a receipt (disabled, unsupported, not read yet) shows

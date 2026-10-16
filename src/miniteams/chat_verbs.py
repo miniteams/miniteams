@@ -22,7 +22,7 @@ from collections.abc import Awaitable, Callable, Coroutine
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeIs
 from urllib.parse import unquote
 
 import httpx
@@ -33,12 +33,20 @@ from websockets.exceptions import ConnectionClosed
 from .archive_store import chat_label, find_chat_dir, messages_by_id, read_page, search_chat
 from .chats import chat_kind
 from .compose import MAX_TEXT, compose_html, reply_quote
+from .decompose import Editable, decompose
 from .directory import Directory, is_app
 from .dump import epoch_seconds, fetch_history
 from .emoji_table import SHORTCODES
 from .emojis import EmojiCache
 from .http import failure
-from .images import MAX_IMAGE_BYTES, MAX_IMAGES, MAX_TOTAL_BYTES, check_batch, check_dimensions
+from .images import (
+    MAX_IMAGE_BYTES,
+    MAX_IMAGES,
+    MAX_TOTAL_BYTES,
+    OBJECT_ID_RE,
+    check_batch,
+    check_dimensions,
+)
 from .messages import (
     TEXT_TYPES,
     activity_line,
@@ -111,6 +119,7 @@ _UNSURE_ERRORS = (
     httpx.RemoteProtocolError,
 )
 UNSURE = "no answer from Teams: the message may have gone out"
+CHANGED = "the message changed since it was opened: reopen it to edit"
 _BLOCK_RE = re.compile(r"<(?:p|div|ul|ol|pre|blockquote|h\d)\b")
 # The page may not load the asyncgw URL (it needs the skype token): previews point at /emoji/<id>.
 _ASYNCGW_SRC_RE = re.compile(
@@ -294,6 +303,7 @@ def chat_record(
         "html": body,
         "edited": is_edited(message),
         "deleted": deleted,
+        "edittime": str(props.get("edittime") or ""),  # spec 019: the editor tells an edit made elsewhere
         "reactions": reactions,
         "mentions": mention_kind(message, me),
         "cmid": str(message.get("clientmessageid") or ""),  # the page swaps its queued bubble for this echo
@@ -336,6 +346,9 @@ class ActRequest:
     key: str = ""
     remove: bool = False
     text: str = ""
+    mentions: tuple[dict[str, Any], ...] = ()  # edit: picked, like a send's
+    keep_quotes: tuple[str, ...] | None = None  # edit: Reply blocks kept, by quoted id; None: an old page
+    keep_images: tuple[str, ...] = ()  # edit: trailing images kept, by AMS object id
 
 
 @dataclass(frozen=True, slots=True)
@@ -452,10 +465,49 @@ def parse_act(action: Action, verb: dict[str, Any]) -> ActRequest | str:
             return "invalid reaction"
         return ActRequest(action, thread, msg, key=sent, remove=remove)
     if action == "edit":
-        if error := _text_error(text):
+        if not any(k in verb for k in ("mentions", "keep_quotes", "keep_images")):
+            if error := _text_error(text):
+                return error
+            return ActRequest(action, thread, msg, text=str(text))
+        quotes, images = verb.get("keep_quotes"), verb.get("keep_images")
+        if not _keys(quotes, MSG_ID_RE):
+            return "invalid kept quote"
+        if not _keys(images, OBJECT_ID_RE):
+            return "invalid kept image"
+        # Kept images alone are a message, as in a send.
+        if not (images and isinstance(text, str) and not text.strip()) and (error := _text_error(text)):
             return error
-        return ActRequest(action, thread, msg, text=str(text))
+        mentions = [] if verb.get("mentions") is None else verb["mentions"]
+        if not isinstance(mentions, list) or not all(_mention_shape(m) for m in mentions):
+            return "invalid mention"
+        return ActRequest(
+            action,
+            thread,
+            msg,
+            text=str(text),
+            mentions=tuple(mentions),
+            keep_quotes=tuple(quotes),
+            keep_images=tuple(images),
+        )
     return ActRequest(action, thread, msg)
+
+
+def _keys(value: Any, pattern: re.Pattern[str]) -> TypeIs[list[str]]:
+    return (
+        isinstance(value, list)
+        and all(isinstance(key, str) and pattern.fullmatch(key) for key in value)
+        and len(set(value)) == len(value)
+    )
+
+
+def parse_editable(verb: dict[str, Any]) -> tuple[str, str] | str:
+    """`editable` → (thread, message id)."""
+    thread, msg = verb.get("editable"), verb.get("msg")
+    if not isinstance(thread, str):
+        return "unknown chat"
+    if not isinstance(msg, str) or not MSG_ID_RE.fullmatch(msg):
+        return "invalid message"
+    return thread, msg
 
 
 def parse_history(verb: dict[str, Any]) -> HistoryRequest | str:
@@ -523,6 +575,11 @@ def _head_send(verb: dict[str, Any]) -> dict[str, Any]:
 def _head_act(action: Action, verb: dict[str, Any]) -> dict[str, Any]:
     msg = verb.get("msg")
     return {action: verb.get(action), "msg": msg if isinstance(msg, str) else None}
+
+
+def _head_editable(verb: dict[str, Any]) -> dict[str, Any]:
+    msg = verb.get("msg")
+    return {"editable": verb.get("editable"), "msg": msg if isinstance(msg, str) else None}
 
 
 def _head_history(verb: dict[str, Any]) -> dict[str, Any]:
@@ -598,6 +655,17 @@ def _resolved(
     return out
 
 
+def _pick_key(mention: dict[str, Any]) -> tuple[str, str, bool]:
+    return str(mention.get("mri")), str(mention.get("name")), bool(mention.get("everyone"))
+
+
+def _before_images(content: str) -> str:
+    """Text ahead of images: inline text gets its own paragraph, as the CLI sends it."""
+    if not content.strip():
+        return ""
+    return content if _BLOCK_RE.search(content) else f"<p>{content}</p>"
+
+
 class ChatVerbs:
     """The chat page's verbs on one board: the archive first, the chat service for what it lacks."""
 
@@ -621,6 +689,7 @@ class ChatVerbs:
         self._replies: set[asyncio.Task[None]] = set()  # the loop keeps only weak refs to tasks
         self._history_busy: set[ServerConnection] = set()  # sockets with a history answer pending
         self._action_busy: set[ServerConnection] = set()  # sockets with a message action pending
+        self._editable_busy: set[ServerConnection] = set()  # sockets opening an editor
         self._search_busy: set[ServerConnection] = set()  # sockets with a search pending
         # socket → (frame sizes, frames so far, their future): the image send waiting for its frames
         self._incoming: dict[ServerConnection, _Incoming] = {}
@@ -643,6 +712,7 @@ class ChatVerbs:
             "search": self._on_search,
             "complete": self._on_complete,
             "preview": self._on_preview,
+            "editable": self._on_editable,
             **acts,
         }
 
@@ -687,6 +757,12 @@ class ChatVerbs:
         acted = functools.partial(self.act_answer, ws, action, verb)
         head = _head_act(action, verb)
         self._background(answer(ws, head, self._one_at_a_time(ws, head, acted, self._action_busy)))
+
+    async def _on_editable(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
+        # Reads the server's copy (maybe an API round trip); its own slot: a pending save never blocks it.
+        opened = functools.partial(self.editable_answer, ws, verb)
+        head = _head_editable(verb)
+        self._background(answer(ws, head, self._one_at_a_time(ws, head, opened, self._editable_busy)))
 
     async def _on_history(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
         # The API fallback is a network round trip: the page's other verbs must not wait.
@@ -790,6 +866,11 @@ class ChatVerbs:
         request = parse_act(action, verb)
         error = request if isinstance(request, str) else await self.act(request, ws)
         return {**_head_act(action, verb), **({"error": error} if error else {"ok": True})}
+
+    async def editable_answer(self, ws: ServerConnection | None, verb: dict[str, Any]) -> dict[str, Any]:
+        request = parse_editable(verb)
+        found = request if isinstance(request, str) else await self.editable(*request, ws=ws)
+        return {**_head_editable(verb), **({"error": found} if isinstance(found, str) else found)}
 
     async def history_answer(self, verb: dict[str, Any]) -> dict[str, Any]:
         """The answer echoes its side (`before`, `after` or `around`) so the page can match it to its
@@ -899,9 +980,7 @@ class ChatVerbs:
                     return "cannot quote this message"
                 quoted = "".join(self._reply_quote(copies[q]) for q in quote)
             if blobs:
-                # Text first, then the images; inline text gets its own paragraph, as the CLI sends it.
-                body = content if not content.strip() or _BLOCK_RE.search(content) else f"<p>{content}</p>"
-                body = body if body.strip() else ""
+                body = _before_images(content)
                 files = [
                     (f"image.{image.kind}", blob)
                     for image, blob in zip(check_batch(blobs), blobs, strict=True)
@@ -995,24 +1074,29 @@ class ChatVerbs:
         settings, token = self.directory.settings, self.directory.skype_token
         try:
             # A reaction claims no authorship: Teams itself refuses one on an unknown message.
-            if action != "react":
-                copy = (await self._server_copies(thread_id, [msg_id])).get(msg_id)
-                if copy is None:
-                    return "unknown message"
-                # The server's copy decides: the page could name anyone's message.
-                if not is_me(str(copy.get("from") or ""), self.me):
-                    return "not your message"
-                props = copy.get("properties")
-                if is_deleted(props if isinstance(props, dict) else {}):
-                    return "message deleted"
-                if action == "edit" and copy.get("messagetype") not in TEXT_TYPES:
-                    return "cannot edit this message"
+            copy = None if action == "react" else await self._own_copy(thread_id, msg_id, action == "edit")
+            if isinstance(copy, str):
+                return copy
             if action == "react":
                 await asyncio.to_thread(
                     react, settings, token, thread_id, msg_id, request.key, remove=request.remove
                 )
             elif action == "edit":
-                await asyncio.to_thread(edit_message, settings, token, thread_id, msg_id, request.text)
+                assert copy is not None
+                # Whatever the page: a message compose cannot write back is not edited from here.
+                form = decompose(copy, self.emojis.names)
+                if isinstance(form, str):
+                    return f"cannot edit here: {form}"
+                if request.keep_quotes is None:  # an old page: its text as typed, as before
+                    await asyncio.to_thread(edit_message, settings, token, thread_id, msg_id, request.text)
+                    return None
+                edited = await self._edited(request, form)
+                if isinstance(edited, str):
+                    return edited
+                content, props = edited
+                await asyncio.to_thread(
+                    edit_message, settings, token, thread_id, msg_id, content, is_html=True, properties=props
+                )
             else:
                 await asyncio.to_thread(delete_message, settings, token, thread_id, msg_id)
         except Exception as exc:  # noqa: BLE001 — a failed action must not drop the socket
@@ -1027,6 +1111,101 @@ class ChatVerbs:
             )
             return reason
         return None
+
+    async def _own_copy(self, thread_id: str, msg_id: str, editing: bool) -> dict[str, Any] | str:
+        """The server's copy of my live message `msg_id` (text, when `editing`), or the refusal."""
+        copy = (await self._server_copies(thread_id, [msg_id])).get(msg_id)
+        if copy is None:
+            return "unknown message"
+        # The server's copy decides: the page could name anyone's message.
+        if not is_me(str(copy.get("from") or ""), self.me):
+            return "not your message"
+        props = copy.get("properties")
+        if is_deleted(props if isinstance(props, dict) else {}):
+            return "message deleted"
+        if editing and copy.get("messagetype") not in TEXT_TYPES:
+            return "cannot edit this message"
+        return copy
+
+    async def _edited(self, request: ActRequest, form: Editable) -> tuple[str, dict[str, Any] | None] | str:
+        """The edited message rebuilt from the server's copy (spec 019): the kept Reply blocks, the text
+        composed as a send would be, the kept images. Mentions already in the copy skip the roster."""
+        assert self.directory is not None and request.keep_quotes is not None
+        # Named by key, not position: an edit made elsewhere since opening must not swap what is kept.
+        quoted, pictured = {q.key for q in form.quotes}, {image.key for image in form.images}
+        if not quoted.issuperset(request.keep_quotes) or not pictured.issuperset(request.keep_images):
+            return CHANGED
+        # The copy's own pick, never the page's: a kept mention cannot bring a label of its choosing.
+        kept = {_pick_key(p): p for p in form.picks}
+        new = [m for m in request.mentions if _pick_key(m) not in kept]
+        resolved: list[dict[str, Any]] = []
+        if new:
+            members = await self._members(request.thread)
+            if members is None:
+                return "roster unavailable"
+            if (checked := _resolved(request.thread, members, new)) is None:
+                return "unknown mention"
+            resolved = checked
+        fresh = iter(resolved)
+        mentions = [kept.get(_pick_key(m)) or next(fresh) for m in request.mentions]
+        settings = self.directory.settings
+        try:
+            content, props = compose_html(
+                request.text, mentions, self.emojis.names, full=True, asyncgw_host=settings.asyncgw_host
+            )
+        except ValueError as exc:
+            return str(exc)
+        if images := "".join(image.html for image in form.images if image.key in request.keep_images):
+            content = _before_images(content) + f"<p>{images}</p>"
+        content = "".join(q.html for q in form.quotes if q.key in request.keep_quotes) + content
+        if too_long(content, is_html=True):
+            return "message too long"
+        return content, props
+
+    async def editable(
+        self, thread_id: str, msg_id: str, ws: ServerConnection | None = None
+    ) -> dict[str, Any] | str:
+        """My message as the editor opens it (spec 019): its markdown, picked mentions, reply quotes and
+        trailing images, or `blocked` with what keeps it from being edited here; the refusal otherwise."""
+        if not self.scope(ws, thread_id):
+            return "unknown chat"
+        if self.directory is None:
+            return "not connected"
+        try:
+            copy = await self._own_copy(thread_id, msg_id, editing=True)
+        except Exception as exc:  # noqa: BLE001 — a failed lookup must not drop the socket
+            reason = failure(exc)
+            log.warning("edit_open_failed", thread=thread_id, message_id=msg_id, error=reason)
+            return reason
+        if isinstance(copy, str):
+            return copy
+        form = decompose(copy, self.emojis.names)
+        if isinstance(form, str):
+            return {"blocked": form}
+        srcs = [image.src for image in form.images]
+        if srcs:
+            with contextlib.suppress(ArchiveUnavailable):  # the AMS URL, as the page shows an unarchived one
+                srcs = await io("media", self._image_srcs, thread_id, form)
+        props = copy.get("properties")
+        props = props if isinstance(props, dict) else {}
+        return {
+            "ok": True,
+            "text": form.text,
+            "picks": form.picks,
+            "quotes": [{"key": q.key, "name": q.name, "line": q.line} for q in form.quotes],
+            "images": [
+                {"key": image.key, "src": src, "alt": image.alt}
+                for image, src in zip(form.images, srcs, strict=True)
+            ],
+            # The edit signal (`version` moves on reactions too): compared with the records' own.
+            "edittime": str(props.get("edittime") or ""),
+        }
+
+    def _image_srcs(self, thread_id: str, form: Editable) -> list[str]:
+        """Each kept image's `/media` path when archived, else its AMS URL. Blocking: archive pool."""
+        chat_dir = archive_dir(self.data_dir, thread_id)
+        media = chat_dir / "media" if chat_dir is not None else None
+        return [media_url(thread_id, media, image.src) or image.src for image in form.images]
 
     async def complete(self, request: CompleteRequest, ws: ServerConnection | None = None) -> dict[str, Any]:
         """Up to _COMPLETE_ITEMS emojis, or members of a chat, matching the prefix."""

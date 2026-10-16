@@ -65,6 +65,9 @@ class Fake(browser_helpers.Fake):
     )
     busy: bool = False  # answer `history` and `search` with `busy`
     follow_error: str = ""  # answer `follow` with this error
+    # spec 019: `editable` answers by message id (else a plain form of "mine"), `edit` answers
+    forms: dict[str, dict[str, Any]] = field(default_factory=dict)
+    edit_error: str = ""
 
     def on_verb(self, msg: dict[str, Any]) -> None:
         if "follow" in msg and self.follow_error:
@@ -106,6 +109,12 @@ class Fake(browser_helpers.Fake):
                 self.answer({"preview": f'<div class="pv">{html}</div>'})
         elif "send" in msg:
             self.send({"sent": msg["send"], "ok": not self.fail, "error": "boom" if self.fail else None})
+        elif "editable" in msg:
+            plain = {"ok": True, "text": "mine", "picks": [], "quotes": [], "images": [], "edittime": ""}
+            self.answer({"editable": msg["editable"], "msg": msg["msg"], **self.forms.get(msg["msg"], plain)})
+        elif "edit" in msg:
+            answer = {"error": self.edit_error} if self.edit_error else {"ok": True}
+            self.answer({"edit": msg["edit"], "msg": msg["msg"], **answer})
 
 
 async def _open(
@@ -384,17 +393,6 @@ async def test_the_popup_opens_inside_the_window(fake: Fake) -> None:
         and pop["y"] + pop["height"] <= reply["y"] + 12
         and reply["y"] + reply["height"] <= height
     )
-
-
-async def test_the_edit_in_place_editor_stays_plain(fake: Fake) -> None:
-    """012 Formatting bullet: an edit stays plain text, no completion in the message editor."""
-    page, _ = _parts(fake)
-    await page.locator('[data-id="1"] [data-act=edit]').dispatch_event("click")
-    editor = page.locator(".editor")
-    await editor.press_sequentially(" :fi @a")
-    await fake.settled(past_ms=POP_ASK_MS)
-    assert fake.of("complete") == []
-    assert await closed(page)
 
 
 # --- picked set per chat ---
