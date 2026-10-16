@@ -110,7 +110,9 @@ class _Sanitizer(HTMLParser):
                 cls = "mention mention-me" if mri and mri == self.me else "mention"
                 extra = _attr("class", cls) + (_attr("data-mri", mri) if mri else "")
         elif tag == "blockquote" and itemtype.endswith("/Reply"):
-            extra = ' class="reply"'
+            mid = a.get("itemid", "")
+            # Digits only: the page reads the quoted message's time from its id (spec 021).
+            extra = ' class="reply"' + (_attr("data-msg", mid) if mid.isascii() and mid.isdigit() else "")
         self._push(tag, emitted)
         if emitted:
             self.out.append(f"<{tag}{extra}>")

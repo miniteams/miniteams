@@ -165,6 +165,7 @@
   .html pre code { padding: 0; background: none; }
   .html blockquote { margin: 4px 0; padding: 2px 10px; border-left: 3px solid var(--line); color: var(--dim); }
   .html blockquote.reply { border-left-color: var(--accent); background: var(--panel-2); border-radius: 0 6px 6px 0; }
+  .html blockquote.reply[data-msg] { cursor: pointer; }
   .html blockquote.reply strong { display: block; color: var(--text); font-size: 12.5px; }
   .html img { max-width: min(100%, 420px); max-height: 360px; width: auto; height: auto; border-radius: 6px; display: block; margin: 4px 0; }
   #msgs .html img:not(.emoji) { cursor: zoom-in; }
@@ -563,6 +564,11 @@
   $msgs.addEventListener("click", (e) => {
     const img = e.target.closest(".html img:not(.emoji)");
     if (img && !img.closest("a")) zoom(img);  // a linked image keeps its link
+    const q = e.target.closest(".html blockquote[role=link]");
+    if (q && !e.target.closest("a") && getSelection().isCollapsed) quoteJump(q.dataset.msg);  // a click ending a selection selects
+  });
+  $msgs.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && e.target.matches(".html blockquote[role=link]")) { e.preventDefault(); quoteJump(e.target.dataset.msg); }
   });
   $zoom.onclick = () => $zoom.close();
   const toBottom = () => { $list.scrollTop = $list.scrollHeight; lastTop = $list.scrollTop; hist.stick = !hist.newer; if (hist.stick) hist.unseen = 0; showLatest(); };
@@ -580,13 +586,19 @@
     $list.scrollTop += n.getBoundingClientRect().top - $list.getBoundingClientRect().top - a.offset;
     return true;
   };
-  // A jump's message: the hit itself, else the first message from its time on.
+  // A reply's quote (spec 021): its miss stays on the error line (and in the draft) until a jump lands.
+  const QUOTE_MISS = "quoted message not found", QUOTE_GO = "go to the quoted message";
+  const unmiss = () => { if ($err.textContent.startsWith(QUOTE_MISS)) $err.textContent = ""; };
+  // A jump's message: the hit itself, else the first message from its time on; `miss` says the hit is not there.
   const land = (t) => {
-    let n = (t.id && byId(t.id)) || [...$msgs.children].find((x) => x.dataset.at >= t.at) || $msgs.lastElementChild;
+    const hit = t.id && byId(t.id), miss = t.miss && !hit;
+    if (miss) $err.textContent = t.miss;  // shown near its time, unmarked: no message there is the hit
+    else unmiss();
+    let n = hit || [...$msgs.children].find((x) => x.dataset.at >= t.at) || $msgs.lastElementChild;
     if (!n) return;
     while (n.classList.contains("folded")) n = n.previousElementSibling;  // a folded run shows its head
     for (const old of $msgs.querySelectorAll(".hit")) old.classList.remove("hit");
-    n.classList.add("hit");
+    if (!miss) n.classList.add("hit");
     n.scrollIntoView({ block: t.id ? "center" : "start" });
   };
 
@@ -607,7 +619,13 @@
     node.dataset.id = r.id; node.dataset.from = r.from || ""; node.dataset.at = r.at || "";
     const body = el("div", "body");
     if (r.deleted) body.append(el("div", "html", "message deleted"));
-    else { const h = el("div", "html"); h.dir = "auto"; h.innerHTML = r.html || ""; body.append(h); }
+    else {
+      const h = el("div", "html"); h.dir = "auto"; h.innerHTML = r.html || ""; body.append(h);
+      // The outermost quote only: a quote quoted inside it would be a link inside a link.
+      for (const q of h.querySelectorAll("blockquote[data-msg]:not(blockquote[data-msg] *)")) {
+        Object.assign(q, { tabIndex: 0, title: QUOTE_GO }); q.setAttribute("role", "link"); q.setAttribute("aria-description", QUOTE_GO);
+      }
+    }
     if (sys) { body.append(Object.assign(el("span", "when", fmtTime(r.at)), { title: r.at })); node.append(body); node.title = r.at; return node; }
     node.tabIndex = 0;  // keyboard users reach the actions through focus-visible
     const name = r.name || (r.me ? "You" : "?");
@@ -1038,7 +1056,14 @@
     hist.pending.add(key);
     if (!at && !hist.newer) { hist.live = []; hist.liveEdits = []; }  // attached: what came before is on screen
   };
-  const jump = (at, id = "") => { resetNav("jump", { at, id }); requestHistory("around", at); };
+  const jump = (at, id = "", miss = "") => { resetNav("jump", { at, id, miss }); requestHistory("around", at); };
+  // Teams message ids are epoch milliseconds: the quoted message's time.
+  const quoteJump = (id) => {
+    unmiss();
+    if (byId(id)) { if (hist.target) Object.assign(hist, { target: null, aroundAt: "" }); land({ id }); return; }  // a jump loading is dropped, a resync is not
+    const d = new Date(Number(id));
+    if (isNaN(d)) $err.textContent = QUOTE_MISS; else jump(d.toISOString(), id, QUOTE_MISS);
+  };
   const onHistory = (m) => {
     if (m.history !== thread) return;  // asked before a switch
     const side = ["after", "around"].find((k) => k in m) || "before", at = m[side] || "";
@@ -1062,7 +1087,7 @@
     if (m.error) {
       if (side === "around" && hist.restore) { resetNav("fallback"); requestHistory(); return; }
       if (lag.id && !hist.newer) behind(lag.id);  // the catch-up this navigation dropped: asked again
-      if (side !== "before" && at) { $err.textContent = (side === "around" ? "jump: " : "history: ") + m.error; hist.target = null; return; }
+      if (side !== "before" && at) { $err.textContent = (side === "around" && hist.target?.miss ? hist.target.miss + ": " : side === "around" ? "jump: " : "history: ") + m.error; hist.target = null; return; }
       if (hist.followFailed) return;  // its error says more than this one
       $note.hidden = false; $note.className = "err";
       $note.textContent = "history: " + m.error;
