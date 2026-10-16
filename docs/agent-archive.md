@@ -12,7 +12,7 @@ data/
     messages.db                     # every message of that conversation, raw API JSON
     media/                          # attachments of the --media selection (default images,
                                     # files, transcripts; --no-media skips); --videos adds meeting
-                                    # recordings/shared videos, named <driveItem-name>.mp4
+                                    # recordings/shared videos, named <file-name>.mp4
                                     # (SharePoint) or <id>.video.mp4 (AMS)
       recordings.json               # recording ↔ video/transcript pairing (see below)
     avatars/                        # sender avatars, <sanitized-MRI>.jpg
@@ -53,7 +53,7 @@ meta(key TEXT PK, value TEXT)  -- archiver liveness: archiver_seen (ISO UTC, eve
 -- <thread>/messages.db
 messages(id TEXT PK, composetime TEXT /*ISO-8601 UTC*/, raw TEXT /*JSON message*/)
 denied_assets(url TEXT PK, status INT, at TEXT,   -- give-up cache, ignore when reading
-              attempts INT, retry_after TEXT)     -- '' = permanent (403); else retry past it (404)
+              attempts INT, retry_after TEXT)     -- '' = permanent (403, 413); else retry past it (404, 415)
 message_versions(id TEXT, version TEXT, raw TEXT /*JSON*/, replaced_at TEXT,
                  PRIMARY KEY (id, version))       -- earlier versions (archive --live only)
 ```
@@ -199,20 +199,20 @@ pass: `{title, duration, videos: [...], transcripts: [...], message_id, composet
 files present on disk (empty lists = the recording existed but nothing was recoverable).
 
 Fallback for chats not yet re-swept: filenames alone don't link them (`sp-<sha1>` is a URL hash,
-videos carry a driveItem name or an AMS object id). The join lives in the **`Media_CallRecording`
+videos carry a file name or an AMS object id). The join lives in the **`Media_CallRecording`
 message** that references both:
 
 | In the message raw | On-disk file |
 |---|---|
-| `<item type="onedriveForBusinessTranscript" uri="U">` | `sp-{sha1(U.split('?')[0])[:16]}.transcript.{json,vtt}` |
-| `<item type="onedriveForBusinessVideo">` → driveItem name | `<OriginalName>.mp4` (SharePoint copy) |
+| `<item type="onedriveForBusinessTranscript" uri="U">` | `sp-{sha1(html.unescape(U).split('?')[0])[:16]}.transcript.{json,vtt}` (older archives: `U` as written) |
+| `<item type="onedriveForBusinessVideo">` → file name | `<OriginalName>.mp4` (SharePoint copy) |
 | `<item type="amsVideo" uri=".../objects/<id>/views/video">` | `<id>.video.mp4` (AMS fallback copy) |
 
 ```python
-import hashlib, re
+import hashlib, html, re
 raw = row_raw  # one Media_CallRecording message
 sp_t = re.search(r'onedriveForBusinessTranscript\\?" uri=\\?"([^"\\]+)', raw)
-stem = "sp-" + hashlib.sha1(sp_t.group(1).split("?")[0].encode()).hexdigest()[:16]
+stem = "sp-" + hashlib.sha1(html.unescape(sp_t.group(1)).split("?")[0].encode()).hexdigest()[:16]
 ams  = re.search(r'amsVideo\\?" uri=\\?"[^"\\]*/objects/([^/\\]+)/', raw)
 # transcript: media/{stem}.transcript.json — video: media/{OriginalName v=…}.mp4 or media/{ams}.video.mp4
 ```

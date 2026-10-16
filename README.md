@@ -243,9 +243,10 @@ before.
 one folder per conversation with a `messages.db` (every message as raw API JSON, keyed by id)
 and a `media/` folder (attachments at original quality). Interrupt anytime — re-running resumes
 from the oldest stored message, tops up new ones, and skips media already on disk. Assets the
-archive gave up on are remembered per chat: a 403 (deleted object, lost share permission) is
-permanent, a 404 backs off (1h → 6h → 12h → 24h → 48h, then every 48h) because it may just be a
-transcript still being generated. `--retry-assets` forces both, and refuses to run under `--loop`
+archive gave up on are remembered per chat: a 403 (deleted object, lost share permission) or a
+413 (transcript over the 50 MiB cap) is permanent, a 404 backs off (1h → 6h → 12h → 24h → 48h,
+then every 48h) because it may just be a transcript still being generated, and a 415 (transcript
+of the wrong content type or encoding) backs off the same way. `--retry-assets` forces them all, and refuses to run under `--loop`
 — a one-shot override on a timer is not an override. Likewise a chat whose whole history is
 403 (revoked meeting access) is skipped on later runs; `--retry-denied` re-attempts it. Every run
 ends with an `archive_recap` log line (chats, failures, new messages, media files, avatars,

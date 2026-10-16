@@ -31,7 +31,7 @@ message text are left out.
 
 - The ic3 token has audience `https://ic3.teams.office.com`, scope `Teams.AccessAsUser.All`.
   MSAL gives it silently for `https://ic3.teams.office.com/.default` on the Teams client (FOCI),
-  the same way `TokenSource.graph_token()` gets its token.
+  the same way `TokenSource.sharepoint_token()` gets its token.
 - `<region>` is the `region` field of the authz exchange (`skype.exchange_skype_token`). `emea`
   answered the list call as well.
 - Headers on the proxy: `Authorization`, `BehaviorOverride: redirectAs404`,

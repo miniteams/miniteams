@@ -315,13 +315,15 @@ def test_deleted_cache_file_leaves_the_in_memory_copy(settings: Settings, monkey
     assert _rt(src) == "rt-live"
 
 
-def test_graph_token_picks_up_a_cache_written_by_another_process(settings: Settings, monkeypatch) -> None:
+def test_sharepoint_token_picks_up_a_cache_written_by_another_process(
+    settings: Settings, monkeypatch
+) -> None:
     monkeypatch.setattr(A, "_app", lambda cid, s, cache: _CacheBackedApp(cache))
     src = A.TokenSource(settings)
-    assert src.graph_token() is None  # no account yet
+    assert src.sharepoint_token("c-my.sharepoint.com") is None  # no account yet
 
     _sibling_write(src._cache_path, "rt-sibling")
-    assert src.graph_token() == "tok-https://graph.microsoft.com/.default"
+    assert src.sharepoint_token("c-my.sharepoint.com") == "tok-https://c-my.sharepoint.com/.default"
     assert _rt(src) == "rt-sibling"
 
 

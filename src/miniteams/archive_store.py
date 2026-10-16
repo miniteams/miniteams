@@ -466,9 +466,10 @@ class ChatStore:
             self._db.execute("ALTER TABLE messages ADD COLUMN pending INTEGER NOT NULL DEFAULT 0")
         self._db.execute("CREATE INDEX IF NOT EXISTS idx_messages_composetime ON messages (composetime)")
         # Negative cache for assets the archive gave up on; `--retry-assets` forces them all.
-        # 403 (deleted object, lost share permission) is permanent — `retry_after` stays ''.
-        # 404 backs off instead of being permanent: a transcript can still be generating when the
-        # recording message lands, and a permanent verdict would lose it for good.
+        # 403 (deleted object, lost share permission) and 413 (transcript over the size cap) are
+        # permanent — `retry_after` stays ''. 404 backs off instead of being permanent: a transcript
+        # can still be generating when the recording message lands, and a permanent verdict would
+        # lose it for good. 415 (transcript of the wrong content type or encoding) backs off the same way.
         # `url` holds a cache KEY, not always a bare URL: assets fetched in several renditions key
         # as `<url>#<ext>`, so one dead rendition never suppresses the one that still serves.
         self._db.execute(
@@ -615,7 +616,8 @@ class ChatStore:
     def mark_denied(
         self, key: str, status: int, when_iso: str, attempts: int = 1, retry_after: str = ""
     ) -> None:
-        """Record a give-up. `retry_after` empty ⇒ permanent (403); an ISO stamp ⇒ retry past it."""
+        """Record a give-up. `retry_after` empty ⇒ permanent (403, 413); an ISO stamp ⇒ retry past it
+        (404, 415)."""
         with self._db:
             self._db.execute(
                 "INSERT OR REPLACE INTO denied_assets (url, status, at, attempts, retry_after) "

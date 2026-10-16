@@ -617,8 +617,9 @@ def main(argv: list[str] | None = None) -> int:
     p_archive.add_argument(
         "--retry-assets",
         action="store_true",
-        help="re-attempt assets the archive gave up on, skipping the backoff: both the 403-denied "
-        "(normally permanent) and the 404 ones still waiting out their retry delay",
+        help="re-attempt assets the archive gave up on, skipping the backoff: the 403-denied and "
+        "413 over-cap ones (normally permanent) and the 404 and 415 ones still waiting out their "
+        "retry delay",
     )
     p_archive.add_argument(
         "--loop",

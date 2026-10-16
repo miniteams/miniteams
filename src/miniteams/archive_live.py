@@ -209,7 +209,6 @@ class LiveArchive:
                     store.media_dir,
                     download=True,
                     sp_token=self.provider.sharepoint_token,
-                    graph_token=self.provider.graph_token,
                     skip_url=store.denied_urls(_now_iso()).__contains__,
                     on_fail=partial(record_asset_failure, store),
                     media=self.media_types,

@@ -368,7 +368,7 @@ None.
 - The bounds are checked against the clock of this machine. A refusal from Teams is still
   handled, for a clock that is off or a call that took too long.
 - `cancel_scheduled` leaves a tombstone in Teams' draft list. No call removes it.
-- The ic3 token gets a public method on `TokenSource`, next to `graph_token()`.
+- The ic3 token gets a public method on `TokenSource`, next to `sharepoint_token()`.
 - `list_scheduled` reads Teams, not the archive copy of `48:drafts`, which is as old as the
   last pass.
 - `update_scheduled` is its own tool. `update_message` edits a delivered message, and mixing both
