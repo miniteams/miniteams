@@ -13,7 +13,7 @@ framing) and [`Gerenios/AADInternals`](https://github.com/Gerenios/AADInternals)
 
 ## Status
 
-Working. Auth (browser/device-code), live `stream` (messages, reactions, attachments,
+Working. Auth (device-code, or browser), live `stream` (messages, reactions, attachments,
 auto-reconnect), `chats` (recent conversations, date-window filter), `dump` (history backfill,
 `--jsonl`), and `send` are all implemented.
 
@@ -27,8 +27,8 @@ uv sync
 ## Usage
 
 ```sh
-uv run miniteams login            # browser (FOCI seed), falls back to device-code; masked tokens
-uv run miniteams --device-code login   # force device-code flow (no browser)
+uv run miniteams login            # device code: open the printed URL, enter the code (also copied to a desktop clipboard); masked tokens
+uv run miniteams --browser-login login   # Azure CLI browser sign-in, Teams scope via FOCI (device code if refused)
 uv run miniteams stream           # live: incoming messages, reactions, attachments
 uv run miniteams stream --media images,transcripts   # download only these attachment types
 uv run miniteams chats            # 20 most recent private chats (id + last activity + names)
@@ -84,7 +84,7 @@ write to Teams as you; with `send_at` (ISO 8601 with an offset, 5 seconds to 125
 `send_message` schedules instead, and `list_scheduled`, `update_scheduled` and `cancel_scheduled`
 manage what Teams is holding (`docs/scheduled-send-wire.md`). `--read-only` keeps every writing tool
 out of the list. Nothing needs a token until the
-API is called; a dead credential makes that call return a device-code URL, and `login` reports the
+API is called; a dead credential makes that call return a device-login URL and code, and `login` reports the
 same flow. The server needs the project's `.env` and `data/`, so register it as
 `uv run --directory /path/to/miniteams miniteams mcp` (a gitignored `.mcp.json` at the repo root
 does it for Claude Code).

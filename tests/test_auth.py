@@ -1,7 +1,8 @@
-"""TokenSource flow + device-code URL injection (no real MSAL/network)."""
+"""TokenSource flow + device-code prompt and clipboard (no real MSAL/network/clipboard)."""
 
 import json
 import os
+import subprocess
 import threading
 from typing import Any
 
@@ -10,6 +11,13 @@ import pytest
 
 from miniteams import auth as A
 from miniteams.config import Settings
+
+
+@pytest.fixture(autouse=True)
+def _no_desktop(monkeypatch) -> None:
+    # A test must never write the developer's real clipboard.
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.delenv("DISPLAY", raising=False)
 
 
 class _FakeApp:
@@ -62,24 +70,136 @@ def test_interactive_foci_swap_refusal_falls_back_to_device_code(
         return _AuthApp() if client_id == s.auth_client_id else _TeamsApp()
 
     monkeypatch.setattr(A, "_app", fake_app)
+    settings.use_device_code = False
     result = A.TokenSource(settings).acquire()
     assert result["access_token"] == "devicetok"
     assert "falling back to device-code" in capsys.readouterr().err
 
 
-def test_device_code_injects_code_into_url(capsys, monkeypatch) -> None:
-    class _DeviceApp:
-        def initiate_device_flow(self, scopes) -> dict:
-            # No verification_uri_complete → must be synthesized from uri + user_code.
-            return {"user_code": "ABCD1234", "verification_uri": "https://microsoft.com/devicelogin"}
+class _DeviceApp:
+    def initiate_device_flow(self, scopes) -> dict:
+        return {"user_code": "ABCD1234", "verification_uri": "https://microsoft.com/devicelogin"}
 
-        def acquire_token_by_device_flow(self, flow) -> dict:
-            return {"access_token": "tok"}
+    def acquire_token_by_device_flow(self, flow) -> dict:
+        return {"access_token": "tok"}
 
+
+def test_device_code_prompt_is_the_plain_url_and_the_code(capsys) -> None:
     result = A._device_code_flow(_DeviceApp(), ["scope"])
     assert result["access_token"] == "tok"
     err = capsys.readouterr().err
-    assert "https://microsoft.com/devicelogin?otc=ABCD1234" in err
+    # Microsoft's page reads nothing from the URL: no fabricated query, no pre-fill claim.
+    assert "open https://microsoft.com/devicelogin and enter the code\n" in err
+    assert "\nCode: ABCD1234\n" in err
+    assert "?" not in err and "otc" not in err and "pre-filled" not in err and "clipboard" not in err
+
+
+def test_default_login_is_device_code(settings: Settings, monkeypatch, capsys) -> None:
+    class _TeamsApp(_DeviceApp, _FakeApp):
+        pass
+
+    def fake_app(client_id, s, cache):
+        assert client_id != s.auth_client_id, "browser seed client used by default"
+        return _TeamsApp()
+
+    monkeypatch.setattr(A, "_app", fake_app)
+    assert A.TokenSource(settings).acquire()["access_token"] == "tok"
+    assert "Code: ABCD1234" in capsys.readouterr().err
+
+
+def test_copied_code_says_so(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setattr(A.shutil, "which", lambda name: f"/usr/bin/{name}")
+    seen: list[tuple[list[str], bytes]] = []
+
+    def run(cmd, input, **kw):  # noqa: A002 — subprocess.run's own keyword
+        seen.append((cmd, input))
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(A.subprocess, "run", run)
+    A._device_code_flow(_DeviceApp(), ["scope"])
+    assert seen == [(["wl-copy"], b"ABCD1234")]
+    assert "\nCode: ABCD1234\n(copied to the clipboard)\n" in capsys.readouterr().err
+
+
+def test_x11_falls_through_to_the_next_tool(monkeypatch) -> None:
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setattr(A.shutil, "which", lambda name: None if name == "xclip" else f"/usr/bin/{name}")
+    seen: list[str] = []
+
+    def run(cmd, **kw):
+        seen.append(cmd[0])
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(A.subprocess, "run", run)
+    assert A._copy_to_clipboard("X") is True
+    assert seen == ["xsel"]
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        subprocess.TimeoutExpired("wl-copy", 2),
+        FileNotFoundError("wl-copy"),
+        subprocess.CompletedProcess(["wl-copy"], 1),
+    ],
+    ids=["timeout", "vanished", "failed"],
+)
+def test_clipboard_failure_neither_crashes_nor_claims(monkeypatch, capsys, outcome) -> None:
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setattr(A.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def run(cmd, **kw):
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(A.subprocess, "run", run)
+    assert A._device_code_flow(_DeviceApp(), ["scope"])["access_token"] == "tok"
+    err = capsys.readouterr().err
+    assert "Code: ABCD1234\n" in err and "clipboard" not in err
+
+
+def test_prompt_is_out_before_the_clipboard_runs(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setattr(A.shutil, "which", lambda name: f"/usr/bin/{name}")
+    printed: list[str] = []
+
+    def run(cmd, **kw):
+        printed.append(capsys.readouterr().err)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(A.subprocess, "run", run)
+    A._device_code_flow(_DeviceApp(), ["scope"])
+    assert printed and "Code: ABCD1234" in printed[0]
+
+
+def test_a_timeout_stops_the_search(monkeypatch) -> None:
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setattr(A.shutil, "which", lambda name: f"/usr/bin/{name}")
+    seen: list[str] = []
+
+    def run(cmd, **kw):
+        seen.append(cmd[0])
+        raise subprocess.TimeoutExpired(cmd, 2)
+
+    monkeypatch.setattr(A.subprocess, "run", run)
+    assert A._copy_to_clipboard("X") is False
+    assert seen == ["xclip"]
+
+
+def test_no_tool_installed_skips_the_copy(monkeypatch) -> None:
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setattr(A.shutil, "which", lambda name: None)
+    monkeypatch.setattr(A.subprocess, "run", lambda *a, **k: pytest.fail("ran a missing tool"))
+    assert A._copy_to_clipboard("X") is False
+
+
+def test_headless_never_runs_a_tool(monkeypatch) -> None:
+    monkeypatch.setattr(A.subprocess, "run", lambda *a, **k: pytest.fail("no desktop, no clipboard"))
+    assert A._copy_to_clipboard("X") is False
 
 
 def test_persist_cache_replaces_atomically_owner_only(tmp_path) -> None:
@@ -300,6 +420,7 @@ def test_interactive_seed_survives_a_sibling_write(settings: Settings, monkeypat
         return _AuthApp(cache) if client_id == s.auth_client_id else _TeamsApp(cache)
 
     monkeypatch.setattr(A, "_app", fake_app)
+    settings.use_device_code = False
     assert A.TokenSource(settings).acquire()["access_token"] == "teamstok"
     assert "falling back to device-code" not in capsys.readouterr().err
 

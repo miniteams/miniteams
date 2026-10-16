@@ -110,7 +110,7 @@ class Settings(BaseSettings):
     trouter_ttl: int = 86400
 
     # --- behaviour ---
-    use_device_code: bool = False
+    use_device_code: bool = True  # False: browser sign-in (`--browser-login`)
     download_media: bool = True  # fetch inbound image/file bytes to media_dir
     log_level: str = "INFO"
     config_dir: Path = Field(default_factory=_default_config_dir)  # tokens, epid (state)
