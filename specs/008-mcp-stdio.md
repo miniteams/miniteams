@@ -79,7 +79,7 @@ you, now or at a time Teams holds the message until.
 | `login` | none | `signed_in` with the account name, or `pending` with the login URL, the code and the seconds left |
 
 - A tool that needs a token and finds none starts the same login and returns it in its error:
-  the URL with the code pre-filled, the code, and how long they stay valid. Calling the tool
+  the login URL, the code to enter there, and how long they stay valid. Calling the tool
   again after signing in runs it.
 - The tool list never changes with the sign-in state. Every tool stays listed, and the one that
   needs a token says so when called.

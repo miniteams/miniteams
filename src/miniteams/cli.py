@@ -397,8 +397,7 @@ def cmd_stream(settings: Settings, args: argparse.Namespace) -> int:
     from .stream import run_forever
 
     # Stream is long-running and often headless (server/SSH) where a localhost browser redirect
-    # can't complete; default the interactive fallback to device-code. A cached token still goes
-    # silent; `--device-code` is implied here.
+    # can't complete: device-code even under `--browser-login`. A cached token still goes silent.
     settings.use_device_code = True
     directory = Directory(settings)
     directory.media = args.media
@@ -468,11 +467,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="miniteams",
         description="Read-only CLI that streams live Microsoft Teams chat events.",
+        allow_abbrev=False,
     )
-    parser.add_argument(
+    login_mode = parser.add_mutually_exclusive_group()
+    login_mode.add_argument(
+        "--browser-login",
+        action="store_true",
+        help="sign in through the Azure CLI browser flow, then get the Teams scope via FOCI",
+    )
+    login_mode.add_argument(
         "--device-code",
         action="store_true",
-        help="authenticate via device-code flow instead of the browser",
+        help="force device code (the default unless MINITEAMS_USE_DEVICE_CODE=false)",
     )
     parser.add_argument("--log-level", default=None, help="override MINITEAMS_LOG_LEVEL")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -716,6 +722,9 @@ def main(argv: list[str] | None = None) -> int:
     p_stream.add_argument("--media", type=_media_list, metavar="TYPES", help=_MEDIA_HELP)
     p_stream.set_defaults(func=cmd_stream)
 
+    # A prefix match would silently pick an option the user never typed (`--browser` → `--browser-login`).
+    for subparser in sub.choices.values():
+        subparser.allow_abbrev = False
     args = parser.parse_args(argv)
     # A one-shot override on a timer stops being an override: it would re-request every dead asset
     # every cycle, which is exactly the hammering the backoff exists to stop.
@@ -760,6 +769,8 @@ def main(argv: list[str] | None = None) -> int:
     settings = Settings()  # type: ignore[call-arg]  # tenant_id comes from env/.env
     if args.device_code:
         settings.use_device_code = True
+    elif args.browser_login:
+        settings.use_device_code = False
     if args.log_level:
         settings.log_level = args.log_level
     setup_logging(settings.log_level)

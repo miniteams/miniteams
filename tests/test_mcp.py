@@ -600,7 +600,7 @@ class _Source:
     def start_device_flow(self) -> dict[str, Any]:
         flow = {
             "user_code": f"CODE{len(self.flows)}",
-            "verification_uri_complete": "https://login.microsoftonline.com/x?otc=CODE",
+            "verification_uri": "https://login.microsoftonline.com/x",
             "expires_at": time.time() + 900,
             "device_code": "secret-device-code",
         }
@@ -649,6 +649,8 @@ def test_a_dead_credential_offers_one_device_flow_until_it_completes(
     assert "secret-device-code" not in refused["text"]
     pending = _call(server, "login")
     assert pending["state"] == "pending" and pending["code"] == "CODE0" and 0 < pending["expires_in"] <= 900
+    assert pending["url"] == "https://login.microsoftonline.com/x"
+    assert "Open https://login.microsoftonline.com/x and enter code CODE0" in refused["text"]
     assert len(source.flows) == 1  # one flow for the error and the login alike
     assert _call(server, "read_transcript", thread_id=PRIVATE)["error"]  # meanwhile: answered at once
     source.done.set()

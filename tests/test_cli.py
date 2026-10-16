@@ -430,3 +430,41 @@ def test_recheck_since_reaches_the_run_as_a_utc_floor(monkeypatch) -> None:
     monkeypatch.setattr(auth, "_app", lambda *a: None)  # msal discovers its authority online
     assert cli.main(["archive", "--recheck-since", "2026-09-22T02:00:00+02:00"]) == 0
     assert seen["recheck_since"] == "2026-09-22T00:00:00"
+
+
+@pytest.mark.parametrize(
+    ("env", "flags", "device_code"),
+    [
+        (None, [], True),
+        (None, ["--device-code"], True),
+        (None, ["--browser-login"], False),
+        ("false", [], False),
+        ("false", ["--device-code"], True),
+    ],
+)
+def test_login_mode_flags(
+    monkeypatch, tmp_path, env: str | None, flags: list[str], device_code: bool
+) -> None:
+    monkeypatch.chdir(tmp_path)  # Settings reads ./.env: a developer's own must not decide the default
+    monkeypatch.setenv("MINITEAMS_TENANT_ID", "tenant-123")
+    if env is None:
+        monkeypatch.delenv("MINITEAMS_USE_DEVICE_CODE", raising=False)
+    else:
+        monkeypatch.setenv("MINITEAMS_USE_DEVICE_CODE", env)
+    seen: list[bool] = []
+    monkeypatch.setattr(cli, "cmd_login", lambda s, a: seen.append(s.use_device_code) or 0)
+    assert cli.main([*flags, "login"]) == 0
+    assert seen == [device_code]
+
+
+def test_login_mode_flags_exclude_each_other() -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["--device-code", "--browser-login", "login"])
+
+
+@pytest.mark.parametrize("argv", [["--browser", "login"], ["--device", "login"], ["chats", "--al"]])
+def test_abbreviated_options_are_refused(monkeypatch, argv: list[str]) -> None:
+    monkeypatch.setattr(cli, "cmd_login", lambda s, a: pytest.fail("ran on an abbreviation"))
+    monkeypatch.setattr(cli, "cmd_chats", lambda s, a: pytest.fail("ran on an abbreviation"))
+    with pytest.raises(SystemExit):
+        cli.main(argv)

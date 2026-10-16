@@ -452,7 +452,7 @@ class Session:
         assert self._flow is not None
         return {
             "state": "pending",
-            "url": self._flow["verification_uri_complete"],
+            "url": self._flow["verification_uri"],
             "code": self._flow["user_code"],
             "expires_in": max(0, int(float(self._flow.get("expires_at") or 0) - time.time())),
             "hint": _LOGIN_HINT,
@@ -823,7 +823,8 @@ TOOLS: tuple[Tool, ...] = (
     Tool(
         "login",
         "Sign the server in when its cached credential is dead or absent: returns `signed_in`, or "
-        "`pending` with a URL and a code for the user to enter. Reads on a reachable archive never need it.",
+        "`pending` with a URL for the user to open and a code to enter there. "
+        "Reads on a reachable archive never need it.",
         {},
         _login,
     ),

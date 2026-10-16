@@ -4,8 +4,8 @@ The Teams first-party client (`client_id`) has no `http://localhost` redirect, s
 interactive flow is rejected (AADSTS50011). To keep the browser flow, the **interactive** leg runs
 on a localhost-registered FOCI public client (`auth_client_id`, Azure CLI) requesting a scope it is
 allowed (`seed_scope`, Graph); that seeds a *family* refresh token into the shared cache. A silent
-call on the Teams client then redeems it for the Teams scope (FOCI). Device-code needs no redirect,
-so it runs on the Teams client directly. Tokens are cached on disk; re-runs are silent.
+call on the Teams client then redeems it for the Teams scope (FOCI). Device-code, the default, needs
+no redirect, so it runs on the Teams client directly. Tokens are cached on disk; re-runs are silent.
 
 `TokenSource` holds one cache/app for a process's lifetime: `acquire()` runs the full flow once
 (may prompt), `refresh()` is silent-only for a reconnect loop — it never prompts, raising
@@ -17,6 +17,9 @@ refresh token the moment one of them redeems it, so the file is re-read whenever
 import atexit
 import base64
 import json
+import os
+import shutil
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -87,19 +90,44 @@ def _app(
     )
 
 
+def _copy_to_clipboard(text: str) -> bool:
+    """Best effort: True only when a desktop clipboard tool took the text."""
+    tools: list[list[str]] = []
+    if os.environ.get("WAYLAND_DISPLAY"):
+        tools.append(["wl-copy"])
+    if os.environ.get("DISPLAY"):
+        tools += [["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]
+    for cmd in tools:
+        if shutil.which(cmd[0]) is None:
+            continue
+        try:
+            # DEVNULL outputs: these tools fork a daemon that keeps the selection; a pipe would hang.
+            done = subprocess.run(
+                cmd, input=text.encode(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2
+            )
+        except subprocess.TimeoutExpired:
+            return False  # a hung display server would stall the next tool too
+        except OSError, subprocess.SubprocessError:
+            continue
+        if done.returncode == 0:
+            return True
+    return False
+
+
 def _device_code_flow(app: msal.PublicClientApplication, scopes: list[str]) -> dict[str, Any]:
     flow = app.initiate_device_flow(scopes=scopes)
     if "user_code" not in flow:
         raise RuntimeError(f"device flow init failed: {flow}")
-    # Prefer the complete URL with the code embedded (otc=) so the user just clicks + confirms;
-    # synthesize it if AAD didn't return one. stderr, not stdout — stdout must stay a clean JSON
-    # stream for `--jsonl | jq`.
-    uri = flow.get("verification_uri_complete") or f"{flow['verification_uri']}?otc={flow['user_code']}"
+    code = flow["user_code"]
+    # Plain URL: Microsoft's device-login page reads no code from its query string.
+    # stderr, not stdout — stdout must stay a clean JSON stream for `--jsonl | jq`.
     print(
-        f"Device login → {uri}\n(code {flow['user_code']} pre-filled; open it and sign in)",
+        f"Device login: open {flow['verification_uri']} and enter the code\nCode: {code}",
         file=sys.stderr,
         flush=True,
     )
+    if _copy_to_clipboard(code):  # after the prompt: a hung display must not delay it
+        print("(copied to the clipboard)", file=sys.stderr, flush=True)
     return dict(app.acquire_token_by_device_flow(flow))
 
 
@@ -199,7 +227,7 @@ class TokenSource:
             return result
 
     def acquire(self) -> dict[str, Any]:
-        """Full flow, runs once and may prompt: silent → device-code/interactive fallback."""
+        """Full flow, runs once and may prompt: silent → device-code, or browser seed + FOCI swap."""
         scopes = self.settings.scope_list
         result = self._silent()
 
@@ -272,7 +300,6 @@ class TokenSource:
             raise RuntimeError(
                 f"device flow init failed: {flow.get('error')}: {flow.get('error_description')}"
             )
-        flow.setdefault("verification_uri_complete", f"{flow['verification_uri']}?otc={flow['user_code']}")
         return dict(flow)
 
     def finish_device_flow(self, flow: dict[str, Any]) -> dict[str, Any]:
