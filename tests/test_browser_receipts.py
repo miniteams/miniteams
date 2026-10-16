@@ -187,6 +187,26 @@ async def test_a_reader_inside_a_folded_run_sits_on_its_visible_head(served: tup
 GAP = "(l => l.scrollHeight - l.scrollTop - l.clientHeight)(document.getElementById('list'))"
 
 
+async def test_receipts_float_in_the_gutter_and_move_no_line(
+    board: W.Board, served: tuple[Pages, Horizons]
+) -> None:
+    """The readers' avatars float in the message's right gutter: one arriving or moving changes no
+    message's height, and they never sit over the text."""
+    pages, _ = served
+    chat = await pages.open(f"/chat/{T}", viewport={"width": 700, "height": 600})
+    await until(chat, "document.querySelectorAll('#msgs > .msg').length === 6")
+    heights = "[...document.querySelectorAll('#msgs > .msg')].map((n) => n.offsetHeight)"
+    before = await chat.evaluate(heights)
+    await _live(board, BOB, 60)
+    await until(chat, "document.querySelector('[data-id=\"60\"] .reads') !== null")
+    assert await chat.evaluate(heights) == before
+    clear = """(() => { const m = document.querySelector('[data-id="60"]');
+      const r = m.querySelector('.reads').getBoundingClientRect();
+      const t = m.querySelector('.html').getBoundingClientRect();
+      return r.left >= t.right && r.bottom <= m.getBoundingClientRect().bottom; })()"""
+    assert await chat.evaluate(clear)
+
+
 async def test_a_live_receipt_at_the_bottom_stays_in_view(
     board: W.Board, served: tuple[Pages, Horizons]
 ) -> None:
