@@ -271,7 +271,11 @@
   });
   const imgs = imageQueue({
     input: $reply, box: $imgs, chat: () => replyTo, busy: (id) => sends.busy(id),
-    error: (id, text) => { errors.set(id, text); render(); },
+    error: (id, text, was) => {
+      if (was !== undefined && errors.get(id) !== was) return;  // another error replaced our refusal since
+      if (text) errors.set(id, text); else errors.delete(id);
+      render();
+    },
   });
   const sends = sendQueue({
     imgs, socket: () => ws, changed: () => render(),

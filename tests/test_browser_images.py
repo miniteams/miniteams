@@ -387,6 +387,35 @@ async def test_images_stay_with_their_chat_and_success_clears_only_its_own(pages
     assert pages.external == []
 
 
+async def test_removing_an_image_clears_its_refusal(widget: Any) -> None:
+    """012-AC25: the refusal is about the images as they were: removing one clears it."""
+    page = widget.page
+    await _paste(page, *(png(i + 1, 1) for i in range(9)))
+    await _thumbs(page, 8)
+    await _error_is(page, "at most 8 images per message")
+    await page.locator(".imgs .rm").first.click()
+    await _thumbs(page, 7)
+    await _error_is(page, "")
+
+
+async def test_a_refusal_cleared_by_a_change_leaves_a_newer_error_alone(pages: Pages) -> None:
+    """012-AC25: clearing a refusal never erases an error the page showed since, in the chat page."""
+    fake = Chat()
+    page = await open_chat(pages, fake, init=FREED)
+    await page.locator("#reply").focus()
+    await _paste(page, *(png(i + 1, 1) for i in range(9)))
+    await _thumbs(page, 8)
+    await _error_is(page, "at most 8 images per message")
+    await page.locator(".imgs .rm").first.click()
+    await _error_is(page, "")
+    await _paste(page, *(png(i + 1, 2) for i in range(2)))
+    await _error_is(page, "at most 8 images per message")
+    await _err(page).evaluate("e => { e.textContent = 'offline, not sent'; }")
+    await page.locator(".imgs .rm").first.click()
+    await _thumbs(page, 7)
+    await _error_is(page, "offline, not sent")
+
+
 async def test_chat_page_preview_and_image_only_send(pages: Pages) -> None:
     """012-AC20, 012-AC21: the chat composer previews and sends images alone, like the widget."""
     fake = Chat()
