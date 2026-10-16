@@ -145,7 +145,7 @@
   #outq { display: grid; gap: 6px; padding: 6px 8px 4px 54px; }
   #outq[hidden] { display: none; }
   #outq .qtext { white-space: pre-wrap; overflow-wrap: anywhere; }
-  .msg { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 0 10px; padding: 4px 8px; border-radius: 10px; position: relative; }
+  .msg { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 0 10px; padding: 4px 80px 4px 8px; border-radius: 10px; position: relative; }
   .msg:not(.cont) { margin-top: 10px; }
   .msg:hover { background: var(--panel); }
   .msg.hit { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
@@ -259,8 +259,9 @@
   .quote span { flex: 1; }
   .quote button { border: 0; background: transparent; cursor: pointer; color: var(--dim); border-radius: 4px; }
   .quote button:hover { color: var(--hot); }
-  /* Read receipts (spec 011): the readers' small avatars under the newest message each one read. */
-  .reads { display: flex; justify-content: flex-end; align-items: center; margin-top: 2px; }
+  /* Read receipts (spec 011): the readers' small avatars by the newest message each one read. They float
+     in the message's right gutter: a receipt moving never changes a message's height. */
+  .reads { position: absolute; right: 8px; bottom: 4px; width: 68px; display: flex; justify-content: flex-end; align-items: center; }
   .reads .ra { width: 16px; height: 16px; border-radius: 50%; display: grid; place-items: center; font-size: 7.5px; font-weight: 650;
     color: #fff; box-shadow: 0 0 0 1.5px var(--bg); }
   .reads .more { font-size: 11px; color: var(--dim); margin-left: 3px; }
