@@ -22,7 +22,7 @@ from .archive_store import ChatStore, Index, merge_dicts, message_version
 from .auth import AuthExpired
 from .chats import in_archive_scope
 from .config import Settings
-from .messages import thread_of
+from .messages import message_files, thread_of
 from .stream import run_forever
 
 log = structlog.get_logger()
@@ -191,13 +191,14 @@ class LiveArchive:
     def _spawn_media(self, thread_id: str, resource: dict[str, Any]) -> None:
         """Background download: awaiting it would hold the socket's read loop (acks, heartbeats)."""
         content, msgtype = resource.get("content") or "", str(resource.get("messagetype") or "")
-        if not self.download_media or not attachments.extract(content, msgtype, self.media_types):
+        shared = message_files(resource)
+        if not self.download_media or not attachments.extract(content, msgtype, self.media_types, shared):
             return
-        task = asyncio.create_task(self._media(thread_id, content, msgtype))
+        task = asyncio.create_task(self._media(thread_id, content, msgtype, shared))
         self._media_tasks.add(task)
         task.add_done_callback(self._media_tasks.discard)
 
-    async def _media(self, thread_id: str, content: str, msgtype: str) -> None:
+    async def _media(self, thread_id: str, content: str, msgtype: str, shared: list[Any]) -> None:
         async with self._media_sem:
             store = ChatStore(self.data_dir, thread_id)
             try:
@@ -212,6 +213,7 @@ class LiveArchive:
                     skip_url=store.denied_urls(_now_iso()).__contains__,
                     on_fail=partial(record_asset_failure, store),
                     media=self.media_types,
+                    files=shared,
                 )
                 log.info("live_media", thread=thread_id, files=sum(1 for n in files if "→" in n))
             except AuthExpired as exc:

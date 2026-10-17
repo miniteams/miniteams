@@ -152,18 +152,23 @@ DEFAULT_MEDIA = frozenset({"images", "files", "transcripts"})  # videos are GB-s
 
 def media_type(kind: str, url: str, hint: str = "") -> str:
     """The `--media` type of one extracted item. `hint` is the `type` attribute of the tag it came
-    from: a `URIObject` (`Picture.1` is a picture) or a recording `<item>` (`onedriveForBusinessVideo`)."""
+    from: a `URIObject` (`Picture.1` is a picture) or a recording `<item>` (`onedriveForBusinessVideo`),
+    or `video` for a video `properties.files` entry."""
     if kind == "image" or (kind == "file" and hint.startswith("Picture.")):
         return "images"
     if kind in ("transcript", "sp_transcript"):
         return "transcripts"
-    if kind == "video" or (kind == "sp_file" and (hint == "onedriveForBusinessVideo" or _is_video_url(url))):
+    video_hint = hint in ("onedriveForBusinessVideo", "video")
+    if kind == "video" or (kind == "sp_file" and (video_hint or _is_video_url(url))):
         return "videos"
     return "files"
 
 
-def extract(content: str, msgtype: str, media: frozenset[str] = DEFAULT_MEDIA) -> list[dict[str, str]]:
-    """Pull attachment references of the selected `media` types out of message content. No network.
+def extract(
+    content: str, msgtype: str, media: frozenset[str] = DEFAULT_MEDIA, files: list[Any] | None = None
+) -> list[dict[str, str]]:
+    """Pull attachment references of the selected `media` types out of message content and its decoded
+    `properties.files` (spec 027: each entry but a pasted `reference` is an `sp_file`). No network.
 
     Videos (meeting recordings, shared video files) are GB-scale and left out of the default. The
     durable SharePoint copy rides the `sp_file` SharePoint path; the fast-expiring AMS copy (`amsVideo`)
@@ -176,8 +181,8 @@ def extract(content: str, msgtype: str, media: frozenset[str] = DEFAULT_MEDIA) -
     # SharePoint copy resolved before deciding to pull the (redundant) AMS bytes.
     ams_videos: list[str] = []
 
-    def _add(kind: str, url: str, hint: str = "") -> None:
-        if kind.startswith("sp_"):
+    def _add(kind: str, url: str, hint: str = "", escaped: bool = True, fallback: str = "") -> None:
+        if kind.startswith("sp_") and escaped:
             # Attribute values are HTML (`&amp;`): unescape once, so the URL stored, checked and
             # fetched is one string.
             url = html.unescape(url)
@@ -186,7 +191,7 @@ def extract(content: str, msgtype: str, media: frozenset[str] = DEFAULT_MEDIA) -
         # Seen even when deselected: the recording's Play <a> must not come back as a document.
         seen.add((kind, url))
         if media_type(kind, url, hint) in media:
-            items.append({"kind": kind, "url": url})
+            items.append({"kind": kind, "url": url} | ({"fallback": fallback} if fallback else {}))
 
     for tag in _IMG_RE.findall(content):
         attrs = _attrs(tag)
@@ -220,6 +225,19 @@ def extract(content: str, msgtype: str, media: frozenset[str] = DEFAULT_MEDIA) -
             continue
         if _is_video_url(href) or attrs.get("itemtype") == _FILE_LINK or _SP_DOC_PREFIX.search(href):
             _add("sp_file", href)
+    for entry in files or ():
+        # A `reference` is a pasted body link: archived above when it is a document (027-AC6).
+        if not isinstance(entry, dict) or entry.get("state") == "reference":
+            continue
+        info = entry.get("fileInfo")
+        # The sharing link first: a file in someone else's OneDrive is often reachable only through it.
+        found = (info.get("shareUrl") if isinstance(info, dict) else None, entry.get("objectUrl"))
+        urls = list(dict.fromkeys(u for u in found if isinstance(u, str) and _sp_host(u)))
+        # The body may link the same file already: one download (027-AC3).
+        if urls and not any(("sp_file", u) in seen for u in urls):
+            video = any(_is_video_url(u) for u in (*urls, str(entry.get("fileName") or "")))
+            fallback = urls[1] if len(urls) > 1 else ""
+            _add("sp_file", urls[0], "video" if video else "", escaped=False, fallback=fallback)
     for url in ams_videos:
         _add("video", url)
     return items
@@ -507,6 +525,39 @@ async def _download_sp_file(client: httpx.AsyncClient, url: str, bearer: str, me
         return str(dest)
 
 
+def _item_urls(item: dict[str, str]) -> list[str]:
+    return [u for u in (item["url"], item.get("fallback")) if u]
+
+
+async def _sp_file_or_fallback(
+    client: httpx.AsyncClient,
+    item: dict[str, str],
+    media_dir: Path,
+    download: bool,
+    sp_token: Callable[[str], str | None] | None,
+    skip_url: Callable[[str], bool] | None,
+) -> tuple[str | None, list[tuple[str, Exception]]]:
+    """(local path, []) of an `sp_file` item, trying its `fallback` URL when the first is denied, fails or is
+    not a file; (None, each URL's error) when none gives a file."""
+    failures: list[tuple[str, Exception]] = []
+    for url in _item_urls(item):
+        if url != item["url"] and skip_url and skip_url(url):
+            continue  # the first URL was vetted by the caller
+        sp_host = _sp_host(url)
+        bearer = sp_token(sp_host) if (download and sp_token and sp_host) else None
+        if not bearer:
+            continue
+        try:
+            fpath = await _download_sp_file(client, url, bearer, media_dir)
+        except Exception as exc:  # noqa: BLE001 — best-effort; the fallback, else ref-only
+            log.debug("sp_file_failed", url=url, error=str(exc))
+            failures.append((url, exc))
+            continue
+        if fpath:
+            return fpath, []
+    return None, failures
+
+
 async def _download_image(
     client: httpx.AsyncClient,
     token: str,
@@ -566,6 +617,7 @@ async def process(
     skip_url: Callable[[str], bool] | None = None,
     on_fail: Callable[[str, Exception], None] | None = None,
     media: frozenset[str] = DEFAULT_MEDIA,
+    files: list[Any] | None = None,
 ) -> list[str]:
     """Return human annotations for the print line, downloading bytes when enabled.
 
@@ -575,8 +627,9 @@ async def process(
     transcripts and SharePoint-hosted shared documents. Without it those items are refs only.
     `skip_url(url)` vetoes a download (ref-only note, no network) — the archive's denied-asset
     cache; `on_fail(url, exc)` observes each failed download so callers can feed that cache.
-    Only the `media` types are extracted: a deselected item is neither fetched nor annotated."""
-    items = extract(content, msgtype, media)
+    Only the `media` types are extracted: a deselected item is neither fetched nor annotated. `files` is the
+    message's decoded `properties.files`."""
+    items = extract(content, msgtype, media, files)
     notes: list[str] = []
     _remote = {"sp_transcript", "sp_file"}
     _ref_label = {"sp_transcript": "transcript(sp)", "sp_file": "file(sp)"}
@@ -591,7 +644,8 @@ async def process(
     try:
         for item in items:
             url, kind = item["url"], item["kind"]
-            if skip_url and skip_url(url):
+            # Per-URL keys: a body link denied under the sharing link must not mute the entry's objectUrl.
+            if skip_url and all(skip_url(u) for u in _item_urls(item)):
                 notes.append(f"[{_ref_label.get(kind, kind)}: {url}]")
                 continue
             if kind == "video":
@@ -626,27 +680,22 @@ async def process(
                     notes.append(f"[transcript(sp): {url}]")
                 continue
             if kind == "sp_file":
-                sp_host = _sp_host(url)
-                bearer = sp_token(sp_host) if (download and sp_token and sp_host) else None
-                if not bearer:
-                    notes.append(f"[file(sp): {url}]")
-                    continue
-                try:
-                    fpath = await _download_sp_file(client, url, bearer, media_dir)
-                    if fpath:
-                        if _is_video_url(url):
-                            # ponytail: message-global flag — one SP video success mutes every AMS
-                            # fallback in the message; pair by recording id if multi-recording
-                            # messages ever appear (today's corpus: one recording per message).
-                            sp_video_ok = True
-                        notes.append(f"[file: {url} → {Path(fpath).resolve().as_uri()}]")
-                    else:
-                        notes.append(f"[file(sp): {url}]")  # folder/site/page — not a file
-                except Exception as exc:  # noqa: BLE001 — best-effort; ref-only on failure
-                    log.debug("sp_file_failed", url=url, error=str(exc))
-                    if on_fail:
-                        on_fail(url, exc)
-                    notes.append(f"[file(sp): {url}]")
+                fpath, failures = await _sp_file_or_fallback(
+                    client, item, media_dir, download, sp_token, skip_url
+                )
+                if fpath:
+                    if _is_video_url(url):
+                        # ponytail: message-global flag — one SP video success mutes every AMS
+                        # fallback in the message; pair by recording id if multi-recording
+                        # messages ever appear (today's corpus: one recording per message).
+                        sp_video_ok = True
+                    notes.append(f"[file: {url} → {Path(fpath).resolve().as_uri()}]")
+                else:
+                    # Only when no URL gave the file: one that served must not be denied for the other.
+                    for failed, error in failures:
+                        if on_fail:
+                            on_fail(failed, error)
+                    notes.append(f"[file(sp): {url}]")  # no bearer, failed, or folder/site/page
                 continue
             if not (download and _downloadable(url)):
                 notes.append(f"[{kind}: {url}]")

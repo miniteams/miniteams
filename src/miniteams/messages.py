@@ -249,6 +249,12 @@ def json_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
+def message_files(message: dict[str, Any]) -> list[Any]:
+    """A message's decoded `properties.files`, for attachment extraction (spec 027)."""
+    props = message.get("properties")
+    return json_list(props.get("files")) if isinstance(props, dict) else []
+
+
 def plain_text(content: str) -> str:
     """HTML body as one line of text.
 
@@ -441,6 +447,7 @@ async def _print_message(resource: dict[str, Any], directory: Directory, tag: st
         directory.settings.media_dir,
         directory.settings.download_media,
         media=directory.media,
+        files=message_files(resource),
     )
     text = strip_html(content) if msgtype == "RichText/Html" else content if msgtype == "Text" else ""
     suffix = (" " + " ".join(notes)) if notes else ""
@@ -526,7 +533,7 @@ async def resource_to_record(resource: dict[str, Any], directory: Directory) -> 
         "messagetype": msgtype,
         "text": text,
         "content_raw": content,
-        "attachments": attachments.extract(content, msgtype, directory.media),
+        "attachments": attachments.extract(content, msgtype, directory.media, message_files(resource)),
         "reactions": props.get("emotions"),
         # Surfaced technical identifiers (also present in `raw`, promoted for convenience).
         "clientmessageid": resource.get("clientmessageid"),

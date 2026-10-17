@@ -734,6 +734,42 @@ def test_record_names_a_pasted_file_link_once() -> None:
     assert alone["html"] == f'<p>see</p><p><a href="{url}" rel="noopener" target="_blank">budget.xlsx</a></p>'
 
 
+_SHARE = "https://example-my.sharepoint.com/:w:/g/personal/someone_example_com/EaBcDeF"
+_LOCAL = f"/media/{quote(T, safe='')}/"
+
+
+def _card_href(media: Path, entry: dict[str, Any]) -> str | None:
+    html = CV.chat_record(_m("1", _at(1), "<p>x</p>", properties={"files": [entry]}), T, media_dir=media)[
+        "html"
+    ]
+    return html.split('href="')[1].split('"')[0] if 'href="' in html else None
+
+
+def test_record_card_opens_the_archived_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """027-AC5: a card whose file the archive holds opens it through /media, in a new tab; without the copy,
+    the hotlink."""
+    media = tmp_path / "media"
+    media.mkdir()
+    (media / "plan v2.docx").write_bytes(b"doc")
+    (media / "big.pdf").write_bytes(b"x" * 11)
+    (media / "dir.pdf").mkdir()
+    (media / "half.pdf.part").write_bytes(b"x")
+    (tmp_path / "outside.pdf").write_bytes(b"x")
+    (media / "out.pdf").symlink_to(tmp_path / "outside.pdf")  # a link out of the folder: /media refuses it
+    linked = {"fileName": "plan v2.docx", "fileInfo": {"shareUrl": _SHARE}}
+    local = f"{_LOCAL}plan%20v2.docx"
+    html = CV.chat_record(_m("1", _at(1), properties={"files": [linked]}), T, media_dir=media)["html"]
+    assert f'<a class="file" href="{local}" rel="noopener" target="_blank">' in html
+    assert _card_href(media, {"fileName": "plan v2.docx"}) == local  # no hotlink at all
+    assert _card_href(media, {**linked, "fileName": "../media/plan v2.docx"}) == local  # a bare name only
+    for name in ("absent.docx", "dir.pdf", "half.pdf.part", "out.pdf", "a\x00b", "", "big.pdf"):
+        monkeypatch.setattr(CV, "_MEDIA_MAX", 10)  # big.pdf: over what /media serves
+        assert _card_href(media, {**linked, "fileName": name}) == _SHARE, name
+    assert _card_href(None, linked) == _SHARE  # no archive folder
+    ref = {**linked, "state": "reference"}  # never downloaded: its link stays the shared one
+    assert _card_href(media, ref) == _SHARE
+
+
 _BOB = "8:orgid:00000000-0000-0000-0000-00000000000c"
 _CARL = "8:orgid:00000000-0000-0000-0000-00000000000d"
 _ACTS = "19:acts@thread.v2"  # archived by the test that reads it
@@ -1361,6 +1397,19 @@ def test_media_file_refuses_oversized_files(
     """011-AC3: the whole-body response is capped."""
     _media(data_dir)
     monkeypatch.setattr(CV, "_MEDIA_MAX", 4)
+    assert board.chat.media_file(f"/media/{quote(T, safe='')}/{OBJ}.png") is None
+
+
+def test_media_file_unreadable_is_none(
+    board: W.Board, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC3: a file gone or unreadable between the check and the read is a 404, not an error."""
+    _media(data_dir)
+
+    def gone(self: Path) -> bytes:
+        raise PermissionError(self)
+
+    monkeypatch.setattr(Path, "read_bytes", gone)
     assert board.chat.media_file(f"/media/{quote(T, safe='')}/{OBJ}.png") is None
 
 

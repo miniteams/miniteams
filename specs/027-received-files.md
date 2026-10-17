@@ -32,7 +32,11 @@ copy when there is one, SharePoint otherwise.
 - **Exclusions honoured.** `--no-media` downloads nothing; `--media` types apply (a video file is
   `videos`, off by default); denied assets back off as today (`--retry-assets` forces them).
 - **Local copy first.** When the archive holds the file, the card opens it through the web's existing
-  `/media/<thread>/<file>` route; else the hotlink.
+  `/media/<thread>/<file>` route; else the hotlink. The archive records which local file each SharePoint
+  URL was saved as, so a card finds its own copy by URL, never by name, and a held file costs no
+  SharePoint call on later passes.
+- **Name collisions.** Two different files with the same name in one chat are both kept: the second is
+  saved as `name (2).ext`, and so on.
 
 ## Out of scope
 
@@ -46,6 +50,10 @@ copy when there is one, SharePoint otherwise.
   name) in the chat page, live and from history; a message without any shows none.
 - [ ] **AC2** A card links to the entry's `shareUrl`, else its `objectUrl`, in a new tab (`noopener`);
   an entry with neither shows its name unlinked; the name is plain text everywhere.
+- [ ] **AC7** A card opens the local copy saved for its own URL; two different files sharing a name never
+  open each other's copy; a file already held is not looked up on SharePoint again.
+- [ ] **AC8** Two different files with the same name in one chat are both downloaded, the second as
+  `name (2).ext`; the same file met twice is downloaded once.
 - [ ] **AC6** A `reference` entry shows as a link named after the file, not a card; when the body already
   links it, that link reads as the file name and no second link appears; it is not downloaded again.
 - [ ] **AC3** With media on and `files` selected, the archive one-shot, the live archiver and
@@ -74,9 +82,18 @@ copy when there is one, SharePoint otherwise.
   `--verify-media` run on the test chat only downloads the trial file and the card opens it; full suite
   and pre-commit green.
 
+### Phase 3 — Local copies by URL, name collisions
+- Work: record URL → local name on download; cards and skip-if-held look up by URL; a different file
+  under a taken name is saved as `name (n).ext`.
+- **Covers**: AC7, AC8
+- **Data model impact**: new URL → local file table in each chat's `messages.db`
+- **DoD**: unit tests for the table, lookup, collision naming and no-network skip; full suite and
+  pre-commit green; live `--verify-media` on the test chat.
+
 ## Data model impact (summary)
 
-None: files go to the existing per-chat `media/` folder; message rows are unchanged.
+A new table in each chat's `messages.db`: SharePoint URL → local file name (additive, created on open, no
+migration of existing rows). Files go to the existing per-chat `media/` folder; message rows are unchanged.
 
 ## Open questions
 
@@ -88,5 +105,7 @@ None.
   (2026-10-17).
 - No size cap beyond the existing media types — not asked; `videos` stays the big-file opt-in.
 - Cards in the chat page only, not the widget's previews — overturnable.
+- URL → local file table and `name (n).ext` collisions, as phase 3 — user's call (2026-10-17, after
+  the phase 2 review).
 - `shareUrl` before `objectUrl`: most received files live in the sender's OneDrive; `reference` entries
   are links named after the file — user's calls (2026-10-17, after review).

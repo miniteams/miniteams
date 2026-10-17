@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, TypeIs
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import httpx
 import structlog
@@ -298,6 +298,32 @@ def _record_type(msgtype: str) -> str:
     return "system" if is_activity(msgtype) else "other"
 
 
+def _servable(media: Path, name: str) -> Path | None:
+    """The file `name` of a chat's `media` folder that `/media` serves, else None. Blocking (NFS)."""
+    try:
+        media = media.resolve(strict=True)
+        target = (media / name).resolve(strict=True)
+        # Resolved: `..`, encoded slashes and symlinks out of the folder or onto a partial download
+        # all fail this one check.
+        if target.parent != media or target.name.endswith(".part") or not target.is_file():
+            return None
+        if target.stat().st_size > _MEDIA_MAX:
+            log.info("media_too_large", folder=str(media), file=name)
+            return None
+    except OSError, ValueError:  # ValueError: an encoded NUL in the name
+        return None
+    return target
+
+
+def local_file(thread_id: str, media_dir: Path | None, name: str) -> str | None:
+    """`/media/<thread>/<name>` when the archive holds a shared file `/media` serves (027-AC5); past the
+    cap or absent, None: the hotlink still opens it."""
+    name = Path(name).name  # as attachments._safe_name stored it
+    if media_dir is None or _servable(media_dir, name) is None:
+        return None
+    return f"/media/{quote(thread_id, safe='')}/{quote(name, safe='')}"
+
+
 def chat_record(
     message: dict[str, Any],
     thread_id: str,
@@ -338,7 +364,8 @@ def chat_record(
             cards = cards_html(message, media_url=lambda u: media_url(thread_id, media_dir, u))
             body += cards
             kind = "text" if cards and kind == "other" else kind
-        files = "" if kind in ("system", "call") else files_html(props.get("files"), named)
+        local = functools.partial(local_file, thread_id, media_dir)
+        files = "" if kind in ("system", "call") else files_html(props.get("files"), named, local)
         if files:  # 027-AC1: after the text, replacing the 📎 marker
             body += files
             kind = "text" if kind == "other" else kind
@@ -1513,18 +1540,12 @@ class ChatVerbs:
         chat_dir = archive_dir(self.data_dir, thread_id)
         if chat_dir is None:
             return None
+        target = _servable(chat_dir / "media", name)
+        if target is None:
+            return None
         try:
-            media = (chat_dir / "media").resolve(strict=True)
-            target = (media / name).resolve(strict=True)
-            # Resolved: `..`, encoded slashes and symlinks out of the folder or onto a partial download
-            # all fail this one check.
-            if target.parent != media or target.name.endswith(".part") or not target.is_file():
-                return None
-            if target.stat().st_size > _MEDIA_MAX:
-                log.info("media_too_large", thread=thread_id, file=name)
-                return None
             body = target.read_bytes()
-        except OSError, ValueError:  # ValueError: an encoded NUL in the name
+        except OSError:
             return None
         return body, mimetypes.guess_type(name)[0] or "application/octet-stream"
 

@@ -534,13 +534,20 @@ def file_links(files: object) -> dict[str, str]:
     }
 
 
-def files_html(files: object, named: set[str] | frozenset[str] = frozenset()) -> str:
-    """`properties.files` as one card per entry, type icon then name (027-AC1), linked to its sharing link
-    else its objectUrl in a new tab, unlinked without either (027-AC2). A `reference` entry is a link named
-    after the file instead, or nothing when the body already links it (a key in `named`, 027-AC6)."""
+def files_html(
+    files: object,
+    named: set[str] | frozenset[str] = frozenset(),
+    local: Callable[[str], str | None] | None = None,
+) -> str:
+    """`properties.files` as one card per entry, type icon then name (027-AC1), linked to its archived copy
+    `local(name)` (027-AC5), else its sharing link, else its objectUrl, in a new tab; unlinked without any
+    (027-AC2). A `reference` entry is a link named after the file instead, or nothing when the body already
+    links it (a key in `named`, 027-AC6)."""
     out = []
     for entry, name, urls in _file_entries(files):
         url = _file_url(urls)
+        if local and entry.get("state") != "reference":
+            url = local(name) or url
         link = f'{_attr("href", url)} rel="noopener" target="_blank"' if url else ""
         if entry.get("state") == "reference":
             if not any(u and _link_key(u) in named for u in urls):

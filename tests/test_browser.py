@@ -57,6 +57,7 @@ D = "19:dddd@thread.v2"  # archived, messages on several days
 K = "19:kkkk@thread.v2"  # archived, a bot card
 R = "19:rrrr@thread.v2"  # archived, deleted runs and reaction chips
 F = "19:ffff@thread.v2"  # archived, a message sharing files (spec 027)
+G = "19:gggg@thread.v2"  # archived, a shared file the archive holds (spec 027)
 GONE = {"deletetime": "1789466600000"}
 # An `open` the spy records, not browser_helpers.BARRIER: the real board drops an unknown verb unseen.
 _BARRIER = ("barrier", False)
@@ -152,6 +153,11 @@ def data_dir(tmp_path: Path) -> Path:
             _m("5", _at(5), "<p>no link</p>", properties=ref),
         ],
     )
+    kept_file = _m("1", _at(1), "<p>kept</p>", properties={"files": browser_helpers.FILES[:1]})
+    _archive(path, G, [kept_file, _m("2", _at(2))])
+    kept = find_chat_dir(path, G)
+    assert kept is not None
+    (kept / "media" / "plan <v2>.docx").write_bytes(b"DOCX")
     return path
 
 
@@ -272,6 +278,20 @@ async def test_a_pasted_file_link_reads_as_the_file_name(chat: Pages) -> None:
         ["budget.xlsx", url, "_blank", "noopener"]
     ]
     assert await page.locator('[data-id="4"] .file, [data-id="5"] .file').count() == 0
+
+
+@pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
+async def test_a_file_card_opens_the_archived_copy(chat: Pages) -> None:
+    """027-AC5: the card of a file the archive holds links its /media copy, in a new tab with noopener, out of
+    Tab outside the focused message (018-AC5); the link serves the file."""
+    page = await chat.open(_chat(G))
+    await _handled(page, "history")
+    href = f"/media/{quote(G, safe='')}/plan%20%3Cv2%3E.docx"
+    link = {"tag": "A", "text": "📝 plan <v2>.docx", "href": href, "target": "_blank", "rel": "noopener"}
+    assert await _file_cards(page, "1") == [link | {"links": 0}]
+    assert await page.locator('[data-id="1"] a.file').evaluate("a => a.tabIndex") == -1
+    got = await page.evaluate("h => fetch(h).then(async r => [r.status, await r.text()])", href)
+    assert got == [200, "DOCX"]
 
 
 @pytest.mark.parametrize("theme", ["light", "dark"])
