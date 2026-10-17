@@ -895,7 +895,7 @@ async def test_row_read_sends_read_and_the_menu_sends_seen(split: Split) -> None
     page, row = await _row_menu(split, 4)
     assert await _focused(page) == "k:seen"
     assert await row.locator('[data-k="more"]').get_attribute("aria-expanded") == "true"
-    assert await row.locator(".rowmenu").inner_text() == "✓ Mark seen\n🔕 Mute"
+    assert await row.locator(".rowmenu").inner_text() == "✓ Mark seen\n🔕 Mute\nSection ▸"
     await row.locator('[data-k="seen"]').click()
     assert await page.locator(".rowmenu").count() == 0
     await row.locator('[data-k="read"]').click()
@@ -939,6 +939,8 @@ async def test_row_menu_closes_when_the_focus_leaves_it(split: Split) -> None:
     page, row = await _row_menu(split, 4)
     await page.keyboard.press("Tab")
     assert await _focused(page) == "k:mute"
+    await page.keyboard.press("Tab")
+    assert await _focused(page) == "k:file"
     await page.keyboard.press("Tab")
     await until(page, "!document.querySelector('.rowmenu')")
     await row.hover()

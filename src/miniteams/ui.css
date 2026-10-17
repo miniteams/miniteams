@@ -37,12 +37,30 @@
   li > .prev { cursor: pointer; }
   /* A row's ⋯ menu; its row stacks above the next rows, which would paint over it. */
   li:has(> .rowmenu) { z-index: 1; }
-  .rowmenu { position: absolute; right: 8px; top: var(--menu-top); display: grid; min-width: 120px; padding: 4px; background: var(--panel);
+  .rowmenu { position: absolute; right: 8px; top: var(--menu-top); display: grid; min-width: 120px; max-height: min(60vh, 360px); overflow-y: auto; padding: 4px; background: var(--panel);
     border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); }
   .rowmenu.up { top: auto; bottom: var(--menu-bottom); }
-  .rowmenu button { border: 0; background: transparent; text-align: left; padding: 3px 8px; border-radius: 6px; cursor: pointer; font-size: 12.5px; white-space: nowrap; }
+  .rowmenu button { border: 0; background: transparent; text-align: left; padding: 3px 8px; border-radius: 6px; cursor: pointer; font-size: 12.5px; white-space: nowrap;
+    max-width: 240px; overflow: hidden; text-overflow: ellipsis; }
   .rowmenu button:hover { background: var(--accent-soft); color: var(--accent); }
   .rowmenu button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .rowmenu input { font: inherit; font-size: 12.5px; color: inherit; background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; margin: 2px 4px; }
+  .rowmenu p { margin: 3px 8px; max-width: 220px; font-size: 12.5px; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  /* Section headers (spec 026) share the rows' list: ul#rows outranks each page's row rules. */
+  #mode[hidden] { display: none; }
+  ul#rows > li.sect { display: flex; align-items: center; gap: 4px; position: relative; padding: 6px 4px 2px; border-radius: 8px; background: none; box-shadow: none; opacity: 1; }
+  ul#rows > li.sect.sel { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .shead { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; border: 0; background: none; padding: 2px 4px; border-radius: 6px;
+    cursor: pointer; text-align: left; font-size: 12px; font-weight: 650; color: var(--dim); }
+  .shead:hover { color: var(--text); }
+  .shead:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .shead .fold { flex: none; width: 1em; }
+  .shead b { flex: none; font-size: 10.5px; padding: 0 6px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); }
+  .shead b.at { background: var(--mention-soft); color: var(--mention); }
+  li.sect > [data-k=more] { display: none; border: 1px solid var(--line); background: var(--panel); border-radius: 6px; height: 20px; padding: 0 6px;
+    font-size: 12px; line-height: 18px; cursor: pointer; color: var(--dim); }
+  li.sect:hover > [data-k=more], li.sect:focus-within > [data-k=more], li.sect.hold > [data-k=more], li.sect:has(> .rowmenu) > [data-k=more] { display: inline-block; }
   .cog { position: relative; flex: none; }
   .cog > button { border: 0; background: transparent; color: var(--dim); font-size: 16px; width: 28px; height: 28px; border-radius: 8px; cursor: pointer; }
   .cog > button:hover, .cog.open > button { background: var(--panel-2); color: var(--text); }

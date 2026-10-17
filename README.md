@@ -113,8 +113,8 @@ seen. Middle or Ctrl/⌘ click opens the https link (or the chat page, see the �
 https link; through `--browser firefox` when set, else in the page's own browser. `xdg-open` only works when the `msteams` handler's `.desktop` entry passes the
 URL along (`Exec=… %u`); otherwise point `--opener` at the client binary, e.g.
 `--opener "/path/to/teams-for-linux --no-sandbox"`. Hovering a preview cut by the row width shows the whole message (up to 1000 characters).
-Hovering (or tabbing into) a row shows `✎`, `👁` (mark read in Teams) and `⋯`, a menu with **✓ Mark seen** and
-**🔕 Mute** (same rows in the chat page's split list, without `✎`). Seen: the row leaves the Inbox until something
+Hovering (or tabbing into) a row shows `✎`, `👁` (mark read in Teams) and `⋯`, a menu with **✓ Mark seen**,
+**🔕 Mute** and **Section ▸** (same rows in the chat page's split list, without `✎`). Seen: the row leaves the Inbox until something
 newer lands on that chat (state in `~/.config/miniteams/seen.json`); the **Seen** tab lists those rows dimmed,
 where ⋯ → ↺ Unseen undoes it. A message that @mentions you gets a blue stripe and an `@ you` tag (`@ all` for an
 @everyone), also when the mention was added by editing an older message; it clears once you mark the row seen
@@ -126,6 +126,17 @@ Escape closes it and keeps the draft; a failed send stays in its queue line with
 **Middle click** and **Chat navigation** (see *Chat page*). The
 Teams session expired (refresh token dead): `web` logs `auth_expired` and waits; run `miniteams login` in another
 terminal and it reconnects within seconds (it watches the token cache file).
+
+**Sections** group chats, in the widget and the split list alike (state in `~/.config/miniteams/sections.json`):
+- ⋯ → Section ▸ files the chat in a section, **None**, or a **New section…** named inline. A chat is in one section at most.
+- Once a section exists, **Recent / Sections** in the list's header switches the arrangement; each view (widget, chat
+  page) keeps its own choice. Sections mode shows the sections in order, chats with none under **Other**, last; the
+  tabs filter as usual, and a search shows only the sections it reaches.
+- A section's header folds it (folds are kept per view); folded, it shows its unread count and `@`. Its ⋯ renames,
+  sets **Recent** (by activity) or **Manual** order (an arrival never moves a chat), moves it up or down, and
+  deletes it (its chats go to Other).
+- Keys: ↑/↓ walk headers and chats; on a header Enter, ← and → fold and unfold; ← on a chat goes to its header;
+  Alt+↑/↓ moves a chat within a Manual section. From a filter box, ←/→ act only while it is empty.
 
 **First launch**
 - Launch with the path `web` logs at start (`web_listening … launch=file://…`):
@@ -169,6 +180,7 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   - Drag the list's edge to resize (or focus it: ←/→, Home/End, Enter or double click resets); width and fold are kept per browser.
   - ☰ folds the list, or opens it over the chat below 700px.
   - Ctrl+K jumps to the list's filter: ↑/↓ pick a row, Enter opens it. Seen and Muted sit behind ⋯ in a narrow list.
+  - **Sections** (see above) work the same here, with their own Recent / Sections choice and folds.
 - **Mark read in Teams when shown** (⚙, on by default): a chat opened, and each message from someone else landing in
   it, marks it read in Teams once the window is visible, focused and at the latest message, and the archive has caught
   up (no "loading latest messages…"); one `read` a second per chat, the last one sent only if all that still holds.

@@ -56,6 +56,7 @@
   body.resizing { user-select: none; cursor: col-resize; }
   @media (width > 700px) { body.side-off #side, body.side-off #grip { display: none; } }
   #side .bar { flex: none; height: var(--bar-h); display: flex; align-items: center; padding: 0 8px; border-bottom: 1px solid var(--line); position: relative; }
+  #side .bar > #mode { flex: none; margin-right: 6px; }
   #side .tabs { flex: none; padding: 6px 8px 4px; position: relative; }
   .seg { display: flex; background: var(--panel-2); border-radius: 10px; padding: 3px; gap: 2px; }
   .seg button { flex: 1 1 auto; border: 0; background: transparent; padding: 3px 4px; white-space: nowrap; border-radius: 8px; cursor: pointer; color: var(--dim); font-size: 12px; }
@@ -310,6 +311,7 @@
 <body>
 <aside id="side" hidden>
   <div class="bar">
+    <div class="seg" id="mode" role="group" aria-label="arrange chats" hidden></div>
     <input id="filter" type="search" placeholder="filter · Ctrl+K" autocomplete="off" spellcheck="false" aria-label="filter chats by name">
     <button id="clear" title="clear the filter" aria-label="clear the filter" hidden>×</button>
   </div>
@@ -364,7 +366,7 @@
 </div>
 <script>
 (() => {
-  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn rowActions caret firstLine completion insertText formatBar imageQueue sendQueue
+  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn itemKey itemOf rowActions sectionList caret firstLine completion insertText formatBar imageQueue sendQueue
   /* ui.js */
   let thread = null;
   try { thread = decodeURIComponent(location.pathname.slice("/chat/".length)); } catch (e) {}
@@ -1545,7 +1547,8 @@
   // --- chatnav=split: the board's list beside the chat (row rules in ui.js) ---
   const $side = document.getElementById("side"), $rows = document.getElementById("rows"), $tabs = document.getElementById("tabs"),
         $filter = document.getElementById("filter"), $nochat = document.getElementById("nochat"), $menu = document.getElementById("menu"),
-        $more = document.getElementById("more"), $clear = document.getElementById("clear"), $grip = document.getElementById("grip");
+        $more = document.getElementById("more"), $clear = document.getElementById("clear"), $grip = document.getElementById("grip"),
+        $mode = document.getElementById("mode");
   let rows = [], browser = false, meName = "", query = "";
   let sel = "";  // the row the arrow keys highlight; its name holds the list's one Tab stop
   let moreOpen = false;
@@ -1595,12 +1598,13 @@
     li.append(name, meta, likeTitle(preview(r, el("span", "prev truncate"), meName), name), ind, ...menu);
     return li;
   };
-  const actions = rowActions($rows, () => renderRows(), send);
+  const secs = sectionList({ view: "chat", list: $rows, send, render: () => renderRows(), select: (k) => { sel = k; }, filter: $filter });
+  const actions = rowActions($rows, () => renderRows(), send, secs);
   const renderRows = () => {
-    if (!split) return;
+    if (!split || actions.held()) return;
     // Rebuilt on every broadcast: the keyboard focus moves to the same control of the new list.
     const f = $side.contains(document.activeElement) ? document.activeElement : null;
-    const fk = f?.dataset.k, fid = f?.closest("#rows > li")?.dataset.id;
+    const fk = f?.dataset.k, fid = itemKey(f?.closest("#rows > li"));
     rows.sort((a, b) => (a.last_activity < b.last_activity) - (a.last_activity > b.last_activity));
     const counts = Object.fromEntries(Object.entries(filters).map(([k, f]) => [k, rows.filter((r) => f(r) && named(r, query)).length]));
     const tabs = Object.entries(TABS).map(([k, lbl]) => {
@@ -1620,6 +1624,7 @@
     more.setAttribute("aria-expanded", String(moreOpen));
     more.onclick = (e) => { e.stopPropagation(); moreOpen = !moreOpen; renderRows(); if (moreOpen) $more.querySelector("button").focus(); };
     $tabs.replaceChildren(...tabs, more);
+    secs.paint($mode);
     $more.replaceChildren(...EXTRA.map((k) => {
       const b = el("button", tab === k ? "on" : null, `${TABS[k]} ${counts[k]}`);
       b.dataset.k = "menu:" + k;
@@ -1631,14 +1636,17 @@
     }));
     $more.hidden = !moreOpen;
     const shown = rows.filter((r) => filters[tab](r) && named(r, query));
-    $rows.replaceChildren(...shown.map(rowOf));
+    $rows.replaceChildren(...secs.items({ shown, query, row: rowOf, actions, sel }));
+    for (const h of $rows.querySelectorAll(".shead")) h.tabIndex = -1;
     const stop = $rows.querySelector("li.sel") || $rows.querySelector("li.cur") || $rows.firstElementChild;
-    if (stop) stop.querySelector(".name").tabIndex = 0;
+    if (stop) stop.querySelector(".name, .shead").tabIndex = 0;
     $nochat.textContent = query ? `no chat matches «${$filter.value.trim()}»` : EMPTY[tab];
-    $nochat.hidden = shown.length > 0;
+    $nochat.hidden = $rows.childElementCount > 0;
     $clear.hidden = !$filter.value;
-    const fli = fid && $rows.querySelector(`li[data-id="${CSS.escape(fid)}"]`);
+    const fli = itemOf($rows, fid);
     if (fli) focusIn(fli, fk);
+    // A focused chat filed into a folded section: its header took the selection, it takes the focus.
+    else if (fid && sel[0] === "§") focusIn(itemOf($rows, sel), "head");
     else if (fk && !fid) $side.querySelector(`[data-k="${fk}"]`)?.focus();
     // A hidden list (folded, drawer closed) keeps the reveal for when it shows.
     if (reveal && rows.length && $rows.offsetParent) { reveal = false; $rows.querySelector("li.cur")?.scrollIntoView({ block: "center" }); }
@@ -1653,10 +1661,10 @@
   const highlight = (li, focus) => {
     if (!li) return;
     for (const o of $rows.querySelectorAll("li.sel")) o.classList.remove("sel");
-    for (const a of $rows.querySelectorAll('.name[tabindex="0"]')) a.tabIndex = -1;
+    for (const a of $rows.querySelectorAll(':is(.name, .shead)[tabindex="0"]')) a.tabIndex = -1;
     li.classList.add("sel");
-    sel = li.dataset.id;
-    const name = li.querySelector(".name");
+    sel = itemKey(li);
+    const name = li.querySelector(".name, .shead");
     name.tabIndex = 0;
     if (focus) name.focus(); else li.scrollIntoView({ block: "nearest" });
   };
@@ -1702,7 +1710,7 @@
     $filter.focus();
   };
   const onBoard = (m) => {
-    rows = m.rows; browser = !!m.browser; meName = m.me || "";
+    rows = m.rows; browser = !!m.browser; meName = m.me || ""; secs.set(m.sections);
     renderRows();
   };
   // A chat's whole screen state goes; its draft, quotes and open editors wait in `drafts`.
@@ -1793,18 +1801,25 @@
     });
     $filter.oninput = () => { query = foldText($filter.value.trim())[0]; sel = ""; renderRows(); };
     $filter.onkeydown = (e) => {
-      const cur = $rows.querySelector("li.sel");
-      if (e.key === "ArrowDown") highlight(cur ? cur.nextElementSibling || cur : $rows.firstElementChild, false);
+      const cur = $rows.querySelector("li.sel"), to = !$filter.value && secs.side(cur, e);
+      if (e.altKey && (e.key === "ArrowDown" || e.key === "ArrowUp") && secs.nudge(sel, e.key === "ArrowDown" ? 1 : -1)) e.preventDefault();
+      else if (e.key === "ArrowDown") highlight(cur ? cur.nextElementSibling || cur : $rows.firstElementChild, false);
       else if (e.key === "ArrowUp") highlight(cur ? cur.previousElementSibling || cur : $rows.lastElementChild, false);
-      else if (e.key === "Enter") { const li = cur || $rows.firstElementChild; if (li) switchTo(li.dataset.id, true); }
+      // ←/→ fold a header or reach a chat's header only in an empty box: else they move the caret.
+      else if (to) highlight(to, false);
+      else if (e.key === "Enter" && cur?.dataset.sid !== undefined) cur.querySelector(".shead").click();
+      else if (e.key === "Enter") { const li = cur || $rows.querySelector("li[data-id]"); if (li) switchTo(li.dataset.id, true); }
       else if (e.key === "Escape" && ($filter.value || sel)) { e.stopPropagation(); clearFilter(); }
       else return;
       e.preventDefault();
     };
     $clear.onclick = () => { clearFilter(); $filter.focus(); };
     $rows.onkeydown = (e) => {
-      const li = e.target.closest?.(".name") && e.target.closest("li");
+      const li = e.target.closest?.(".name, .shead") && e.target.closest("li");
       if (!li) return;
+      if (e.altKey && (e.key === "ArrowDown" || e.key === "ArrowUp") && secs.nudge(li.dataset.id, e.key === "ArrowDown" ? 1 : -1)) { e.preventDefault(); return; }
+      const side = secs.side(li, e);
+      if (side) { e.preventDefault(); highlight(side, true); return; }
       const to = { ArrowDown: li.nextElementSibling, ArrowUp: li.previousElementSibling, Home: $rows.firstElementChild, End: $rows.lastElementChild }[e.key];
       if (to === undefined) return;
       e.preventDefault();

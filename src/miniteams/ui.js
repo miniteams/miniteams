@@ -151,28 +151,36 @@
     return prev;
   };
 
-  // A row's actions: 👁 (Teams' read, seen on every device) inline, the private seen and the mute behind ⋯.
-  // Rows are rebuilt on every broadcast: the open menu is kept by row id and comes back with its row.
-  // Returns the inline buttons and the menu (none or one) to append to the row's `li`.
-  const rowActions = (list, render, send) => {
-    let open = "", up = false;
-    const close = (id, restore = true) => {
+  // A list item is a chat row (`data-id`) or a section header (`data-sid`, "" for Other, spec 026); its
+  // key is the row id, or "§" and the section id. Rows are rebuilt on every broadcast: keys find them again.
+  const itemKey = (li) => li?.dataset.id ?? (li?.dataset.sid !== undefined ? "§" + li.dataset.sid : undefined);
+  const itemOf = (list, key) => key ? list.querySelector(key[0] === "§" ? `li[data-sid="${CSS.escape(key.slice(1))}"]` : `li[data-id="${CSS.escape(key)}"]`) : null;
+
+  // A row's actions: 👁 (Teams' read, seen on every device) inline, the private seen, the mute and the
+  // section behind ⋯; a section header's ⋯ manages the section (spec 026). One menu open at a time, kept
+  // by item key across re-renders. `secs`: the page's sectionList. Returns the inline buttons and the menu
+  // (none or one) to append to the item's `li`.
+  const rowActions = (list, render, send, secs) => {
+    let open = "", up = false, sub = "", typed = null, composing = false;  // sub: the menu's inner page; typed: its name input
+    const shut = () => { open = ""; sub = ""; typed = null; composing = false; };
+    const close = (key, restore = true) => {
       // Pointer dismissal must not leave focus pinning the row's hover actions open.
       if (!restore && list.contains(document.activeElement)) document.activeElement.blur();
-      open = ""; render();
-      if (restore) focusIn(list.querySelector(`li[data-id="${CSS.escape(id)}"]`), "more");
+      shut(); render();
+      if (restore) focusIn(itemOf(list, key), "more");
     };
-    addEventListener("click", (e) => { if (open && !e.target.closest?.(".rowmenu, [data-k=more]")) { open = ""; render(); } });
+    addEventListener("click", (e) => { if (open && !e.target.closest?.(".rowmenu, [data-k=more]")) { shut(); render(); } });
     // After the move, not during it: a broadcast re-render puts the focus back into the menu first. Its own ⋯ keeps it, to toggle.
     // Only the menu node goes: a full render between press and release would drop the click that moved the focus.
     list.addEventListener("focusout", () => setTimeout(() => {
       const menu = list.querySelector(".rowmenu");
       if (!open || !menu || menu.parentElement.contains(document.activeElement)) return;
-      open = "";
+      shut();
       menu.parentElement.querySelector("[data-k=more]")?.setAttribute("aria-expanded", "false");
       menu.remove();
     }));
     const btn = (cls, text, k, act) => { const b = el("button", cls, text); b.dataset.k = k; b.onclick = act; return b; };
+    const pick = (on, text, k, act) => { const b = btn(null, (on ? "✓ " : "") + text, k, act); b.setAttribute("aria-pressed", String(on)); return b; };
     // Anchor to the trigger, not the row: previews and mention badges make rows taller.
     const anchor = (menu) => {
       const li = menu.parentElement;
@@ -182,12 +190,11 @@
       menu.style.setProperty("--menu-top", `${more.bottom - row.top + 4}px`);
       menu.style.setProperty("--menu-bottom", `${row.bottom - more.top + 4}px`);
     };
-    return (r) => {
-      const inline = [];
-      if (r.last_id) inline.push(Object.assign(btn("read", "👁", "read", () => send({ read: r.id })), { title: "mark read in Teams" }));
+    // `build(act, to)` fills the open menu: `act(verb)` sends and closes, `to(page)` turns to an inner page.
+    const menuOf = (key, build) => {
       const more = btn("more", "⋯", "more", (e) => {
-        if (open === r.id) { close(r.id, e.detail === 0); return; }
-        open = r.id; up = false; render();
+        if (open === key) { close(key, e.detail === 0); return; }
+        shut(); open = key; up = false; render();
         const menu = list.querySelector(".rowmenu");
         if (menu) {
           anchor(menu);
@@ -199,22 +206,184 @@
           menu.querySelector("button")?.focus();
         }
       });
-      more.title = "more"; more.setAttribute("aria-label", "more"); more.setAttribute("aria-expanded", String(open === r.id));
-      inline.push(more);
-      if (open !== r.id) return [inline, []];
-      const m = mentioned(r), undo = isSeen(r) && !m;
-      // What was on screen: a message or mention landing between render and click must keep the row visible.
-      const shownAt = m && Date.parse(r.mention.at) > Date.parse(r.last_activity) ? r.mention.at : r.last_activity;
-      const act = (verb) => (e) => { close(r.id, e.detail === 0); send(verb); };
+      more.title = "more"; more.setAttribute("aria-label", "more"); more.setAttribute("aria-expanded", String(open === key));
+      if (open !== key) return [more, []];
+      const act = (verb) => (e) => { close(key, e.detail === 0); send(verb); };
+      const to = (page) => () => {
+        sub = page; typed = null; composing = false; render();
+        const menu = list.querySelector(".rowmenu");
+        (menu?.querySelector("input") || menu?.querySelector("button"))?.focus();
+      };
+      // Kept across re-renders: a broadcast must not drop what is being typed. Plain text, sent as typed.
+      const ask = (value, label, ok, verb) => {
+        if (!typed) {
+          typed = Object.assign(el("input"), { value, maxLength: 60 }); typed.dataset.k = "sname"; typed.setAttribute("aria-label", label);
+          typed.addEventListener("compositionstart", () => { composing = true; });
+          typed.addEventListener("compositionend", () => { composing = false; render(); });
+        }
+        const go = (e) => { const v = typed.value.trim(); if (v) act(verb(v))(e); };
+        typed.onkeydown = (e) => { if (e.key === "Enter" && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); go(e); } };
+        return [typed, btn(null, ok, "ok", go), btn(null, "Cancel", "cancel", to(""))];
+      };
       const menu = el("div", up ? "rowmenu up" : "rowmenu");
       queueMicrotask(() => anchor(menu));
-      menu.append(
-        btn(null, undo ? "↺ Unseen" : "✓ Mark seen", "seen", act(undo ? { unseen: r.id } : { seen: r.id, at: shownAt })),
-        Object.assign(btn(null, r.muted ? "🔔 Unmute" : "🔕 Mute", "mute", act(r.muted ? { unmute: r.id } : { mute: r.id })),
-          { title: r.muted ? "" : "hide until unmuted" }));
-      menu.onkeydown = (e) => { if (e.key === "Escape") { e.stopPropagation(); close(r.id); } };
-      return [inline, [menu]];
+      menu.append(...build(act, to, ask));
+      menu.onkeydown = (e) => { if (e.key === "Escape") { e.stopPropagation(); if (sub) to("")(); else close(key); } };
+      return [more, [menu]];
     };
+    const row = (r) => {
+      const inline = [];
+      if (r.last_id) inline.push(Object.assign(btn("read", "👁", "read", () => send({ read: r.id })), { title: "mark read in Teams" }));
+      const [more, menu] = menuOf(r.id, (act, to, ask) => {
+        if (sub === "new") return ask("", "new section name", "Create", (name) => ({ section_new: name, chat: r.id }));
+        if (sub === "file") {
+          const at = secs.holder(r.id);
+          return [...secs.list().map((s) => pick(s === at, s.name, "sec", act({ section_file: r.id, section: s.id }))),
+            pick(!at, "None", "none", act({ section_file: r.id, section: null })), btn(null, "New section…", "new", to("new"))];
+        }
+        const m = mentioned(r), undo = isSeen(r) && !m;
+        // What was on screen: a message or mention landing between render and click must keep the row visible.
+        const shownAt = m && Date.parse(r.mention.at) > Date.parse(r.last_activity) ? r.mention.at : r.last_activity;
+        return [btn(null, undo ? "↺ Unseen" : "✓ Mark seen", "seen", act(undo ? { unseen: r.id } : { seen: r.id, at: shownAt })),
+          Object.assign(btn(null, r.muted ? "🔔 Unmute" : "🔕 Mute", "mute", act(r.muted ? { unmute: r.id } : { mute: r.id })),
+            { title: r.muted ? "" : "hide until unmuted" }),
+          btn(null, "Section ▸", "file", to("file"))];
+      });
+      inline.push(more);
+      return [inline, menu];
+    };
+    const head = (s) => menuOf("§" + s.id, (act, to, ask) => {
+      if (sub === "rename") return ask(s.name, "section name", "Rename", (name) => ({ section_rename: s.id, name }));
+      if (sub === "delete") {
+        // The focus goes on to the next item that outlives the section: one of its chats (now under Other),
+        // else a header still there; else the previous one, else the filter box.
+        const gone = (e) => {
+          const li = itemOf(list, "§" + s.id), stays = (n) => n.dataset.id || (secs.list().length > 1 && n.dataset.sid !== undefined);
+          let n = li?.nextElementSibling;
+          while (n && !stays(n)) n = n.nextElementSibling;
+          if (!n) { n = li?.previousElementSibling; while (n && !stays(n)) n = n.previousElementSibling; }
+          act({ section_delete: s.id })(e);
+          secs.land(itemKey(n));
+        };
+        return [el("p", null, `Delete ${s.name}? Its chats go to Other.`), btn(null, "Delete", "ok", gone), btn(null, "Cancel", "cancel", to(""))];
+      }
+      const all = secs.list(), i = all.findIndex((x) => x.id === s.id);
+      return [btn(null, "Rename…", "rename", to("rename")),
+        pick(s.order === "recent", "Recent order", "order:recent", act({ section_order: s.id, order: "recent" })),
+        pick(s.order === "manual", "Manual order", "order:manual", act({ section_order: s.id, order: "manual" })),
+        ...(i > 0 ? [btn(null, "↑ Move up", "up", act({ section_move: s.id, by: -1 }))] : []),
+        ...(i < all.length - 1 ? [btn(null, "↓ Move down", "down", act({ section_move: s.id, by: 1 }))] : []),
+        btn(null, "Delete…", "delete", to("delete"))];
+    });
+    // A redraw would move the name box and cancel an IME composition: the page waits for its end.
+    return Object.assign(row, { head, held: () => composing && document.activeElement === typed });
+  };
+
+  // The list's sections (spec 026), from the board frame only: a change shows once the server broadcasts
+  // it, in every view alike. The mode and the folds are per view (`view`), on their own keys: the ⚙
+  // settings are shared. `render()` redraws the page's list, `select(key)` sets its selection, `filter`
+  // is its filter box.
+  const sectionList = ({ view, list, send, render, select, filter }) => {
+    const MODE = "sections:" + view, FOLDS = "folds:" + view;
+    let sections = [], mode = store(MODE) === "sections" ? "sections" : "recent", searching = false, shownIn = new Map();  // section id → its chats on screen
+    const saved = () => { try { const ids = JSON.parse(store(FOLDS)); return new Set(Array.isArray(ids) ? ids.filter((id) => typeof id === "string") : []); } catch (e) { return new Set(); } };
+    const folded = saved(), searched = new Set();  // searched: folds made during a search, gone with it
+    const on = () => mode === "sections" && sections.length > 0;
+    const set = (all) => {
+      sections = (Array.isArray(all) ? all : []).filter((s) => s && typeof s.id === "string" && s.id && typeof s.name === "string" && Array.isArray(s.chats))
+        .map((s) => ({ id: s.id, name: s.name, order: s.order === "manual" ? "manual" : "recent", chats: s.chats.filter((c) => typeof c === "string") }));
+    };
+    const holder = (id) => sections.find((s) => s.chats.includes(id));
+    const fold = (sid, shut) => {
+      const into = searching ? searched : folded;
+      if (shut) into.add(sid); else into.delete(sid);
+      if (searching) { render(); return; }
+      // Only this change on what is stored: another page of this view may have folded others since.
+      const all = saved();
+      if (shut) all.add(sid); else all.delete(sid);
+      keep(FOLDS, JSON.stringify([...all].filter((id) => !id || sections.some((s) => s.id === id))));
+      render();
+    };
+    // Folded: the chats shown under it by the tabs' rules, unread and @, as a count and a mark.
+    const header = (s, rows, shut, sel, actions) => {
+      const sid = s ? s.id : "", li = el("li", "sect" + (sel === "§" + sid ? " sel" : ""));
+      li.dataset.sid = sid;
+      const b = el("button", "shead");
+      b.dataset.k = "head";
+      b.setAttribute("aria-expanded", String(!shut));
+      const glyph = el("span", "fold", shut ? "▸" : "▾");
+      glyph.setAttribute("aria-hidden", "true");  // aria-expanded says it
+      b.append(glyph, Object.assign(el("span", "sname truncate", s ? s.name : "Other"), { dir: "auto" }));
+      const n = shut ? rows.filter(filters.unread).length : 0;
+      if (n) b.append(el("b", "n", n), el("span", "sr", " unread"));
+      if (shut && rows.some(filters.mention)) b.append(el("b", "at", "@"), el("span", "sr", " mentioned"));
+      b.onclick = () => fold(sid, !shut);
+      li.append(b);
+      if (s) { const [more, menu] = actions.head(s); li.append(more, ...menu); }
+      return li;
+    };
+    // `shown`: the rows the tab and the filter keep, newest first. Recent: as they are. Sections: under
+    // their headers, Manual ones in their stored order, Other last. A search shows only the sections it
+    // reaches, unfolded until a fold made during it.
+    const items = ({ shown, query, row, actions, sel }) => {
+      searching = !!query;
+      if (!searching) searched.clear();
+      if (!on()) return shown.map(row);
+      const filed = new Set(sections.flatMap((s) => s.chats)), byId = new Map(shown.map((r) => [r.id, r]));
+      const groups = [...sections.map((s) => {
+        const mine = new Set(s.chats);
+        return [s, s.order === "manual" ? s.chats.map((id) => byId.get(id)).filter(Boolean) : shown.filter((r) => mine.has(r.id))];
+      }), [null, shown.filter((r) => !filed.has(r.id))]];
+      shownIn = new Map(groups.map(([s, rows]) => [s?.id, rows.map((r) => r.id)]));
+      // A chat selected in a folded section hands the selection to its header: nothing hidden takes keys.
+      const hidden = groups.find(([s, rows]) => (searching ? searched : folded).has(s ? s.id : "") && rows.some((r) => r.id === sel));
+      if (hidden) select(sel = "§" + (hidden[0]?.id ?? ""));
+      // Other only with chats to show: it is no drop target in this phase.
+      return groups.flatMap(([s, rows]) => {
+        if (!rows.length && (searching || !s)) return [];
+        const shut = (searching ? searched : folded).has(s ? s.id : "");
+        return [header(s, rows, shut, sel, actions), ...(shut ? [] : rows.map(row))];
+      });
+    };
+    // The Recent / Sections switch, in `box`, shown once a section exists.
+    const paint = (box) => {
+      const k = box.contains(document.activeElement) && document.activeElement.dataset.k;  // a key press on it keeps it
+      box.hidden = !sections.length;
+      box.replaceChildren(...[["recent", "Recent"], ["sections", "Sections"]].map(([k, label]) => {
+        const b = el("button", mode === k ? "on" : null, label);
+        b.dataset.k = "mode:" + k;
+        b.setAttribute("aria-pressed", String(mode === k));
+        b.onclick = () => { mode = k; keep(MODE, k); render(); };
+        return b;
+      }));
+      if (k) (box.hidden ? filter : box.querySelector(`[data-k="${k}"]`))?.focus();
+    };
+    // The focus once an item went: on `key`'s item, else on the filter box.
+    const land = (key) => { select(key || ""); render(); (itemOf(list, key)?.querySelector(".name, .shead") || filter).focus(); };
+    // ←/→ on an item: a header folds and unfolds, ← on a chat reaches its header. The item to select, or null.
+    // Modified arrows stay the browser's: Alt+← is Back, which the chat page follows.
+    const side = (li, e) => {
+      const key = e.key;
+      if (!on() || !li || (key !== "ArrowLeft" && key !== "ArrowRight") || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return null;
+      if (li.dataset.sid === undefined) {
+        if (key !== "ArrowLeft") return null;
+        let h = li.previousElementSibling;
+        while (h && h.dataset.sid === undefined) h = h.previousElementSibling;
+        return h;
+      }
+      fold(li.dataset.sid, key === "ArrowLeft");
+      return itemOf(list, "§" + li.dataset.sid);
+    };
+    // Alt+↑/↓: a chat moves past the next chat shown in its Manual section (hidden ones would swallow a
+    // ±1 step); false when it is in none.
+    const nudge = (id, by) => {
+      const s = on() && holder(id);
+      if (s?.order !== "manual") return false;
+      const seen = shownIn.get(s.id) || [], next = seen[seen.indexOf(id) + by];
+      if (seen.includes(id) && next) send({ section_chat_move: id, to: s.chats.indexOf(next) });
+      return true;
+    };
+    return { set, list: () => sections, holder, items, paint, side, nudge, land };
   };
 
   // A textarea exposes no caret coordinates: lay the text out in a hidden copy, the caret's word whole (it wraps with it).

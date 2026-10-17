@@ -114,6 +114,8 @@ if readable, a **Teams sections** mode gets its own spec, alongside the local on
 - Tabs and mode independent; seen chats leave their section in Inbox; one section per chat; menus and
   drag and drop both in v1; recency inside a section; accordion with badges, no auto-unfold; mode button
   in the list header; empty sections always shown, hidden by a search — user's calls (2026-10-17).
+- A folded section's badge counts only the chats the current tab and search show — user's call
+  (2026-10-17).
 - Manual order inside a section, per section, no separate edit mode — user's call (2026-10-17, review
   comment).
 - "Other" for the implicit last section, in English like the rest of the UI — overturnable.
