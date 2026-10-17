@@ -1372,7 +1372,7 @@ async def test_a_split_chat_socket_subscribes_to_the_board(board: W.Board, setti
             _event("NewMessage", B, id="7", composetime=_at(7), messagetype="Text", content="hi")
         )
         frame = json.loads(await asyncio.wait_for(split.recv(), 2))
-        assert set(frame) == {"rows", "page", "opener", "browser", "me", "busy"}
+        assert set(frame) == {"rows", "page", "opener", "browser", "me", "busy", "sections"}
         assert (frame["rows"][0]["last_activity"], frame["rows"][0]["text"]) == (_at(7), "hi")
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(split.recv(), 0.3)
@@ -3120,6 +3120,8 @@ def test_the_board_takes_every_chat_verb_from_chat_verbs(board: W.Board) -> None
         "read",
         "mute",
         "unmute",
+        # spec 026: chat sections
+        *(f"section_{v}" for v in ("new", "rename", "order", "move", "delete", "file", "chat_move")),
         *chat,
         "board",
         "follow",

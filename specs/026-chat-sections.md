@@ -1,6 +1,6 @@
 # 026 — Chat sections
 
-**Status**: approved
+**Status**: in progress
 **Requested by**: babs
 **Date**: 2026-10-17
 
