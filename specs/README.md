@@ -25,6 +25,6 @@
 | [021](021-quote-jump.md) | A reply's quote leads to the quoted message | shipped |
 | [022](022-members-popover.md) | The chat's members on hover | shipped |
 | [023](023-name-to-private-chat.md) | A sender's name leads to the private chat with them | phase 1 shipped |
-| [025](025-file-attachments.md) | Send any file as an attachment | shipped (AC1: card in Teams to check) |
+| [025](025-file-attachments.md) | Send any file as an attachment | shipped |
 | [026](026-chat-sections.md) | Chat sections | shipped |
-| [027](027-received-files.md) | Show received files | approved |
+| [027](027-received-files.md) | Show received files | shipped |

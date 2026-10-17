@@ -1,6 +1,6 @@
 # 027 — Show received files
 
-**Status**: in progress
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-10-17
 
@@ -46,21 +46,21 @@ copy when there is one, SharePoint otherwise.
 
 ## Acceptance criteria
 
-- [ ] **AC1** A message with one or more `properties.files` entries shows one card per non-`reference` file (type icon,
+- [x] **AC1** A message with one or more `properties.files` entries shows one card per non-`reference` file (type icon,
   name) in the chat page, live and from history; a message without any shows none.
-- [ ] **AC2** A card links to the entry's `shareUrl`, else its `objectUrl`, in a new tab (`noopener`);
+- [x] **AC2** A card links to the entry's `shareUrl`, else its `objectUrl`, in a new tab (`noopener`);
   an entry with neither shows its name unlinked; the name is plain text everywhere.
-- [ ] **AC7** A card opens the local copy saved for its own URL; two different files sharing a name never
+- [x] **AC7** A card opens the local copy saved for its own URL; two different files sharing a name never
   open each other's copy; a file already held is not looked up on SharePoint again.
-- [ ] **AC8** Two different files with the same name in one chat are both downloaded, the second as
+- [x] **AC8** Two different files with the same name in one chat are both downloaded, the second as
   `name (2).ext`; the same file met twice is downloaded once.
-- [ ] **AC6** A `reference` entry shows as a link named after the file, not a card; when the body already
+- [x] **AC6** A `reference` entry shows as a link named after the file, not a card; when the body already
   links it, that link reads as the file name and no second link appears; it is not downloaded again.
-- [ ] **AC3** With media on and `files` selected, the archive one-shot, the live archiver and
+- [x] **AC3** With media on and `files` selected, the archive one-shot, the live archiver and
   `--verify-media` download each entry to the chat's media folder, once.
-- [ ] **AC4** `--no-media` downloads none; a video entry follows the `videos` type; a denied entry backs
+- [x] **AC4** `--no-media` downloads none; a video entry follows the `videos` type; a denied entry backs
   off and `--retry-assets` forces it, as for other assets.
-- [ ] **AC5** When the file is in the archive, the card opens the local copy; when it is not, the
+- [x] **AC5** When the file is in the archive, the card opens the local copy; when it is not, the
   hotlink.
 
 ## Phases
