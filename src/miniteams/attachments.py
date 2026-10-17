@@ -12,16 +12,21 @@ import base64
 import hashlib
 import html
 import re
+import sqlite3
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 from urllib.parse import quote, urlsplit
 
 import httpx
 import structlog
 
 from miniteams.http import aget_with_retry, astream_with_retry
+
+if TYPE_CHECKING:
+    from miniteams.archive_store import ChatStore
 
 log = structlog.get_logger()
 
@@ -73,9 +78,24 @@ def object_id(url: str) -> str:
     return match.group(1) if match else "object"
 
 
+# 255-byte file names, written as `<name>.part` first: names that fit were always writable, kept as is.
+_NAME_MAX = 255 - len(".part")
+
+
+def _cut(name: str, tag: str = "") -> str:
+    """`name` with `tag` before its extension, the stem cut so the whole stays within _NAME_MAX bytes."""
+    suffix = Path(name).suffix
+    suffix = suffix if len(suffix.encode()) < _NAME_MAX // 2 else ""
+    stem = name.removesuffix(suffix)
+    room = _NAME_MAX - len(tag.encode()) - len(suffix.encode())
+    if len(stem.encode()) > room:
+        stem = stem.encode()[:room].decode(errors="ignore")  # a multibyte character cut in two is dropped
+    return f"{stem}{tag}{suffix}"
+
+
 def _safe_name(name: str) -> str:
     # Security: server-supplied filename — collapse any path components to a bare name.
-    return Path(name).name or "file"
+    return _cut(Path(name).name or "file")
 
 
 # Tenant hosts only: a bearer for `<host>` is minted and sent to exactly this host. No userinfo, port,
@@ -104,14 +124,17 @@ def _is_video_url(url: str) -> bool:
 
 
 _TITLE_RE = re.compile(r"<Title>([^<]*)</Title>")
+_OD_VIDEO = "onedriveForBusinessVideo"
 _ORIGNAME_RE = re.compile(r'<OriginalName v="([^"]*)"')
 _DURATION_RE = re.compile(r'duration="([^"]*)"')
 
 
-def recording_files(content: str, media_dir: Path) -> dict[str, Any]:
+def recording_files(content: str, media_dir: Path, store: ChatStore | None = None) -> dict[str, Any]:
     """Manifest entry for one Media_CallRecording message: which of its video/transcript
     files exist on disk. Filenames alone can't pair them (sp-<sha1> vs file names) —
-    this derives every candidate name from the message and keeps the ones present."""
+    this derives every candidate name from the message and keeps the ones present. With the chat's
+    `store`, the SharePoint copy is the one recorded for the recording's URLs (`name (n).ext` after a
+    collision, 027-AC8), else the one under its original name."""
     videos: list[str] = []
     transcripts: list[str] = []
 
@@ -131,11 +154,24 @@ def recording_files(content: str, media_dir: Path) -> dict[str, Any]:
             transcripts += _present(f"{object_id(uri)}.transcript.*")
         elif typ == "amsVideo":
             videos += _present(f"{object_id(uri)}.video.*")
+    # The URLs extract() fetches the SharePoint copy by: the OneDrive item and the Play link, unescaped.
+    sp_urls = [
+        html.unescape(a["uri"])
+        for t in _ITEM_RE.findall(content)
+        if (a := _attrs(t)).get("type") == _OD_VIDEO
+    ] + [
+        html.unescape(h)
+        for t in _A_RE.findall(content)
+        if "sharepoint.com" in (h := _attrs(t).get("href", ""))
+    ]
+    held = _held(store, sp_urls, media_dir) if sp_urls else None
     orig = _ORIGNAME_RE.search(content)
-    if orig:
+    if held:
+        videos.insert(0, Path(held).name)  # SharePoint copy first: durable, human-named
+    elif orig:
         name = _safe_name(orig.group(1))
         if (media_dir / name).exists():
-            videos.insert(0, name)  # SharePoint copy first: durable, human-named
+            videos.insert(0, name)
     title = _TITLE_RE.search(content)
     duration = _DURATION_RE.search(content)
     return {
@@ -211,7 +247,7 @@ def extract(
             _add("transcript", attrs["uri"])
         elif attrs.get("type") == "onedriveForBusinessTranscript" and attrs.get("uri"):
             _add("sp_transcript", attrs["uri"])
-        elif attrs.get("type") == "onedriveForBusinessVideo" and attrs.get("uri"):
+        elif attrs.get("type") == _OD_VIDEO and attrs.get("uri"):
             # recording on OneDrive: same SharePoint path as docs
             _add("sp_file", attrs["uri"], "onedriveForBusinessVideo")
         elif attrs.get("type") == "amsVideo" and attrs.get("uri"):
@@ -460,8 +496,40 @@ def _sp_web(path: str) -> str:
     return "/".join(seg[:3]) if len(seg) > 2 and seg[1] in ("sites", "teams", "personal") else ""
 
 
-async def _sp_file_source(client: httpx.AsyncClient, url: str, hdr: dict[str, str]) -> tuple[str, str] | None:
-    """(file name, content URL) of a SharePoint document or share link, None for a non-file.
+# SharePoint eTags read `"{<file unique id>},<version>"`: the id outlives renames and new versions.
+_GUID_RE = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.IGNORECASE)
+
+
+def _sp_id(meta: dict[str, Any]) -> str:
+    """The file's unique id from REST metadata (`UniqueId`) or a driveItem (`eTag`), '' without either."""
+    found = _GUID_RE.search(str(meta.get("UniqueId") or meta.get("eTag") or ""))
+    return found.group(0).lower() if found else ""
+
+
+class _SpSource(NamedTuple):
+    name: str
+    content_url: str
+    item_id: str  # '' when SharePoint did not say
+    size: int | None  # bytes, None when SharePoint did not say
+    modified: float | None  # epoch seconds of the last change, for the mismatch log; None if unsaid
+
+
+def _sp_size(value: object) -> int | None:
+    # REST `Length` is a string, a driveItem `size` a number.
+    return int(value) if isinstance(value, int | str) and str(value).isdigit() else None
+
+
+def _sp_time(value: object) -> float | None:
+    """Epoch seconds of REST `TimeLastModified` or driveItem `lastModifiedDateTime` (ISO, UTC)."""
+    try:
+        stamp = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return stamp.timestamp() if stamp.tzinfo else None
+
+
+async def _sp_file_source(client: httpx.AsyncClient, url: str, hdr: dict[str, str]) -> _SpSource | None:
+    """Name, content URL, unique id and size of a SharePoint document or share link, None for a non-file.
 
     SharePoint REST on the file's own host, never Graph: `GetFileByUrl` takes direct paths and share
     links alike but only resolves them on the file's own site. A miss falls back to SharePoint's own
@@ -478,7 +546,14 @@ async def _sp_file_source(client: httpx.AsyncClient, url: str, hdr: dict[str, st
         meta = await aget_with_retry(
             client, f"{rest}?@u={at}", headers={**hdr, "Accept": "application/json;odata=nometadata"}
         )
-        return str(meta.json().get("Name") or "file"), f"{rest}/$value?@u={at}"
+        data = meta.json()
+        return _SpSource(
+            str(data.get("Name") or "file"),
+            f"{rest}/$value?@u={at}",
+            _sp_id(data),
+            _sp_size(data.get("Length")),
+            _sp_time(data.get("TimeLastModified")),
+        )
     except httpx.HTTPStatusError as exc:
         log.debug("sp_rest_file_miss", url=url, status=exc.response.status_code)
     # Share id: unpadded base64url of the sharing URL, prefixed "u!".
@@ -488,41 +563,144 @@ async def _sp_file_source(client: httpx.AsyncClient, url: str, hdr: dict[str, st
     info = (await aget_with_retry(client, item, headers=hdr)).json()
     if "file" not in info:  # folder / notebook / list item — not a single downloadable file
         return None
-    return str(info.get("name") or "file"), f"{item}/content"
+    return _SpSource(
+        str(info.get("name") or "file"),
+        f"{item}/content",
+        _sp_id(info),
+        _sp_size(info.get("size")),
+        _sp_time(info.get("lastModifiedDateTime")),
+    )
 
 
-async def _download_sp_file(client: httpx.AsyncClient, url: str, bearer: str, media_dir: Path) -> str | None:
+def _numbered(name: str, n: int) -> str:
+    """`name`, then `stem (n).ext` for the n-th different file under it (027-AC8)."""
+    # A dotfile or an extensionless name has no suffix: `.env (2)`, `notes (2)`.
+    return name if n == 1 else _cut(name, f" ({n})")
+
+
+def _held(files: ChatStore | None, urls: list[str], media_dir: Path) -> str | None:
+    """The media file already saved for one of `urls`, None when none is still on disk."""
+    saved = files.saved_files(urls) if files else {}
+    for url in urls:
+        if url in saved and (media_dir / saved[url]).is_file():
+            return str(media_dir / saved[url])
+    return None
+
+
+def _record(files: ChatStore, urls: list[str], name: str, item_id: str) -> bool:
+    try:
+        files.save_file(urls, name, item_id)
+    except sqlite3.Error as exc:  # a locked archive: the copy stands, the next pass records it
+        log.warning("sp_file_record_failed", file=name, error=str(exc))
+        return False
+    return True
+
+
+async def _download_sp_file(
+    client: httpx.AsyncClient,
+    url: str,
+    bearer: str,
+    media_dir: Path,
+    files: ChatStore | None = None,
+    urls: list[str] | None = None,
+) -> str | None:
     """Fetch a SharePoint/OneDrive shared document with a SharePoint bearer for its host.
 
     Returns the local path, or None when the share resolves to a non-file (folder/site/page).
-    Named by the file's real name; skip-if-exists on re-runs."""
+    Named by the file's real name, `name (n).ext` when a different file holds it (027-AC8). With `files`
+    (the chat's store), the copy is recorded under each of `urls` (default `[url]`); a copy under the name
+    that nobody recorded (saved before the record) counts as this file when `_legacy_match` holds. Without
+    `files`, any copy under the name does, as before the record."""
+    urls = urls or [url]
     hdr = {"Authorization": f"Bearer {bearer}"}
     source = await _sp_file_source(client, url, hdr)
     if source is None:
         return None
-    name, content_url = source
-    name = _safe_name(name)
-    dest = media_dir / name
-    async with _serialized(str(dest)):
-        if dest.exists():
+    name = _safe_name(source.name)
+    async with _serialized(str(media_dir / name)):
+        held = _held(files, urls, media_dir)  # a concurrent task saved this very file meanwhile
+        if held:
+            return held
+        n = 0
+        while True:
+            n += 1
+            dest = media_dir / _numbered(name, n)
+            if n == 1:
+                got = await _claim(client, source, hdr, dest, files, urls, url)
+            else:
+                # The numbered name may be another file's own SharePoint name, downloading under its lock.
+                # Never a cycle: a lock is only ever taken under one with a shorter name.
+                async with _serialized(str(dest)):
+                    got = await _claim(client, source, hdr, dest, files, urls, url)
+            if got:
+                return got
+
+
+class _Unrecorded(OSError):
+    """A numbered copy downloaded while the archive could not record it, dropped: the entry's other URL
+    would only download it again."""
+
+
+def _legacy_match(dest: Path, source: _SpSource) -> bool:
+    """Whether `dest`, saved under the file's name before the record, is this file: SharePoint's size only.
+    Its times would bind another file of the same name; a duplicate is worth less than a wrong file."""
+    stat = dest.stat()
+    if stat.st_size == source.size:
+        return True
+    log.warning(
+        "sp_file_legacy_mismatch",
+        name=dest.name,
+        local_size=stat.st_size,
+        remote_size=source.size,
+        local_mtime=stat.st_mtime,
+        remote_modified=source.modified,
+    )
+    return False
+
+
+async def _claim(
+    client: httpx.AsyncClient,
+    source: _SpSource,
+    hdr: dict[str, str],
+    dest: Path,
+    files: ChatStore | None,
+    urls: list[str],
+    url: str,
+) -> str | None:
+    """`dest` for this file: kept when it already is this file, downloaded when free; None when another file
+    holds it."""
+    if dest.exists():
+        if files is None:
             return str(dest)  # skip re-download
-        media_dir.mkdir(parents=True, exist_ok=True)
-        tmp = media_dir / f"{name}.part"
-        try:
-            # Streamed, not buffered: shared items include meeting recordings (GBs) — a whole-body
-            # `.content` read would pin RSS by the full file size (see _stream_to).
-            async with astream_with_retry(client, content_url, headers=hdr, follow_redirects=True) as resp:
-                with tmp.open("wb") as fh:
-                    async for chunk in resp.aiter_bytes(65536):
-                        fh.write(chunk)
-            tmp.rename(dest)
-        except BaseException:
-            tmp.unlink(missing_ok=True)  # truncated file would look complete to a later skip-if-exists
-            raise
-        if _is_video_url(url):
-            # One line per fresh video download (cached early-return above stays quiet).
-            log.info("video_downloaded", source="sharepoint", path=str(dest), bytes=dest.stat().st_size)
+        owners = files.file_owners(dest.name)
+        if not owners and dest.name == _safe_name(source.name):
+            if not _legacy_match(dest, source):
+                return None
+        elif not (source.item_id and source.item_id in owners):
+            return None
+        _record(files, urls, dest.name, source.item_id)
         return str(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(f"{dest.name}.part")
+    try:
+        # Streamed, not buffered: shared items include meeting recordings (GBs) — a whole-body
+        # `.content` read would pin RSS by the full file size (see _stream_to).
+        async with astream_with_retry(client, source.content_url, headers=hdr, follow_redirects=True) as resp:
+            with tmp.open("wb") as fh:
+                async for chunk in resp.aiter_bytes(65536):
+                    fh.write(chunk)
+        tmp.rename(dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)  # truncated file would look complete to a later skip-if-exists
+        raise
+    if files and not _record(files, urls, dest.name, source.item_id) and dest.name != _safe_name(source.name):
+        # Unrecorded, a numbered copy is nobody's: the next pass would number past it, one more each pass.
+        dest.unlink()
+        raise _Unrecorded(f"{dest.name}: downloaded but not recorded")
+    if _is_video_url(url):
+        # One line per fresh video download (cached early-return above stays quiet).
+        log.info("video_downloaded", source="sharepoint", path=str(dest), bytes=dest.stat().st_size)
+    return str(dest)
 
 
 def _item_urls(item: dict[str, str]) -> list[str]:
@@ -536,19 +714,29 @@ async def _sp_file_or_fallback(
     download: bool,
     sp_token: Callable[[str], str | None] | None,
     skip_url: Callable[[str], bool] | None,
+    files: ChatStore | None = None,
 ) -> tuple[str | None, list[tuple[str, Exception]]]:
     """(local path, []) of an `sp_file` item, trying its `fallback` URL when the first is denied, fails or is
-    not a file; (None, each URL's error) when none gives a file."""
+    not a file; (None, each URL's error) when none gives a file. A copy saved for one of its URLs costs no
+    SharePoint call (027-AC7)."""
+    urls = _item_urls(item)
+    held = _held(files, urls, media_dir)
+    if held:
+        return held, []
     failures: list[tuple[str, Exception]] = []
-    for url in _item_urls(item):
-        if url != item["url"] and skip_url and skip_url(url):
-            continue  # the first URL was vetted by the caller
+    for url in urls:
+        if skip_url and skip_url(url):
+            continue  # a denied sharing link must not be asked again because its objectUrl still serves
         sp_host = _sp_host(url)
         bearer = sp_token(sp_host) if (download and sp_token and sp_host) else None
         if not bearer:
             continue
         try:
-            fpath = await _download_sp_file(client, url, bearer, media_dir)
+            # Every URL of the entry names the same file: recorded together, either finds it next time.
+            fpath = await _download_sp_file(client, url, bearer, media_dir, files, urls)
+        except _Unrecorded as exc:  # the other URL is the same file: it would only be downloaded and dropped
+            failures.append((url, exc))
+            break
         except Exception as exc:  # noqa: BLE001 — best-effort; the fallback, else ref-only
             log.debug("sp_file_failed", url=url, error=str(exc))
             failures.append((url, exc))
@@ -618,6 +806,7 @@ async def process(
     on_fail: Callable[[str, Exception], None] | None = None,
     media: frozenset[str] = DEFAULT_MEDIA,
     files: list[Any] | None = None,
+    store: ChatStore | None = None,
 ) -> list[str]:
     """Return human annotations for the print line, downloading bytes when enabled.
 
@@ -628,7 +817,8 @@ async def process(
     `skip_url(url)` vetoes a download (ref-only note, no network) — the archive's denied-asset
     cache; `on_fail(url, exc)` observes each failed download so callers can feed that cache.
     Only the `media` types are extracted: a deselected item is neither fetched nor annotated. `files` is the
-    message's decoded `properties.files`."""
+    message's decoded `properties.files`. `store`, the chat's archive, records which file each SharePoint URL
+    was saved as and skips those already held (027-AC7, AC8)."""
     items = extract(content, msgtype, media, files)
     notes: list[str] = []
     _remote = {"sp_transcript", "sp_file"}
@@ -645,7 +835,8 @@ async def process(
         for item in items:
             url, kind = item["url"], item["kind"]
             # Per-URL keys: a body link denied under the sharing link must not mute the entry's objectUrl.
-            if skip_url and all(skip_url(u) for u in _item_urls(item)):
+            # sp_file items are checked URL by URL in _sp_file_or_fallback: each counted once.
+            if kind != "sp_file" and skip_url and all(skip_url(u) for u in _item_urls(item)):
                 notes.append(f"[{_ref_label.get(kind, kind)}: {url}]")
                 continue
             if kind == "video":
@@ -681,7 +872,7 @@ async def process(
                 continue
             if kind == "sp_file":
                 fpath, failures = await _sp_file_or_fallback(
-                    client, item, media_dir, download, sp_token, skip_url
+                    client, item, media_dir, download, sp_token, skip_url, store
                 )
                 if fpath:
                     if _is_video_url(url):

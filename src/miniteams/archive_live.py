@@ -214,6 +214,7 @@ class LiveArchive:
                     on_fail=partial(record_asset_failure, store),
                     media=self.media_types,
                     files=shared,
+                    store=store,
                 )
                 log.info("live_media", thread=thread_id, files=sum(1 for n in files if "→" in n))
             except AuthExpired as exc:

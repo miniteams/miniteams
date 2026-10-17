@@ -158,6 +158,9 @@ def data_dir(tmp_path: Path) -> Path:
     kept = find_chat_dir(path, G)
     assert kept is not None
     (kept / "media" / "plan <v2>.docx").write_bytes(b"DOCX")
+    store = ChatStore(path, G)  # the copy is found by its URL, never by name (027-AC7)
+    store.save_file([browser_helpers.SHARE], "plan <v2>.docx", "")
+    store.close()
     return path
 
 
@@ -282,8 +285,8 @@ async def test_a_pasted_file_link_reads_as_the_file_name(chat: Pages) -> None:
 
 @pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
 async def test_a_file_card_opens_the_archived_copy(chat: Pages) -> None:
-    """027-AC5: the card of a file the archive holds links its /media copy, in a new tab with noopener, out of
-    Tab outside the focused message (018-AC5); the link serves the file."""
+    """027-AC5, AC7: the card of a file the archive holds for its URL links its /media copy, in a new tab with
+    noopener, out of Tab outside the focused message (018-AC5); the link serves the file."""
     page = await chat.open(_chat(G))
     await _handled(page, "history")
     href = f"/media/{quote(G, safe='')}/plan%20%3Cv2%3E.docx"

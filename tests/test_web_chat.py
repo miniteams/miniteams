@@ -738,19 +738,22 @@ _SHARE = "https://example-my.sharepoint.com/:w:/g/personal/someone_example_com/E
 _LOCAL = f"/media/{quote(T, safe='')}/"
 
 
-def _card_href(media: Path, entry: dict[str, Any]) -> str | None:
-    html = CV.chat_record(_m("1", _at(1), "<p>x</p>", properties={"files": [entry]}), T, media_dir=media)[
-        "html"
-    ]
+_OBJ = "https://example-my.sharepoint.com/personal/someone_example_com/Documents/plan%20v2.docx"
+
+
+def _card_href(media: Path | None, entry: dict[str, Any], saved: dict[str, str] | None = None) -> str | None:
+    message = _m("1", _at(1), "<p>x</p>", properties={"files": [entry]})
+    html = CV.chat_record(message, T, media_dir=media, saved=saved)["html"]
     return html.split('href="')[1].split('"')[0] if 'href="' in html else None
 
 
 def test_record_card_opens_the_archived_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """027-AC5: a card whose file the archive holds opens it through /media, in a new tab; without the copy,
-    the hotlink."""
+    """027-AC5, AC7: a card opens the copy the archive saved for its own URL through /media, in a new tab;
+    without one, or with a copy /media refuses, the hotlink; a file of the same name never stands in."""
     media = tmp_path / "media"
     media.mkdir()
     (media / "plan v2.docx").write_bytes(b"doc")
+    (media / "plan v2 (2).docx").write_bytes(b"other doc")
     (media / "big.pdf").write_bytes(b"x" * 11)
     (media / "dir.pdf").mkdir()
     (media / "half.pdf.part").write_bytes(b"x")
@@ -758,16 +761,91 @@ def test_record_card_opens_the_archived_copy(tmp_path: Path, monkeypatch: pytest
     (media / "out.pdf").symlink_to(tmp_path / "outside.pdf")  # a link out of the folder: /media refuses it
     linked = {"fileName": "plan v2.docx", "fileInfo": {"shareUrl": _SHARE}}
     local = f"{_LOCAL}plan%20v2.docx"
-    html = CV.chat_record(_m("1", _at(1), properties={"files": [linked]}), T, media_dir=media)["html"]
+    saved = {_SHARE: "plan v2.docx"}
+    html = CV.chat_record(_m("1", _at(1), properties={"files": [linked]}), T, media_dir=media, saved=saved)[
+        "html"
+    ]
     assert f'<a class="file" href="{local}" rel="noopener" target="_blank">' in html
-    assert _card_href(media, {"fileName": "plan v2.docx"}) == local  # no hotlink at all
-    assert _card_href(media, {**linked, "fileName": "../media/plan v2.docx"}) == local  # a bare name only
-    for name in ("absent.docx", "dir.pdf", "half.pdf.part", "out.pdf", "a\x00b", "", "big.pdf"):
+    assert (
+        _card_href(media, {"fileName": "x", "objectUrl": _OBJ}, {_OBJ: "plan v2.docx"}) == local
+    )  # objectUrl
+    # Two files named alike: each card its own copy, whatever the entry's name says.
+    other = {"fileName": "plan v2.docx", "fileInfo": {"shareUrl": f"{_SHARE}2"}}
+    both = {_SHARE: "plan v2.docx", f"{_SHARE}2": "plan v2 (2).docx"}
+    assert _card_href(media, other, both) == f"{_LOCAL}plan%20v2%20%282%29.docx"
+    assert _card_href(media, linked, both) == local
+    # A name on disk without a record for the URL: the hotlink (an older copy, or another file).
+    assert _card_href(media, linked) == _SHARE
+    assert _card_href(media, other, saved) == f"{_SHARE}2"
+    assert _card_href(media, {"fileName": "plan v2.docx"}, saved) is None  # no URL: no link at all
+    for name in ("absent.docx", "dir.pdf", "half.pdf.part", "out.pdf", "a\x00b", "", "big.pdf", "../media/x"):
         monkeypatch.setattr(CV, "_MEDIA_MAX", 10)  # big.pdf: over what /media serves
-        assert _card_href(media, {**linked, "fileName": name}) == _SHARE, name
-    assert _card_href(None, linked) == _SHARE  # no archive folder
+        assert _card_href(media, linked, {_SHARE: name}) == _SHARE, name
+    assert _card_href(None, linked, saved) == _SHARE  # no archive folder
     ref = {**linked, "state": "reference"}  # never downloaded: its link stays the shared one
-    assert _card_href(media, ref) == _SHARE
+    assert _card_href(media, ref, saved) == _SHARE
+
+
+async def test_history_cards_open_their_own_copies(
+    board: W.Board, data_dir: Path, no_api: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """027-AC7: a history page finds each card's copy by its URL, two files of one name each their own, in one
+    read-only query for the page."""
+    two = f"{_SHARE}2"
+    store = ChatStore(data_dir, T)
+    store.insert_page(
+        [
+            _m("8", _at(8), properties={"files": [{"fileName": "a.pdf", "fileInfo": {"shareUrl": _SHARE}}]}),
+            _m("9", _at(9), properties={"files": json.dumps([{"fileName": "a.pdf", "objectUrl": two}])}),
+        ]
+    )
+    (store.media_dir / "a.pdf").write_bytes(b"1")
+    (store.media_dir / "a (2).pdf").write_bytes(b"2")
+    store.save_file([_SHARE], "a.pdf", "")
+    store.save_file([two], "a (2).pdf", "")
+    store.close()
+    calls: list[list[str]] = []
+    real = CV.saved_files
+    monkeypatch.setattr(CV, "saved_files", lambda chat_dir, urls: calls.append(urls) or real(chat_dir, urls))
+    answer = await _history(board, T, limit=2)
+    hrefs = [m["html"].split('href="')[1].split('"')[0] for m in answer["messages"]]
+    assert hrefs == [f"{_LOCAL}a.pdf", f"{_LOCAL}a%20%282%29.pdf"]
+    assert calls == [[_SHARE, two]]
+    calls.clear()
+    await _history(board, T, before=_at(8), limit=2)  # a page without files: no query
+    assert calls == []
+
+
+async def test_history_of_an_archive_older_than_the_record(
+    board: W.Board, data_dir: Path, no_api: None
+) -> None:
+    """027-AC7: an archive not yet opened by phase 3 has no table: the card takes the hotlink, and the
+    read-only lookup never creates the table."""
+    store = ChatStore(data_dir, T)
+    store.insert_page(
+        [_m("9", _at(9), properties={"files": [{"fileName": "a.pdf", "fileInfo": {"shareUrl": _SHARE}}]})]
+    )
+    (store.media_dir / "a.pdf").write_bytes(b"1")
+    store._db.execute("DROP TABLE sp_files")
+    store._db.commit()
+    store.close()
+    answer = await _history(board, T, limit=1)
+    assert f'href="{_SHARE}"' in answer["messages"][0]["html"]
+    db = sqlite3.connect(store.dir / "messages.db")
+    try:
+        assert db.execute("SELECT 1 FROM sqlite_master WHERE name = 'sp_files'").fetchone() is None
+    finally:
+        db.close()
+
+
+def test_page_files_survives_an_unreadable_archive(tmp_path: Path) -> None:
+    """027-AC7: no messages.db, or a broken one, costs the cards their local copy only."""
+    files = {"files": [{"fileName": "a.pdf", "fileInfo": {"shareUrl": _SHARE}}]}
+    message = _m("1", _at(1), properties=files)
+    assert CV.page_files(tmp_path / "media", [message]) == {}
+    (tmp_path / "messages.db").write_bytes(b"not a database")
+    assert CV.page_files(tmp_path / "media", [message]) == {}
+    assert CV.page_files(None, [message]) == {}
 
 
 _BOB = "8:orgid:00000000-0000-0000-0000-00000000000c"

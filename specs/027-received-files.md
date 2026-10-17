@@ -107,5 +107,7 @@ None.
 - Cards in the chat page only, not the widget's previews — overturnable.
 - URL → local file table and `name (n).ext` collisions, as phase 3 — user's call (2026-10-17, after
   the phase 2 review).
+- Legacy copies adopted on size match only; a mismatch makes a (2) copy — user's call (2026-10-18): a
+  wrong file is worse than a duplicate.
 - `shareUrl` before `objectUrl`: most received files live in the sender's OneDrive; `reference` entries
   are links named after the file — user's calls (2026-10-17, after review).

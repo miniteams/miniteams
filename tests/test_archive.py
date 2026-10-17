@@ -235,6 +235,7 @@ async def test_media_downloaded_skipped_and_failure_nonfatal(
         on_fail=None,
         media=None,
         files=None,
+        store=None,
     ):  # noqa: ANN001
         seen.append((content, media_dir))
         if len(seen) == 1:
@@ -763,6 +764,7 @@ async def test_media_denied_cache_skips_and_records(settings: Settings, tmp_path
         on_fail=None,
         media=None,
         files=None,
+        store=None,
     ):  # noqa: ANN001
         if skip_url and skip_url(URL):
             calls.append("skipped")

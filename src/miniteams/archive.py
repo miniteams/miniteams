@@ -344,6 +344,7 @@ async def _download_media(
                     on_fail=partial(record_asset_failure, store),
                     media=media,
                     files=message_files(message),
+                    store=store,
                 )
             except Exception as exc:  # noqa: BLE001 — one message's media must not abort the pass
                 log.debug("message_media_failed", id=message.get("id"), error=str(exc))
@@ -378,7 +379,7 @@ def _write_recordings_manifest(store: ChatStore, recordings: list[dict[str, Any]
     — pure derived data, safe to regenerate."""
     entries = []
     for m in recordings:
-        entry = attachments.recording_files(m.get("content") or "", store.media_dir)
+        entry = attachments.recording_files(m.get("content") or "", store.media_dir, store)
         entry["message_id"] = m.get("id")
         entry["composetime"] = m.get("composetime")
         entries.append(entry)

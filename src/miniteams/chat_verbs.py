@@ -31,7 +31,7 @@ import structlog
 from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import ConnectionClosed
 
-from .archive_store import chat_label, find_chat_dir, messages_by_id, read_page, search_chat
+from .archive_store import chat_label, find_chat_dir, messages_by_id, read_page, saved_files, search_chat
 from .chats import chat_kind
 from .compose import MAX_TEXT, compose_html, reply_quote
 from .decompose import Editable, decompose
@@ -65,7 +65,7 @@ from .messages import (
     reaction_key,
     snippet,
 )
-from .render import cards_html, file_links, files_html, media_url, sanitize
+from .render import cards_html, file_links, file_urls, files_html, media_url, sanitize
 from .send import attach_images, delete_message, edit_message, message_html, react, send_message, too_long
 
 log = structlog.get_logger()
@@ -315,13 +315,31 @@ def _servable(media: Path, name: str) -> Path | None:
     return target
 
 
-def local_file(thread_id: str, media_dir: Path | None, name: str) -> str | None:
-    """`/media/<thread>/<name>` when the archive holds a shared file `/media` serves (027-AC5); past the
-    cap or absent, None: the hotlink still opens it."""
-    name = Path(name).name  # as attachments._safe_name stored it
-    if media_dir is None or _servable(media_dir, name) is None:
-        return None
-    return f"/media/{quote(thread_id, safe='')}/{quote(name, safe='')}"
+def local_file(thread_id: str, media_dir: Path | None, saved: dict[str, str], urls: list[str]) -> str | None:
+    """`/media/<thread>/<name>` of the file the archive saved for one of `urls` (`saved`: url → name) when
+    `/media` serves it (027-AC5, AC7); never by name alone; past the cap or absent, None: the hotlink."""
+    for url in urls:
+        name = saved.get(url)
+        if media_dir is not None and name and _servable(media_dir, name) is not None:
+            return f"/media/{quote(thread_id, safe='')}/{quote(name, safe='')}"
+    return None
+
+
+def page_files(media_dir: Path | None, messages: list[dict[str, Any]]) -> dict[str, str]:
+    """url → archived file name for the shared files of a page: one read-only query (NFS). Blocking."""
+    urls = [
+        url
+        for message in messages
+        if isinstance(props := message.get("properties"), dict)
+        for url in file_urls(props.get("files"))
+    ]
+    if media_dir is None or not urls:
+        return {}
+    try:
+        return saved_files(media_dir.parent, urls)
+    except (OSError, sqlite3.Error) as exc:
+        log.info("archive_files_lookup_failed", folder=str(media_dir.parent), error=str(exc))
+        return {}
 
 
 def chat_record(
@@ -332,9 +350,11 @@ def chat_record(
     custom: frozenset[str] = frozenset(),
     name_for: Callable[[str], str] | None = None,
     images: dict[str, str] | None = None,
+    saved: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """One message as the chat page shows it (spec 011): sanitised body, reactions, mention kind.
-    `custom`: the custom emoji object ids `/emoji/<id>` serves; `images`: their reaction key → object id."""
+    `custom`: the custom emoji object ids `/emoji/<id>` serves; `images`: their reaction key → object id;
+    `saved`: `page_files`."""
     props = message.get("properties")
     props = props if isinstance(props, dict) else {}
     message = {**message, "properties": props}  # mention_kind reads it too
@@ -364,7 +384,7 @@ def chat_record(
             cards = cards_html(message, media_url=lambda u: media_url(thread_id, media_dir, u))
             body += cards
             kind = "text" if cards and kind == "other" else kind
-        local = functools.partial(local_file, thread_id, media_dir)
+        local = functools.partial(local_file, thread_id, media_dir, saved or {})
         files = "" if kind in ("system", "call") else files_html(props.get("files"), named, local)
         if files:  # 027-AC1: after the text, replacing the 📎 marker
             body += files
@@ -1604,6 +1624,7 @@ class ChatVerbs:
         """Records of a page, on the archive pool: sanitising globs the media folder (NFS)."""
         records = []
         custom, images = self.emojis.custom(), self.emojis.images()
+        saved = page_files(media, messages)
         for message in messages:
             try:
                 records.append(
@@ -1615,6 +1636,7 @@ class ChatVerbs:
                         custom,
                         self.directory.name_for if self.directory else None,
                         images,
+                        saved,
                     )
                 )
             except Exception as exc:  # noqa: BLE001 — one malformed message must not lose the page
