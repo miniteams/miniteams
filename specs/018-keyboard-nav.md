@@ -1,6 +1,6 @@
 # 018 — Keyboard navigation in the chat page
 
-**Status**: approved
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-10-17
 
@@ -26,13 +26,21 @@ composer.
   history as scrolling does. Folded runs (`.cont`) are steps too, their head shown with them. The
   focused message is scrolled into view and outlined.
 - **Thread → composer.** ↓ on the last message, or Escape, returns to the composer, caret at the
-  end. A printable letter that is not an action key returns to the composer and lands there.
+  end. A printable character other than Space that is not an action key returns to the composer and
+  lands there.
+- **Space.** On a message or a link in it, Space scrolls the thread one screen down, Shift+Space one
+  screen up, like a feed. The focus stays unless its message leaves the view; then it moves to the
+  first (down) or last (up) message in view. A focused button keeps its own Space.
 - **Actions on the focused message.** `e` edit (own, editable), `r` quote, `+` react (opens the
   picker), `p` private chat with its sender (spec 023; same rules as clicking the name), Enter on a
   quote follows it (spec 021). Each key does nothing where its button would not be offered.
 - **Tab stops.** The per-message controls (action bar buttons, sender names) leave the Tab order;
   they stay clickable. The formatting bar (B I S …) becomes one toolbar Tab stop walked by ←/→.
-  So Tab hops zone to zone: header, thread, toolbar, composer.
+  Links in message bodies (URLs, shared files, card toggles, code blocks) are out of Tab too, except in
+  the focused message: Tab walks its links in order, then leaves for the toolbar; Shift+Tab walks back
+  to the message.
+  On a link, ↑/↓ move to the previous/next message, Escape returns to its message, Enter stays the
+  link's own. So Tab hops zone to zone: header, thread, [focused message's links], toolbar, composer.
 - **Search.** `/` from the thread focuses the chat's search box (`#find`); Ctrl+Shift+F does from
   anywhere in the page. Ctrl+F stays the browser's.
 - **Unchanged.** Ctrl+K (conversation panel and its search, ↓ walks the results), the list's own
@@ -46,19 +54,22 @@ composer.
 
 ## Acceptance criteria
 
-- [ ] **AC1** ↑ in an empty composer, or with the caret on its first visual line, focuses the last
+- [x] **AC1** ↑ in an empty composer, or with the caret on its first visual line, focuses the last
   message; not with a selection, an open completion list or during IME composition.
-- [ ] **AC2** The thread is one Tab stop; ↑/↓, PgUp/PgDn, Home/End move the focus; folded runs are
+- [x] **AC2** The thread is one Tab stop; ↑/↓, PgUp/PgDn, Home/End move the focus; folded runs are
   steps; the focused message is in view and outlined; reaching the top loads older history.
-- [ ] **AC3** ↓ on the last message or Escape returns to the composer with the caret at the end; a
-  non-action letter returns there and is typed.
-- [ ] **AC4** On the focused message, `e`, `r`, `+`, `p` and Enter (on a quote) do what their
+- [x] **AC3** ↓ on the last message or Escape returns to the composer with the caret at the end; a
+  printable character other than Space that is not an action key returns there and is typed. Space /
+  Shift+Space on a message or its link scroll the thread a screen down / up, nothing typed, the focus
+  kept on a message in view.
+- [x] **AC4** On the focused message, `e`, `r`, `+`, `p` and Enter (on a quote) do what their
   buttons or clicks do, and nothing where those are not offered.
-- [ ] **AC5** Per-message controls are out of the Tab order; the formatting bar is one Tab stop
-  walked by ←/→; Tab hops header → thread → toolbar → composer.
-- [ ] **AC6** `/` from the thread and Ctrl+Shift+F from anywhere focus the chat search; Ctrl+F is
+- [x] **AC5** Per-message controls are out of the Tab order; the formatting bar is one Tab stop
+  walked by ←/→; Tab hops header → thread → [focused message's links] → toolbar → composer; on a
+  link, ↑/↓ move by message and Escape returns to its message.
+- [x] **AC6** `/` from the thread and Ctrl+Shift+F from anywhere focus the chat search; Ctrl+F is
   left to the browser.
-- [ ] **AC7** Ctrl+K and the list's keys behave as before.
+- [x] **AC7** Ctrl+K and the list's keys behave as before.
 
 ## Phases
 
@@ -85,3 +96,7 @@ None.
   2026-10-15, settled by default; overturnable.
 - `p` for the private chat — sender names leave the Tab order (one stop per message would defeat
   the single thread stop), so spec 023's action needs a key.
+- Links: out of Tab except in the focused message, walked by Tab (user's call 2026-10-17).
+- Space scrolls the thread a screen like a feed, Shift+Space up; the focus moves only to stay in view
+  (user's call 2026-10-17).
+- Space on a card toggle toggles it (native button behaviour), not scroll.

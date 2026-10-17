@@ -181,7 +181,7 @@ async def pages(request: pytest.FixtureRequest) -> AsyncIterator[Pages]:
         if browser is not None:
             await browser.close()
         await driver.__aexit__(None, None, None)
-    assert found is None or found.errors == []
+    assert found is None or found.errors == [], found.errors
 
 
 def row(
