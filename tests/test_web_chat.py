@@ -127,8 +127,12 @@ def quiet_directory(directory: Directory, monkeypatch: pytest.MonkeyPatch) -> Di
     async def fake_label(self: Directory, thread_id: str) -> str:
         return f"label:{thread_id}"
 
+    async def no_roster(self: Directory, thread_id: str) -> dict[str, Any] | None:
+        return None  # what a 404 caches: a follow of a counted chat fetches its roster (spec 022)
+
     monkeypatch.setattr(Directory, "display", fake_display)
     monkeypatch.setattr(Directory, "label", fake_label)
+    monkeypatch.setattr(Directory, "_fetch_thread", no_roster)
     directory.me = ME
     return directory
 
@@ -1262,6 +1266,7 @@ async def test_chat_socket_never_receives_the_board(board: W.Board, settings: Se
             "page": W.page_version("chat.html"),
             "read_only": False,
             "typing": [],
+            "people": None,  # no member count in the label: no roster (spec 022)
         }
         assert len(board.clients) == 1
         board.broadcast()

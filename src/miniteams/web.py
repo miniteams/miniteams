@@ -97,6 +97,7 @@ _CALL_STARTER_RE = re.compile(
 )
 _LABEL_CONCURRENCY = 8
 _HISTORY_PAGE = 20  # history fetched per row at bootstrap: stub resolution + mention scan
+_COUNT_RE = re.compile(r" · \d+p$")  # a label's member count, as roster_label writes it
 _MENTION_SCAN = 50  # newest rows whose history is scanned for mentions at bootstrap
 _FIRST_CHUNK = 50  # rows the background fill paints before walking the rest of the listing
 _SEED_REREAD = 30.0  # seconds before the archive index is worth re-reading for a name
@@ -818,7 +819,7 @@ class Board:
             with contextlib.suppress(ArchiveUnavailable):  # the page shows the id rather than nothing
                 label = await io("label", index_label, self.data_dir, thread_id)
         # `opener` tells the page whether Open in Teams goes through the server or its own new tab.
-        return {
+        frame: dict[str, Any] = {
             "follow": thread_id,
             "ok": True,
             "label": label or thread_id,
@@ -828,6 +829,15 @@ class Board:
             # Live frames only say what changes: who already types is in the timers, board row or not.
             "typing": [n for tid, n in self._typing_timers if tid == thread_id and n != _YOU],
         }
+        # Spec 022: the members popover opens on the label's count only (none on a 1:1, a channel's would
+        # be its whole team); a roster to fetch comes later in its own frame, the socket loop never waits.
+        if not in_scope(thread_id) or not _COUNT_RE.search(frame["label"]):
+            frame["people"] = None
+        elif (roster := await self.chat.roster_now(thread_id)) is not None:
+            frame |= roster
+        else:
+            self.chat.roster_later(ws, thread_id, lambda: self._following(ws, thread_id))
+        return frame
 
     async def _forward(
         self, thread_id: str, resource_type: Any, resource: dict[str, Any], msgtype: str

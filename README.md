@@ -221,6 +221,7 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   GET on chat open and after every reconnect; cached in the presence file so a reopened chat paints at once.
 - **Browsing**: infinite scroll both ways, "↓ latest" when away from the bottom, header search, Open in Teams.
 - **Reply quotes** (spec 021): click a quote (or Tab to it, Enter) to jump to the quoted message, loading the history around it; "quoted message not found" when it is gone.
+- **Members** (spec 022): hover, click or Tab to "N members" for the people, You first then by name, with avatar and presence when known; 50 rows then "… and N more", bots and apps as "+ N apps", "members unavailable" when the roster cannot be had (a roster not cached is fetched without delaying the page). Escape or leaving closes it.
 - **Archive**: history and search read the archive under `--data-dir`. Without one the page shows the latest API page only
   and search is off.
 
