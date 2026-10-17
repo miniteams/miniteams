@@ -18,6 +18,7 @@ the history.
 import asyncio
 import base64
 import contextlib
+import copy
 import errno
 import functools
 import hashlib
@@ -85,6 +86,7 @@ from .messages import (
 from .presence import Presence, dm_ids, dm_peer, open_cache, person
 from .receipts import EVENT as RECEIPT_EVENT
 from .receipts import Receipts
+from .sections import Sections
 from .send import mark_read
 from .stream import run_forever
 
@@ -609,6 +611,7 @@ class Board:
         typing_ttl: float = _TYPING_TTL,
         seen_path: Path | None = None,
         muted_path: Path | None = None,
+        sections_path: Path | None = None,
         opener: list[str] | None = None,
         open_scheme: str = "msteams",
         browser: list[str] | None = None,
@@ -659,12 +662,15 @@ class Board:
             data_dir,
             lambda thread_id: str(self.rows.get(thread_id, {}).get("last_id") or ""),
         )
+        # Ids are kept while their chat is off the board: the board holds only the newest chats.
+        self.sections = Sections(sections_path, lambda: self.rows)
         board_first: dict[str, Handler] = {
             "seen": self._on_seen,
             "unseen": self._on_unseen,
             "read": self._on_read,
             "mute": self._on_mute,
             "unmute": self._on_unmute,
+            **self._section_handlers(),
         }
         board_last: dict[str, Handler] = {
             "board": self._on_board,
@@ -1223,6 +1229,7 @@ class Board:
                 "browser": self.browser is not None,
                 "me": self.me_name,
                 "busy": self.busy,
+                "sections": self.sections.items,
             },
             ensure_ascii=False,
         )
@@ -1363,6 +1370,37 @@ class Board:
 
     async def _on_unmute(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
         self.set_muted(verb["unmute"], False)
+
+    def _section_handlers(self) -> dict[str, Handler]:
+        """Spec 026 verbs: each names its section (or chat) in its key; a change is saved and broadcast."""
+        s = self.sections
+        changes: dict[str, Callable[[dict[str, Any]], bool]] = {
+            "section_new": lambda v: s.create(v["section_new"], v.get("chat")),
+            "section_rename": lambda v: s.rename(v["section_rename"], v.get("name")),
+            "section_order": lambda v: s.set_order(v["section_order"], v.get("order")),
+            "section_move": lambda v: s.move(v["section_move"], v.get("by"), v.get("to")),
+            "section_delete": lambda v: s.delete(v["section_delete"]),
+            "section_file": lambda v: s.file(v["section_file"], v.get("section"), v.get("at")),
+            "section_chat_move": lambda v: s.move_chat(v["section_chat_move"], v.get("by"), v.get("to")),
+        }
+        return {key: functools.partial(self._on_section, key, change) for key, change in changes.items()}
+
+    async def _on_section(
+        self, key: str, change: Callable[[dict[str, Any]], bool], ws: ServerConnection, verb: dict[str, Any]
+    ) -> None:
+        before = copy.deepcopy(self.sections.items)
+        try:
+            if not change(verb):
+                log.debug("section_verb_refused", verb=key)
+                return
+            if self.sections.items == before:
+                return
+            self.sections.save()
+        except Exception:
+            # Half a change, or one not saved, must not stay shown: a retry would find nothing to do.
+            self.sections.items = before
+            raise
+        self.broadcast()
 
     async def _on_board(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
         # A split chat page shows the list too: from now on it gets the board's rows, exactly what
@@ -1729,6 +1767,7 @@ async def run(
             reactions=reactions,
             seen_path=seen_path,
             muted_path=settings.config_dir / "muted.json",
+            sections_path=settings.config_dir / "sections.json",
             opener=None if opener in ("", "none") else opener.split(),
             open_scheme=open_scheme,
             browser=None if browser in ("", "none") else browser.split(),
