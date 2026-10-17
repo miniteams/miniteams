@@ -469,12 +469,17 @@
     return { hide, answered, key, lost };
   };
 
-  // Pasted images (spec 012 phase 5): queued per chat in paste order, kept in memory only (a reload
-  // loses them, the text draft stays), uploaded by the server only when sent. Limits mirror images.py;
-  // the server checks the bytes again. Hooks: `chat()` the chat shown, `error(id, text)` a refusal,
-  // `busy(id)` its send awaits an answer (the images shown are the next message's, never locked).
+  // Pasted images (spec 012 phase 5) and attached files (spec 025): queued per chat in the order added,
+  // kept in memory only (a reload loses them, the text draft stays), uploaded by the server only when
+  // sent. A pasted or dropped image Teams shows inline (IMG_TYPES) takes the inline path, anything else,
+  // and whatever the paperclip picks, goes as a file card. Limits mirror images.py and files.py; the
+  // server checks the bytes again. Hooks: `chat()` the chat shown, `error(id, text)` a refusal, `busy(id)`
+  // its send awaits an answer (the attachments shown are the next message's, never locked). `clip`: the
+  // paperclip button, `zone`: where a drop attaches.
   const IMG_MAX = 8, IMG_BYTES = 10 << 20, IMG_TOTAL = 40 << 20, IMG_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
-  const imageQueue = ({ input, box, chat, error, busy }) => {
+  const FILE_MAX = 10, FILE_BYTES = 100 << 20, FILE_CHUNK = 1 << 20, WIRE_HIGH = 4 << 20;
+  const bytes = (n) => n < 1024 ? `${n} B` : n < 1 << 20 ? `${(n / 1024).toFixed(1)} KiB` : `${(n / (1 << 20)).toFixed(1)} MiB`;
+  const imageQueue = ({ input, box, chat, error, busy, clip, zone }) => {
     const queues = new Map(), flight = new Map(), kept = new Map();  // kept: chat id → the attempt of a failed message edited in the composer
     // A refusal is about the images as they were: any change of them clears it, unless the page shows another error since.
     const refused = new Map();
@@ -497,18 +502,29 @@
       render();
     };
     del.onclick = () => { if (shown) remove(...shown); };
+    const thumb = (id, it, i) => {
+      const t = el("span", "thumb"), open = el("button", "open"), x = el("button", "rm", "×");
+      open.append(Object.assign(el("img"), { src: it.url, alt: `image ${i}` }));
+      open.title = "preview"; open.onclick = () => { shown = [id, it]; big.src = it.url; big.alt = `image ${i}`; view.showModal(); };
+      x.title = "remove"; x.setAttribute("aria-label", `remove image ${i}`); x.onclick = () => remove(id, it);
+      t.append(open, x);
+      return t;
+    };
+    // A file's name is data, never markup: text nodes only.
+    const chip = (id, it) => {
+      const c = el("span", "chip"), x = el("button", "rm", "×");
+      c.append(Object.assign(el("span", "name", it.file.name), { dir: "auto", title: it.file.name }), el("small", null, bytes(it.file.size)));
+      x.title = "remove"; x.setAttribute("aria-label", `remove ${it.file.name}`); x.onclick = () => remove(id, it);
+      c.append(x);
+      return c;
+    };
     const render = () => {
       const id = chat(), items = list(id), off = busy(id);
       box.hidden = !items.length && !off;
       box.classList.toggle("busy", off);
-      box.replaceChildren(...items.map((it, i) => {
-        const t = el("span", "thumb"), open = el("button", "open"), x = el("button", "rm", "×");
-        open.append(Object.assign(el("img"), { src: it.url, alt: `image ${i + 1}` }));
-        open.title = "preview"; open.onclick = () => { shown = [id, it]; big.src = it.url; big.alt = `image ${i + 1}`; view.showModal(); };
-        x.title = "remove"; x.setAttribute("aria-label", `remove image ${i + 1}`); x.onclick = () => remove(id, it);
-        t.append(open, x);
-        return t;
-      }), el("span", "temp", off ? "sending…" : "images are lost on reload"));
+      let n = 0;
+      box.replaceChildren(...items.map((it) => it.url ? thumb(id, it, ++n) : chip(id, it)),
+        el("span", "temp", off ? "sending…" : n < items.length ? "attachments are lost on reload" : "images are lost on reload"));
     };
     const measure = (url) => new Promise((ok, ko) => {
       const img = new Image();
@@ -516,12 +532,22 @@
       img.onerror = ko;
       img.src = url;
     });
-    // One paste after the other: a second Ctrl+V must not overtake the first one's measuring.
-    const add = (id, files) => { adding++; chain = chain.then(async () => {
+    // One paste after the other: a second Ctrl+V must not overtake the first one's measuring. `docs`:
+    // every file goes as a file card (the paperclip), images included.
+    const add = (id, files, docs = false) => { adding++; chain = chain.then(async () => {
       for (const file of files) {
-        const items = list(id), total = items.reduce((n, it) => n + it.file.size, 0);
-        const refusal = !IMG_TYPES.includes(file.type) ? "unsupported image: PNG, JPEG, GIF or WebP only"
-          : items.length >= IMG_MAX ? `at most ${IMG_MAX} images per message`
+        if (docs || !IMG_TYPES.includes(file.type)) {
+          const refusal = list(id).filter((it) => !it.url).length >= FILE_MAX ? `at most ${FILE_MAX} files per message`
+            : file.size > FILE_BYTES ? `${file.name}: over ${FILE_BYTES >> 20} MiB` : "";
+          if (refusal) { refuse(id, refusal); continue; }
+          queues.set(id, [...list(id), { file }]);
+          kept.delete(id);
+          unrefuse(id);
+          render();
+          continue;
+        }
+        const items = list(id).filter((it) => it.url), total = items.reduce((n, it) => n + it.file.size, 0);
+        const refusal = items.length >= IMG_MAX ? `at most ${IMG_MAX} images per message`
           : file.size > IMG_BYTES ? `an image is over ${IMG_BYTES >> 20} MiB`
           : total + file.size > IMG_TOTAL ? `images are over ${IMG_TOTAL >> 20} MiB in total` : "";
         if (refusal) { refuse(id, refusal); continue; }
@@ -542,26 +568,60 @@
       e.preventDefault();
       add(chat(), files);
     });
+    if (clip) {
+      const pick = Object.assign(el("input"), { type: "file", multiple: true, hidden: true });
+      pick.setAttribute("aria-label", "files to attach");
+      pick.onchange = () => { add(chat(), [...pick.files], true); pick.value = ""; input.focus(); };
+      clip.after(pick);
+      clip.onclick = () => pick.click();
+    }
+    const carries = (e) => [...(e.dataTransfer?.types || [])].includes("Files");
+    zone?.addEventListener("dragover", (e) => { if (carries(e) && !input.disabled && !input.readOnly) e.preventDefault(); });
+    zone?.addEventListener("drop", (e) => {
+      const files = [...(e.dataTransfer?.files || [])];
+      if (!files.length || input.disabled || input.readOnly) return;
+      e.preventDefault();
+      add(chat(), files);
+      input.focus();
+    });
+    // A file dropped next to the composer would replace the page, its drafts and attachments with it.
+    addEventListener("dragover", (e) => { if (carries(e) && !e.defaultPrevented) { e.preventDefault(); e.dataTransfer.dropEffect = "none"; } });
+    addEventListener("drop", (e) => { if (carries(e)) e.preventDefault(); });
     // Any edit makes the composer's message a new one: an identical text must not be looked up as the old one.
     input.addEventListener("input", () => kept.delete(chat()));
     addEventListener("pagehide", (e) => { if (!e.persisted) for (const q of queues.values()) for (const it of q) URL.revokeObjectURL(it.url); });
-    // The send verb for `id` gets its images and a message id, then each image follows as one binary
-    // frame, in order. `sent`: the queued message's last attempt; the very same message again keeps its
-    // id and asks the server to look for it first (Teams does not dedupe, and any failure may hide a
-    // posted message); an edited one is a new message, so an edit is never swallowed by the check. False
-    // when nothing is left to send (every pasted image refused), for the page to settle.
-    const send = async (ws, id, verb, items, sent) => {
-      if (ws?.readyState !== 1) return true;  // closing: the page's `lost` requeues the message, images included
-      if (!items.length && !verb.text.trim()) return false;
-      const json = JSON.stringify(verb), same = sent?.json === json;  // images added or removed already dropped the attempt
+    // The send verb for `id` gets its images, files and a message id, then each image follows as one
+    // binary frame, then each file in FILE_CHUNK frames, in order. `sent`: the queued message's last
+    // attempt; the very same message again keeps its id and asks the server to look for it first (Teams
+    // does not dedupe, and any failure may hide a posted message); an edited one is a new message, so an
+    // edit is never swallowed by the check. False when nothing is left to send (every pasted image
+    // refused), for the page to settle. Resolves once the verb is out; the files stream on after it.
+    // One send on the wire at a time: the server takes binary frames as the latest send's.
+    let wire = Promise.resolve();
+    const send = (ws, id, verb, items, sent) => new Promise((ok) => { wire = wire.then(async () => {
+      if (ws?.readyState !== 1) return ok(true);  // closing: the page's `lost` requeues the message, attachments included
+      if (!items.length && !verb.text.trim()) return ok(false);
+      const json = JSON.stringify(verb), same = sent?.json === json;  // attachments added or removed already dropped the attempt
       const cmid = same ? sent.cmid : String(last = Math.max(Date.now(), last + 1));
-      flight.set(id, { cmid, json, items });
+      const pics = items.filter((it) => it.url), docs = items.filter((it) => !it.url), f = { cmid, json, items };
+      flight.set(id, f);
       ws.send(JSON.stringify({ ...verb, cmid, ...(same ? { check: true } : {}),
-        ...(items.length ? { images: items.map((it) => ({ w: it.w, h: it.h, size: it.file.size })) } : {}) }));
-      for (const it of items) ws.send(it.file);
-      return true;
-    };
-    // Success drops the images sent.
+        ...(pics.length ? { images: pics.map((it) => ({ w: it.w, h: it.h, size: it.file.size })) } : {}),
+        ...(docs.length ? { files: docs.map((it) => ({ name: it.file.name, size: it.file.size })) } : {}) }));
+      ok(true);
+      // Bytes, not Blobs: Firefox sends Blobs as they finish reading, a smaller one overtaking. Paced on
+      // the socket's buffer: 1 GiB of files must not queue in memory. A failure, a dropped socket or a
+      // retry ends this attempt's stream.
+      const parts = [...pics.map((it) => it.file), ...docs.flatMap((it) => Array.from({ length: Math.ceil(it.file.size / FILE_CHUNK) },
+        (_, i) => it.file.slice(i * FILE_CHUNK, (i + 1) * FILE_CHUNK)))];
+      for (const part of parts) {
+        while (ws.readyState === 1 && ws.bufferedAmount > WIRE_HIGH) await new Promise((r) => setTimeout(r, 20));
+        const data = await part.arrayBuffer();
+        if (ws.readyState !== 1 || f.stop) return;
+        ws.send(data);
+      }
+    }).catch(() => ok(true)); });
+    // Success drops the attachments sent.
     const settled = (id) => {
       for (const it of flight.get(id)?.items || []) URL.revokeObjectURL(it.url);
       flight.delete(id);
@@ -573,7 +633,7 @@
     // attempt is kept until the composer changes (`again`): sent unchanged, it is a retry.
     const back = (id, items, sent) => { queues.set(id, [...items, ...list(id)]); if (sent) kept.set(id, sent); render(); };
     // A failure or a dropped socket: the send in flight, its attempt and images, handed back to its queued message.
-    const recall = (id) => { const f = flight.get(id); flight.delete(id); return f; };
+    const recall = (id) => { const f = flight.get(id); if (f) f.stop = true; flight.delete(id); return f; };
     // The send in flight: a reload keeps its attempt with its queued message.
     const attempt = (id) => { const f = flight.get(id); return f ? { cmid: f.cmid, json: f.json } : undefined; };
     // A stored draft's kept attempt (data from sessionStorage), checked like any input.
@@ -613,6 +673,8 @@
     const push = (id, item, front = false) => {
       const q = of(id), pics = imgs.list(id).length > 0 || imgs.adding(), was = !imgs.adding() && imgs.again(id);
       const e = { ...item, pics, images: imgs.take(id), state: q.paused ? "paused" : "queued" };
+      // Its bubble or line names its files.
+      e.images.then((items) => { e.files = items.filter((it) => !it.url).map((it) => it.file.name); if (e.files.length) changed(id); });
       if (was && was.json === JSON.stringify(item.verb)) Object.assign(e, { sent: was, cmid: was.cmid });  // its echo may be on screen
       if (front) q.list.unshift(e); else q.list.push(e);
       changed(id);
@@ -688,7 +750,7 @@
       }
       const [text, label, acts, open] = [".qtext", ".qstate", ".qacts", "textarea"].map((k) => e.node.querySelector(k));
       e.node.className = "q " + e.state;
-      text.textContent = e.verb.text || "🖼";
+      text.textContent = [e.verb.text, e.files?.length ? "📎 " + e.files.join(", ") : ""].filter(Boolean).join(" ") || "🖼";
       label.textContent = label.title = e.state === "failed" ? "failed: " + e.why : LABEL[e.state];
       acts.hidden = e.state !== "failed" || e.editing !== undefined;
       text.hidden = e.editing !== undefined;
@@ -735,7 +797,7 @@
     const pick = (m) => keys(m, ["name", "mri", "everyone"]) && str(m.name) && str(m.mri) && [undefined, true].includes(m.everyone);
     const verbOk = (v, id) => keys(v, ["send", "text", "mentions", "format", "quote"]) && v.send === id && str(v.text) && str(v.format)
       && Array.isArray(v.mentions) && v.mentions.every(pick) && (v.quote === undefined || Array.isArray(v.quote) && v.quote.every(str));
-    const LOST = "images not kept across the reload: paste them again";
+    const LOST = "attachments not kept across the reload: add them again";
     // `only`: the chats to take (null: all), the others' queues stay stored.
     const load = (only = null) => {
       let stored = [];

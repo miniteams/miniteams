@@ -242,7 +242,7 @@ async def test_preview_and_removal(widget: Any) -> None:
 
 async def test_limits_refuse_with_a_clear_error_and_keep_the_draft(widget: Any) -> None:
     """012-AC25: count, size, total and content limits refuse the image with a clear error; the text and
-    the images already queued stay."""
+    the images already queued stay. A pasted non-image becomes a file chip (025-AC5)."""
     page, box = widget.page, widget.page.locator("#reply")
     await box.press_sequentially("keep me")
     await _paste(page, *(png(i + 1, 1) for i in range(9)))
@@ -252,8 +252,9 @@ async def test_limits_refuse_with_a_clear_error_and_keep_the_draft(widget: Any) 
         await page.locator(".imgs .rm").first.click()
     await _paste(page, (png(), "image/png", 10 << 20))
     await _error_is(page, "an image is over 10 MiB")
-    await _paste(page, (b"%PDF-1.4", "application/pdf", 0))
-    await _error_is(page, "unsupported image: PNG, JPEG, GIF or WebP only")
+    await _paste(page, (b"%PDF-1.4", "application/pdf", 0))  # not an image: a file chip (025-AC5)
+    await until(page, "document.querySelectorAll('.imgs .chip').length === 1")
+    await _error_is(page, "")
     await _err(page).evaluate("e => { e.textContent = ''; }")
     freed = await page.evaluate("window.__freed.length")
     await _paste(page, (b"\0" * 64, "image/png", 0))  # an image label, no image inside
@@ -283,8 +284,9 @@ async def test_a_failed_send_keeps_everything_and_retries_with_the_same_id(widge
     await queue_is(page, ("hi", "failed: Teams answered 403"))
     assert await box.input_value() == ""
     await _thumbs(page, 0)
+    widget.frames.clear()  # an answer before the bytes stops them (025): only the retry's count
     await act(page, "retry")
-    await wait(lambda: len(widget.of("send")) == 2 and len(widget.frames) == 2)
+    await wait(lambda: len(widget.of("send")) == 2 and widget.frames == [png()])
     assert widget.cmids[0] == widget.cmids[1]
     assert "check" not in widget.of("send")[0] and widget.of("send")[1]["check"] is True
 

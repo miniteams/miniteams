@@ -79,7 +79,7 @@ async def test_widget_burst_sends_one_at_a_time_and_stays_open(pages: Pages) -> 
 
 
 WS = re.compile(r"^ws://127\.0\.0\.1:8/ws$")
-LOST = "images not kept across the reload: paste them again"
+LOST = "attachments not kept across the reload: add them again"
 
 
 async def _queue_then_reload(fake: Any, page: Page, reload: dict[str, Any], *, pics: bool = False) -> None:

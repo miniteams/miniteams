@@ -90,6 +90,8 @@
   #reply:disabled { opacity: .6; }
   .composer small { display: block; color: var(--hot); font-size: 12px; margin-top: 2px; }
   li.composer .imgs { --thumb: 32px; margin: 4px 0 0; gap: 8px; }
+  #reply { padding-right: 30px; }
+  .composer .clip { position: absolute; top: 3px; right: 14px; border: 0; background: none; padding: 2px 4px; cursor: pointer; color: inherit; }
   /* The open reply's send queue (spec 017): a truncated line per message. Contained: a long line must
      not widen the list's grid column. */
   .qlines { contain: inline-size; }
@@ -258,10 +260,12 @@
 
   const actions = rowActions($rows, () => render(), send);
   const $composer = el("li", "composer"), $reply = el("textarea"), $err = el("small"), $pop = el("div"), $imgs = el("div", "imgs"), $lines = el("div", "qlines");
+  const $clip = Object.assign(el("button", "clip", "📎"), { id: "clip", title: "attach files" });
+  $clip.setAttribute("aria-label", "attach files");
   $reply.id = "reply"; $reply.rows = 1; $reply.placeholder = "reply · Enter sends, Shift+Enter new line";
   $reply.setAttribute("aria-label", "reply");
   $pop.id = "pop"; $pop.hidden = true;
-  $composer.append($reply, $pop, $imgs, $err, $lines);
+  $composer.append($reply, $pop, $imgs, $err, $lines, $clip);  // last: Tab from the box reaches a failed line's actions first
   const grow = () => { $reply.style.height = "auto"; $reply.style.height = $reply.scrollHeight + 2 + "px"; };
   const edited = () => { drafts.set(replyTo, $reply.value); grow(); };
 
@@ -270,7 +274,7 @@
     put: (text, from, to) => $reply.setRangeText(text, from, to, "end"),
   });
   const imgs = imageQueue({
-    input: $reply, box: $imgs, chat: () => replyTo, busy: (id) => sends.busy(id),
+    input: $reply, box: $imgs, chat: () => replyTo, busy: (id) => sends.busy(id), clip: $clip, zone: $composer,
     error: (id, text, was) => {
       if (was !== undefined && errors.get(id) !== was) return;  // another error replaced our refusal since
       if (text) errors.set(id, text); else errors.delete(id);

@@ -349,6 +349,7 @@
     <button data-fmt="list" title="list" aria-label="list">•</button>
     <button data-fmt="quote" title="quote" aria-label="quote">❝</button>
     <span class="sep"></span>
+    <button id="clip" title="attach files" aria-label="attach files">📎</button>
     <button id="show" title="preview the formatted message" aria-label="preview" aria-pressed="false">preview</button>
   </div>
   <div id="quotes" hidden></div>
@@ -785,6 +786,8 @@
     const wrap = el("div", "editbox"), qs = el("div", "quotes"), box = el("textarea", "editor"), pics = el("div", "imgs"),
       bar = $tools.cloneNode(true), view = el("div", "view html"), pop = el("div", "pop"), note = el("small", "edit-note"), err = el("small", "edit-err");
     bar.removeAttribute("id");
+    bar.querySelector("#clip")?.remove();  // an edit keeps its attachments as they are
+    bar.querySelector("input[type=file]")?.remove();
     const eye = bar.querySelector("[aria-pressed]");
     eye.removeAttribute("id"); eye.textContent = "👁";
     pop.id = "editpop-" + r.id;
@@ -1403,7 +1406,8 @@
     else if (esearch.key(e)) { e.preventDefault(); e.stopPropagation(); }
   });
   $eq.addEventListener("blur", () => setTimeout(() => { if (document.activeElement !== $eq) closeSearch(); }));
-  const imgs = imageQueue({ input: $reply, box: document.getElementById("imgs"), chat: () => thread, busy: (id) => sends.busy(id), error: (id, text, was) => {
+  const imgs = imageQueue({ input: $reply, box: document.getElementById("imgs"), chat: () => thread, busy: (id) => sends.busy(id),
+    clip: document.getElementById("clip"), zone: document.querySelector("footer"), error: (id, text, was) => {
     // `was`: clearing a refusal of ours, only if it is still the line shown.
     if (was === undefined || (id === thread ? $err.textContent : draftOf(id)?.err ?? "") === was) noteFor(id, text);
   } });

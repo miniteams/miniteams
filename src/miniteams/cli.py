@@ -123,9 +123,6 @@ def cmd_send(settings: Settings, args: argparse.Namespace) -> int:
     if too_long(text, is_html=args.html):  # before auth and uploads: nothing to clean up after
         log.error("send_too_long", hint="Teams caps a message at 28 KiB of HTML")
         return 2
-    if args.image and args.attach:
-        log.error("send_bad_file", error="--image and --attach go in separate messages")
-        return 2
     with contextlib.ExitStack() as opened:
         images: list[tuple[str, bytes]] = []
         attached: list[tuple[str, BinaryIO, int]] = []
@@ -152,7 +149,7 @@ def _send(
     images: list[tuple[str, bytes]],
     attached: list[tuple[str, BinaryIO, int]],
 ) -> int:
-    from .send import send_images, send_message
+    from .send import images_body, send_images, send_message
 
     aad, skype_token = _ensure_skype_token(settings)
     display_name = (aad.get("id_token_claims") or {}).get("name") or ""
@@ -162,6 +159,8 @@ def _send(
 
         token = aad["access_token"]
         drive = onedrive(settings, token, token_source(settings).sharepoint_token)
+        if images:
+            text = images_body(settings, skype_token, args.thread, text, images, is_html=args.html)
         send_files(
             settings,
             skype_token,
@@ -171,7 +170,7 @@ def _send(
             text,
             attached,
             display_name,
-            is_html=args.html,
+            is_html=args.html or bool(images),
         )
     elif images:
         send_images(settings, skype_token, args.thread, text, images, display_name, is_html=args.html)

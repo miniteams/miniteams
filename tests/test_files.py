@@ -768,8 +768,6 @@ def test_cli_refuses_too_many_or_too_big_files_before_auth(settings: Settings, t
     big.write_bytes(b"x" * 11)
     odd = tmp_path / "a:b.txt"
     odd.write_bytes(b"1")
-    picture = tmp_path / "p.png"
-    picture.write_bytes(png())
     monkeypatch.setattr(files, "MAX_FILE_BYTES", 10)
     cases = [
         (_args(tmp_path, *[str(small)] * 11), "11 files: at most 10"),
@@ -777,7 +775,6 @@ def test_cli_refuses_too_many_or_too_big_files_before_auth(settings: Settings, t
         (_args(tmp_path, str(tmp_path / "missing")), "missing: No such file"),
         (_args(tmp_path, str(tmp_path)), "not a regular file"),
         (_args(tmp_path, str(odd)), "not a file name OneDrive takes"),
-        (_args(tmp_path, str(small), image=[str(picture)]), "--image and --attach go in separate messages"),
     ]
     real_open = cli._open_regular
     # A stub, not capture_logs: once cli.main() ran setup_logging, cli.log is cached past its reach.
@@ -844,6 +841,53 @@ def test_cli_attach_sends_the_files(settings: Settings, sp: FakeSharePoint, tmp_
     (body,) = sp.posted
     assert [e["fileName"] for e in json.loads(body["properties"]["files"])] == ["report.pdf"]
     assert next(iter(sp.items.values()))["data"] == b"%PDF-1.7"
+
+
+def test_the_cards_join_the_messages_own_properties(settings: Settings, sp: FakeSharePoint) -> None:
+    """025-AC5: a composer message's mentions and its file cards travel together, with its id."""
+    drive = _drive(settings, sp)
+    entries, uploaded = files.upload_files(settings, "sk", drive, ME, THREAD, _open([("a.pdf", b"1")]))
+    files.post_files(
+        settings,
+        "sk",
+        THREAD,
+        "<p>hi</p>",
+        "Me",
+        drive=drive,
+        entries=entries,
+        uploaded=uploaded,
+        properties={"mentions": "[]"},
+        is_html=True,
+        client_message_id="99",
+    )
+    (body,) = sp.posted
+    assert body["properties"]["mentions"] == "[]" and _cards_of(body) == ["a.pdf"]
+    assert body["clientmessageid"] == "99" and body["content"] == "<p>hi</p>"
+
+
+def _cards_of(body: dict[str, Any]) -> list[str]:
+    return [e["fileName"] for e in json.loads(body["properties"]["files"])]
+
+
+def test_cli_sends_images_and_files_in_one_message(
+    settings: Settings, sp: FakeSharePoint, tmp_path, monkeypatch
+) -> None:
+    """025: `--image` with `--attach`: one message, the text, the inline images, the file cards."""
+    doc, picture = tmp_path / "report.pdf", tmp_path / "p.png"
+    doc.write_bytes(b"%PDF-1.7")
+    picture.write_bytes(png())
+    monkeypatch.setattr(cli, "_ensure_skype_token", lambda s: ({"access_token": AAD}, "sk"))
+    monkeypatch.setattr("miniteams.auth.self_mri", lambda token: ME)
+    monkeypatch.setattr(
+        "miniteams.auth.token_source", lambda s: SimpleNamespace(sharepoint_token=lambda h: "sp-token")
+    )
+    monkeypatch.setattr(send, "upload_image", lambda *a: "0-weu-d1-" + "1" * 32)
+    args = _args(tmp_path, str(doc), image=[str(picture)])
+    args.text = "a < b"
+    assert cli.cmd_send(settings, args) == 0
+    (body,) = sp.posted
+    assert body["content"].startswith("<p>a &lt; b</p><p><img ") and "1" * 32 in body["content"]
+    assert [e["fileName"] for e in json.loads(body["properties"]["files"])] == ["report.pdf"]
 
 
 def test_parser_takes_repeated_attach(monkeypatch) -> None:
