@@ -91,6 +91,8 @@ class Settings(BaseSettings):
         "?isMailAddress=false&canBeSmtpAddress=false&enableGuest=true"
         "&includeIBBarredUsers=true&skypeTeamsInfo=true&includeBots=true"
     )
+    # The user's tenants (AAD bearer); the primary domain names the OneDrive host (files.py).
+    tenants_url: str = "https://teams.microsoft.com/api/mt/beta/users/tenants"
 
     # --- trouter / registrar (M1+) ---
     trouter_info_url: str = "https://go.trouter.teams.microsoft.com/v4/a"

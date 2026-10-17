@@ -22,3 +22,4 @@
 | [019](019-edit-composer-parity.md) | Editing a message works like composing one | shipped |
 | [020](020-auto-read.md) | Mark a chat read in Teams when it is shown | shipped |
 | [021](021-quote-jump.md) | A reply's quote leads to the quoted message | shipped |
+| [025](025-file-attachments.md) | Send any file as an attachment | in progress |

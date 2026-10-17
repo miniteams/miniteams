@@ -14,7 +14,9 @@ def _ns(**kw: Any) -> argparse.Namespace:
 
 
 def test_cmd_send_without_text_or_file_returns_2(settings: Settings) -> None:
-    rc = cli.cmd_send(settings, _ns(text=None, file=None, thread="48:notes", html=False, image=None))
+    rc = cli.cmd_send(
+        settings, _ns(text=None, file=None, thread="48:notes", html=False, image=None, attach=None)
+    )
     assert rc == 2  # returns before auth
 
 
@@ -34,7 +36,7 @@ def test_cmd_send_file_takes_precedence_over_text(settings: Settings, monkeypatc
 
     monkeypatch.setattr("miniteams.send.send_message", fake_send)
     rc = cli.cmd_send(
-        settings, _ns(text="positional", file=str(msg), thread="48:notes", html=True, image=None)
+        settings, _ns(text="positional", file=str(msg), thread="48:notes", html=True, image=None, attach=None)
     )
     assert rc == 0
     assert seen == {"text": "from-file", "html": True}

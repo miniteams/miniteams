@@ -135,8 +135,8 @@ def _has_token(result: dict[str, Any] | None) -> TypeGuard[dict[str, Any]]:
     return result is not None and "access_token" in result
 
 
-def self_mri(access_token: str) -> str:
-    """`8:orgid:<oid>` from the AAD access token's claims; "" when they cannot be read.
+def _claims(access_token: str) -> dict[str, Any]:
+    """Claims of our own AAD access token, {} when they cannot be read.
 
     Our own token, already trusted for the API calls it authorises — the payload is decoded
     without signature verification only to learn who we are (the silent refresh returns no
@@ -144,10 +144,20 @@ def self_mri(access_token: str) -> str:
     try:
         payload = access_token.split(".")[1]
         claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-        oid = str(claims.get("oid") or "")
     except IndexError, ValueError, AttributeError:
-        return ""
+        return {}
+    return claims if isinstance(claims, dict) else {}
+
+
+def self_mri(access_token: str) -> str:
+    """`8:orgid:<oid>` from the AAD access token's claims; "" when they cannot be read."""
+    oid = str(_claims(access_token).get("oid") or "")
     return f"8:orgid:{oid}" if oid else ""
+
+
+def token_tenant(access_token: str) -> str:
+    """The tenant GUID (`tid`) the AAD access token was issued in; "" when it cannot be read."""
+    return str(_claims(access_token).get("tid") or "")
 
 
 class AuthExpired(RuntimeError):
