@@ -3123,6 +3123,114 @@ def test_the_board_takes_every_chat_verb_from_chat_verbs(board: W.Board) -> None
         *chat,
         "board",
         "follow",
+        "dm",  # spec 023: my 1:1 with a sender
         "open",
         "authors",  # spec 015: a chat page's authors, for their presence
     ]
+
+
+# --- my 1:1 with a sender (spec 023) ---
+
+
+def _dm(a: str, b: str) -> str:
+    return f"19:{a.removeprefix('8:orgid:')}_{b.removeprefix('8:orgid:')}@unq.gbl.spaces"
+
+
+def _row_of(thread_id: str) -> dict[str, dict[str, Any]]:
+    return {thread_id: {"id": thread_id, "label": "Ann Lee", "last_activity": _at(1), "seen_at": None}}
+
+
+@pytest.mark.parametrize("order", ["me first", "them first"])
+async def test_dm_answers_a_board_row_in_either_order(
+    tmp_path: Path, quiet_directory: Directory, no_api: None, order: str
+) -> None:
+    """023-AC2/AC5: a 1:1 on the board, either id order, answered from the rows: no index read (there is
+    none), no Teams call; an MRI in upper case finds it too."""
+    dm = _dm(ME, ANN) if order == "me first" else _dm(ANN, ME)
+    board = W.Board(_row_of(dm), quiet_directory, me=ME, data_dir=tmp_path / "missing")
+    for mri in (ANN, ANN.upper().replace("8:ORGID:", "8:orgid:")):
+        assert await board.dm(mri) == {"dm": mri, "chat": dm}
+
+
+@pytest.mark.parametrize("order", ["me first", "them first"])
+async def test_dm_answers_the_archive_index_in_either_order(
+    tmp_path: Path, quiet_directory: Directory, no_api: None, order: str
+) -> None:
+    """023-AC2/AC5: a 1:1 only in the archive index, either id order."""
+    dm = _dm(ME, ANN) if order == "me first" else _dm(ANN, ME)
+    board = W.Board({}, quiet_directory, me=ME, data_dir=_archive(tmp_path / "d", dm, None))
+    assert await board.dm(ANN) == {"dm": ANN, "chat": dm}
+
+
+async def test_dm_without_a_one_to_one_says_so(
+    tmp_path: Path, quiet_directory: Directory, data_dir: Path, no_api: None
+) -> None:
+    """023-AC5: no 1:1 on the board nor in the archive, or no archive at all: "no private chat"; someone
+    else's 1:1 with them is not mine."""
+    other = "8:orgid:00000000-0000-0000-0000-00000000000c"
+    for board in (
+        W.Board(_row_of(_dm(other, ANN)), quiet_directory, me=ME, data_dir=data_dir),
+        W.Board({}, quiet_directory, me=ME),
+    ):
+        assert await board.dm(ANN) == {"dm": ANN, "error": "no private chat with them yet"}
+
+
+@pytest.mark.parametrize(
+    "mri", ["", "28:bot-id", "8:orgid:not-a-guid", ME, ME.upper().replace("8:ORGID:", "8:orgid:")]
+)
+async def test_dm_of_no_person_or_of_me_is_unknown(
+    quiet_directory: Directory, data_dir: Path, no_api: None, mri: str
+) -> None:
+    """023-AC5: no org user, or me (I am excluded): "unknown person", nothing looked up."""
+    board = W.Board(_row_of(_dm(ME, ME)), quiet_directory, me=ME, data_dir=data_dir)
+    assert await board.dm(mri) == {"dm": mri, "error": "unknown person"}
+
+
+async def test_dm_without_my_own_id_is_unknown(quiet_directory: Directory, no_api: None) -> None:
+    """023-AC5: a server that does not know me cannot name our 1:1."""
+    board = W.Board(_row_of(_dm(ME, ANN)), quiet_directory)
+    assert await board.dm(ANN) == {"dm": ANN, "error": "unknown person"}
+
+
+@pytest.mark.parametrize("archive", ["no folder", "no index", "unreadable index"])
+async def test_dm_without_a_readable_archive_index_finds_none(
+    tmp_path: Path, quiet_directory: Directory, no_api: None, archive: str
+) -> None:
+    """023-AC5: a data dir without a readable index is no 1:1 there, not a failure."""
+    data = tmp_path / "d"
+    if archive != "no folder":
+        data.mkdir()
+    if archive == "unreadable index":
+        (data / "index.db").write_text("not a database")
+    board = W.Board({}, quiet_directory, me=ME, data_dir=data)
+    assert await board.dm(ANN) == {"dm": ANN, "error": "no private chat with them yet"}
+
+
+async def test_dm_with_the_archive_stuck_says_so(
+    tmp_path: Path, quiet_directory: Directory, monkeypatch: pytest.MonkeyPatch, no_api: None
+) -> None:
+    """023-AC5: an archive read past its deadline: "archive unavailable"."""
+
+    async def stuck(*_: Any) -> Any:
+        raise CV.ArchiveUnavailable("archive unavailable (dir)")
+
+    monkeypatch.setattr(W, "io", stuck)
+    board = W.Board({}, quiet_directory, me=ME, data_dir=tmp_path / "d")
+    assert await board.dm(ANN) == {"dm": ANN, "error": "archive unavailable"}
+
+
+async def test_dm_verb_on_the_chat_socket(
+    tmp_path: Path, quiet_directory: Directory, settings: Settings, no_api: None
+) -> None:
+    """023-AC5: the page's `dm` verb answers on its socket, the chat under `chat` (a `thread` key would be
+    dropped by a page showing another chat); no archive index answers "no private chat", no failure."""
+    dm = _dm(ANN, ME)
+    board = W.Board(_row_of(dm), quiet_directory, me=ME, data_dir=tmp_path / "missing")
+    cy = "8:orgid:00000000-0000-0000-0000-00000000000c"
+    with structlog.testing.capture_logs() as logs:
+        async with _served(board, settings), board_socket(_host(board), board.secret, chat=True) as ws:
+            await ws.send(json.dumps({"dm": ANN}))
+            assert await _frame(ws) == {"dm": ANN, "chat": dm}
+            await ws.send(json.dumps({"dm": cy}))
+            assert await _frame(ws) == {"dm": cy, "error": "no private chat with them yet"}
+    assert [e for e in logs if e["event"] == "verb_failed"] == []

@@ -915,6 +915,8 @@ async def test_actions_reachable_from_the_keyboard_and_picker_closes(chat: Pages
             break
     assert await page.locator('[data-id="1"] .actions').is_visible()
     await page.keyboard.press("Tab")
+    assert await page.evaluate("document.activeElement.role") == "link"  # spec 023: the sender's name first
+    await page.keyboard.press("Tab")
     focused = await page.evaluate("[document.activeElement.dataset.act, document.activeElement.ariaLabel]")
     assert focused == ["reply", "reply with quote"]
     await page.keyboard.press("Tab")
@@ -1720,6 +1722,8 @@ async def test_reaction_chips_add_or_remove_mine(chat: Pages, calls: list[tuple[
     await chips.nth(1).click()
     await _until(calls, 2)
     await page.locator('[data-id="1"]').focus()
+    await page.keyboard.press("Tab")
+    assert await page.evaluate("document.activeElement.role") == "link"  # spec 023: the sender's name first
     await page.keyboard.press("Tab")
     assert await page.evaluate("document.activeElement.ariaLabel") == "👍 1, remove"
     await page.keyboard.press("Tab")

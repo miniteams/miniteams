@@ -163,6 +163,9 @@
   .head { display: flex; align-items: baseline; gap: 8px; }
   .head b { font-weight: 600; }
   .msg.me .head b { color: var(--accent); }
+  .head b.who { cursor: pointer; border-radius: 3px; }
+  .head b.who:hover { text-decoration: underline; }
+  .head b.who:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   .when, .edited { font-size: 11.5px; color: var(--faint); white-space: nowrap; }
   .html { overflow-wrap: anywhere; }
   .html p { margin: 0; }
@@ -577,10 +580,33 @@
     if (img && !img.closest("a")) zoom(img);  // a linked image keeps its link
     const q = e.target.closest(".html blockquote[role=link]");
     if (q && !e.target.closest("a") && getSelection().isCollapsed) quoteJump(q.dataset.msg);  // a click ending a selection selects
+    const who = e.target.closest(".head .who");
+    if (!who || !getSelection().isCollapsed) return;  // a drag selecting the name copies it
+    dmAsk(who, e.ctrlKey || e.metaKey);  // Ctrl/⌘ click = middle click, as on the list's rows
+    if (e.detail > 0) who.blur();  // a pointer's focus there would pin the action bar; a keyboard's stays
   });
+  $msgs.addEventListener("auxclick", (e) => { const who = e.button === 1 && e.target.closest(".head .who"); if (who) dmAsk(who, true); });
   $msgs.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && e.target.matches(".html blockquote[role=link]")) { e.preventDefault(); quoteJump(e.target.dataset.msg); }
+    if (e.key === "Enter" && e.target.matches(".head .who")) { e.preventDefault(); dmAsk(e.target, false); }
   });
+  // Spec 023: the server answers which 1:1 holds me and the sender; the latest name asked wins.
+  const DM_GO = "open your private chat";
+  let dmWant = null;
+  const dmAsk = (who, tab) => {
+    dmWant = { mri: who.closest(".msg").dataset.from, tab, from: thread };
+    send({ dm: dmWant.mri }) || ($err.textContent = "offline, private chat not opened");
+  };
+  const onDm = (m) => {
+    const want = dmWant;
+    if (!want || m.dm !== want.mri) return;
+    dmWant = null;
+    if (want.from !== thread) return;  // the page moved on meanwhile
+    if (typeof m.chat !== "string") $err.textContent = "private chat: " + (m.error || "failed");
+    else if (want.tab) openTab(m.chat);
+    else if (split) switchTo(m.chat, true);
+    else location.assign(chatPath(m.chat) + location.search);
+  };
   $zoom.onclick = () => $zoom.close();
   const toBottom = () => { $list.scrollTop = $list.scrollHeight; lastTop = $list.scrollTop; hist.stick = !hist.newer; if (hist.stick) hist.unseen = 0; showLatest(); };
   const byId = (id) => $msgs.querySelector(`[data-id="${CSS.escape(id)}"]`);
@@ -643,8 +669,10 @@
     const av = el("div", "av", initials(name));
     av.style.background = avatarBg(r.from || name);
     if (r.from) { av.dataset.pmri = r.from.toLowerCase(); presenceDot(av); authorsSoon(); }
-    const head = el("div", "head");
-    head.append(Object.assign(el("b", null, name), { dir: "auto" }), Object.assign(el("span", "when", fmtTime(r.at)), { title: r.at }));
+    const head = el("div", "head"), who = Object.assign(el("b", null, name), { dir: "auto" });
+    // Spec 023: someone else's name, in a chat that is not our 1:1, leads to our 1:1.
+    if (!r.me && /^8:orgid:/i.test(r.from) && kind(thread) !== "dm") { Object.assign(who, { className: "who", tabIndex: 0, title: DM_GO }); who.setAttribute("role", "link"); }
+    head.append(who, Object.assign(el("span", "when", fmtTime(r.at)), { title: r.at }));
     if (r.edited && !r.deleted) head.append(el("span", "edited", "edited"));
     body.prepend(head);
     if (!r.deleted && r.reactions && r.reactions.length) {
@@ -1450,6 +1478,10 @@
   // Read once, never written: the widget owns the stored tab.
   let tab = Object.hasOwn(TABS, pref("tab") || "") ? pref("tab") : "all";
   const chatPath = (id) => "/chat/" + encodeURIComponent(id);
+  // The new tab opens in split too: --browser has none of this page's stored settings. The server opens
+  // only a chat on the board (or followed): another one goes through the page.
+  const openTab = (id) => browser && rows.some((r) => r.id === id) ? send({ open: id, chat: true, chatnav: "split" })
+    : window.open(chatPath(id) + "?chatnav=split", "_blank", "noopener");
   const rowOf = (r) => {
     const m = mentioned(r), dm = kind(r.id) === "dm";
     const li = el("li", (r.unread ? "unread " : "") + ((isSeen(r) || r.muted) && !m ? "seen " : "") + (r.id === thread ? "cur " : "")
@@ -1466,12 +1498,7 @@
     const name = Object.assign(marked(el("a", "name truncate"), rowTitle(r), query), { href: r.link || "#", target: "_blank", rel: "noopener", title: r.label, dir: "auto" });
     name.dataset.k = "name";
     name.tabIndex = -1;  // renderRows gives one row the Tab stop
-    // The new tab opens in split too: --browser has none of this page's stored settings.
-    const middle = (ev) => {
-      ev.preventDefault();
-      if (browser) send({ open: r.id, chat: true, chatnav: "split" });
-      else window.open(chatPath(r.id) + "?chatnav=split", "_blank", "noopener");
-    };
+    const middle = (ev) => { ev.preventDefault(); openTab(r.id); };
     // Plain click switches in place; Shift click opens Teams as on the board; middle click is onauxclick's.
     name.onclick = (ev) => {
       if (ev.button === 1) { ev.preventDefault(); return; }
@@ -1755,6 +1782,7 @@
       else if ("gap" in m) { if (m.gap === thread) resync(); }  // no `thread` key: a gap of a chat left is ignored here
       else if ("follow" in m) onFollow(m);
       else if ("people" in m) { if (m.members === thread) setRoster(m); }  // a chat left since: dropped
+      else if ("dm" in m) onDm(m);
       else if ("history" in m) onHistory(m);
       else if ("search" in m) onSearch(m);
       else if ("complete" in m) { complete.answered(m); esearch.answered(m); for (const w of $msgs.querySelectorAll(".editbox")) w.ed.complete.answered(m); }
