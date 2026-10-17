@@ -1,6 +1,6 @@
 # 025 — Send any file as an attachment
 
-**Status**: shipped (AC1 awaits a look at the card in Teams)
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-10-17
 
@@ -39,7 +39,7 @@ own file card.
 
 ## Acceptance criteria
 
-- [ ] **AC1** `miniteams send --attach f.pdf --thread <chat>` posts a message that Teams shows with
+- [x] **AC1** `miniteams send --attach f.pdf --thread <chat>` posts a message that Teams shows with
   its file card, openable by every member of that chat (verified live on the test chat).
 - [x] **AC2** The file lands in the sender's Teams chat files folder, whatever its localized name,
   and no request goes to graph.microsoft.com.
