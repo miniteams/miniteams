@@ -8,7 +8,7 @@ import stat
 import sys
 from datetime import UTC
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import structlog
 
@@ -75,19 +75,29 @@ def cmd_handshake(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
-def _read_image(path: Path, limit: int) -> bytes:
-    """A regular file's bytes, at most `limit`; ValueError for anything else."""
+def _open_regular(path: Path) -> BinaryIO:
+    """`path` opened for reading if it is a regular file; ValueError for anything else."""
     try:
         # A FIFO or a device would block or never end (/dev/zero): refused before the open.
         if not stat.S_ISREG(os.stat(path).st_mode):
             raise ValueError(f"{path.name}: not a regular file")
         # Non-blocking and re-checked on the fd: a swap to a FIFO after the stat cannot hang us.
-        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb") as fh:
-            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
-                raise ValueError(f"{path.name}: not a regular file")
-            data = fh.read(limit + 1)  # a file growing past the cap is caught too
+        fh = os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb")
     except OSError as exc:
         raise ValueError(f"{path.name}: {exc.strerror or exc}") from exc
+    if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+        fh.close()
+        raise ValueError(f"{path.name}: not a regular file")
+    return fh
+
+
+def _read_image(path: Path, limit: int) -> bytes:
+    """A regular file's bytes, at most `limit`; ValueError for anything else."""
+    with _open_regular(path) as fh:
+        try:
+            data = fh.read(limit + 1)  # a file growing past the cap is caught too
+        except OSError as exc:
+            raise ValueError(f"{path.name}: {exc.strerror or exc}") from exc
     if len(data) > limit:
         raise ValueError(f"{path.name}: over {limit >> 20} MiB")
     return data
@@ -95,31 +105,75 @@ def _read_image(path: Path, limit: int) -> bytes:
 
 def cmd_send(settings: Settings, args: argparse.Namespace) -> int:
     """Send a message — defaults to your own Notes (write-safe target)."""
+    from .files import check_files
     from .images import MAX_IMAGE_BYTES, check_batch
-    from .send import send_images, send_message
 
     if args.file:
         text = Path(args.file).read_text(encoding="utf-8")
     elif args.text is not None:
         text = args.text
-    elif args.image:
+    elif args.image or args.attach:
         text = ""
     else:
-        log.error("send_no_input", hint="provide TEXT, --file or --image")
+        log.error("send_no_input", hint="provide TEXT, --file, --image or --attach")
         return 2
 
-    images: list[tuple[str, bytes]] = []
-    if args.image:
+    from .send import too_long
+
+    if too_long(text, is_html=args.html):  # before auth and uploads: nothing to clean up after
+        log.error("send_too_long", hint="Teams caps a message at 28 KiB of HTML")
+        return 2
+    if args.image and args.attach:
+        log.error("send_bad_file", error="--image and --attach go in separate messages")
+        return 2
+    with contextlib.ExitStack() as opened:
+        images: list[tuple[str, bytes]] = []
+        attached: list[tuple[str, BinaryIO, int]] = []
         try:  # before auth: a bad file never costs a login
-            images = [(Path(path).name, _read_image(Path(path), MAX_IMAGE_BYTES)) for path in args.image]
-            check_batch([data for _, data in images])
+            if args.image:
+                images = [(Path(path).name, _read_image(Path(path), MAX_IMAGE_BYTES)) for path in args.image]
+                check_batch([data for _, data in images])
+            if args.attach:
+                check_files([(Path(path).name, 0) for path in args.attach])  # the count, before any open
+                for path in args.attach:
+                    fh = opened.enter_context(_open_regular(Path(path)))
+                    attached.append((Path(path).name, fh, os.fstat(fh.fileno()).st_size))
+                check_files([(name, size) for name, _, size in attached])
         except ValueError as exc:
-            log.error("send_bad_image", error=str(exc))
+            log.error("send_bad_file", error=str(exc))
             return 2
+        return _send(settings, args, text, images, attached)
+
+
+def _send(
+    settings: Settings,
+    args: argparse.Namespace,
+    text: str,
+    images: list[tuple[str, bytes]],
+    attached: list[tuple[str, BinaryIO, int]],
+) -> int:
+    from .send import send_images, send_message
 
     aad, skype_token = _ensure_skype_token(settings)
     display_name = (aad.get("id_token_claims") or {}).get("name") or ""
-    if images:
+    if attached:
+        from .auth import self_mri, token_source
+        from .files import onedrive, send_files
+
+        token = aad["access_token"]
+        drive = onedrive(settings, token, token_source(settings).sharepoint_token)
+        send_files(
+            settings,
+            skype_token,
+            drive,
+            self_mri(token),
+            args.thread,
+            text,
+            attached,
+            display_name,
+            is_html=args.html,
+        )
+    elif images:
         send_images(settings, skype_token, args.thread, text, images, display_name, is_html=args.html)
     else:
         send_message(settings, skype_token, args.thread, text, display_name, is_html=args.html)
@@ -519,6 +573,12 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         metavar="FILE",
         help="attach an inline image (PNG, JPEG, GIF, WebP); repeat for several, sent after the text",
+    )
+    p_send.add_argument(
+        "--attach",
+        action="append",
+        metavar="FILE",
+        help="attach any file as Teams does (OneDrive, shared with the chat); up to 10, 100 MiB each",
     )
     p_send.set_defaults(func=cmd_send)
 

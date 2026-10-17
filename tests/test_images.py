@@ -462,7 +462,7 @@ def test_cli_refuses_a_character_device(settings: Settings, monkeypatch) -> None
 
 
 def test_cli_refuses_a_missing_path_and_a_directory(settings: Settings, monkeypatch, tmp_path) -> None:
-    # 012-AC24: a bad path is a clear rc 2 (send_bad_image), not a crash through command_failed.
+    # 012-AC24: a bad path is a clear rc 2 (send_bad_file), not a crash through command_failed.
     assert _bad_image_rc(settings, monkeypatch, str(tmp_path / "nope.png")) == 2
     assert _bad_image_rc(settings, monkeypatch, str(tmp_path)) == 2
 

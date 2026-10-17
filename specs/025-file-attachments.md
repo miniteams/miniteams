@@ -26,7 +26,8 @@ own file card.
   through the send queue (spec 017) like any other.
 - **Limits.** Up to 10 files and 100 MiB per file per message in this version; larger uploads use an
   upload session in chunks.
-- **CLI.** `miniteams send --file <path>` (repeatable), the first consumer and the trial harness.
+- **CLI.** `miniteams send --attach <path>` (repeatable; `--file` already reads the body from a file), the
+  first consumer and the trial harness.
 - **Failure.** An upload or share that fails leaves no message posted and says why; a file uploaded
   but not shared is deleted again.
 
@@ -38,12 +39,12 @@ own file card.
 
 ## Acceptance criteria
 
-- [ ] **AC1** `miniteams send --file f.pdf --thread <chat>` posts a message that Teams shows with
+- [ ] **AC1** `miniteams send --attach f.pdf --thread <chat>` posts a message that Teams shows with
   its file card, openable by every member of that chat (verified live on the test chat).
-- [ ] **AC2** The file lands in the sender's Teams chat files folder, whatever its localized name,
+- [x] **AC2** The file lands in the sender's Teams chat files folder, whatever its localized name,
   and no request goes to graph.microsoft.com.
-- [ ] **AC3** A file over the single-request limit uploads in chunks and arrives intact.
-- [ ] **AC4** An upload or share failure posts nothing, reports the cause, and leaves no orphan file.
+- [x] **AC3** A file over the single-request limit uploads in chunks and arrives intact.
+- [x] **AC4** An upload or share failure posts nothing, reports the cause, and leaves no orphan file.
 - [ ] **AC5** In the chat page and the widget, the paperclip and a drop attach files as chips; × removes
   one; Enter sends them with the text through the send queue.
 - [ ] **AC6** More than 10 files or a file over 100 MiB is refused with a clear message.
@@ -52,7 +53,7 @@ own file card.
 
 ### Phase 1 — The send path, by live trials
 - Work: OneDrive host and chat files folder discovery, upload (simple and session), share with the
-  chat's members, message with `properties.files`, cleanup on failure; `send --file`; trials on the
+  chat's members, message with `properties.files`, cleanup on failure; `send --attach`; trials on the
   test chat only, each trial's files deleted and shares revoked afterwards.
 - **Covers**: AC1, AC2, AC3, AC4, AC6 (CLI side)
 - **Data model impact**: none
@@ -74,6 +75,11 @@ None.
 - How Teams shares chat files (which call, which permission scope) — settled by phase 1's trials.
 
 ## Decisions
+
+- Phase 1 shipped: AC2-AC4 and the CLI side of AC6 verified by 5 live trials on the test chat
+  (cleaned up). AC1's card in a member's Teams client is still to be looked at.
+- The share is an edit link for the chat's people (`scope: users`), Teams' chat default as far as the
+  archived share tokens show.
 
 - Live trials on the test chat, files deleted and shares revoked after each (user's call, 2026-10-17):
   no capture of the Teams client is available.
