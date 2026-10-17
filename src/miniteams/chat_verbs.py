@@ -15,6 +15,7 @@ import json
 import mimetypes
 import re
 import sqlite3
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -22,7 +23,7 @@ from collections.abc import Awaitable, Callable, Coroutine
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, TypeIs
+from typing import Any, BinaryIO, Literal, TypeIs
 from urllib.parse import unquote
 
 import httpx
@@ -38,6 +39,7 @@ from .directory import Directory, is_app
 from .dump import epoch_seconds, fetch_history
 from .emoji_table import SHORTCODES
 from .emojis import EmojiCache
+from .files import check_files, my_onedrive, post_files, upload_files
 from .http import failure
 from .images import (
     MAX_IMAGE_BYTES,
@@ -108,7 +110,7 @@ _DEADLINES: dict[IoKind, float] = {
 _ACTIVITY = "_activity"  # record key: a system line's (msgtype, Activity), until named
 _LOOKUP_PAGE = 20  # API messages read ending at an older message the latest page lacks
 _FORMATS = ("inline", "full")
-_FRAMES_WAIT = 30.0  # seconds a send's image frames may take to follow it
+_FRAMES_WAIT = 30.0  # seconds a send waits for its next attachment frame: a slow link keeps going
 _ECHO_WAIT = 15.0  # seconds an unanswered send waits for its own echo before saying it may have gone out
 _UPLOAD_DRAFTS = 16  # drafts whose uploaded objects are kept for a retry (each a few ids)
 # Raised once the request may have reached Teams: a blind resend could post it twice (no dedup, spec 012 5a).
@@ -128,7 +130,67 @@ _ASYNCGW_SRC_RE = re.compile(
 )
 
 
-type _Incoming = tuple[tuple[int, ...], list[bytes], asyncio.Future[list[bytes]]]
+type Frames = tuple[list[bytes], list[BinaryIO]]  # a send's images, then its files spooled, in order
+
+
+def stored(exc: OSError) -> str:
+    return f"could not store the file: {exc.strerror or exc}"
+
+
+class _Incoming:
+    """A send's binary frames as they arrive: each image in one frame, then each file in chunks, written
+    to an unnamed temp file under `spool` (gone once closed, or with the process, crash included)."""
+
+    def __init__(
+        self, sizes: tuple[int, ...], files: tuple[tuple[str, int], ...], spool: Path | None
+    ) -> None:
+        self.sizes, self.files, self.blobs = sizes, files, list[bytes]()
+        self.future: asyncio.Future[Frames] = asyncio.get_running_loop().create_future()
+        self.spools: list[BinaryIO] = []
+        self.at = 0  # the file the next chunk belongs to
+        self.seen = asyncio.get_running_loop().time()  # the last frame taken: the wait is an idle one
+        if files:
+            if spool is None:
+                self.future.set_exception(ValueError("not connected"))
+                return
+            # ponytail: no per-process cap on spooled bytes: 10 x 100 MiB per socket, sockets unbounded;
+            # a global budget if the cache disk ever fills
+            try:
+                spool.mkdir(mode=0o700, parents=True, exist_ok=True)
+                for _ in files:
+                    self.spools.append(tempfile.TemporaryFile(dir=spool))
+            except OSError as exc:
+                self.close()
+                self.future.set_exception(ValueError(stored(exc)))
+                return
+        self._advance()
+
+    def take(self, data: bytes) -> str | None:
+        """One frame; the refusal when it is not the one expected."""
+        if len(self.blobs) < len(self.sizes):
+            if len(data) != self.sizes[len(self.blobs)]:
+                return "image size mismatch"
+            self.blobs.append(data)
+        else:
+            fh = self.spools[self.at]
+            # The cap holds while streaming: a chunk never goes past the size the send announced.
+            if not 0 < len(data) <= self.files[self.at][1] - fh.tell():
+                return "file size mismatch"
+            # ponytail: written in the loop, a page's 1 MiB frame at a time; to_thread if it stalls
+            fh.write(data)
+        self.seen = asyncio.get_running_loop().time()
+        self._advance()
+        return None
+
+    def _advance(self) -> None:
+        while self.at < len(self.files) and self.spools[self.at].tell() == self.files[self.at][1]:
+            self.at += 1
+        if len(self.blobs) == len(self.sizes) and self.at == len(self.files) and not self.future.done():
+            self.future.set_result((self.blobs, self.spools))
+
+    def close(self) -> None:
+        for fh in self.spools:
+            fh.close()
 
 
 class ArchiveUnavailable(Exception):
@@ -341,6 +403,7 @@ class SendRequest:
     images: tuple[int, ...] = ()  # byte sizes of the binary frames that follow, in order
     cmid: str = ""  # the page's clientmessageid, kept across the retries of one draft
     check: bool = False  # a retry after an unsure send: post only if the chat lacks `cmid`
+    files: tuple[tuple[str, int], ...] = ()  # (name, size), their chunks after the images, in order
 
 
 @dataclass(frozen=True, slots=True)
@@ -428,6 +491,25 @@ def _image_sizes(images: Any) -> tuple[int, ...] | str:
     return tuple(sizes)
 
 
+def _file_list(files: Any) -> tuple[tuple[str, int], ...] | str:
+    """`files` ([{name, size}]) → (name, size) pairs within the limits; the bytes are counted again."""
+    if (
+        not isinstance(files, list)
+        or not all(
+            isinstance(f, dict) and isinstance(f.get("name"), str) and type(f.get("size")) is int
+            for f in files
+        )
+        or any(f["size"] < 0 for f in files)
+    ):
+        return "invalid files"
+    found = tuple((str(f["name"]), int(f["size"])) for f in files)
+    try:
+        check_files(list(found))
+    except ValueError as exc:
+        return str(exc)
+    return found
+
+
 def parse_send(verb: dict[str, Any]) -> SendRequest | str:
     thread, text = verb.get("send"), verb.get("text")
     if not isinstance(thread, str):
@@ -435,8 +517,12 @@ def parse_send(verb: dict[str, Any]) -> SendRequest | str:
     images = _image_sizes([] if verb.get("images") is None else verb["images"])
     if isinstance(images, str):
         return images
-    # Images alone are a message: the text may then be empty.
-    if not (images and isinstance(text, str) and not text.strip()) and (error := _text_error(text)):
+    files = _file_list([] if verb.get("files") is None else verb["files"])
+    if isinstance(files, str):
+        return files
+    # Images or files alone are a message: the text may then be empty.
+    alone = (images or files) and isinstance(text, str) and not text.strip()
+    if not alone and (error := _text_error(text)):
         return error
     cmid, check = verb.get("cmid", ""), verb.get("check", False)
     if not (cmid == "" or isinstance(cmid, str) and MSG_ID_RE.fullmatch(cmid)) or not isinstance(check, bool):
@@ -455,7 +541,7 @@ def parse_send(verb: dict[str, Any]) -> SendRequest | str:
         return "invalid mention"
     if (full := _format(verb.get("format"))) is None:
         return "invalid format"
-    return SendRequest(thread, str(text), tuple(quote), tuple(mentions), full, images, cmid, check)
+    return SendRequest(thread, str(text), tuple(quote), tuple(mentions), full, images, cmid, check, files)
 
 
 def parse_act(action: Action, verb: dict[str, Any]) -> ActRequest | str:
@@ -704,10 +790,10 @@ class ChatVerbs:
         self.data_dir = data_dir
         self._replies: set[asyncio.Task[None]] = set()  # the loop keeps only weak refs to tasks
         self._history_busy: set[ServerConnection] = set()  # sockets with a history answer pending
-        self._action_busy: set[ServerConnection] = set()  # sockets with a message action pending
+        self._action_busy: set[ServerConnection] = set()  # sockets acting or reading a quote
         self._editable_busy: set[ServerConnection] = set()  # sockets opening an editor
         self._search_busy: set[ServerConnection] = set()  # sockets with a search pending
-        # socket → (frame sizes, frames so far, their future): the image send waiting for its frames
+        # socket → the send waiting for its image and file frames
         self._incoming: dict[ServerConnection, _Incoming] = {}
         # (thread, cmid) → digest → object ids: a retry of the draft reuses what it already uploaded
         self._uploads: OrderedDict[tuple[str, str], dict[str, list[str]]] = OrderedDict()
@@ -744,7 +830,7 @@ class ChatVerbs:
         work: Callable[[], Awaitable[dict[str, Any]]],
         slots: set[ServerConnection],
     ) -> dict[str, Any]:
-        """One history page, message action (or quoted send), or search per socket: another while it
+        """One history page, message action, or search per socket: another while it
         runs answers `busy`."""
         if ws in slots:
             return {**head, "error": "busy"}
@@ -758,15 +844,11 @@ class ChatVerbs:
         # A send can take the whole HTTP timeout: the page's other verbs must not queue behind it.
         request = parse_send(verb)
         frames = (
-            self._expect(ws, request.images) if isinstance(request, SendRequest) and request.images else None
+            self._expect(ws, request.images, request.files)
+            if isinstance(request, SendRequest) and (request.images or request.files)
+            else None
         )
-        sent = functools.partial(self.send_answer, ws, verb, frames)
-        # Quotes cost a lookup: they count as a message action.
-        head = _head_send(verb)
-        if verb.get("quote"):
-            self._background(answer(ws, head, self._one_at_a_time(ws, head, sent, self._action_busy)))
-        else:
-            self._background(answer(ws, head, sent()))
+        self._background(answer(ws, _head_send(verb), self.send_answer(ws, verb, frames)))
 
     async def _on_act(self, action: Action, ws: ServerConnection, verb: dict[str, Any]) -> None:
         # An HTTP round trip, like send: the page's other verbs must not queue behind it.
@@ -805,71 +887,103 @@ class ChatVerbs:
         self,
         ws: ServerConnection | None,
         verb: dict[str, Any],
-        frames: Awaitable[list[bytes]] | None = None,
+        frames: Awaitable[Frames] | None = None,
     ) -> dict[str, Any]:
         # Only the sending page learns the outcome; every page sees the echoed message.
         request = parse_send(verb)
         error = request if isinstance(request, str) else None
         blobs: list[bytes] = []
-        if isinstance(request, SendRequest) and request.images:
-            try:
-                assert frames is not None  # _on_send pairs every image send with its frames
-                blobs = await asyncio.wait_for(frames, _FRAMES_WAIT)
-            except TimeoutError:
-                if ws is not None:
-                    self._drop_frames(ws, frames)  # partial blobs freed; a late frame finds nothing
-                error = "images did not arrive"
-            except ValueError as exc:
-                error = str(exc)
-        if isinstance(request, SendRequest) and error is None:
-            error = await self.send(request, ws, blobs)
+        spools: list[BinaryIO] = []
+        try:
+            if isinstance(request, SendRequest) and (request.images or request.files):
+                try:
+                    assert frames is not None  # _on_send pairs every attachment send with its frames
+                    blobs, spools = await self._arrived(ws, frames)
+                except TimeoutError:
+                    if ws is not None:
+                        self._drop_frames(ws, frames)  # partial blobs freed; a late frame finds nothing
+                    error = "files did not arrive" if request.files else "images did not arrive"
+                except ValueError as exc:
+                    error = str(exc)
+            if isinstance(request, SendRequest) and error is None:
+                for fh in spools:
+                    fh.seek(0)
+                docs = [(name, fh, size) for (name, size), fh in zip(request.files, spools, strict=True)]
+                error = await self.send(request, ws, blobs, docs)
+        finally:
+            for fh in spools:
+                fh.close()
         if not error:
             return {**_head_send(verb), "ok": True}
         return {**_head_send(verb), "error": error, **({"unsure": True} if error == UNSURE else {})}
 
-    # --- image frames: binary socket messages following their `send`, in order ---
+    # --- attachment frames: binary socket messages following their `send`, in order ---
 
-    def _expect(self, ws: ServerConnection, sizes: tuple[int, ...]) -> asyncio.Future[list[bytes]]:
-        """The frames `sizes` announces, as they arrive on `ws`; an earlier send still short of its own
-        fails, so a frame never lands in the wrong message."""
-        self._fail_frames(ws, "images missing")
-        future: asyncio.Future[list[bytes]] = asyncio.get_running_loop().create_future()
-        self._incoming[ws] = (sizes, [], future)
-        return future
+    async def _arrived(self, ws: ServerConnection | None, frames: Awaitable[Frames]) -> Frames:
+        """`frames` once all arrived; TimeoutError after _FRAMES_WAIT without a new one."""
+        loop, start = asyncio.get_running_loop(), asyncio.get_running_loop().time()
+        waiting = asyncio.ensure_future(frames)
+        while True:
+            pending = self._incoming.get(ws) if ws is not None else None
+            seen = pending.seen if pending is not None and pending.future is waiting else start
+            left = seen + _FRAMES_WAIT - loop.time()
+            if left <= 0:
+                waiting.cancel()
+                raise TimeoutError
+            with contextlib.suppress(TimeoutError):
+                return await asyncio.wait_for(asyncio.shield(waiting), left)
+
+    def _expect(
+        self, ws: ServerConnection, sizes: tuple[int, ...], files: tuple[tuple[str, int], ...] = ()
+    ) -> asyncio.Future[Frames]:
+        """The frames `sizes` and `files` announce, as they arrive on `ws`; an earlier send still short of
+        its own fails, so a frame never lands in the wrong message."""
+        earlier = self._incoming.get(ws)
+        self._fail_frames(ws, "attachments missing" if earlier and earlier.files else "images missing")
+        spool = self.directory.settings.cache_dir / "uploads" if self.directory is not None else None
+        pending = _Incoming(sizes, files, spool)
+        if not pending.future.done():
+            self._incoming[ws] = pending
+        return pending.future
 
     def frame(self, ws: ServerConnection, data: bytes) -> None:
-        """One binary message of `ws`: the next image of its pending send."""
+        """One binary message of `ws`: the next image or file chunk of its pending send."""
         pending = self._incoming.get(ws)
         if pending is None:
             log.debug("ws_frame_ignored", size=len(data))
             return
-        sizes, blobs, future = pending
-        if future.done():  # its send gave up waiting (cancelled): the frame is late, not the next one
+        if pending.future.done():  # its send gave up waiting (cancelled): the frame is late, not the next one
             del self._incoming[ws]
+            pending.close()
             log.debug("ws_frame_ignored", size=len(data))
             return
-        if len(data) != sizes[len(blobs)]:
-            self._fail_frames(ws, "image size mismatch")
-            return
-        blobs.append(data)
-        if len(blobs) == len(sizes):
-            del self._incoming[ws]
-            future.set_result(blobs)
+        try:
+            error = pending.take(data)
+        except OSError as exc:  # a full disk fails this send, never the socket
+            error = stored(exc)
+        if error:
+            self._fail_frames(ws, error)
+        elif pending.future.done():
+            del self._incoming[ws]  # its spools are the send's now
 
     def _fail_frames(self, ws: ServerConnection, reason: str) -> None:
         pending = self._incoming.pop(ws, None)
-        if pending is not None and not pending[2].done():
-            pending[2].set_exception(ValueError(reason))
+        if pending is not None:
+            pending.close()
+            if not pending.future.done():
+                pending.future.set_exception(ValueError(reason))
 
     def _drop_frames(self, ws: ServerConnection, future: object) -> None:
-        if (pending := self._incoming.get(ws)) is not None and pending[2] is future:
+        if (pending := self._incoming.get(ws)) is not None and pending.future is future:
             del self._incoming[ws]
+            pending.close()
 
     def forget(self, ws: ServerConnection) -> None:
         """A closed socket: its send waiting for frames is dropped, nothing uploaded."""
         pending = self._incoming.pop(ws, None)
         if pending is not None:
-            pending[2].cancel()
+            pending.close()
+            pending.future.cancel()
 
     def echoed(self, thread_id: str, cmid: str) -> None:
         """A message came back on the live stream: a send unsure of its outcome learns it went out."""
@@ -923,11 +1037,16 @@ class ChatVerbs:
     # --- verbs ---
 
     async def send(
-        self, request: SendRequest, ws: ServerConnection | None = None, blobs: list[bytes] | None = None
+        self,
+        request: SendRequest,
+        ws: ServerConnection | None = None,
+        blobs: list[bytes] | None = None,
+        docs: list[tuple[str, BinaryIO, int]] | None = None,
     ) -> str | None:
         """Post the text to the chat as me, after one Reply block per quoted id, with the mentions and
-        markdown (spec 012), then `blobs` (the images, in order). Returns the refusal/failure reason
-        (UNSURE when Teams may have it anyway), None once Teams accepted it.
+        markdown (spec 012), then `blobs` (the images, in order), with `docs` ((name, file, size)) as
+        file cards (spec 025). Returns the refusal/failure reason (UNSURE when Teams may have it anyway),
+        None once Teams accepted it.
 
         The row is left alone: the Trouter echo of the sent message updates it like any other."""
         thread_id, cmid = request.thread, request.cmid
@@ -950,7 +1069,7 @@ class ChatVerbs:
             )
         error: str | None = UNSURE  # cancelled mid-send: it may have gone out
         try:
-            error = await self._send(request, blobs or [])
+            error = await self._send(request, blobs or [], docs or [], ws)
         finally:
             if self._inflight.get(key) is outcome:
                 del self._inflight[key]
@@ -959,7 +1078,13 @@ class ChatVerbs:
             self._uploads.pop(key, None)
         return error
 
-    async def _send(self, request: SendRequest, blobs: list[bytes]) -> str | None:
+    async def _send(
+        self,
+        request: SendRequest,
+        blobs: list[bytes],
+        docs: list[tuple[str, BinaryIO, int]],
+        ws: ServerConnection | None = None,
+    ) -> str | None:
         assert self.directory is not None
         thread_id, cmid = request.thread, request.cmid
         mentions = list(request.mentions)
@@ -986,8 +1111,17 @@ class ChatVerbs:
             extra: dict[str, Any] = {}
             quoted = ""
             if request.quote:
+                # Quotes cost a lookup: a message action's slot, for the lookup only (not the upload).
+                if ws is not None and ws in self._action_busy:
+                    return "busy"
                 quote = list(request.quote)
-                copies = await self._server_copies(thread_id, quote)
+                if ws is not None:
+                    self._action_busy.add(ws)
+                try:
+                    copies = await self._server_copies(thread_id, quote)
+                finally:
+                    if ws is not None:
+                        self._action_busy.discard(ws)
                 if any(q not in copies for q in quote):
                     return "unknown quoted message"
                 if any(
@@ -1021,21 +1155,40 @@ class ChatVerbs:
                 extra["properties"] = props
             if cmid:
                 extra["client_message_id"] = cmid
-            return await self._post(thread_id, cmid, text, extra)
+            post: Callable[..., Any] = send_message
+            if docs:
+                # Last before the post: a refusal above must not cost an upload.
+                try:
+                    drive = await asyncio.to_thread(my_onedrive, settings)
+                    entries, uploaded = await asyncio.to_thread(
+                        upload_files, settings, self.directory.skype_token, drive, self.me, thread_id, docs
+                    )
+                except Exception as exc:  # noqa: BLE001 — nothing was posted: a plain failure, never unsure
+                    log.warning("files_failed", thread=thread_id, error_type=type(exc).__name__)
+                    return f"files not sent: {failure(exc)}"
+                post = functools.partial(post_files, drive=drive, entries=entries, uploaded=uploaded)
+            return await self._post(thread_id, cmid, text, extra, post)
         except Exception as exc:  # noqa: BLE001 — a failed send must not drop the socket
             error = failure(exc)
             log.warning("send_failed", thread=thread_id, error=error, error_type=type(exc).__name__)
             return error
 
-    async def _post(self, thread_id: str, cmid: str, text: str, extra: dict[str, Any]) -> str | None:
-        """send_message; a request lost after it may have reached Teams waits for the message's own
-        echo, and is never sent again from here."""
+    async def _post(
+        self,
+        thread_id: str,
+        cmid: str,
+        text: str,
+        extra: dict[str, Any],
+        post: Callable[..., Any],
+    ) -> str | None:
+        """`post` (send_message, or post_files with its cards); a request lost after it may have reached
+        Teams waits for the message's own echo, and is never sent again from here."""
         assert self.directory is not None
         key = (thread_id, cmid)
         echo = self._echoes[key] = asyncio.Event()
         try:
             await asyncio.to_thread(
-                send_message,
+                post,
                 self.directory.settings,
                 self.directory.skype_token,
                 thread_id,

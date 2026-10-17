@@ -747,7 +747,7 @@ async def test_toolbar_buttons_are_labelled(fake: Fake) -> None:
     labels = await page.locator("#tools button").evaluate_all(
         "bs => bs.map(b => b.getAttribute('aria-label'))"
     )
-    assert labels == ["bold", "italic", "strikethrough", "code", "list", "quote", "preview"]
+    assert labels == ["bold", "italic", "strikethrough", "code", "list", "quote", "attach files", "preview"]
 
 
 async def test_ctrl_b_and_ctrl_i_wrap_and_an_empty_selection_types_inside(fake: Fake) -> None:

@@ -18,7 +18,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 import structlog
 
-from .auth import token_tenant
+from .auth import token_source, token_tenant
 from .config import Settings
 from .send import NOTES_THREAD, _fail, send_message
 
@@ -315,23 +315,22 @@ def _discard(drive: OneDrive, ids: list[str]) -> None:
             log.warning("orphan_delete_failed", item=item_id, error=str(exc)[:200])
 
 
-def send_files(
+def my_onedrive(settings: Settings) -> OneDrive:
+    """The signed-in user's OneDrive, from the cached sign-in: silent, it never prompts."""
+    source = token_source(settings)
+    return onedrive(settings, str(source.refresh()["access_token"]), source.sharepoint_token)
+
+
+def upload_files(
     settings: Settings,
     skype_token: str,
     drive: OneDrive,
     me: str,
     thread_id: str,
-    text: str,
     files: list[tuple[str, BinaryIO, int]],
-    display_name: str,
-    *,
-    is_html: bool = False,
-) -> dict[str, Any]:
-    """One message from `me` (MRI): `text` and `files` ((name, readable file, size)) as file cards.
-
-    Nothing is posted unless every file is uploaded and shared, and what was uploaded is deleted again
-    when anything fails or the chat service rejects the message. A post that may have landed (timeout,
-    dropped connection) keeps the files: deleting them would break the cards of a posted message."""
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Upload `files` ((name, readable file, size)) and share them with the chat's people but `me`:
+    their `properties.files` entries and item ids. Whatever was uploaded is deleted again on failure."""
     check_files([(name, size) for name, _, size in files])
     members = chat_members(settings, skype_token, thread_id, me)
     folder = chat_folder(drive)
@@ -346,6 +345,24 @@ def send_files(
     except BaseException:
         _discard(drive, uploaded)
         raise
+    return entries, uploaded
+
+
+def post_files(
+    settings: Settings,
+    skype_token: str,
+    thread_id: str,
+    text: str,
+    display_name: str,
+    *,
+    drive: OneDrive,
+    entries: list[dict[str, Any]],
+    uploaded: list[str],
+    properties: dict[str, Any] | None = None,
+    **kw: Any,
+) -> dict[str, Any]:
+    """send_message with the uploaded files' cards. A rejected post deletes them; a post that may have
+    landed (timeout, dropped connection) keeps them: deleting them would break a posted message's cards."""
     try:
         return send_message(
             settings,
@@ -353,8 +370,8 @@ def send_files(
             thread_id,
             text,
             display_name,
-            is_html=is_html,
-            properties={"files": json.dumps(entries)},
+            properties={**(properties or {}), "files": json.dumps(entries)},
+            **kw,
         )
     except BaseException as exc:
         # Only a 4xx or an error envelope says nothing was posted: a gateway 5xx can follow a stored message.
@@ -364,3 +381,31 @@ def send_files(
         else:
             log.warning("files_kept_post_unknown", thread=thread_id, items=uploaded)
         raise
+
+
+def send_files(
+    settings: Settings,
+    skype_token: str,
+    drive: OneDrive,
+    me: str,
+    thread_id: str,
+    text: str,
+    files: list[tuple[str, BinaryIO, int]],
+    display_name: str,
+    *,
+    is_html: bool = False,
+) -> dict[str, Any]:
+    """One message from `me` (MRI): `text` and `files` ((name, readable file, size)) as file cards.
+    Nothing is posted unless every file is uploaded and shared (upload_files, post_files)."""
+    entries, uploaded = upload_files(settings, skype_token, drive, me, thread_id, files)
+    return post_files(
+        settings,
+        skype_token,
+        thread_id,
+        text,
+        display_name,
+        drive=drive,
+        entries=entries,
+        uploaded=uploaded,
+        is_html=is_html,
+    )

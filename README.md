@@ -39,7 +39,7 @@ uv run miniteams send --file msg.txt              # body from a file (escaped)
 uv run miniteams send --file test.html --html     # raw RichText/Html (formatted)
 uv run miniteams send "look" --thread 19:xxx@thread.v2 --image a.png --image b.jpg  # inline images after the text
 uv run miniteams send "here" --thread 19:xxx@thread.v2 --attach f.pdf  # any file, as Teams does: to your OneDrive
-                                  # chat files folder, shared with the chat (up to 10, 100 MiB each)
+                                  # chat files folder, shared with the chat (up to 10, 100 MiB each; --image too)
 uv run miniteams update <msg-id-or-deep-link> "fixed text"   # edit a sent message
 uv run miniteams react <msg-id-or-deep-link> like    # react (heart, laugh, 1f525_fire…)
 uv run miniteams react <msg-id-or-deep-link> like --remove   # take it back
@@ -180,7 +180,7 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
     (chat page) before a line-start marker; any other backslash stays as typed (`\\srv\share`), and backslashes
     inside `code`, link labels and URLs stay as typed.
   - Enter empties the box at once: sends queue one at a time per chat, in order. Queued sends survive a reload or a
-    dropped connection and go out in order, an unanswered one checked (their pasted images do not survive a reload).
+    dropped connection and go out in order, an unanswered one checked (their images and files do not survive a reload).
     A chat page in list mode sends only its own chat's: other chats' wait for the widget (◀) or their own page.
   - The queue shows: greyed bubbles after the chat page's last message (`queued`, `sending…`, `sent` (acknowledged,
     waiting for Teams' echo), `failed` with its reason, `paused`), each replaced by the message once Teams echoes it;
@@ -195,6 +195,10 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
     a reload drops them, the text draft stays. A failed or unanswered send may have gone out: ↻, or the unchanged
     message sent again, even after a reload, looks for it in the chat before posting again; an edited one goes out
     as a new message.
+  - Attach any file with 📎 or by dropping it on the composer (up to 10, 100 MiB each): a chip with its name and size,
+    × to drop. A dropped or pasted PNG, JPEG, GIF or WebP stays an inline image; 📎 attaches even those as files.
+    Enter sends them with the text, as Teams does (your OneDrive chat files folder, shared with the chat). The page
+    streams them to the local server, which spools them to unnamed temp files under `~/.cache/miniteams/uploads/`.
   - Widget: inline formatting.
   - Chat page: bold, italic, strike, code, lists, quotes through a toolbar or Ctrl+B / Ctrl+I, plus a preview of the message as posted.
 - **Messages**: hover for actions: reply with a quote, react, edit and delete your own. The picker shows 8 favorites

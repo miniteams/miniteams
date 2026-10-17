@@ -202,10 +202,7 @@ def send_images(
     client_message_id: str | None = None,
 ) -> dict[str, Any]:
     """One message: `text` first, then `images` ((filename, bytes), in order) in one paragraph."""
-    body = message_html(text, is_html)
-    if body and not is_html:
-        body = f"<p>{body}</p>"
-    content = attach_images(settings, skype_token, thread_id, body, images)
+    content = images_body(settings, skype_token, thread_id, text, images, is_html=is_html)
     return send_message(
         settings,
         skype_token,
@@ -215,6 +212,22 @@ def send_images(
         is_html=True,
         client_message_id=client_message_id,
     )
+
+
+def images_body(
+    settings: Settings,
+    skype_token: str,
+    thread_id: str,
+    text: str,
+    images: list[tuple[str, bytes]],
+    *,
+    is_html: bool = False,
+) -> str:
+    """The HTML of `text` followed by `images`, uploaded: text ahead of images gets its own paragraph."""
+    body = message_html(text, is_html)
+    if body and not is_html:
+        body = f"<p>{body}</p>"
+    return attach_images(settings, skype_token, thread_id, body, images)
 
 
 def send_typing(settings: Settings, skype_token: str, thread_id: str) -> dict[str, Any]:

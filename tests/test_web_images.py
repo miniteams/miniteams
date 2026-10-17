@@ -87,7 +87,7 @@ async def _answer(board: W.Board, verb: dict[str, Any], blobs: list[bytes] | Non
     frames = None
     if blobs is not None:
         frames = asyncio.get_running_loop().create_future()
-        frames.set_result(blobs)
+        frames.set_result((blobs, []))
     return await board.chat.send_answer(None, verb, frames)
 
 

@@ -1,6 +1,6 @@
 # 025 — Send any file as an attachment
 
-**Status**: in progress
+**Status**: shipped (AC1 awaits a look at the card in Teams)
 **Requested by**: babs
 **Date**: 2026-10-17
 
@@ -45,9 +45,9 @@ own file card.
   and no request goes to graph.microsoft.com.
 - [x] **AC3** A file over the single-request limit uploads in chunks and arrives intact.
 - [x] **AC4** An upload or share failure posts nothing, reports the cause, and leaves no orphan file.
-- [ ] **AC5** In the chat page and the widget, the paperclip and a drop attach files as chips; × removes
+- [x] **AC5** In the chat page and the widget, the paperclip and a drop attach files as chips; × removes
   one; Enter sends them with the text through the send queue.
-- [ ] **AC6** More than 10 files or a file over 100 MiB is refused with a clear message.
+- [x] **AC6** More than 10 files or a file over 100 MiB is refused with a clear message.
 
 ## Phases
 
@@ -86,3 +86,10 @@ None.
 - Images keep their inline AMS path; only other files go through OneDrive — because that is what
   Teams does and inline images already work.
 - 10 files, 100 MiB each in this version — overturnable; Teams itself allows far more.
+- Phase 2 transport: the page streams files over its socket in 1 MiB binary frames into unnamed temp
+  files under the cache dir — because the local server answers GET only, so an upload route would need
+  a second server.
+- Known ceiling: no per-process cap on spooled bytes (10 × 100 MiB per socket, sockets unbounded); a
+  global budget if the cache disk ever fills.
+- Known ceiling: a retry after a post with an unknown outcome uploads and shares the files again when
+  the check finds no message, leaving the first try's shared copies behind.
