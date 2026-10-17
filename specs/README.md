@@ -27,3 +27,4 @@
 | [023](023-name-to-private-chat.md) | A sender's name leads to the private chat with them | phase 1 shipped |
 | [025](025-file-attachments.md) | Send any file as an attachment | shipped |
 | [026](026-chat-sections.md) | Chat sections | shipped |
+| [027](027-received-files.md) | Show received files | shipped |

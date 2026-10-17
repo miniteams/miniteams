@@ -31,6 +31,7 @@ from .config import Settings, write_private
 from .directory import Directory
 from .drafts import iter_draft_pages
 from .dump import epoch_seconds, iter_history_pages
+from .messages import message_files
 from .skype import exchange_skype_token
 
 log = structlog.get_logger()
@@ -307,7 +308,7 @@ async def _download_media(
         content, msgtype = m.get("content") or "", str(m.get("messagetype") or "")
         if msgtype == "RichText/Media_CallRecording":
             recordings.append(m)
-        if attachments.extract(content, msgtype, media):
+        if attachments.extract(content, msgtype, media, message_files(m)):
             targets.append(m)
     if not targets:
         # Still derive the recordings manifest: a chat can hold recording messages whose only
@@ -342,6 +343,8 @@ async def _download_media(
                     skip_url=_skip,
                     on_fail=partial(record_asset_failure, store),
                     media=media,
+                    files=message_files(message),
+                    store=store,
                 )
             except Exception as exc:  # noqa: BLE001 — one message's media must not abort the pass
                 log.debug("message_media_failed", id=message.get("id"), error=str(exc))
@@ -376,7 +379,7 @@ def _write_recordings_manifest(store: ChatStore, recordings: list[dict[str, Any]
     — pure derived data, safe to regenerate."""
     entries = []
     for m in recordings:
-        entry = attachments.recording_files(m.get("content") or "", store.media_dir)
+        entry = attachments.recording_files(m.get("content") or "", store.media_dir, store)
         entry["message_id"] = m.get("id")
         entry["composetime"] = m.get("composetime")
         entries.append(entry)

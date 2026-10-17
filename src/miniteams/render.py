@@ -13,10 +13,10 @@ from collections.abc import Callable
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from .attachments import existing, object_id
-from .messages import reaction_emoji
+from .messages import file_name, json_list, reaction_emoji
 
 _KEPT = frozenset(
     (
@@ -25,6 +25,7 @@ _KEPT = frozenset(
 )
 _VOID = frozenset({"br", "hr", "img"})
 _DROP_CONTENT = frozenset({"script", "style", "iframe"})
+_BLOCKS = _KEPT - frozenset("a b strong i em u s del code span img".split())
 _HTML_MAX = 128 * 1024  # chars, well past a real Teams message body
 _IMG_ATTRS = ("alt", "title")
 _STEM_RE = re.compile(r"[\w-][\w.-]*")  # no glob characters, no leading dot
@@ -64,10 +65,15 @@ class _Sanitizer(HTMLParser):
         me: str,
         mentions: dict[str, str],
         custom: frozenset[str] = frozenset(),
+        names: dict[str, str] | None = None,
+        named: set[str] | None = None,
     ) -> None:
         super().__init__(convert_charrefs=True)
         self.thread_id, self.media_dir, self.me, self.mentions = thread_id, media_dir, me, mentions
         self.custom = custom
+        self.names, self.named = names or {}, named if named is not None else set()
+        # (open-stack index, output length) of a link renamed after a file: its own content is cut at its end.
+        self.renamed: tuple[int, int] | None = None
         self.out: list[str] = []
         # (tag, emitted): dropped spans/links stay on the stack so their end tag closes nothing else.
         self.open: list[tuple[str, bool]] = []
@@ -81,6 +87,9 @@ class _Sanitizer(HTMLParser):
             return
         if self.hidden:
             return
+        if tag in _BLOCKS:  # a renamed link left open must not swallow the rest of the message
+            while self.renamed is not None:
+                self._close()
         a = {k: v or "" for k, v in attrs}
         itemtype = a.get("itemtype", "")
         if tag == "emoji" or itemtype.endswith("/Emoji"):
@@ -106,6 +115,13 @@ class _Sanitizer(HTMLParser):
             emitted = href is not None
             if href is not None:
                 extra = _attr("href", href) + ' rel="noopener" target="_blank"'
+                key = _link_key(href) if self.names and self.renamed is None else ""
+                if key and key in self.names:  # 027-AC6: a pasted file link reads as its name
+                    self.named.add(key)
+                    self._push(tag, True)
+                    self.out.append(f"<a{extra}>{html.escape(self.names[key])}")
+                    self.renamed = (len(self.open) - 1, len(self.out))
+                    return
         elif tag == "span":
             emitted = itemtype.endswith("/Mention")
             if emitted:
@@ -169,6 +185,9 @@ class _Sanitizer(HTMLParser):
     def _close(self) -> None:
         tag, emitted = self.open.pop()
         self.counts[tag] -= 1
+        if self.renamed is not None and self.renamed[0] == len(self.open):
+            del self.out[self.renamed[1] :]
+            self.renamed = None
         if emitted:
             self.out.append(f"</{tag}>")
 
@@ -190,12 +209,15 @@ def sanitize(
     me: str = "",
     mentions: dict[str, str] | None = None,
     custom: frozenset[str] = frozenset(),
+    names: dict[str, str] | None = None,
+    named: set[str] | None = None,
 ) -> str:
     """Teams HTML → allowlisted HTML; `mentions` maps a Mention span's `itemid` to its MRI, `custom`
-    holds the custom emoji object ids `/emoji/<id>` serves.
+    holds the custom emoji object ids `/emoji/<id>` serves. A link whose `_link_key` is in `names` reads as
+    that file name instead of its content; its key is added to `named`.
 
     Input past `_HTML_MAX` chars is cut off: the parser's cost must stay bounded per message."""
-    parser = _Sanitizer(thread_id, media_dir, me, mentions or {}, custom)
+    parser = _Sanitizer(thread_id, media_dir, me, mentions or {}, custom, names, named)
     parser.feed(content[:_HTML_MAX])
     return parser.result()
 
@@ -447,6 +469,103 @@ def card_html(card: dict[str, Any], media_url: MediaUrl | None = None, content_t
     """One card content dict (its attachment's `content_type`) → `div.card`; `media_url` maps an
     image URL to its archived `/media/...` path, anything else renders the alt text."""
     return f'<div class="card">{_CardRenderer(media_url).card(card, content_type=content_type)}</div>'
+
+
+_FILE_ICONS = {
+    ext: icon
+    for icon, exts in (
+        ("📝", "doc docx docm dot dotx odt rtf"),
+        ("📊", "xls xlsx xlsm xlsb csv ods"),
+        ("📽", "ppt pptx pptm pps ppsx odp"),
+        ("📕", "pdf"),
+        ("🖼", "png jpg jpeg gif bmp svg webp heic tif tiff"),
+        ("🗜", "zip 7z rar tar gz tgz bz2 xz"),
+        ("📃", "txt md log json xml yaml yml"),
+        ("🎞", "mp4 mov avi mkv webm wmv m4v"),
+    )
+    for ext in exts.split()
+}
+
+
+_URL_BAD = re.compile(r"[\x00-\x20\x7f-\x9f\s]")
+
+
+def _link_key(url: str) -> str:
+    """A link's identity: its query sorted, without the `e=…` a pasted sharing link carries, the fragment or
+    a trailing slash."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    # Only `e` goes: `Doc.aspx?sourcedoc=…`, `AllItems.aspx?id=…` name the file in their query.
+    query = urlencode(sorted((k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "e"))
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"), query, ""))
+
+
+def _file_entries(files: object) -> list[tuple[dict[str, Any], str, list[str]]]:
+    """(entry, name, [shareUrl, objectUrl]) per `properties.files` entry (JSON string or list)."""
+    out = []
+    for entry in json_list(files):
+        if isinstance(entry, dict):
+            info = entry.get("fileInfo")
+            share = _str(info.get("shareUrl")) if isinstance(info, dict) else ""
+            name = file_name(entry)
+            out.append((entry, name, [share, _str(entry.get("objectUrl"))]))
+    return out
+
+
+def _file_url(urls: list[str]) -> str | None:
+    """The first https URL of `urls` (027-AC2: the sharing link, then objectUrl)."""
+    for url in urls:
+        # The raw string is what lands in href: gate it, not urlsplit's cleaned-up reading of it.
+        if url[:8].lower() == "https://" and not _URL_BAD.search(url) and _web_url(url) is not None:
+            return url
+    return None
+
+
+def file_links(files: object) -> dict[str, str]:
+    """`reference` entries (pasted links, 027-AC6) as {`_link_key` of each URL: file name}, for sanitize."""
+    return {
+        _link_key(url): name
+        for entry, name, urls in _file_entries(files)
+        if entry.get("state") == "reference"
+        for url in urls
+        if url
+    }
+
+
+def file_urls(files: object) -> list[str]:
+    """Every URL of the `properties.files` entries: the keys of their archived copies (027-AC7)."""
+    return [url for _, _, urls in _file_entries(files) for url in urls if url]
+
+
+def files_html(
+    files: object,
+    named: set[str] | frozenset[str] = frozenset(),
+    local: Callable[[list[str]], str | None] | None = None,
+) -> str:
+    """`properties.files` as one card per entry, type icon then name (027-AC1), linked to the archived copy
+    of its URLs `local(urls)` (027-AC5, AC7), else its sharing link, else its objectUrl, in a new tab;
+    unlinked without any (027-AC2). A `reference` entry is a link named after the file instead, or nothing
+    when the body already links it (a key in `named`, 027-AC6)."""
+    out = []
+    for entry, name, urls in _file_entries(files):
+        url = _file_url(urls)
+        if local and entry.get("state") != "reference":
+            url = local(urls) or url
+        link = f'{_attr("href", url)} rel="noopener" target="_blank"' if url else ""
+        if entry.get("state") == "reference":
+            if not any(u and _link_key(u) in named for u in urls):
+                out.append(
+                    f"<p><a{link}>{html.escape(name)}</a></p>" if url else f"<p>{html.escape(name)}</p>"
+                )
+            continue
+        kind = (_str(entry.get("fileType")) or _str(entry.get("type")) or name.rpartition(".")[2]).lower()
+        # A space, not a gap: a quote takes the card's first text line, icon and name together.
+        icon = f'<span class="file-icon">{_FILE_ICONS.get(kind, "📎")}</span>'
+        inner = f'{icon} <span class="file-name">{html.escape(name)}</span>'
+        out.append(f'<a class="file"{link}>{inner}</a>' if url else f'<span class="file">{inner}</span>')
+    return "".join(out)
 
 
 def _json(value: object) -> object:

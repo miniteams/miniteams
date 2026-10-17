@@ -117,6 +117,17 @@ def test_snippet_file_and_card_posts_are_not_deleted() -> None:
     assert W.snippet("RichText/Html", "", {"files": "not json"}) == "🗑 deleted"
 
 
+def test_snippet_names_files_like_the_cards() -> None:
+    """027-AC1: the list snippet names a file as its card does: fileName, else title, else "file"."""
+    files = [
+        {"title": "deck.pptx"},
+        {"fileName": "", "title": "t.txt"},
+        {"fileName": 5},
+        {"fileName": "a.pdf"},
+    ]
+    assert W.snippet("RichText/Html", "", {"files": files}) == "📎 deck.pptx, t.txt, file, a.pdf"
+
+
 def test_snippet_renders_emoji_alt() -> None:
     assert (
         W.snippet("RichText/Html", '<p><emoji id="1f600_grinningface" alt="😀" title="Grinning"></emoji></p>')

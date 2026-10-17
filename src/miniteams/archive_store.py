@@ -266,6 +266,27 @@ def messages_by_id(chat_dir: Path, ids: list[str]) -> dict[str, dict[str, Any]]:
     return {str(msg_id): message for msg_id, raw in rows if (message := _row_message(raw)) is not None}
 
 
+def _saved_files(db: sqlite3.Connection, urls: list[str]) -> dict[str, str]:
+    """{url: media file name} of the `urls` a download recorded."""
+    marks = ",".join("?" * len(urls))
+    return dict(db.execute(f"SELECT url, name FROM sp_files WHERE url IN ({marks})", urls).fetchall())
+
+
+def saved_files(chat_dir: Path, urls: list[str]) -> dict[str, str]:
+    """`ChatStore.saved_files`, read-only; {} for an archive older than the table, same errors as
+    `read_page` otherwise."""
+    path = chat_dir / "messages.db"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name = 'sp_files'").fetchone() is None:
+            return {}  # not opened for writing since phase 3: nothing recorded yet
+        return _saved_files(db, urls)
+    finally:
+        db.close()
+
+
 def search_chat(
     chat_dir: Path, query: str, limit: int, *, since: str = "", until: str = ""
 ) -> tuple[list[dict[str, Any]], bool]:
@@ -491,6 +512,17 @@ class ChatStore:
                 PRIMARY KEY (id, version)
             )"""
         )
+        # Which media file each SharePoint URL was saved as (027-AC7/AC8): names alone collide.
+        # `item_id` is SharePoint's id of the file, '' when unknown: two URLs of one file, one copy.
+        self._db.execute(
+            """CREATE TABLE IF NOT EXISTS sp_files (
+                url TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                item_id TEXT NOT NULL DEFAULT '',
+                at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            )"""
+        )
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_sp_files_name ON sp_files (name)")
         cols = {r[1] for r in self._db.execute("PRAGMA table_info(denied_assets)")}
         for name, decl in (
             ("attempts", "INTEGER NOT NULL DEFAULT 1"),
@@ -623,6 +655,20 @@ class ChatStore:
                 "INSERT OR REPLACE INTO denied_assets (url, status, at, attempts, retry_after) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (key, status, when_iso, attempts, retry_after),
+            )
+
+    def saved_files(self, urls: list[str]) -> dict[str, str]:
+        return _saved_files(self._db, urls)
+
+    def file_owners(self, name: str) -> set[str]:
+        """SharePoint ids of the files saved as `name` ('' for an unknown one); empty when none is."""
+        return {r[0] for r in self._db.execute("SELECT item_id FROM sp_files WHERE name = ?", (name,))}
+
+    def save_file(self, urls: list[str], name: str, item_id: str) -> None:
+        with self._db:
+            self._db.executemany(
+                "INSERT OR REPLACE INTO sp_files (url, name, item_id) VALUES (?, ?, ?)",
+                [(url, name, item_id) for url in urls],
             )
 
     def close(self) -> None:

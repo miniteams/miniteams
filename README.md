@@ -238,6 +238,7 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   nothing, never "unread". Kept live from Teams' receipt events on `web`'s Trouter socket, reconciled by one read-only
   GET on chat open and after every reconnect; cached in the presence file so a reopened chat paints at once.
 - **Browsing**: infinite scroll both ways, "↓ latest" when away from the bottom, header search, Open in Teams.
+- **Received files** (spec 027): a card per file (icon, name) linking the copy the archive saved for that file's own link (when held and ≤ 50 MiB), else its sharing link, else its objectUrl; a pasted file link reads as the file name.
 - **Reply quotes** (spec 021): click a quote (or Tab to it, Enter) to jump to the quoted message, loading the history around it; "quoted message not found" when it is gone.
 - **Members** (spec 022): hover, click or Tab to "N members" for the people, You first then by name, with avatar and presence when known; 50 rows then "… and N more", bots and apps as "+ N apps", "members unavailable" when the roster cannot be had (a roster not cached is fetched without delaying the page). Escape or leaving closes it.
 - **Private chat** (spec 023): in a chat with several people, click someone else's name (or Tab to it, Enter) to switch to your 1:1 with them; Back returns. Middle or Ctrl/⌘ click opens it in a new tab. The server finds the 1:1 in the board rows, then the archive index, with no Teams call; "no private chat with them yet" when there is none.
@@ -281,7 +282,7 @@ types downloaded, comma-separated; the rest of the run is unchanged:
 | Type | Downloads |
 |---|---|
 | `images` | inline pictures, full and optimized views; picture `URIObject`s |
-| `files` | shared documents (SharePoint) and other attachments (card and recording thumbnails) |
+| `files` | shared documents (SharePoint, linked in the body or sent as a file card) and other attachments (card and recording thumbnails) |
 | `transcripts` | meeting transcripts, every format served (AMS by content type, SharePoint JSON + VTT) |
 | `videos` | meeting recordings and shared video files (large) |
 
@@ -289,6 +290,17 @@ The default is `images,files,transcripts`. `--no-media` is an empty selection an
 default plus `videos`; neither combines with `--media`. `--verify-media` and `--assets-only` only
 fetch the selected types, and a deselected type is neither fetched nor annotated. Files already on
 disk are never deleted, whatever the selection.
+
+SharePoint files are saved under their own name; a different file arriving under a taken name is
+saved as `name (2).ext`, `name (3).ext`… Each chat's `messages.db` records which file every
+SharePoint link was saved as (`sp_files`): a held file costs no SharePoint call on later passes,
+and the chat page opens each card's own copy, never one that merely shares its name. Files saved
+before this record existed have none: their cards keep the hotlink until the chat's next media pass
+(`--verify-media` sweeps every chat) spends one metadata call per such file. A copy whose size matches
+SharePoint's is then recorded for good. Any other, or one SharePoint gives no size for, is taken for
+another file: it stays, an `sp_file_legacy_mismatch` warning names it, and the file is downloaded again
+as `name (2).ext`. SharePoint names past 250 bytes are cut
+to fit, extension kept.
 
 `archive --live` (spec 005) replaces the `--loop` timer with the event stream. It subscribes first,
 buffers events while a normal pass catches the archive up, then applies them and writes each new

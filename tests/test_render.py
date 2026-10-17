@@ -2,6 +2,7 @@
 
 import base64
 import gc
+import html
 import json
 import re
 import time
@@ -18,6 +19,8 @@ from miniteams.render import (
     card_html,
     card_markdown_html,
     cards_html,
+    file_links,
+    files_html,
     media_url,
     sanitize,
 )
@@ -955,3 +958,276 @@ def test_table_rows_render_as_a_facts_table() -> None:
     plain = dict(card["body"][0])
     plain.pop("firstRowAsHeaders")
     assert "<th>" not in card_html({"type": "AdaptiveCard", "body": [plain]})
+
+
+# --- shared files (spec 027) ---
+
+_DOC = "https://example.sharepoint.com/sites/team/Shared%20Documents/plan.docx"
+
+
+@pytest.mark.parametrize("as_string", [True, False])
+def test_files_render_one_card_each_icon_and_name(as_string: bool) -> None:
+    """027-AC1, 027-AC2: one card per entry, JSON string or list; an https objectUrl links in a new tab,
+    an entry without one shows its name unlinked."""
+    files = [{"fileName": "plan.docx", "type": "docx", "objectUrl": _DOC}, {"title": "notes.txt"}]
+    assert files_html(json.dumps(files) if as_string else files) == (
+        f'<a class="file" href="{_DOC}" rel="noopener" target="_blank"><span class="file-icon">📝</span>'
+        ' <span class="file-name">plan.docx</span></a>'
+        '<span class="file"><span class="file-icon">📃</span> <span class="file-name">notes.txt</span></span>'
+    )
+
+
+@pytest.mark.parametrize(
+    ("entry", "icon"),
+    [
+        ({"fileName": "a.bin", "fileType": "XLSX"}, "📊"),
+        ({"fileName": "a.bin", "type": "pptx"}, "📽"),
+        ({"fileName": "Report.PDF"}, "📕"),
+        ({"fileName": "a.png"}, "🖼"),
+        ({"fileName": "a.tar.gz"}, "🗜"),
+        ({"fileName": "a.mp4"}, "🎞"),
+        ({"fileName": "a.unknown"}, "📎"),
+        ({"fileName": "noext"}, "📎"),
+        ({}, "📎"),
+    ],
+)
+def test_file_icon_follows_the_type_then_the_extension(entry: dict[str, Any], icon: str) -> None:
+    """027-AC1: the icon by broad type, `fileType`/`type` first, then the name's extension."""
+    assert f'<span class="file-icon">{icon}</span>' in files_html([entry])
+
+
+def test_file_name_and_url_are_escaped() -> None:
+    """027-AC2: no markup from an entry reaches the page: the name is text, the URL an attribute."""
+    url = 'https://example.sharepoint.com/a"><script>x()</script>'
+    out = files_html([{"fileName": '<img src=x onerror="x()">&.pdf', "objectUrl": url}])
+    assert "<img" not in out and "<script" not in out
+    assert "&lt;img src=x onerror=&quot;x()&quot;&gt;&amp;.pdf</span></a>" in out
+    assert 'href="https://example.sharepoint.com/a&quot;&gt;&lt;script&gt;' in out
+    assert files_html([{"fileName": 5, "title": ["x"]}]).endswith(
+        '📎</span> <span class="file-name">file</span></span>'
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "javascript:alert(1)",
+        " JaVaScRiPt:alert(1)",
+        "\x01javascript:alert(1)",
+        "\x00https://example.sharepoint.com/plan.docx",
+        "\thttps://example.sharepoint.com/plan.docx",
+        " https://example.sharepoint.com/plan.docx",
+        "https://example.sharepoint.com/plan.docx\n",
+        "https://example.sharepoint.com/pl\x85an.docx",
+        "https://example.sharepoint.com/pl an.docx",
+        "data:text/html,<script>x()</script>",
+        "http://example.sharepoint.com/plan.docx",
+        "//example.sharepoint.com/plan.docx",
+        "/media/x",
+        "https://[x",
+        "",
+        None,
+        42,
+    ],
+)
+def test_file_url_other_than_https_leaves_the_name_unlinked(url: object) -> None:
+    """027-AC2: only an https objectUrl links; any other scheme, a relative or broken URL shows the name."""
+    out = files_html([{"fileName": "plan.docx", "objectUrl": url}])
+    card = '<span class="file"><span class="file-icon">📝</span> <span class="file-name">plan.docx</span>'
+    assert out == card + "</span>"
+
+
+@pytest.mark.parametrize("files", [None, "", "[]", "not json", "{}", [], [None, 5, "x"], {"fileName": "a"}])
+def test_no_file_entries_render_no_card(files: object) -> None:
+    """027-AC1: a message without file entries shows no card."""
+    assert files_html(files) == ""
+
+
+_SHARE = "https://example-my.sharepoint.com/:w:/g/personal/someone_example_com/EaBcDeF"
+_CARD_OPEN = '<span class="file-icon">📝</span> <span class="file-name">plan.docx</span>'
+
+
+@pytest.mark.parametrize(
+    ("info", "obj", "href"),
+    [
+        ({"shareUrl": _SHARE}, _DOC, _SHARE),  # the sharing link first
+        ({"shareUrl": "javascript:x()"}, _DOC, _DOC),  # a refused one: objectUrl
+        ({"shareUrl": "\x00" + _SHARE}, _DOC, _DOC),
+        ({"shareUrl": ""}, _DOC, _DOC),
+        ("not a dict", _DOC, _DOC),
+        ({"shareUrl": 5}, "http://x/", None),  # neither: unlinked
+        ({}, "data:x", None),
+    ],
+)
+def test_file_card_links_the_share_url_then_the_object_url(info: object, obj: str, href: str | None) -> None:
+    """027-AC2: a card links its `fileInfo.shareUrl`, else its `objectUrl`, each through the https gate;
+    with neither it shows its name unlinked."""
+    out = files_html([{"fileName": "plan.docx", "objectUrl": obj, "fileInfo": info}])
+    if href is None:
+        assert out == f'<span class="file">{_CARD_OPEN}</span>'
+    else:
+        assert out == f'<a class="file" href="{href}" rel="noopener" target="_blank">{_CARD_OPEN}</a>'
+
+
+def _ref(**over: Any) -> dict[str, Any]:
+    entry = {
+        "fileName": "b<u>.xlsx",
+        "state": "reference",
+        "objectUrl": _DOC,
+        "fileInfo": {"shareUrl": _SHARE},
+    }
+    return entry | over
+
+
+def test_reference_entry_is_a_link_named_after_the_file_not_a_card() -> None:
+    """027-AC6: a pasted link's entry renders a plain link to its URL, named after the file, escaped; with
+    no usable URL its name alone; already linked by the body (`named`), nothing."""
+    named_link = f'<p><a href="{_SHARE}" rel="noopener" target="_blank">b&lt;u&gt;.xlsx</a></p>'
+    assert files_html([_ref()]) == named_link
+    assert files_html(json.dumps([_ref(objectUrl="x", fileInfo={})])) == "<p>b&lt;u&gt;.xlsx</p>"
+    assert files_html([_ref()], {_SHARE}) == ""
+    assert files_html([_ref()], {_DOC}) == ""
+    assert files_html([_ref()], {"https://other.example/x"}) == named_link
+
+
+def test_file_links_keys_only_reference_entries() -> None:
+    """027-AC6: sanitize names the body links of reference entries only, by both their URLs."""
+    files = [_ref(), {"fileName": "c.pdf", "objectUrl": "https://example.sharepoint.com/c.pdf"}]
+    assert file_links(files) == {_SHARE: "b<u>.xlsx", _DOC: "b<u>.xlsx"}
+    assert file_links([_ref(objectUrl="", fileInfo=None)]) == {}
+    assert file_links([_ref(objectUrl="https://[x?e=1", fileInfo=None)]) == {"https://[x?e=1": "b<u>.xlsx"}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        f'<p>see <a href="{_SHARE}">{_SHARE}</a> ok</p>',
+        f'<p>see <a href="{_SHARE}?e=aBc">link <b>bold</b><img src="https://x/i.png"></a> ok</p>',
+        f'<p>see <a href="{_SHARE}/#frag"><span>x</span></a> ok</p>',
+        f'<p>see <a href="{_DOC}">doc</a> ok</p>',
+    ],
+)
+def test_a_body_link_to_a_reference_entry_reads_as_the_file_name(body: str) -> None:
+    """027-AC6: the body's link to a pasted file keeps its href and reads as the file name, its own content
+    gone, the rest of the markup intact; the entry is then reported linked."""
+    named: set[str] = set()
+    out = sanitize(body, T, names=file_links([_ref()]), named=named)
+    assert out.startswith("<p>see <a href=") and out.endswith(
+        'rel="noopener" target="_blank">b&lt;u&gt;.xlsx</a> ok</p>'
+    )
+    assert out.count("<a ") == 1 and "<b>" not in out and "<img" not in out
+    assert named and files_html([_ref()], named) == ""
+
+
+def test_only_matching_body_links_are_renamed() -> None:
+    """027-AC6: other links keep their text; an unclosed renamed link still closes balanced."""
+    named: set[str] = set()
+    other = '<a href="https://example.org/" rel="noopener" target="_blank">site</a>'
+    body = f'<p><a href="https://example.org/">site</a> <b><a href="{_SHARE}">x<i>y'
+    out = sanitize(body, T, names=file_links([_ref()]), named=named)
+    assert (
+        out == f'<p>{other} <b><a href="{_SHARE}" rel="noopener" target="_blank">b&lt;u&gt;.xlsx</a></b></p>'
+    )
+    assert named == {_SHARE}
+    assert sanitize(body, T) == (
+        f'<p>{other} <b><a href="{_SHARE}" rel="noopener" target="_blank">x<i>y</i></a></b></p>'
+    )
+    two = file_links([_ref(), _ref(fileName="f.xlsx", objectUrl="", fileInfo={"shareUrl": _OTHER})])
+    nested = f'<a href="{_SHARE}">one<a href="{_OTHER}">two</a>tail</a> after'
+    assert sanitize(nested, T, names=two) == f'<a href="{_SHARE}" {_NEW_TAB}>b&lt;u&gt;.xlsx</a> after'
+
+
+_OTHER = "https://example.sharepoint.com/:x:/s/team/EfFfFfF"
+_NEW_TAB = 'rel="noopener" target="_blank"'
+_SITE = "https://example.sharepoint.com/sites/team/_layouts/15"
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (  # no end tag: the next block closes it, its content kept
+            f'<p>see <a href="{_SHARE}">x<b>y<p>next</p>',
+            f'<p>see <a href="{_SHARE}" {_NEW_TAB}>b&lt;u&gt;.xlsx</a><p>next</p></p>',
+        ),
+        (
+            f'<a href="{_SHARE}">x<br>after<ul><li>i</li></ul>',
+            f'<a href="{_SHARE}" {_NEW_TAB}>b&lt;u&gt;.xlsx</a><br>after<ul><li>i</li></ul>',
+        ),
+        (
+            f'<div><a href="{_SHARE}">x<blockquote>q</blockquote></div>',
+            f'<div><a href="{_SHARE}" {_NEW_TAB}>b&lt;u&gt;.xlsx</a><blockquote>q</blockquote></div>',
+        ),
+        (
+            f'<table><tr><td><a href="{_SHARE}">x<td>next</td></tr></table>',
+            f'<table><tr><td><a href="{_SHARE}" {_NEW_TAB}>b&lt;u&gt;.xlsx</a><td>next</td></td></tr>'
+            "</table>",
+        ),
+        (
+            f'<a href="{_SHARE}">x<h2>title</h2>',
+            f'<a href="{_SHARE}" {_NEW_TAB}>b&lt;u&gt;.xlsx</a><h2>title</h2>',
+        ),
+    ],
+)
+def test_an_unclosed_renamed_link_ends_at_the_next_block(body: str, expected: str) -> None:
+    """027-AC6: a renamed link Teams never closed does not swallow the rest of the message."""
+    assert sanitize(body, T, names=file_links([_ref()])) == expected
+
+
+def test_doc_aspx_links_are_told_apart_by_their_query() -> None:
+    """027-AC6: links of one site differing by `sourcedoc`/`id` are different files; only `e` is ignored."""
+    a, b = (
+        f"{_SITE}/Doc.aspx?sourcedoc=%7Baaaa%7D&action=edit",
+        f"{_SITE}/Doc.aspx?action=edit&sourcedoc=%7Bbbbb%7D",
+    )
+    files = [
+        _ref(fileName="a.docx", objectUrl=a, fileInfo={}),
+        _ref(fileName="b.docx", objectUrl=b, fileInfo={}),
+    ]
+    named: set[str] = set()
+    body = f'<p><a href="{b}">B</a> <a href="{a}&amp;e=Xy1">A</a></p>'
+    out = sanitize(body, T, names=file_links(files), named=named)
+    assert ">b.docx</a> <a" in out and out.endswith(">a.docx</a></p>")
+    assert files_html(files, named) == ""
+    unrelated = f"{_SITE}/Doc.aspx?sourcedoc=%7Bcccc%7D"
+    named.clear()
+    out = sanitize(f'<p><a href="{unrelated}">C</a></p>', T, names=file_links(files), named=named)
+    assert out == f'<p><a href="{unrelated}" {_NEW_TAB}>C</a></p>'
+    assert files_html(files[:1], named) == f'<p><a href="{html.escape(a)}" {_NEW_TAB}>a.docx</a></p>'
+    for page in ("AllItems.aspx", "stream.aspx"):
+        names = file_links([_ref(objectUrl=f"{_SITE}/{page}?id=%2Fa", fileInfo={})])
+        out = sanitize(f'<a href="{_SITE}/{page}?id=%2Fz">z</a>', T, names=names, named=named)
+        assert out.endswith(">z</a>") and named == set()
+
+
+def test_a_sharing_link_matches_with_its_e_parameter() -> None:
+    """027-AC6: `/:x:/…?e=abc` is the entry's sharing link."""
+    named: set[str] = set()
+    names = file_links([_ref(fileInfo={"shareUrl": _OTHER})])
+    out = sanitize(f'<a href="{_OTHER}?e=abc">l</a>', T, names=names, named=named)
+    assert out.endswith(">b&lt;u&gt;.xlsx</a>") and named
+
+
+@pytest.mark.parametrize(
+    ("entry_url", "body_url"),
+    [
+        (
+            f"{_SITE}/Doc.aspx?sourcedoc=%7Baaaa%7D&action=edit",
+            f"{_SITE}/Doc.aspx?action=edit&sourcedoc=%7Baaaa%7D",
+        ),
+        (f"{_SITE}/AllItems.aspx?id=%2Fa&viewid=v", f"{_SITE}/AllItems.aspx?viewid=v&e=Q1&id=%2Fa"),
+        (
+            _OTHER,
+            _OTHER.replace("example.sharepoint.com", "Example.SharePoint.COM").replace("https", "HTTPS"),
+        ),
+        (_OTHER.replace("example.sharepoint.com", "EXAMPLE.sharepoint.com"), f"{_OTHER}?e=x"),
+    ],
+)
+def test_a_body_link_matches_whatever_its_query_order_or_host_case(entry_url: str, body_url: str) -> None:
+    """027-AC6: query parameters in another order, or the scheme and host in another case: the same link."""
+    named: set[str] = set()
+    out = sanitize(f'<a href="{body_url}">l</a>', T, names=_names(entry_url), named=named)
+    assert out.endswith(">b&lt;u&gt;.xlsx</a>") and named
+
+
+def _names(url: str) -> dict[str, str]:
+    return file_links([_ref(objectUrl=url, fileInfo={})])

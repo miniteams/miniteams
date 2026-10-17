@@ -14,6 +14,8 @@ import test_browser_split_ux as ux
 from browser_helpers import Page, Pages, rendered, until, wait  # skips without playwright
 from test_browser_split_ux import _board, _id
 
+from miniteams.render import files_html
+
 pytestmark = pytest.mark.browser
 pages = browser_helpers.pages
 BOTH = pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
@@ -839,6 +841,32 @@ async def test_an_arrival_or_a_redraw_keeps_the_focused_messages_links_tabbable(
     await page.locator(f'[data-id="{LINKED}"] .reacts button').wait_for()
     assert await page.evaluate(TABBABLE) == list(LINKS[LINKED])
     assert await _at(page) == str(LINKED)
+
+
+@BOTH
+async def test_a_file_cards_link_is_a_tab_stop_only_in_the_focused_message(split: ux.Split) -> None:
+    """018-AC5, 027-AC2: a shared file's card link is out of Tab like a link, except in the focused message;
+    its unlinked card is never a stop."""
+    page, fake = await _open(split)
+    await _walk_to(page, LINKED)
+    files = {**_msg(1060), "html": "<p>files</p>" + files_html(browser_helpers.FILES)}
+    fake.send({"thread": GROUP, "msg": files})
+    card = page.locator('[data-id="1060"] a.file')
+    await card.wait_for()
+    assert await card.evaluate("a => a.tabIndex") == -1
+    await page.locator("#reply").focus()
+    await page.keyboard.press("ArrowUp")  # the new last message
+    await _shown(page, 1060)
+    assert await page.evaluate(TABBABLE) == [browser_helpers.SHARE]
+    await page.keyboard.press("Tab")
+    assert await card.evaluate("a => a === document.activeElement")
+    await page.keyboard.press("Tab")
+    assert await page.evaluate("document.activeElement.closest('#tools') !== null")
+    await page.keyboard.press("Shift+Tab")
+    await page.keyboard.press("Escape")
+    await _shown(page, 1060)
+    await page.keyboard.press("ArrowUp")
+    assert await card.evaluate("a => a.tabIndex") == -1
 
 
 @BOTH

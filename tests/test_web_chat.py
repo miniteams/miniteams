@@ -668,6 +668,11 @@ def test_resolved_refuses_a_blank_roster_name() -> None:
         assert CV._resolved(T, [{"mri": ANN, "name": "  "}], [{"name": label, "mri": ANN}]) is None
 
 
+_FILE_CARD = (
+    '<span class="file"><span class="file-icon">📕</span> <span class="file-name">a.pdf</span></span>'
+)
+
+
 @pytest.mark.parametrize(
     ("msgtype", "content", "props", "kind", "body"),
     [
@@ -675,7 +680,7 @@ def test_resolved_refuses_a_blank_roster_name() -> None:
         ("Event/Call", "<ended/>", {}, "call", "📞 call ended"),
         ("ThreadActivity/AddMember", "<addmember/>", {}, "system", "👥 member added"),
         ("RichText/Media_Card", "<x/>", {}, "other", "🃏 card"),
-        ("RichText/Html", "", {"files": json.dumps([{"fileName": "a<b>.pdf"}])}, "text", "📎 a&lt;b&gt;.pdf"),
+        ("RichText/Media_Card", "", {"files": [{"fileName": "a.pdf"}]}, "text", _FILE_CARD),
     ],
 )
 def test_record_types_and_markers(
@@ -686,6 +691,161 @@ def test_record_types_and_markers(
         {"id": "1", "composetime": _at(1), "messagetype": msgtype, "content": content, "properties": props}, T
     )
     assert (record["type"], record["html"]) == (kind, body)
+
+
+@pytest.mark.parametrize("as_string", [True, False])
+def test_record_shows_file_cards_after_the_text(as_string: bool) -> None:
+    """027-AC1: a message's file entries render as cards after its text, the text itself unchanged; a
+    file-only message shows its cards instead of the 📎 marker; a deleted one shows none."""
+    files = [{"fileName": "a.pdf"}]
+    props = {"files": json.dumps(files) if as_string else files}
+    assert (
+        CV.chat_record(_m("1", _at(1), "<p>see</p>", properties=props), T)["html"]
+        == "<p>see</p>" + _FILE_CARD
+    )
+    only = CV.chat_record({**_m("1", _at(1)), "content": "", "properties": props}, T)
+    assert only["html"] == _FILE_CARD
+    gone = CV.chat_record(_m("1", _at(1), properties={**props, "deletetime": "1789466500000"}), T)
+    assert "file" not in gone["html"]
+    assert CV.chat_record(_m("1", _at(1), properties={"files": "[]"}), T)["html"] == "<p>m1</p>"
+
+
+@pytest.mark.parametrize(
+    ("msgtype", "content"),
+    [("Event/Call", "<ended/>"), ("ThreadActivity/AddMember", "<addmember/>"), ("ThreadActivity/X", "<x/>")],
+)
+def test_call_and_activity_records_show_no_file_cards(msgtype: str, content: str) -> None:
+    """027-AC1: file cards belong to messages; a call or a system line carrying `files` shows none."""
+    message = {
+        **_m("1", _at(1), content),
+        "messagetype": msgtype,
+        "properties": {"files": [{"fileName": "a.pdf"}]},
+    }
+    assert "file" not in CV.chat_record(message, T)["html"]
+
+
+def test_record_names_a_pasted_file_link_once() -> None:
+    """027-AC6: a reference entry the body links renames that link, no second one; unlinked, it adds one."""
+    url = "https://example.sharepoint.com/:x:/s/team/EbUdGeT"
+    props = {"files": [{"fileName": "budget.xlsx", "state": "reference", "fileInfo": {"shareUrl": url}}]}
+    linked = CV.chat_record(_m("1", _at(1), f'<p><a href="{url}?e=x">{url}</a></p>', properties=props), T)
+    assert linked["html"] == f'<p><a href="{url}?e=x" rel="noopener" target="_blank">budget.xlsx</a></p>'
+    alone = CV.chat_record(_m("1", _at(1), "<p>see</p>", properties=props), T)
+    assert alone["html"] == f'<p>see</p><p><a href="{url}" rel="noopener" target="_blank">budget.xlsx</a></p>'
+
+
+_SHARE = "https://example-my.sharepoint.com/:w:/g/personal/someone_example_com/EaBcDeF"
+_LOCAL = f"/media/{quote(T, safe='')}/"
+
+
+_OBJ = "https://example-my.sharepoint.com/personal/someone_example_com/Documents/plan%20v2.docx"
+
+
+def _card_href(media: Path | None, entry: dict[str, Any], saved: dict[str, str] | None = None) -> str | None:
+    message = _m("1", _at(1), "<p>x</p>", properties={"files": [entry]})
+    html = CV.chat_record(message, T, media_dir=media, saved=saved)["html"]
+    return html.split('href="')[1].split('"')[0] if 'href="' in html else None
+
+
+def test_record_card_opens_the_archived_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """027-AC5, AC7: a card opens the copy the archive saved for its own URL through /media, in a new tab;
+    without one, or with a copy /media refuses, the hotlink; a file of the same name never stands in."""
+    media = tmp_path / "media"
+    media.mkdir()
+    (media / "plan v2.docx").write_bytes(b"doc")
+    (media / "plan v2 (2).docx").write_bytes(b"other doc")
+    (media / "big.pdf").write_bytes(b"x" * 11)
+    (media / "dir.pdf").mkdir()
+    (media / "half.pdf.part").write_bytes(b"x")
+    (tmp_path / "outside.pdf").write_bytes(b"x")
+    (media / "out.pdf").symlink_to(tmp_path / "outside.pdf")  # a link out of the folder: /media refuses it
+    linked = {"fileName": "plan v2.docx", "fileInfo": {"shareUrl": _SHARE}}
+    local = f"{_LOCAL}plan%20v2.docx"
+    saved = {_SHARE: "plan v2.docx"}
+    html = CV.chat_record(_m("1", _at(1), properties={"files": [linked]}), T, media_dir=media, saved=saved)[
+        "html"
+    ]
+    assert f'<a class="file" href="{local}" rel="noopener" target="_blank">' in html
+    assert (
+        _card_href(media, {"fileName": "x", "objectUrl": _OBJ}, {_OBJ: "plan v2.docx"}) == local
+    )  # objectUrl
+    # Two files named alike: each card its own copy, whatever the entry's name says.
+    other = {"fileName": "plan v2.docx", "fileInfo": {"shareUrl": f"{_SHARE}2"}}
+    both = {_SHARE: "plan v2.docx", f"{_SHARE}2": "plan v2 (2).docx"}
+    assert _card_href(media, other, both) == f"{_LOCAL}plan%20v2%20%282%29.docx"
+    assert _card_href(media, linked, both) == local
+    # A name on disk without a record for the URL: the hotlink (an older copy, or another file).
+    assert _card_href(media, linked) == _SHARE
+    assert _card_href(media, other, saved) == f"{_SHARE}2"
+    assert _card_href(media, {"fileName": "plan v2.docx"}, saved) is None  # no URL: no link at all
+    for name in ("absent.docx", "dir.pdf", "half.pdf.part", "out.pdf", "a\x00b", "", "big.pdf", "../media/x"):
+        monkeypatch.setattr(CV, "_MEDIA_MAX", 10)  # big.pdf: over what /media serves
+        assert _card_href(media, linked, {_SHARE: name}) == _SHARE, name
+    assert _card_href(None, linked, saved) == _SHARE  # no archive folder
+    ref = {**linked, "state": "reference"}  # never downloaded: its link stays the shared one
+    assert _card_href(media, ref, saved) == _SHARE
+
+
+async def test_history_cards_open_their_own_copies(
+    board: W.Board, data_dir: Path, no_api: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """027-AC7: a history page finds each card's copy by its URL, two files of one name each their own, in one
+    read-only query for the page."""
+    two = f"{_SHARE}2"
+    store = ChatStore(data_dir, T)
+    store.insert_page(
+        [
+            _m("8", _at(8), properties={"files": [{"fileName": "a.pdf", "fileInfo": {"shareUrl": _SHARE}}]}),
+            _m("9", _at(9), properties={"files": json.dumps([{"fileName": "a.pdf", "objectUrl": two}])}),
+        ]
+    )
+    (store.media_dir / "a.pdf").write_bytes(b"1")
+    (store.media_dir / "a (2).pdf").write_bytes(b"2")
+    store.save_file([_SHARE], "a.pdf", "")
+    store.save_file([two], "a (2).pdf", "")
+    store.close()
+    calls: list[list[str]] = []
+    real = CV.saved_files
+    monkeypatch.setattr(CV, "saved_files", lambda chat_dir, urls: calls.append(urls) or real(chat_dir, urls))
+    answer = await _history(board, T, limit=2)
+    hrefs = [m["html"].split('href="')[1].split('"')[0] for m in answer["messages"]]
+    assert hrefs == [f"{_LOCAL}a.pdf", f"{_LOCAL}a%20%282%29.pdf"]
+    assert calls == [[_SHARE, two]]
+    calls.clear()
+    await _history(board, T, before=_at(8), limit=2)  # a page without files: no query
+    assert calls == []
+
+
+async def test_history_of_an_archive_older_than_the_record(
+    board: W.Board, data_dir: Path, no_api: None
+) -> None:
+    """027-AC7: an archive not yet opened by phase 3 has no table: the card takes the hotlink, and the
+    read-only lookup never creates the table."""
+    store = ChatStore(data_dir, T)
+    store.insert_page(
+        [_m("9", _at(9), properties={"files": [{"fileName": "a.pdf", "fileInfo": {"shareUrl": _SHARE}}]})]
+    )
+    (store.media_dir / "a.pdf").write_bytes(b"1")
+    store._db.execute("DROP TABLE sp_files")
+    store._db.commit()
+    store.close()
+    answer = await _history(board, T, limit=1)
+    assert f'href="{_SHARE}"' in answer["messages"][0]["html"]
+    db = sqlite3.connect(store.dir / "messages.db")
+    try:
+        assert db.execute("SELECT 1 FROM sqlite_master WHERE name = 'sp_files'").fetchone() is None
+    finally:
+        db.close()
+
+
+def test_page_files_survives_an_unreadable_archive(tmp_path: Path) -> None:
+    """027-AC7: no messages.db, or a broken one, costs the cards their local copy only."""
+    files = {"files": [{"fileName": "a.pdf", "fileInfo": {"shareUrl": _SHARE}}]}
+    message = _m("1", _at(1), properties=files)
+    assert CV.page_files(tmp_path / "media", [message]) == {}
+    (tmp_path / "messages.db").write_bytes(b"not a database")
+    assert CV.page_files(tmp_path / "media", [message]) == {}
+    assert CV.page_files(None, [message]) == {}
 
 
 _BOB = "8:orgid:00000000-0000-0000-0000-00000000000c"
@@ -1315,6 +1475,19 @@ def test_media_file_refuses_oversized_files(
     """011-AC3: the whole-body response is capped."""
     _media(data_dir)
     monkeypatch.setattr(CV, "_MEDIA_MAX", 4)
+    assert board.chat.media_file(f"/media/{quote(T, safe='')}/{OBJ}.png") is None
+
+
+def test_media_file_unreadable_is_none(
+    board: W.Board, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC3: a file gone or unreadable between the check and the read is a 404, not an error."""
+    _media(data_dir)
+
+    def gone(self: Path) -> bytes:
+        raise PermissionError(self)
+
+    monkeypatch.setattr(Path, "read_bytes", gone)
     assert board.chat.media_file(f"/media/{quote(T, safe='')}/{OBJ}.png") is None
 
 

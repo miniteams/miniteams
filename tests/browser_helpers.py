@@ -86,6 +86,41 @@ EMOJIS = [
     *({"name": f"tr{i}", "custom": i, "src": f"/emoji/{i}"} for i in ("..", "%2e%2e", "a\nb", "a/b")),
     *({"name": f"zz{i:02d}", "char": "z"} for i in range(12)),  # more rows than the list shows
 ]
+# A received message's `properties.files` (spec 027), in the shape Teams posts: one with a sharing link, one
+# without any URL; then a pasted link's entry (`reference`).
+SHARED = "https://example.sharepoint.com/sites/team/Shared%20Documents/plan.docx"
+SHARE = "https://example-my.sharepoint.com/:w:/g/personal/someone_example_com/EaBcDeF"
+REF_URL = "https://example.sharepoint.com/:x:/s/team/EbUdGeT"
+FILES = [
+    {
+        "@type": "http://schema.skype.com/File",
+        "itemid": "00000000-0000-0000-0000-0000000000f1",
+        "fileName": "plan <v2>.docx",
+        "title": "plan <v2>.docx",
+        "type": "docx",
+        "fileType": "docx",
+        "state": "active",
+        "objectUrl": SHARED,
+        "baseUrl": "https://example.sharepoint.com/sites/team/",
+        "fileInfo": {"fileUrl": SHARED, "shareUrl": SHARE},
+    },
+    {
+        "@type": "http://schema.skype.com/File",
+        "itemid": "00000000-0000-0000-0000-0000000000f2",
+        "fileName": "notes.txt",
+        "type": "txt",
+        "state": "active",
+    },
+]
+REF = {
+    "@type": "http://schema.skype.com/File",
+    "itemid": "00000000-0000-0000-0000-0000000000f3",
+    "fileName": "budget.xlsx",
+    "type": "xlsx",
+    "state": "reference",
+    "objectUrl": "https://example.sharepoint.com/sites/team/Shared%20Documents/budget.xlsx",
+    "fileInfo": {"shareUrl": REF_URL},
+}
 MALFORMED: list[Any] = [None, {"name": 5}, "x", {"name": "nuke", "char": "☢"}]
 
 
