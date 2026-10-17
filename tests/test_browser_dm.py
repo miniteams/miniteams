@@ -125,12 +125,12 @@ async def _shows(page: Page, fake: Fake, thread: str, query: str = "?chatnav=spl
 
 @BOTH
 async def test_only_someone_elses_name_in_a_group_chat_is_a_target(split: ux.Split) -> None:
-    """023-AC1: in a chat with several people, another sender's name is a link-like target (pointer, Tab,
-    role link); mine is not."""
-    page, _ = await _open(split)
+    """023-AC1: in a chat with several people, another sender's name is a link-like target (pointer, role
+    link, `p` on its message: 018-AC4/AC5 take it out of the Tab order); mine is not."""
+    page, fake = await _open(split)
     ann = page.locator(_who(0))
     assert await ann.get_attribute("role") == "link"
-    assert await ann.get_attribute("tabindex") == "0"
+    assert await ann.get_attribute("tabindex") == "-1"
     assert await ann.evaluate("b => getComputedStyle(b).cursor") == "pointer"
     mine = page.locator(_who(1))
     assert await mine.get_attribute("role") is None
@@ -139,9 +139,10 @@ async def test_only_someone_elses_name_in_a_group_chat_is_a_target(split: ux.Spl
     for i in (4, 5):  # an app, no sender id: nobody to reach
         assert await page.locator(_who(i)).get_attribute("role") is None
     assert await page.locator(_who(7)).get_attribute("role") == "link"
-    await page.locator('[data-id="1000"]').focus()
-    await page.keyboard.press("Tab")
-    assert await page.evaluate("document.activeElement.textContent") == "Ann Lee"
+    for i in (1, 4, 0):  # mine, an app's: no lookup; Ann's
+        await page.locator(f'[data-id="{1000 + i}"]').focus()
+        await page.keyboard.press("p")
+    await wait(lambda: fake.dms() == [ANN], "dm")
 
 
 @BOTH

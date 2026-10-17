@@ -905,22 +905,28 @@ async def test_escape_during_a_save_then_its_failure_lands_on_the_composer_line(
 
 
 async def test_actions_reachable_from_the_keyboard_and_picker_closes(chat: Pages) -> None:
-    """011-AC12: a message reached by Tab shows its actions, Tab reaches labelled buttons, a click does
-    not pin the bar; the picker closes when the pointer leaves the message and on Escape."""
+    """011-AC12 with 018-AC5: Tab reaches the thread's one stop, a message showing its actions; its buttons
+    are labelled and out of the Tab order (keys act on them, 018-AC4); a click does not pin the bar; the
+    picker closes when the pointer leaves the message and on Escape."""
     page = await chat.open(_chat(T))
     await _handled(page, "history")
     for _ in range(12):  # Tab, not focus(): the bar follows keyboard focus (focus-visible) only
         await page.keyboard.press("Tab")
-        if await page.evaluate("document.activeElement.dataset.id") == "1":
+        if await page.evaluate("document.activeElement.closest('#msgs') !== null"):
             break
-    assert await page.locator('[data-id="1"] .actions').is_visible()
+    assert await page.evaluate("document.activeElement.dataset.id") == "3"  # the last message
+    assert await page.locator('[data-id="3"] .actions').is_visible()
+    buttons = await page.locator('[data-id="3"] .actions > button').evaluate_all(
+        "bs => bs.map(b => [b.dataset.act, b.ariaLabel, b.tabIndex])"
+    )
+    assert ["reply", "reply with quote", -1] in buttons
+    assert all(label and tab == -1 for _, label, tab in buttons)
     await page.keyboard.press("Tab")
-    assert await page.evaluate("document.activeElement.role") == "link"  # spec 023: the sender's name first
-    await page.keyboard.press("Tab")
-    focused = await page.evaluate("[document.activeElement.dataset.act, document.activeElement.ariaLabel]")
-    assert focused == ["reply", "reply with quote"]
-    await page.keyboard.press("Tab")
-    await page.keyboard.press("Enter")
+    assert await page.evaluate("document.activeElement.closest('#msgs') === null")
+    await page.keyboard.press("Shift+Tab")
+    await page.keyboard.press("Home")
+    assert await page.evaluate("document.activeElement.dataset.id") == "1"
+    await page.keyboard.press("+")
     picker = page.locator('[data-id="1"] .picker')
     assert await picker.is_visible()
     assert await picker.locator('[data-fav="👍"]').get_attribute("aria-label") == "👍"
@@ -1705,7 +1711,8 @@ async def test_a_live_delete_after_a_run_grows_it(board: W.Board, chat: Pages) -
 
 async def test_reaction_chips_add_or_remove_mine(chat: Pages, calls: list[tuple[Any, ...]]) -> None:
     """011-AC26, 016-AC4: a chip I gave removes my reaction, another adds it; chips are labelled, marked
-    when mine, reachable by Tab; every chip is a button, unknown names too."""
+    when mine, out of the Tab order (018-AC5), the picker's `+` reaches the same toggle; every chip is a
+    button, unknown names too."""
     page = await chat.open(_chat(R))
     await _handled(page, "history")
     chips = page.locator('[data-id="1"] .reacts button')
@@ -1721,11 +1728,10 @@ async def test_reaction_chips_add_or_remove_mine(chat: Pages, calls: list[tuple[
     await _until(calls, 1)
     await chips.nth(1).click()
     await _until(calls, 2)
+    assert await chips.evaluate_all("bs => bs.map(b => b.tabIndex)") == [-1, -1, -1, -1]
     await page.locator('[data-id="1"]').focus()
-    await page.keyboard.press("Tab")
-    assert await page.evaluate("document.activeElement.role") == "link"  # spec 023: the sender's name first
-    await page.keyboard.press("Tab")
-    assert await page.evaluate("document.activeElement.ariaLabel") == "👍 1, remove"
+    await page.keyboard.press("+")
+    assert await page.evaluate("document.activeElement.ariaLabel") == "remove 👍"
     await page.keyboard.press("Tab")
     await page.keyboard.press("Enter")
     await _until(calls, 3)

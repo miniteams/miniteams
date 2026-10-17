@@ -386,16 +386,20 @@ async def test_row_buttons_take_no_width_until_hover_or_focus(split: Split) -> N
 
 async def test_the_chat_header_is_ten_tabs_from_the_filter_with_many_rows(split: Split) -> None:
     """011-AC29: one row name in the Tab order (roving tabindex): with 400 rows, Tab goes filter → tabs →
-    current row (→ ⋯) → separator → ☰ within 10 presses, then members (022-AC3: its open list) → search."""
+    current row (→ ⋯) → separator → ☰ within 10 presses, then members (022-AC3: its open list) → search;
+    018-AC5: then the rest of the header, the thread (one message), the toolbar (one button), the composer."""
     split.fake.rows = _board(400)
     page = await split.open(viewport={"width": 1300, "height": 800})
     assert await page.locator('#rows .name[tabindex="0"]').count() == 1
     await page.locator("#filter").focus()
     path = []
-    for _ in range(12):
+    zone = (
+        "(e => e.closest('#msgs') ? 'thread' : e.closest('#tools') ? 'toolbar' : '')(document.activeElement)"
+    )
+    for _ in range(18):
         await page.keyboard.press("Tab")
-        path.append(await _focused(page))
-        if path[-1] == "#find":
+        path.append(await page.evaluate(zone) or await _focused(page))
+        if path[-1] == "#reply":
             break
     assert path == [
         "k:tab:all",
@@ -409,6 +413,11 @@ async def test_the_chat_header_is_ten_tabs_from_the_filter_with_many_rows(split:
         "#members",
         "#mpop",
         "#find",
+        "#teams",
+        "#gear",
+        "thread",
+        "toolbar",
+        "#reply",
     ]
     assert path.index("#menu") < 10
     cur = page.locator("#rows li.cur")

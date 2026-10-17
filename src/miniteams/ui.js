@@ -217,6 +217,19 @@
     };
   };
 
+  // A textarea exposes no caret coordinates: lay the text out in a hidden copy, the caret's word whole (it wraps with it).
+  const caret = (input, at = input.selectionStart) => {
+    const cs = getComputedStyle(input), copy = el("div", null, input.value.slice(0, at)), mark = el("span", null, input.value.slice(at).match(/^\S*/)[0] || "​");
+    for (const k of ["font", "padding", "border", "boxSizing", "lineHeight", "letterSpacing", "tabSize", "width"]) copy.style[k] = cs[k];
+    Object.assign(copy.style, { position: "absolute", visibility: "hidden", whiteSpace: "pre-wrap", overflowWrap: "break-word", top: 0, left: 0 });
+    copy.append(mark); document.body.append(copy);
+    const xy = [mark.offsetLeft, mark.offsetTop, mark.offsetHeight];
+    copy.remove();
+    return xy;
+  };
+  // A wrapped line counts as several: the caret is on the first one the reader sees.
+  const firstLine = (input) => caret(input)[1] === caret(input, 0)[1];
+
   // `:` / `@` completion (spec 012) on `input`, its list in `pop`. The pages differ only in the hooks:
   // `chat()` the chat the text goes to, `put(text, from, to, item)` the insertion, `edited()` after it, and
   // `above`, the list above the caret line (composer at the window's bottom) rather than under it.
@@ -240,16 +253,6 @@
       const m = e || /(?:^|\s)@([^\s@]*(?: [^\s@]*)?)$/.exec(before);
       return m && { kind: e ? "emoji" : "member", q: m[1], start: at - m[1].length - 1 };
     };
-    // A textarea exposes no caret coordinates: lay the text before the caret out in a hidden copy.
-    const caret = () => {
-      const cs = getComputedStyle(input), copy = el("div", null, input.value.slice(0, input.selectionStart)), mark = el("span", null, "​");
-      for (const k of ["font", "padding", "border", "boxSizing", "lineHeight", "letterSpacing", "tabSize", "width"]) copy.style[k] = cs[k];
-      Object.assign(copy.style, { position: "absolute", visibility: "hidden", whiteSpace: "pre-wrap", overflowWrap: "break-word", top: 0, left: 0 });
-      copy.append(mark); document.body.append(copy);
-      const xy = [mark.offsetLeft, mark.offsetTop, mark.offsetHeight];
-      copy.remove();
-      return xy;
-    };
     const render = () => {
       pop.hidden = !comp;
       input.setAttribute("aria-expanded", String(!!comp));
@@ -268,7 +271,7 @@
         return o;
       }));
       input.setAttribute("aria-activedescendant", `${pop.id}-${comp.active}`);
-      const [x, y, h] = caret();
+      const [x, y, h] = caret(input);
       pop.style.top = input.offsetTop - input.scrollTop + (above ? y - pop.offsetHeight : y + h) + "px";
       pop.style.left = input.offsetLeft + Math.max(0, Math.min(x, input.offsetWidth - pop.offsetWidth)) + "px";
       document.getElementById(`${pop.id}-${comp.active}`).scrollIntoView({ block: "nearest" });
@@ -433,6 +436,15 @@
       edited();
     };
     for (const btn of bar.querySelectorAll("[data-fmt]")) btn.onclick = () => format(btn.dataset.fmt);
+    // One Tab stop (role=toolbar): ←/→ walk its buttons and move the stop, Home/End reach its ends.
+    const tools = [...bar.querySelectorAll("button")];
+    tools.forEach((b, i) => { b.tabIndex = i ? -1 : 0; });
+    bar.addEventListener("focusin", (e) => { if (tools.includes(e.target)) for (const b of tools) b.tabIndex = b === e.target ? 0 : -1; });
+    bar.addEventListener("keydown", (e) => {
+      const i = tools.indexOf(e.target), n = tools.length, to = i < 0 ? undefined : { ArrowRight: (i + 1) % n, ArrowLeft: (i + n - 1) % n, Home: 0, End: n - 1 }[e.key];
+      if (to === undefined) return;
+      e.preventDefault(); tools[to].focus();
+    });
     const show = bar.querySelector("[aria-pressed]");
     show.setAttribute("aria-pressed", "false");  // a bar copied from one showing its preview starts off
     // Only the answer to the last ask, while on, shows.

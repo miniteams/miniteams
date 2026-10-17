@@ -157,6 +157,7 @@
   .msg:not(.cont) { margin-top: 10px; }
   .msg:hover { background: var(--panel); }
   .msg.hit { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
+  .msg:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
   .av { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; font-weight: 650; font-size: 13px; color: #fff; }
   .msg.cont .av, .msg.cont .head { display: none; }
   .body { grid-column: 2; min-width: 0; }
@@ -237,6 +238,7 @@
   /* A click focuses the message itself (not focus-visible): no bar pinned. Not `:has(:focus-visible)`:
      Chrome drops the focus when Tab leaves the message for its first button. */
   .msg:hover .actions, .msg:focus-visible .actions, .msg:focus-within:not(:focus) .actions { display: flex; }
+  .msg:has(> .actions > .picker:not([hidden])) .actions { display: flex; }  /* `+` on a message focused by a click */
   .msg:has(.editor) .actions { display: none !important; }  /* outranks the focus-within rule: the editor holds focus */
   .actions button { border: 0; background: transparent; border-radius: 6px; padding: 0 6px; cursor: pointer; color: var(--dim); font-size: 12.5px; }
   .actions button:hover { background: var(--panel-2); color: var(--accent); }
@@ -333,7 +335,8 @@
   <div id="hits" hidden></div>
 </header>
 <div id="pane">
-  <div id="list"><div id="note">loading…</div><div id="msgs"></div><div id="outq" hidden></div></div>
+  <!-- tabindex -1: Firefox would make the scroller a Tab stop of its own, next to the thread's. -->
+  <div id="list" tabindex="-1"><div id="note">loading…</div><div id="msgs" role="feed" aria-label="messages"></div><div id="outq" hidden></div></div>
   <button id="latest" class="btn" hidden>↓ latest</button>
   <div id="lag" role="status" hidden>loading latest messages…</div>
 </div>
@@ -361,7 +364,7 @@
 </div>
 <script>
 (() => {
-  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn rowActions completion insertText formatBar imageQueue sendQueue
+  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn rowActions caret firstLine completion insertText formatBar imageQueue sendQueue
   /* ui.js */
   let thread = null;
   try { thread = decodeURIComponent(location.pathname.slice("/chat/".length)); } catch (e) {}
@@ -587,10 +590,35 @@
     if (e.detail > 0) who.blur();  // a pointer's focus there would pin the action bar; a keyboard's stays
   });
   $msgs.addEventListener("auxclick", (e) => { const who = e.button === 1 && e.target.closest(".head .who"); if (who) dmAsk(who, true); });
+  const MAC = /mac/i.test(navigator.userAgentData?.platform ?? navigator.platform);
+  const PASS = "a[href], summary, pre";  // a body's own Tab stops: links, card toggles (Action.ShowCard), scrollable code blocks
   $msgs.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && e.target.matches(".html blockquote[role=link]")) { e.preventDefault(); quoteJump(e.target.dataset.msg); }
-    if (e.key === "Enter" && e.target.matches(".head .who")) { e.preventDefault(); dmAsk(e.target, false); }
+    const t = e.target, k = e.key;
+    if (k === "Enter" && t.matches(".html blockquote[role=link]")) { e.preventDefault(); quoteJump(t.dataset.msg, true); return; }
+    if (k === "Enter" && t.matches(".head .who")) { e.preventDefault(); dmAsk(t, false); return; }
+    // A message or a control of its own a click focused: its editor, picker and emoji search keep their keys.
+    const m = t.closest("#msgs > .msg");
+    const option = MAC && e.altKey && !e.ctrlKey && [...k].length === 1;  // macOS Option types characters (Option+r is ®)
+    if (!m || t.closest(".editbox, .picker, .esearch") || e.metaKey || ((e.ctrlKey || e.altKey) && !option && !e.getModifierState("AltGraph"))) return;  // AltGr is Ctrl+Alt on Windows
+    if (t !== m && (k === "Enter" || (k === " " && !t.matches("a[href], pre")))) return;  // a link or button keeps Enter, a button its Space
+    const all = steps(), i = all.indexOf(m), y = (n) => n.getBoundingClientRect().top, h = $list.clientHeight;
+    const move = { ArrowUp: () => all[i - 1] || m, ArrowDown: () => all[i + 1], Home: () => all[0], End: () => all.at(-1),
+      PageUp: () => all.findLast((n) => y(n) <= y(m) - h) || all[0], PageDown: () => all.find((n) => y(n) >= y(m) + h) || all.at(-1) }[k];
+    const act = (a) => readOnly ? null : m.querySelector(`:scope > .actions > [data-act=${a}]`);
+    if (move) { const n = move(); if (n) visit(n); else toComposer(); }  // ↓ past the last message
+    else if (k === "Escape") { if (t.matches(PASS)) m.focus(); else toComposer(); }
+    else if (k === " ") byScreen(m, e.shiftKey ? -1 : 1);
+    else if (k === "e" || k === "r") act(k === "e" ? "edit" : "reply")?.click();
+    else if (k === "+") { const b = act("react"), p = m.querySelector(":scope > .actions > .picker"); if (b) { if (p.hidden) b.click(); p.querySelector("button")?.focus(); } }
+    else if (k === "p") { const who = m.querySelector(".head .who"); if (who) dmAsk(who, false); }
+    else if (k === "Enter") { const q = m.querySelector(".html blockquote[role=link]"), run = m.querySelector(":scope > .run"); if (q) quoteJump(q.dataset.msg, true); else if (run) { run.click(); m.focus(); } else m.querySelector(":scope > .body > .blocked > button")?.click(); }
+    else if (k === "/") toFind();
+    // Any other character is the reader typing again: it lands at the composer's end.
+    else if ([...k].length === 1 && !$reply.disabled) { const at = $reply.value.length; insertText($reply, k, at, at, at + k.length, at + k.length); }
+    else return;
+    e.preventDefault();
   });
+  addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && e.shiftKey && !e.altKey && e.key.toLowerCase() === "f") { e.preventDefault(); toFind(); } });
   // Spec 023: the server answers which 1:1 holds me and the sender; the latest name asked wins.
   const DM_GO = "open your private chat";
   let dmWant = null;
@@ -628,7 +656,7 @@
   const QUOTE_MISS = "quoted message not found", QUOTE_GO = "go to the quoted message";
   const unmiss = () => { if ($err.textContent.startsWith(QUOTE_MISS)) $err.textContent = ""; };
   // A jump's message: the hit itself, else the first message from its time on; `miss` says the hit is not there.
-  const land = (t) => {
+  const land = (t, focus = false) => {
     const hit = t.id && byId(t.id), miss = t.miss && !hit;
     if (miss) $err.textContent = t.miss;  // shown near its time, unmarked: no message there is the hit
     else unmiss();
@@ -638,6 +666,7 @@
     for (const old of $msgs.querySelectorAll(".hit")) old.classList.remove("hit");
     if (!miss) n.classList.add("hit");
     n.scrollIntoView({ block: t.id ? "center" : "start" });
+    if (focus) visit(n);
   };
 
   const clock = (d) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
@@ -659,20 +688,21 @@
     if (r.deleted) body.append(el("div", "html", "message deleted"));
     else {
       const h = el("div", "html"); h.dir = "auto"; h.innerHTML = r.html || ""; body.append(h);
+      for (const a of h.querySelectorAll(PASS)) a.tabIndex = -1;  // restop hands Tab to the focused message's links and toggles
       // The outermost quote only: a quote quoted inside it would be a link inside a link.
       for (const q of h.querySelectorAll("blockquote[data-msg]:not(blockquote[data-msg] *)")) {
-        Object.assign(q, { tabIndex: 0, title: QUOTE_GO }); q.setAttribute("role", "link"); q.setAttribute("aria-description", QUOTE_GO);
+        Object.assign(q, { tabIndex: -1, title: QUOTE_GO }); q.setAttribute("role", "link"); q.setAttribute("aria-description", QUOTE_GO);  // Enter on its message follows it
       }
     }
+    node.tabIndex = -1; node.setAttribute("role", "article");  // restop gives one message the thread's Tab stop
     if (sys) { body.append(Object.assign(el("span", "when", fmtTime(r.at)), { title: r.at })); node.append(body); node.title = r.at; return node; }
-    node.tabIndex = 0;  // keyboard users reach the actions through focus-visible
     const name = r.name || (r.me ? "You" : "?");
     const av = el("div", "av", initials(name));
     av.style.background = avatarBg(r.from || name);
     if (r.from) { av.dataset.pmri = r.from.toLowerCase(); presenceDot(av); authorsSoon(); }
     const head = el("div", "head"), who = Object.assign(el("b", null, name), { dir: "auto" });
     // Spec 023: someone else's name, in a chat that is not our 1:1, leads to our 1:1.
-    if (!r.me && /^8:orgid:/i.test(r.from) && kind(thread) !== "dm") { Object.assign(who, { className: "who", tabIndex: 0, title: DM_GO }); who.setAttribute("role", "link"); }
+    if (!r.me && /^8:orgid:/i.test(r.from) && kind(thread) !== "dm") { Object.assign(who, { className: "who", tabIndex: -1, title: DM_GO }); who.setAttribute("role", "link"); }
     head.append(who, Object.assign(el("span", "when", fmtTime(r.at)), { title: r.at }));
     if (r.edited && !r.deleted) head.append(el("span", "edited", "edited"));
     body.prepend(head);
@@ -687,7 +717,7 @@
         if (face) chip.prepend(face);
         chip.title = people;
         if (!readOnly) {
-          chip.setAttribute("aria-label", `${x.emoji} ${x.count}, ${x.mine ? "remove" : "add"}`);
+          chip.setAttribute("aria-label", `${x.emoji} ${x.count}, ${x.mine ? "remove" : "add"}`); chip.tabIndex = -1;
           chip.onclick = () => readOnly || send({ react: thread, msg: r.id, key: x.key, remove: x.mine }) || ($err.textContent = "offline, not sent");
         }
         line.append(chip);
@@ -696,7 +726,7 @@
     }
     const actions = el("div", "actions");
     actions.onmousedown = (e) => e.preventDefault();  // a mouse click must not leave focus on the button and pin the bar
-    const button = (act, text, title, onclick) => { const b = el("button", null, text); b.dataset.act = act; b.title = title; b.setAttribute("aria-label", title); b.onclick = onclick; actions.append(b); return b; };
+    const button = (act, text, title, onclick) => { const b = el("button", null, text); b.dataset.act = act; b.title = title; b.setAttribute("aria-label", title); b.onclick = onclick; b.tabIndex = -1; actions.append(b); return b; };
     if (!r.deleted) {
       // Where `send` takes a quote: a text-type message (`editable`, whoever wrote it) with a sender.
       if (r.editable && r.from) button("reply", "↩", "reply with quote", () => addQuote(r, node));
@@ -709,13 +739,14 @@
         const mine = !!chipOf(r, f)?.mine, b = el("button", mine ? "mine" : null);
         b.append(favFace(f));
         b.dataset.fav = f; b.title = mine ? `remove ${favName(f)}` : favName(f); b.setAttribute("aria-label", b.title);
-        b.onclick = () => { picker.hidden = true; react(r, f, true); };
+        b.onclick = () => { const back = picker.contains(document.activeElement); picker.hidden = true; react(r, f, true); if (back) node.focus(); };
         return b;
       }), anyEmoji);
       button("react", "☺", "react", () => { fillPicker(); picker.hidden = !picker.hidden; });
       actions.append(picker);
       node.addEventListener("mouseleave", () => { picker.hidden = true; });
-      node.addEventListener("keydown", (e) => { if (e.key === "Escape") picker.hidden = true; });
+      picker.addEventListener("focusout", (e) => { if (!picker.contains(e.relatedTarget)) picker.hidden = true; });  // its buttons would stay Tab stops
+      node.addEventListener("keydown", (e) => { if (e.key === "Escape" && !picker.hidden) { e.stopPropagation(); node.focus(); picker.hidden = true; } });  // closing it is all Escape does
       if (r.me && r.editable) button("edit", "✎", "edit", () => startEdit(node, r));
       if (r.me) {
         button("delete", "🗑", "delete", () => { if (confirm("Delete this message?")) send({ delete: thread, msg: r.id }) || ($err.textContent = "offline, not deleted"); });
@@ -764,13 +795,13 @@
   const CHANGED = "the message changed since it was opened: reopen it to edit";  // chat_verbs.CHANGED
   const rerender = (id) => {
     const node = $msgs.querySelector(`[data-id="${CSS.escape(id)}"]`), r = hist.records.get(id);
-    if (node && r) { node.replaceWith(renderMessage(r)); regroup(); }
+    if (node && r) redraw(node, r);
   };
   const linkBtn = (text, act) => Object.assign(el("button", "link", text), { onclick: act });
   // Not editable here (a table, a card…): the reason, as text, and the way to edit it in Teams.
   const blocked = (id, reason) => {
     const line = el("div", "blocked", `can't edit here: ${reason} · `);
-    line.append(linkBtn("Open in Teams", () => openTeams(id)));
+    line.append(Object.assign(linkBtn("Open in Teams", () => openTeams(id)), { tabIndex: -1 }));  // a per-message control: out of Tab
     byId(id)?.querySelector(":scope > .body").append(line);
   };
   // The server's form, checked like any input: what the editor shows goes in as text only.
@@ -920,7 +951,7 @@
       });
       if (!many) return;
       const b = el("button", "run", `${members.length} messages deleted`);
-      b.setAttribute("aria-expanded", String(open));
+      b.setAttribute("aria-expanded", String(open)); b.tabIndex = -1;  // Enter on the run's head toggles it
       b.onclick = () => {
         for (const n of members) if (open) hist.unfolded.delete(n.dataset.id); else hist.unfolded.add(n.dataset.id);
         fold();
@@ -963,6 +994,43 @@
     }
   };
 
+  // A message drawn again (a reaction landing, an edit ending) keeps the focus it held.
+  const redraw = (node, r) => {
+    const n = renderMessage(r), had = node.contains(document.activeElement);
+    node.replaceWith(n); regroup();
+    if (had) { n.focus({ preventScroll: true }); keepFocus(true); }
+  };
+  // Focus the thread held, lost with a removed or folded message, goes to the thread's stop.
+  const keepFocus = (had) => { if (had && !$msgs.contains(document.activeElement)) $msgs.querySelector(':scope > [tabindex="0"]')?.focus({ preventScroll: true }); };
+  // Spec 018: the thread is one Tab stop, the message last focused, else the last one.
+  let stopId = "";
+  const steps = () => [...$msgs.querySelectorAll(":scope > .msg:not(.folded)")];
+  const restop = () => {
+    let n = stopId ? byId(stopId) : null;
+    while (n?.classList.contains("folded")) n = n.previousElementSibling;
+    for (const o of $msgs.querySelectorAll(`:scope > [tabindex="0"], .html :is(${PASS})[tabindex="0"]`)) o.tabIndex = -1;
+    if (n ||= steps().at(-1)) for (const o of [n, ...n.querySelectorAll(`.html :is(${PASS})`)]) o.tabIndex = 0;
+  };
+  $msgs.addEventListener("focusin", (e) => { const n = e.target.closest("#msgs > .msg"); if (n) { stopId = n.dataset.id; restop(); } });
+  // A grouped message brings its head into view with it when both fit; the scroll loads older pages at the top.
+  const visit = (n) => {
+    let head = n;
+    while (head.classList.contains("cont") && head.previousElementSibling) head = head.previousElementSibling;
+    head.scrollIntoView({ block: "nearest" });
+    n.focus({ preventScroll: true }); n.scrollIntoView({ block: "nearest" });
+  };
+  // Space reads on like a feed; the focus follows only when its message leaves the view, to stay visible.
+  const byScreen = (m, dir) => {
+    $list.scrollBy(0, dir * $list.clientHeight);
+    const v = $list.getBoundingClientRect(), b = (n) => n.getBoundingClientRect();
+    const whole = (n) => b(n).top >= v.top - 1 && b(n).bottom <= v.bottom + 1, part = (n) => b(n).bottom > v.top && b(n).top < v.bottom;
+    if (whole(m)) return;
+    const seen = steps().filter(whole), near = seen.length ? seen : steps().filter(part);
+    (dir > 0 ? near[0] : near.at(-1))?.focus({ preventScroll: true });
+  };
+  const toComposer = () => { const end = $reply.value.length; $reply.focus(); $reply.setSelectionRange(end, end); };
+  const toFind = () => { $find.focus(); $find.select(); };
+
   // Consecutive messages from one sender within 5 minutes share one avatar and name.
   const regroup = () => {
     fold();
@@ -975,6 +1043,7 @@
       prev = n;
     }
     paintReceipts();
+    restop();
   };
 
   // A page that replaces the screen: the latest one, a jump, a reconnect.
@@ -991,6 +1060,7 @@
       for (const r of hist.live) if (!hist.records.has(r.id)) hist.records.set(r.id, r);
       hist.live = [];
     }
+    const had = $msgs.contains(document.activeElement);  // the reader was in the thread: they stay there
     $msgs.replaceChildren(...[...hist.records.values()].map(renderMessage));
     regroup();
     const edits = hist.liveEdits;
@@ -1007,8 +1077,10 @@
     const t = jumped ? hist.target : null, back = hist.restore;
     if (jumped) hist.target = null;
     hist.restore = null;
-    if (t) land(t);
+    const refocus = had && !$msgs.contains(document.activeElement);  // a restored editor holds it already
+    if (t) land(t, refocus);
     else if (!toAnchor(back)) toBottom();
+    if (!t) keepFocus(refocus);
     hist.stick = !hist.newer && near();
     showLatest();
     fill();
@@ -1037,9 +1109,10 @@
     const editor = cut.findIndex((n) => n.querySelector(".editor"));
     if (editor >= 0) cut.length = editor;  // an unsaved edit outlives the trim
     if (!cut.length) return;
+    const had = $msgs.contains(document.activeElement);
     for (const n of cut) { hist.records.delete(n.dataset.id); n.remove(); }
     hist.older = true; hist.olderAt = "";  // the edge moved down past the cursor
-    regroup();
+    regroup(); keepFocus(had);
   };
 
   const append = (r) => {
@@ -1090,8 +1163,7 @@
     hist.records.set(r.id, merged);
     const ed = !merged.deleted && editorOf(r.id);
     if (ed) { ed.elsewhere(merged); return; }  // an edit in progress: shown once it ends
-    node.replaceWith(renderMessage(merged));
-    regroup();
+    redraw(node, merged);
   };
 
   // History is keyed on its cursor, which the answer echoes: one request per cursor in flight.
@@ -1104,9 +1176,9 @@
   };
   const jump = (at, id = "", miss = "") => { resetNav("jump", { at, id, miss }); requestHistory("around", at); };
   // Teams message ids are epoch milliseconds: the quoted message's time.
-  const quoteJump = (id) => {
+  const quoteJump = (id, focus = false) => {
     unmiss();
-    if (byId(id)) { if (hist.target) Object.assign(hist, { target: null, aroundAt: "" }); land({ id }); return; }  // a jump loading is dropped, a resync is not
+    if (byId(id)) { if (hist.target) Object.assign(hist, { target: null, aroundAt: "" }); land({ id }, focus); return; }  // a jump loading is dropped, a resync is not
     const d = new Date(Number(id));
     if (isNaN(d)) $err.textContent = QUOTE_MISS; else jump(d.toISOString(), id, QUOTE_MISS);
   };
@@ -1462,6 +1534,8 @@
   $reply.onkeydown = (e) => {
     if (complete.key(e)) { e.preventDefault(); return; }
     if (composeBar.key(e)) return;
+    const plain = !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey && !e.isComposing && e.keyCode !== 229;
+    if (e.key === "ArrowUp" && plain && $reply.selectionStart === $reply.selectionEnd && firstLine($reply) && steps().length) { e.preventDefault(); visit(steps().at(-1)); return; }
     if (e.key !== "Enter" || e.shiftKey || e.isComposing || e.keyCode === 229) return;
     e.preventDefault();
     submit();
@@ -1634,7 +1708,7 @@
   // A chat's whole screen state goes; its draft, quotes and open editors wait in `drafts`.
   const reset = () => {
     resetNav("switch");
-    receipts = {};
+    receipts = {}; stopId = "";
     typing.clear(); renderTyping();
     $msgs.replaceChildren(); $note.hidden = false; $note.className = ""; $note.textContent = "loading…";
     closeHits(); $find.value = "";

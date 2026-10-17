@@ -157,17 +157,23 @@ async def test_a_quote_off_screen_jumps_to_its_message(split: ux.Split) -> None:
 
 
 @BOTH
-async def test_a_quote_is_reached_by_tab_and_jumps_on_enter(split: ux.Split) -> None:
-    """021-AC4: Tab from its message reaches the quote, a link to assistive tech; Enter jumps like a click,
-    on screen and off it."""
+async def test_enter_on_a_quoting_message_jumps(split: ux.Split) -> None:
+    """021-AC4 with 018-AC4/AC5: the quote is a link to assistive tech, out of the Tab order; Enter on its
+    message jumps like a click, on screen and off it, and so does Enter on the quote itself once focused; the
+    focus lands on the quoted message."""
     page, fake = await _open(split)
     assert await page.locator(_quote(40)).get_attribute("role") == "link"
+    assert await page.locator(_quote(40)).get_attribute("tabindex") == "-1"
+    await page.locator(_quote(43)).focus()
+    await page.keyboard.press("Enter")
+    await _shown(page, ON)
+    assert await page.evaluate("document.activeElement.dataset.id") == ON  # the focus follows the jump
+    await page.evaluate("document.querySelector('.msg.hit').classList.remove('hit')")
     for i, mid in ((40, ON), (41, OFF)):
         await page.locator(f'[data-id="{1000 + i}"]').focus()
-        await page.keyboard.press("Tab")
-        assert await page.evaluate("document.activeElement.dataset.msg") == mid
         await page.keyboard.press("Enter")
         await _shown(page, mid)
+        assert await page.evaluate("document.activeElement.dataset.id") == mid
     assert fake.arounds() == [OFF_AT]
 
 
@@ -277,7 +283,7 @@ async def test_a_quote_inside_a_quote_is_not_a_link_of_its_own(split: ux.Split) 
         page.locator(f"{_quote(44)}[data-msg='{OFF}']"),
     )
     assert await outer.get_attribute("role") == "link"
-    assert await outer.get_attribute("tabindex") == "0"
+    assert await outer.get_attribute("tabindex") == "-1"  # Enter on its message follows it (018-AC4)
     assert await outer.get_attribute("aria-description") == "go to the quoted message"
     assert await outer.get_attribute("title") == "go to the quoted message"
     assert await inner.get_attribute("role") is None
