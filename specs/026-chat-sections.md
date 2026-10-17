@@ -1,6 +1,6 @@
 # 026 — Chat sections
 
-**Status**: in progress
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-10-17
 
@@ -53,32 +53,32 @@ miniteams' own; Teams does not see them.
 
 ## Acceptance criteria
 
-- [ ] **AC1** With no section, the list looks as today and the mode button is absent; creating a
+- [x] **AC1** With no section, the list looks as today and the mode button is absent; creating a
   section from a chat's ⋯ → **New section…** shows the button and files the chat there.
-- [ ] **AC2** In Sections mode, chats are grouped under their section headers in the saved section
+- [x] **AC2** In Sections mode, chats are grouped under their section headers in the saved section
   order, by recency inside each, chats with no section under Other, last.
-- [ ] **AC3** Recent / Sections switches the arrangement; each view remembers its own mode across
+- [x] **AC3** Recent / Sections switches the arrangement; each view remembers its own mode across
   reloads, and switching one view leaves the other unchanged.
-- [ ] **AC4** The tabs filter as today in both modes; a chat marked seen leaves its section in Inbox and
+- [x] **AC4** The tabs filter as today in both modes; a chat marked seen leaves its section in Inbox and
   shows under it in Seen.
-- [ ] **AC5** A section with no chat to show stays shown in every tab; during a search only sections
+- [x] **AC5** A section with no chat to show stays shown in every tab; during a search only sections
   holding a result show, unfolded, and their remembered fold state is back once the search is cleared.
-- [ ] **AC6** A folded section shows its unread count and `@` by the tabs' rules, stays folded on an
+- [x] **AC6** A folded section shows its unread count and `@` by the tabs' rules, stays folded on an
   arrival, and its fold state is remembered per view.
-- [ ] **AC7** From the menus: file a chat in a section or None, create, rename, move up/down and delete
+- [x] **AC7** From the menus: file a chat in a section or None, create, rename, move up/down and delete
   a section; deleting moves its chats to Other.
-- [ ] **AC8** By drag and drop: a chat onto a header (folded too), onto a chat of another section, or
+- [x] **AC8** By drag and drop: a chat onto a header (folded too), onto a chat of another section, or
   onto Other files it accordingly; a header dragged between sections reorders them; Other stays last.
-- [ ] **AC9** ↑/↓ walk headers and chats, skipping folded sections' chats; Enter, ←, → fold and unfold
+- [x] **AC9** ↑/↓ walk headers and chats, skipping folded sections' chats; Enter, ←, → fold and unfold
   a header; ← on a chat reaches its header; the list's other keys and Ctrl+K behave as before.
-- [ ] **AC10** A change made in one view shows in another open view without a reload, and survives a
+- [x] **AC10** A change made in one view shows in another open view without a reload, and survives a
   server restart.
-- [ ] **AC11** A section name is plain text everywhere (no markup), non-empty, and bounded in length; a
+- [x] **AC11** A section name is plain text everywhere (no markup), non-empty, and bounded in length; a
   chat id unknown to the board is refused.
-- [ ] **AC12** A section set to Manual keeps its order when a message arrives; a newly filed chat lands on
+- [x] **AC12** A section set to Manual keeps its order when a message arrives; a newly filed chat lands on
   top; Alt+↑/↓ moves a chat within it; the order survives a reload and shows in every view; switching back
   to Recent orders by activity again.
-- [ ] **AC13** In a Manual section, a chat dragged among its chats lands at the drop position.
+- [x] **AC13** In a Manual section, a chat dragged among its chats lands at the drop position.
 
 ## Phases
 
