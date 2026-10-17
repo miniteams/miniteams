@@ -82,7 +82,7 @@ from .messages import (
     snippet,
     thread_of,
 )
-from .presence import Presence, dm_peer, open_cache, person
+from .presence import Presence, dm_ids, dm_peer, open_cache, person
 from .receipts import EVENT as RECEIPT_EVENT
 from .receipts import Receipts
 from .send import mark_read
@@ -669,6 +669,7 @@ class Board:
         board_last: dict[str, Handler] = {
             "board": self._on_board,
             "follow": self._on_follow,
+            "dm": self._on_dm,
             "open": self._on_open,
             "authors": self._on_authors,
         }
@@ -838,6 +839,21 @@ class Board:
         else:
             self.chat.roster_later(ws, thread_id, lambda: self._following(ws, thread_id))
         return frame
+
+    async def dm(self, mri: str) -> dict[str, Any]:
+        """Page verb `dm` (spec 023): my 1:1 with `mri`, from the board rows then the archive index; no
+        Teams call."""
+        ids = dm_ids(self.me, mri)
+        if not ids:
+            return {"dm": mri, "error": "unknown person"}
+        found = next((tid for tid in ids if tid in self.rows), "")
+        if not found and self.data_dir is not None:
+            try:
+                found = await io("dir", _indexed, self.data_dir, ids)
+            except ArchiveUnavailable:
+                return {"dm": mri, "error": "archive unavailable"}
+        # `chat`, not `thread`: the page drops a frame whose `thread` is not the chat it shows.
+        return {"dm": mri, "chat": found} if found else {"dm": mri, "error": "no private chat with them yet"}
 
     async def _forward(
         self, thread_id: str, resource_type: Any, resource: dict[str, Any], msgtype: str
@@ -1361,6 +1377,9 @@ class Board:
     async def _on_follow(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
         await answer(ws, {"follow": verb["follow"]}, self.follow(ws, verb["follow"]))
 
+    async def _on_dm(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
+        await answer(ws, {"dm": verb["dm"]}, self.dm(verb["dm"]))
+
     async def _on_open(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
         target, msg = parse_open(verb)
         await self.open_row(verb["open"], target, ws, msg)
@@ -1383,6 +1402,11 @@ def parse_open(verb: dict[str, Any]) -> tuple[OpenTarget, str]:
     msg = verb.get("msg")
     msg = msg if isinstance(msg, str) and MSG_ID_RE.fullmatch(msg) else ""
     return ("web" if verb.get("web") is True else "app"), msg
+
+
+def _indexed(data_dir: Path, ids: tuple[str, ...]) -> str:
+    """The first of `ids` the archive index holds, "" for none or no readable index. Blocking."""
+    return next((tid for tid in ids if archive_dir(data_dir, tid) is not None), "")
 
 
 def _verb_key(

@@ -77,6 +77,15 @@ def dm_peer(thread_id: str, me: str) -> str:
     return person("8:orgid:" + (found[2] if found[1] == mine else found[1]))
 
 
+def dm_ids(me: str, mri: Any) -> tuple[str, ...]:
+    """Spec 023: the two ids the 1:1 of `me` and `mri` may have (Teams does not always sort them);
+    () when either is no org user or both are me."""
+    mine, theirs = (person(m).removeprefix("8:orgid:") for m in (me, mri))
+    if not mine or not theirs or mine == theirs:
+        return ()
+    return f"19:{mine}_{theirs}@unq.gbl.spaces", f"19:{theirs}_{mine}@unq.gbl.spaces"
+
+
 def parse(entries: Any) -> dict[str, tuple[str, str] | None]:
     """`presence: [...]` of a snapshot or a callback → mri → (availability, activity); None = unknown."""
     out: dict[str, tuple[str, str] | None] = {}

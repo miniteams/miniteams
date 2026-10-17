@@ -23,4 +23,5 @@
 | [020](020-auto-read.md) | Mark a chat read in Teams when it is shown | shipped |
 | [021](021-quote-jump.md) | A reply's quote leads to the quoted message | shipped |
 | [022](022-members-popover.md) | The chat's members on hover | shipped |
+| [023](023-name-to-private-chat.md) | A sender's name leads to the private chat with them | phase 1 shipped |
 | [025](025-file-attachments.md) | Send any file as an attachment | in progress |

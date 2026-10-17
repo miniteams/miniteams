@@ -139,6 +139,16 @@ def test_dm_peer_is_the_other_member_only() -> None:
     assert P.dm_peer(f"19:{oid(ME)}_{oid(ANN)}@unq.gbl.spaces", "") == ""
 
 
+def test_dm_ids_are_both_orders_of_two_org_users() -> None:
+    """Spec 023: the 1:1 of two people, either order; none for me, a non-user or a missing id."""
+    oid = lambda m: m.removeprefix("8:orgid:")  # noqa: E731
+    both = f"19:{oid(ME)}_{oid(ANN)}@unq.gbl.spaces", f"19:{oid(ANN)}_{oid(ME)}@unq.gbl.spaces"
+    assert P.dm_ids(ME, ANN) == both
+    assert P.dm_ids(ME, ANN.upper().replace("8:ORGID:", "8:orgid:")) == P.dm_ids(ME, ANN)
+    for me, mri in ((ME, ME), (ME, "28:bot-id"), (ME, None), (ME, ""), ("", ANN), ("28:bot-id", ANN)):
+        assert P.dm_ids(me, mri) == ()
+
+
 # --- snapshot + subscription on the web's own socket ---
 
 
