@@ -668,6 +668,11 @@ def test_resolved_refuses_a_blank_roster_name() -> None:
         assert CV._resolved(T, [{"mri": ANN, "name": "  "}], [{"name": label, "mri": ANN}]) is None
 
 
+_FILE_CARD = (
+    '<span class="file"><span class="file-icon">📕</span> <span class="file-name">a.pdf</span></span>'
+)
+
+
 @pytest.mark.parametrize(
     ("msgtype", "content", "props", "kind", "body"),
     [
@@ -675,7 +680,7 @@ def test_resolved_refuses_a_blank_roster_name() -> None:
         ("Event/Call", "<ended/>", {}, "call", "📞 call ended"),
         ("ThreadActivity/AddMember", "<addmember/>", {}, "system", "👥 member added"),
         ("RichText/Media_Card", "<x/>", {}, "other", "🃏 card"),
-        ("RichText/Html", "", {"files": json.dumps([{"fileName": "a<b>.pdf"}])}, "text", "📎 a&lt;b&gt;.pdf"),
+        ("RichText/Media_Card", "", {"files": [{"fileName": "a.pdf"}]}, "text", _FILE_CARD),
     ],
 )
 def test_record_types_and_markers(
@@ -686,6 +691,47 @@ def test_record_types_and_markers(
         {"id": "1", "composetime": _at(1), "messagetype": msgtype, "content": content, "properties": props}, T
     )
     assert (record["type"], record["html"]) == (kind, body)
+
+
+@pytest.mark.parametrize("as_string", [True, False])
+def test_record_shows_file_cards_after_the_text(as_string: bool) -> None:
+    """027-AC1: a message's file entries render as cards after its text, the text itself unchanged; a
+    file-only message shows its cards instead of the 📎 marker; a deleted one shows none."""
+    files = [{"fileName": "a.pdf"}]
+    props = {"files": json.dumps(files) if as_string else files}
+    assert (
+        CV.chat_record(_m("1", _at(1), "<p>see</p>", properties=props), T)["html"]
+        == "<p>see</p>" + _FILE_CARD
+    )
+    only = CV.chat_record({**_m("1", _at(1)), "content": "", "properties": props}, T)
+    assert only["html"] == _FILE_CARD
+    gone = CV.chat_record(_m("1", _at(1), properties={**props, "deletetime": "1789466500000"}), T)
+    assert "file" not in gone["html"]
+    assert CV.chat_record(_m("1", _at(1), properties={"files": "[]"}), T)["html"] == "<p>m1</p>"
+
+
+@pytest.mark.parametrize(
+    ("msgtype", "content"),
+    [("Event/Call", "<ended/>"), ("ThreadActivity/AddMember", "<addmember/>"), ("ThreadActivity/X", "<x/>")],
+)
+def test_call_and_activity_records_show_no_file_cards(msgtype: str, content: str) -> None:
+    """027-AC1: file cards belong to messages; a call or a system line carrying `files` shows none."""
+    message = {
+        **_m("1", _at(1), content),
+        "messagetype": msgtype,
+        "properties": {"files": [{"fileName": "a.pdf"}]},
+    }
+    assert "file" not in CV.chat_record(message, T)["html"]
+
+
+def test_record_names_a_pasted_file_link_once() -> None:
+    """027-AC6: a reference entry the body links renames that link, no second one; unlinked, it adds one."""
+    url = "https://example.sharepoint.com/:x:/s/team/EbUdGeT"
+    props = {"files": [{"fileName": "budget.xlsx", "state": "reference", "fileInfo": {"shareUrl": url}}]}
+    linked = CV.chat_record(_m("1", _at(1), f'<p><a href="{url}?e=x">{url}</a></p>', properties=props), T)
+    assert linked["html"] == f'<p><a href="{url}?e=x" rel="noopener" target="_blank">budget.xlsx</a></p>'
+    alone = CV.chat_record(_m("1", _at(1), "<p>see</p>", properties=props), T)
+    assert alone["html"] == f'<p>see</p><p><a href="{url}" rel="noopener" target="_blank">budget.xlsx</a></p>'
 
 
 _BOB = "8:orgid:00000000-0000-0000-0000-00000000000c"

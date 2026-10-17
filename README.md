@@ -238,6 +238,7 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   nothing, never "unread". Kept live from Teams' receipt events on `web`'s Trouter socket, reconciled by one read-only
   GET on chat open and after every reconnect; cached in the presence file so a reopened chat paints at once.
 - **Browsing**: infinite scroll both ways, "↓ latest" when away from the bottom, header search, Open in Teams.
+- **Received files** (spec 027): a card per file (icon, name) linking its sharing link; a pasted file link reads as the file name.
 - **Reply quotes** (spec 021): click a quote (or Tab to it, Enter) to jump to the quoted message, loading the history around it; "quoted message not found" when it is gone.
 - **Members** (spec 022): hover, click or Tab to "N members" for the people, You first then by name, with avatar and presence when known; 50 rows then "… and N more", bots and apps as "+ N apps", "members unavailable" when the roster cannot be had (a roster not cached is fetched without delaying the page). Escape or leaving closes it.
 - **Private chat** (spec 023): in a chat with several people, click someone else's name (or Tab to it, Enter) to switch to your 1:1 with them; Back returns. Middle or Ctrl/⌘ click opens it in a new tab. The server finds the 1:1 in the board rows, then the archive index, with no Teams call; "no private chat with them yet" when there is none.

@@ -231,6 +231,14 @@ def strip_html(content: str) -> str:
     return html.unescape(TAG_RE.sub("", content)).strip()
 
 
+def file_name(entry: dict[str, Any]) -> str:
+    """A `properties.files` entry's name: `fileName`, else `title`, else "file" (spec 027)."""
+    for key in ("fileName", "title"):
+        if isinstance(value := entry.get(key), str) and value:
+            return value
+    return "file"
+
+
 def json_list(value: Any) -> list[Any]:
     """`properties.files` / `.cards` arrive as JSON *strings* (`'[]'` is truthy) or as lists."""
     if isinstance(value, str):
@@ -272,9 +280,7 @@ def snippet(msgtype: str, content: str, props: dict[str, Any] | None = None) -> 
         if not text:
             # A file/card post has an empty body and its payload in properties; the list stub of
             # a deleted message has neither; a body that strips to nothing is an image tag.
-            names = [
-                str(f.get("fileName") or "file") for f in json_list(props.get("files")) if isinstance(f, dict)
-            ]
+            names = [file_name(f) for f in json_list(props.get("files")) if isinstance(f, dict)]
             if names:
                 text = "📎 " + ", ".join(names)
             elif json_list(props.get("cards")):

@@ -65,7 +65,7 @@ from .messages import (
     reaction_key,
     snippet,
 )
-from .render import cards_html, media_url, sanitize
+from .render import cards_html, file_links, files_html, media_url, sanitize
 from .send import attach_images, delete_message, edit_message, message_html, react, send_message, too_long
 
 log = structlog.get_logger()
@@ -322,13 +322,15 @@ def chat_record(
     if activity:
         body = html.escape(activity_line(msgtype, activity, me, name_for))
     elif not deleted:
+        named: set[str] = set()  # 027-AC6: the reference entries the body already links
         if msgtype == "RichText/Html":
             mentions = {
                 str(m.get("itemid")): str(m.get("mri") or "")
                 for m in json_list(props.get("mentions"))
                 if isinstance(m, dict)
             }
-            body = sanitize(content, thread_id, media_dir, me, mentions, custom)
+            names = file_links(props.get("files"))
+            body = sanitize(content, thread_id, media_dir, me, mentions, custom, names, named)
         elif msgtype == "Text":
             body = html.escape(content)
         if msgtype == "RichText/Media_Card" or props.get("cards"):
@@ -336,6 +338,10 @@ def chat_record(
             cards = cards_html(message, media_url=lambda u: media_url(thread_id, media_dir, u))
             body += cards
             kind = "text" if cards and kind == "other" else kind
+        files = "" if kind in ("system", "call") else files_html(props.get("files"), named)
+        if files:  # 027-AC1: after the text, replacing the 📎 marker
+            body += files
+            kind = "text" if kind == "other" else kind
         body = body or html.escape(snippet(msgtype, content, props))  # file/card posts, markers
     reactions = []
     for emotion in json_list(props.get("emotions")):

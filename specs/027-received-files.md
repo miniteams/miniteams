@@ -18,10 +18,14 @@ copy when there is one, SharePoint otherwise.
 
 ## Scope
 
-- **Card.** Each `properties.files` entry of a message renders as a card in the thread: a type icon and
+- **Card.** Each `properties.files` entry of a message (other than `reference`) renders as a card in the thread: a type icon and
   the file name, in the message, after its text. Live, history and edited messages alike.
-- **Hotlink.** The card links to the file's SharePoint `objectUrl`, opened in a new tab (the browser's
-  Microsoft session does the auth). A file without an `objectUrl` shows its name, not a link.
+- **Hotlink.** The card links to the file's sharing link (`fileInfo.shareUrl`), else its `objectUrl`,
+  opened in a new tab (the browser's Microsoft session does the auth). A file with neither shows its
+  name, not a link.
+- **Pasted links (`state: "reference"`).** No card: a plain link whose text is the file name. When the
+  message body already links that file, that link's text becomes the file name instead of a second
+  link. No extra download: body SharePoint links are already archived.
 - **Archive.** `properties.files` entries become attachment items of the existing pipeline (SharePoint
   download without Graph, as `sp_file`), in the archive one-shot, the live archiver and the
   `--verify-media` sweep (which catches up on already archived messages).
@@ -38,10 +42,12 @@ copy when there is one, SharePoint otherwise.
 
 ## Acceptance criteria
 
-- [ ] **AC1** A message with one or more `properties.files` entries shows one card per file (type icon,
+- [ ] **AC1** A message with one or more `properties.files` entries shows one card per non-`reference` file (type icon,
   name) in the chat page, live and from history; a message without any shows none.
-- [ ] **AC2** A card links to the entry's `objectUrl` in a new tab (`noopener`); an entry with no
-  `objectUrl` shows its name unlinked; the name is plain text everywhere.
+- [ ] **AC2** A card links to the entry's `shareUrl`, else its `objectUrl`, in a new tab (`noopener`);
+  an entry with neither shows its name unlinked; the name is plain text everywhere.
+- [ ] **AC6** A `reference` entry shows as a link named after the file, not a card; when the body already
+  links it, that link reads as the file name and no second link appears; it is not downloaded again.
 - [ ] **AC3** With media on and `files` selected, the archive one-shot, the live archiver and
   `--verify-media` download each entry to the chat's media folder, once.
 - [ ] **AC4** `--no-media` downloads none; a video entry follows the `videos` type; a denied entry backs
@@ -52,8 +58,9 @@ copy when there is one, SharePoint otherwise.
 ## Phases
 
 ### Phase 1 — Card and hotlink
-- Work: render `properties.files` as cards in the chat page, linked to `objectUrl`.
-- **Covers**: AC1, AC2
+- Work: render `properties.files` as cards in the chat page, linked to `shareUrl`, else `objectUrl`;
+  `reference` entries as links named after the file.
+- **Covers**: AC1, AC2, AC6
 - **Data model impact**: none
 - **DoD**: unit tests on the server side of the rendering; browser tests in Chrome and Firefox; full
   suite and pre-commit green; the trial message in the test chat shows its card.
@@ -81,3 +88,5 @@ None.
   (2026-10-17).
 - No size cap beyond the existing media types — not asked; `videos` stays the big-file opt-in.
 - Cards in the chat page only, not the widget's previews — overturnable.
+- `shareUrl` before `objectUrl`: most received files live in the sender's OneDrive; `reference` entries
+  are links named after the file — user's calls (2026-10-17, after review).

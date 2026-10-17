@@ -56,6 +56,7 @@ LONG = 250
 D = "19:dddd@thread.v2"  # archived, messages on several days
 K = "19:kkkk@thread.v2"  # archived, a bot card
 R = "19:rrrr@thread.v2"  # archived, deleted runs and reaction chips
+F = "19:ffff@thread.v2"  # archived, a message sharing files (spec 027)
 GONE = {"deletetime": "1789466600000"}
 # An `open` the spy records, not browser_helpers.BARRIER: the real board drops an unknown verb unseen.
 _BARRIER = ("barrier", False)
@@ -140,6 +141,17 @@ def data_dir(tmp_path: Path) -> Path:
     deleted = [_m(i, _at(int(i)), properties=GONE, **(mine if i == "3" else {})) for i in "234"]
     others = [_m(str(i), _at(i), properties=GONE if i == 7 else {}) for i in range(5, 21)]
     _archive(path, R, [_m("1", _at(1), properties=reacts), *deleted, *others])
+    ref = {"files": json.dumps([browser_helpers.REF])}
+    pasted = f'<p>see <a href="{browser_helpers.REF_URL}?e=x">{browser_helpers.REF_URL}</a></p>'
+    _archive(
+        path,
+        F,
+        [
+            _m("1", _at(1), "<p>here</p>", properties={"files": json.dumps(browser_helpers.FILES)}),
+            _m("4", _at(4), pasted, properties=ref),
+            _m("5", _at(5), "<p>no link</p>", properties=ref),
+        ],
+    )
     return path
 
 
@@ -193,6 +205,82 @@ async def test_live_append_edit_delete_reaction_and_typing(board: W.Board, chat:
     assert await page.locator('[data-id="4"] .html').inner_text() == "message deleted"
     await board.on_event(_event("NewMessage", T, messagetype="Control/Typing"))
     await page.wait_for_function("document.getElementById('typing').textContent.includes('Ann Lee')")
+
+
+async def _file_cards(page: Page, mid: str) -> list[dict[str, Any]]:
+    return list(
+        await page.locator(f'[data-id="{mid}"] .html .file').evaluate_all(
+            "ns => ns.map(n => ({tag: n.tagName, text: n.textContent, href: n.getAttribute('href'),"
+            " target: n.getAttribute('target'), rel: n.getAttribute('rel'),"
+            " links: n.querySelectorAll('a').length}))"
+        )
+    )
+
+
+@pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
+async def test_shared_files_show_as_cards_from_history_and_live(board: W.Board, chat: Pages) -> None:
+    """027-AC1, 027-AC2: each file entry is a card after the text, from history, live and edited; its sharing
+    link, else objectUrl, opens in a new tab with noopener; an entry with neither shows its name unlinked, as
+    plain text."""
+    page = await chat.open(_chat(F))
+    await _handled(page, "history")
+    link = {"tag": "A", "text": "📝 plan <v2>.docx", "href": browser_helpers.SHARE, "target": "_blank"}
+    link |= {"rel": "noopener", "links": 0}
+    plain = {"tag": "SPAN", "text": "📃 notes.txt", "href": None, "target": None, "rel": None, "links": 0}
+    assert await _file_cards(page, "1") == [link, plain]
+    assert (
+        await page.locator('[data-id="1"] .html').evaluate("h => h.firstElementChild.outerHTML")
+        == "<p>here</p>"
+    )
+    await board.on_event(
+        _event(
+            "NewMessage",
+            F,
+            **{**_m("2", _at(2)), "content": "", "properties": {"files": browser_helpers.FILES}},
+        )
+    )
+    await page.wait_for_selector('[data-id="2"] .file')
+    assert await _file_cards(page, "2") == [link, plain]
+    assert "📎" not in await page.locator('[data-id="2"] .html').inner_text()  # the cards replace the marker
+    await board.on_event(
+        _event("NewMessage", F, **_m("3", _at(3), "<p>no files</p>", properties={"files": "[]"}))
+    )
+    await page.wait_for_selector('[data-id="3"]')
+    assert await page.locator('[data-id="3"] .file').count() == 0
+    edit = {"edittime": "1789466500000", "files": json.dumps(browser_helpers.FILES)}
+    await board.on_event(_event("MessageUpdate", F, **_m("1", _at(1), "<p>here again</p>", properties=edit)))
+    await page.wait_for_selector('[data-id="1"] .edited')
+    assert await _file_cards(page, "1") == [link, plain]
+    # A quote's line: a file-only message's icon and name together.
+    for mid, line in (("2", "📝 plan <v2>.docx"), ("1", "here again")):
+        await page.locator(f'[data-id="{mid}"]').hover()
+        await _act(page, mid, "reply").click()
+        assert await page.locator(f'#quotes [data-quote="{mid}"] span').inner_text() == line
+
+
+@pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
+async def test_a_pasted_file_link_reads_as_the_file_name(chat: Pages) -> None:
+    """027-AC6: a reference entry the body links renames that link, no card nor second link; one the body
+    does not link adds a plain link named after the file, not a card."""
+    page = await chat.open(_chat(F))
+    await _handled(page, "history")
+    links = "ns => ns.map(a => [a.textContent, a.getAttribute('href'), a.target, a.rel])"
+    url = browser_helpers.REF_URL
+    named = ["budget.xlsx", f"{url}?e=x", "_blank", "noopener"]
+    assert await page.locator('[data-id="4"] .html a').evaluate_all(links) == [named]
+    assert await page.locator('[data-id="5"] .html a').evaluate_all(links) == [
+        ["budget.xlsx", url, "_blank", "noopener"]
+    ]
+    assert await page.locator('[data-id="4"] .file, [data-id="5"] .file').count() == 0
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+async def test_file_cards_read_in_both_themes(chat: Pages, theme: str) -> None:
+    """027-AC1: a file card's name, linked or not, reads at 4.5:1 or more in either theme."""
+    page = await chat.open(f"{_chat(F)}?theme={theme}")
+    await _handled(page, "history")
+    ratios = await page.locator(".html .file").evaluate_all(f"ns => ns.map({CONTRAST})")
+    assert len(ratios) == 2 and min(ratios) >= 4.5, ratios
 
 
 async def test_a_system_line_shows_who_and_its_time(board: W.Board, chat: Pages) -> None:
