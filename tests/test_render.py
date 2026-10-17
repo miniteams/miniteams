@@ -215,6 +215,11 @@ def test_unicode_emoji_becomes_its_character() -> None:
     assert sanitize('<emoji id="cool" alt="😎" title="Cool"></emoji>!', T) == "😎!"
     span = '<span itemtype="http://schema.skype.com/Emoji">👍</span>'
     assert sanitize(span, T) == "👍"
+    # Without `alt`, the emoticon id names it.
+    img = '<img itemscope itemtype="http://schema.skype.com/Emoji" itemid="{}" src="https://x/y.png">'
+    assert sanitize(img.format("meltingface") + img.format("1f389_partypopper"), T) == "🫠🎉"
+    assert sanitize('<emoji id="rock"></emoji>', T) == "🤘"
+    assert sanitize('<emoji alt=""></emoji>', T) == ""
 
 
 def test_custom_emoji_points_at_the_archived_file(media: Path) -> None:
@@ -227,12 +232,33 @@ def test_custom_emoji_points_at_the_archived_file(media: Path) -> None:
         f'<img src="/media/19%3Aaaaa%40thread.v2/{OBJ}.png" class="emoji" alt=":party:">'
     )
     # Not archived: the page cannot fetch it, so its name stands in.
-    assert sanitize(tag, T, None) == ":party:"
+    assert sanitize(tag, T, None) == '<span class="custom-emoji">party</span>'
     # Not archived yet but a known custom emoji (L7): the emoji cache serves it.
     assert sanitize(tag, T, None, custom=frozenset({OBJ})) == (
         f'<img src="/emoji/{OBJ}" class="emoji" alt=":party:">'
     )
-    assert sanitize(tag, T, None, custom=frozenset({"other"})) == ":party:"
+    assert sanitize(tag, T, None, custom=frozenset({"other"})) == '<span class="custom-emoji">party</span>'
+    # The itemid's tail need not be the image id: whichever of the two the cache serves, `src` first.
+    tailed = tag.replace(f'itemid="party;{OBJ}"', 'itemid="party;0-weu-d1-tail"')
+    assert sanitize(tailed, T, None, custom=frozenset({OBJ})) == (
+        f'<img src="/emoji/{OBJ}" class="emoji" alt=":party:">'
+    )
+    assert sanitize(tailed, T, None, custom=frozenset({"0-weu-d1-tail", OBJ})).startswith(
+        f'<img src="/emoji/{OBJ}"'
+    )
+    assert sanitize(tailed, T, None, custom=frozenset({"0-weu-d1-tail"})).startswith(
+        '<img src="/emoji/0-weu-d1-tail"'
+    )
+    # Some carry no `src`: the itemid's tail is the image id.
+    bare = f'<img alt="party" itemid="party;{OBJ}" itemtype="http://schema.skype.com/CustomEmoji">'
+    assert (
+        sanitize(bare, T, None, custom=frozenset({OBJ}))
+        == f'<img src="/emoji/{OBJ}" class="emoji" alt="party">'
+    )
+    assert (
+        sanitize(bare.replace('itemid="party;', 'itemid="x<b>;'), T)
+        == '<span class="custom-emoji">x&lt;b&gt;</span>'
+    )
     # The archived file still wins, and a plain image is never routed to /emoji.
     assert sanitize(tag, T, media, custom=frozenset({OBJ})).startswith('<img src="/media/')
     assert "/emoji/" not in sanitize(

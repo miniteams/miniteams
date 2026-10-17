@@ -12,6 +12,7 @@ import html
 import json
 import re
 import unicodedata
+from collections import Counter
 from collections.abc import Callable
 from typing import Any, NamedTuple
 
@@ -21,6 +22,7 @@ from . import attachments
 from ._io import emit
 from .directory import Directory
 from .emoji_table import SHORTCODES
+from .teams_emojis import TEAMS_DIVERSE, TEAMS_EMOJIS, TEAMS_PLAIN
 
 log = structlog.get_logger()
 
@@ -80,38 +82,6 @@ EMOJI = {
     "upsidedownface": "🙃",
 }
 
-# Teams names differ from the composer's GitHub/Slack shortcodes.
-_REACTION_ALIASES = {
-    "crossedfingers": "crossed_fingers",
-    "launch": "rocket",
-    "loudlycrying": "sob",
-    "clappinghands": "clap",
-    "handsinair": "raised_hands",
-    "victory": "v",
-    "ok": "ok_hand",
-    "raisedfist": "fist_raised",
-    "pointupindex": "point_up",
-    "fistbump": "punch",
-    "screamingfear": "scream",
-    "think": "thinking",
-    "sweatgrinning": "sweat_smile",
-    "upsidedownface": "upside_down_face",
-    "cwl": "joy",
-    "hearteyes": "heart_eyes",
-    "seenoevil": "see_no_evil",
-    "speaknoevil": "speak_no_evil",
-    "puke": "vomiting_face",
-    "lipssealed": "zipper_mouth_face",
-    "hi": "wave",
-    "heartorange": "orange_heart",
-    "heartgreen": "green_heart",
-    "heartyellow": "yellow_heart",
-    "angryface": "angry",
-    "devil": "smiling_imp",
-    "tongueout": "stuck_out_tongue",
-    "grinningfacewithsmilingeyes": "smile",
-}
-
 # Only Unicode Emoji_Modifier_Base characters can take a skin tone.
 # https://www.unicode.org/Public/17.0.0/ucd/emoji/emoji-data.txt
 _TONE_BASES = frozenset(
@@ -133,21 +103,28 @@ def reaction_emoji(key: str) -> str:
     if emoji == f":{base}:":
         return f":{key}:"
     positions = [i for i, char in enumerate(emoji) if char in _TONE_BASES]
-    # Multi-person and already toned sequences need an explicit Unicode key.
-    if len(positions) != 1 or any("🏻" <= char <= "🏿" for char in emoji):
+    if not positions and base in TEAMS_DIVERSE:
+        return emoji  # Teams tones its own art (`bartlett`, a footballer); the glyph ⚽ takes no tone
+    # Multi-person (ZWJ) and already toned sequences need an explicit Unicode key; `fistbump` (🤜🤛) is
+    # two emojis side by side and tones both.
+    if not positions or len(positions) > 1 and "\u200d" in emoji or any("🏻" <= c <= "🏿" for c in emoji):
         return f":{key}:"
-    i = positions[0] + 1
-    tail = emoji[i:].removeprefix("\ufe0f")
-    return emoji[:i] + chr(0x1F3FA + int(tone)) + tail
+    out, start = [], 0
+    for i in positions:
+        out += [emoji[start : i + 1], chr(0x1F3FA + int(tone))]
+        start = i + 1 + (emoji[i + 1 : i + 2] == "\ufe0f")
+    return "".join(out) + emoji[start:]
 
 
 def _reaction_base(key: str) -> str:
     """Resolve legacy names and Teams' hexadecimal Unicode reaction keys."""
+    # EMOJI first: the page's default favorites match chips by these characters (😢 `sad`, not 🙁).
     if key in EMOJI:
         return EMOJI[key]
-    name = _REACTION_ALIASES.get(key, key)
-    if name in SHORTCODES:
-        return SHORTCODES[name]
+    if key in TEAMS_EMOJIS:
+        return TEAMS_EMOJIS[key]
+    if key in SHORTCODES:
+        return SHORTCODES[key]
     codes, sep, _ = key.partition("_")
     if sep and (chars := _code_points(codes)):
         return chars
@@ -175,11 +152,20 @@ def _code_points(codes: str) -> str | None:
     return None
 
 
-# Character (no U+FE0F) → Teams' name for it; EMOJI first, so 👍 is `like`, not `yes`.
-_TEAMS_NAMES = {
-    char.replace("\ufe0f", ""): name
-    for name, char in reversed([*EMOJI.items(), *((a, SHORTCODES[t]) for a, t in _REACTION_ALIASES.items())])
-}
+def _teams_names() -> dict[str, str]:
+    """Character (no U+FE0F) → the Teams name to send for it. Keyed by what the name displays, so a chip
+    shows the character picked; EMOJI first (👍 is `like`, not `yes`). A character Teams names several
+    times goes as its plain name (TEAMS_PLAIN), never a themed variant: without one, the caller's
+    `<hex>_<unicode name>` key."""
+    shared = Counter(char.replace("\ufe0f", "") for char in TEAMS_EMOJIS.values())
+    single = (n for n, char in TEAMS_EMOJIS.items() if shared[char.replace("\ufe0f", "")] == 1)
+    names: dict[str, str] = {}
+    for name in (*EMOJI, *TEAMS_PLAIN.values(), *single):
+        names.setdefault(_reaction_base(name).replace("\ufe0f", ""), name)
+    return names
+
+
+_TEAMS_NAMES = _teams_names()
 
 REACTION_KEY_MAX = 200
 # Disjoint by their first character: Teams names start with a letter, Unicode keys with a digit.
@@ -187,6 +173,7 @@ _TEAMS_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9]{0,63}(?:-tone[1-5])?")
 _UNICODE_KEY_RE = re.compile(
     r"(?P<codes>[0-9][0-9a-fA-F]{3,5}(?:-[0-9a-fA-F]{4,6}){0,15})(?:_\w+)?", re.ASCII
 )
+_TONE_RE = re.compile(r"-tone[1-5]\Z")
 _CUSTOM_KEY_RE = re.compile(r"[A-Za-z0-9_+-]{1,64};[\w-]{1,128}", re.ASCII)  # compose.EMOJI_NAME_RE;<AMS id>
 
 
@@ -196,7 +183,12 @@ def reaction_key(key: str) -> str | None:
     (`1f98a_foxface`, Teams' own form). None for anything else."""
     if len(key) > REACTION_KEY_MAX:
         return None
-    if _TEAMS_NAME_RE.fullmatch(key) or _CUSTOM_KEY_RE.fullmatch(key):
+    # Some catalog ids fit neither shape (`happy_person_raising_one_hand`, `50th_mail`).
+    if (
+        _TEAMS_NAME_RE.fullmatch(key)
+        or _CUSTOM_KEY_RE.fullmatch(key)
+        or _TONE_RE.sub("", key) in TEAMS_EMOJIS
+    ):
         return key
     if not (m := _UNICODE_KEY_RE.fullmatch(key)) or not (chars := _code_points(m["codes"])):
         return None

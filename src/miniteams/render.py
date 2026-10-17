@@ -16,6 +16,7 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 from .attachments import existing, object_id
+from .messages import reaction_emoji
 
 _KEPT = frozenset(
     (
@@ -86,7 +87,9 @@ class _Sanitizer(HTMLParser):
             if tag == "span":
                 self._push(tag, False)  # its text is the character
             elif tag in ("img", "emoji"):
-                self.out.append(html.escape(a.get("alt", "")))
+                # A few come without `alt`: the id names the emoticon.
+                emoticon = a.get("itemid") or a.get("id", "")
+                self.out.append(html.escape(a.get("alt") or (reaction_emoji(emoticon) if emoticon else "")))
             return
         if tag == "img":
             self._img(a, emoji=itemtype.endswith("/CustomEmoji"))
@@ -120,11 +123,14 @@ class _Sanitizer(HTMLParser):
     def _img(self, a: dict[str, str], emoji: bool) -> None:
         src = a.get("src", "")
         local = media_url(self.thread_id, self.media_dir, src)
-        if local is None and emoji and (oid := object_id(src)) in self.custom:
+        name, _, tail = a.get("itemid", "").partition(";")
+        # The itemid's tail need not be the image id, but it is all a `src`-less one has.
+        oid = next((o for o in (object_id(src), tail) if o in self.custom), None) if emoji else None
+        if local is None and oid is not None:
             local = f"/emoji/{oid}"  # sent before the archiver fetched it: served from the emoji cache
         if local is None:
-            if emoji:
-                self.out.append(html.escape(a.get("alt", "")))
+            if emoji:  # no glyph to fall back on: its name, styled apart from the text
+                self.out.append(f'<span class="custom-emoji">{html.escape(name or a.get("alt", ""))}</span>')
                 return
             url = _web_url(src)
             if url is None:

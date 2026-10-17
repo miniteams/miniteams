@@ -190,6 +190,8 @@
   .reacts { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
   .reacts > * { font-size: 12px; border: 1px solid var(--line); background: var(--panel); border-radius: 99px; padding: 0 7px; }
   .reacts button { cursor: pointer; }
+  .reacts img.emoji { height: 1.3em; width: auto; vertical-align: -.3em; }
+  .custom-emoji { font-size: .85em; padding: 0 4px; border-radius: 4px; background: var(--panel-2); color: var(--dim); }
   .reacts button:hover:not(.mine) { border-color: var(--dim); }
   .reacts > .mine { border-color: var(--accent); background: var(--accent-soft); }
   body.readonly .reacts button { pointer-events: none; }
@@ -649,7 +651,11 @@
       const line = el("div", "reacts");
       const people = r.reactions.map((x) => `${x.emoji} — ${(x.people || []).join(", ") || x.count}`).join("\n");
       for (const x of r.reactions) {
-        const chip = el(readOnly ? "span" : "button", x.mine ? "mine" : null, `${x.emoji} ${x.count}`);
+        // A custom emoji has no character: its image, else its name.
+        const face = x.src ? Object.assign(el("img", "emoji"), { src: x.src, alt: x.emoji })
+          : x.key.includes(";") ? el("span", "custom-emoji", x.key.split(";")[0]) : null;
+        const chip = el(readOnly ? "span" : "button", x.mine ? "mine" : null, face ? ` ${x.count}` : `${x.emoji} ${x.count}`);
+        if (face) chip.prepend(face);
         chip.title = people;
         if (!readOnly) {
           chip.setAttribute("aria-label", `${x.emoji} ${x.count}, ${x.mine ? "remove" : "add"}`);
