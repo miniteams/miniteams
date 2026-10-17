@@ -135,6 +135,8 @@ terminal and it reconnects within seconds (it watches the token cache file).
 - A section's header folds it (folds are kept per view); folded, it shows its unread count and `@`. Its ⋯ renames,
   sets **Recent** (by activity) or **Manual** order (an arrival never moves a chat), moves it up or down, and
   deletes it (its chats go to Other).
+- Drag and drop (Sections mode): a chat onto a header (folded too) or a chat files it in that section, at the drop
+  position in a Manual one; onto Other it leaves its section. A header dropped on another lands before it; Other stays last.
 - Keys: ↑/↓ walk headers and chats; on a header Enter, ← and → fold and unfold; ← on a chat goes to its header;
   Alt+↑/↓ moves a chat within a Manual section. From a filter box, ←/→ act only while it is empty.
 

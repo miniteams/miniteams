@@ -61,6 +61,11 @@
   li.sect > [data-k=more] { display: none; border: 1px solid var(--line); background: var(--panel); border-radius: 6px; height: 20px; padding: 0 6px;
     font-size: 12px; line-height: 18px; cursor: pointer; color: var(--dim); }
   li.sect:hover > [data-k=more], li.sect:focus-within > [data-k=more], li.sect.hold > [data-k=more], li.sect:has(> .rowmenu) > [data-k=more] { display: inline-block; }
+  /* .sect.dropin: a selected header's solid outline must not hide that it takes the drop. */
+  ul#rows > li.dropin, ul#rows > li.sect.dropin { outline: 2px dashed var(--accent); outline-offset: -2px; }
+  ul#rows > li:is(.dropup, .dropdown)::after { content: ""; position: absolute; left: 6px; right: 6px; height: 2px; border-radius: 1px; background: var(--accent); pointer-events: none; }
+  ul#rows > li.dropup::after { top: -2px; }
+  ul#rows > li.dropdown::after { bottom: -2px; }
   .cog { position: relative; flex: none; }
   .cog > button { border: 0; background: transparent; color: var(--dim); font-size: 16px; width: 28px; height: 28px; border-radius: 8px; cursor: pointer; }
   .cog > button:hover, .cog.open > button { background: var(--panel-2); color: var(--text); }

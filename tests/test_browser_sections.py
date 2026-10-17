@@ -1,4 +1,4 @@
-"""Chat sections in the list (spec 026 phase 1): the widget and the chat page's split list against a real
+"""Chat sections in the list (spec 026): the widget and the chat page's split list against a real
 board and its sections store. Synthetic data, no network, no Teams.
 
 Run: `uv run --with playwright pytest tests/test_browser_sections.py`.
@@ -231,7 +231,7 @@ async def test_tabs_filter_in_both_modes_and_a_seen_chat_leaves_its_section(view
     await _sections_mode(page)
     await _list_is(page, ["#Work", NAME[B], "#Other", NAME[C]])
     seen = await views.open(view, page.context, tab="seen")
-    await _list_is(seen, ["#Work", NAME[A]])
+    await _list_is(seen, ["#Work", NAME[A], "#Other"])
     recent = await views.open(view, tab="seen")  # a fresh browser: Recent
     await _list_is(recent, [NAME[A]])
 
@@ -250,7 +250,7 @@ async def test_empty_sections_stay_and_a_search_shows_only_what_it_reaches(views
     await _head(page, views.sid("Work")).locator(".shead").click()
     await _list_is(page, ["#Empty", "#Work ▸", "#Other", NAME[A], NAME[C]])
     muted = await views.open(view, page.context, tab="muted")
-    await _list_is(muted, ["#Empty", "#Work ▸"])
+    await _list_is(muted, ["#Empty", "#Work ▸", "#Other"])
     box = await _filter(page)
     if view == "split":
         await page.keyboard.press("Control+k")
@@ -511,7 +511,7 @@ async def test_a_manual_section_keeps_its_order_and_moves_with_alt_arrows(views:
     await _menu(_row(page, C))
     await page.locator(".rowmenu [data-k=file]").click()
     await page.locator(".rowmenu [data-k=sec]").click()
-    await _list_is(page, ["#Work", NAME[C], NAME[A], NAME[B]])
+    await _list_is(page, ["#Work", NAME[C], NAME[A], NAME[B], "#Other"])
     if view == "widget":
         box = page.locator("#q")
         await box.focus()
@@ -523,17 +523,17 @@ async def test_a_manual_section_keeps_its_order_and_moves_with_alt_arrows(views:
         await _row(page, C).locator(".name").focus()
         await page.keyboard.press("Alt+ArrowDown")
     await wait(lambda: views.chats("Work") == [A, C, B], "moved")
-    await _list_is(page, ["#Work", NAME[A], NAME[C], NAME[B]])
+    await _list_is(page, ["#Work", NAME[A], NAME[C], NAME[B], "#Other"])
     if view == "split":
         await until(page, f"document.activeElement.closest('li')?.dataset.id === {json.dumps(C)}")
     await views.reload(page)
-    await _list_is(page, ["#Work", NAME[A], NAME[C], NAME[B]])
+    await _list_is(page, ["#Work", NAME[A], NAME[C], NAME[B], "#Other"])
     other = await views.open("split" if view == "widget" else "widget")
     await _sections_mode(other)
-    await _list_is(other, ["#Work", NAME[A], NAME[C], NAME[B]])
+    await _list_is(other, ["#Work", NAME[A], NAME[C], NAME[B], "#Other"])
     await _menu(_head(page, work))
     await page.locator(".rowmenu [data-k='order:recent']").click()
-    await _list_is(page, ["#Work", NAME[B], NAME[A], NAME[C]])
+    await _list_is(page, ["#Work", NAME[B], NAME[A], NAME[C], "#Other"])
 
 
 # --- review follow-ups ---
@@ -602,7 +602,7 @@ async def test_alt_arrows_move_over_the_chats_shown_only(views: Views, view: str
     views.board.rows[B]["seen_at"] = "2027-01-01T00:00:00.000Z"
     page = await views.open(view)
     await _sections_mode(page)
-    await _list_is(page, ["#Work", NAME[A], NAME[C]])
+    await _list_is(page, ["#Work", NAME[A], NAME[C], "#Other"])
     if view == "widget":
         box = page.locator("#q")
         await box.focus()
@@ -613,10 +613,10 @@ async def test_alt_arrows_move_over_the_chats_shown_only(views: Views, view: str
     else:
         await _row(page, A).locator(".name").focus()
         await page.keyboard.press("Alt+ArrowDown")
-    await _list_is(page, ["#Work", NAME[C], NAME[A]])
+    await _list_is(page, ["#Work", NAME[C], NAME[A], "#Other"])
     assert views.chats("Work") == [B, C, A]
     await (page.locator("#q") if view == "widget" else page.locator(":focus")).press("Alt+ArrowUp")
-    await _list_is(page, ["#Work", NAME[A], NAME[C]])
+    await _list_is(page, ["#Work", NAME[A], NAME[C], "#Other"])
     assert views.chats("Work") == [B, A, C]
 
 
@@ -760,7 +760,7 @@ async def test_deleting_a_section_moves_the_focus_to_the_next_item(views: Views,
     await _list_is(page, ["#Home", "#Other", NAME[A], NAME[B], NAME[C]])
     await _focus_is(page, B)
     muted = await views.open(view, page.context, tab="muted")
-    await _list_is(muted, ["#Home"])
+    await _list_is(muted, ["#Home", "#Other"])
     await _menu(_head(muted, views.sid("Home")))
     await muted.locator(".rowmenu [data-k=delete]").click()
     await muted.locator(".rowmenu [data-k=ok]").press("Enter")
@@ -851,3 +851,365 @@ async def test_two_pages_of_a_view_keep_each_others_folds(views: Views, view: st
     await _head(two, home).locator(".shead").click()
     await views.reload(one)
     await _list_is(one, ["#Work ▸", "#Home", NAME[C], "#Other", NAME[A]])
+
+
+# --- AC8, AC13: drag and drop (phase 2) ---
+
+SENT = "window.__out.filter(f => Object.keys(f).some(k => k.startsWith('section'))).length"
+
+
+async def _drag(page: Page, item: Any, onto: Any, at: str = "middle") -> None:
+    """Drags `item` with the mouse onto `onto`, near its top, middle or bottom edge."""
+    box = await onto.bounding_box()
+    assert box
+    y = {"top": 4, "middle": box["height"] / 2, "bottom": box["height"] - 4}[at]
+    await item.drag_to(onto, target_position={"x": box["width"] / 2, "y": y})
+
+
+async def _drops_nothing(page: Page, item: Any, onto: Any, at: str = "middle") -> None:
+    """The drop sends no sections verb; the list is drawn again once the drag ended."""
+    n = await page.evaluate(SENT)
+    await _drag(page, item, onto, at)
+    await page.evaluate("new Promise(r => setTimeout(r, 100))")
+    assert await page.evaluate(SENT) == n
+    assert await page.locator("#rows > li:is(.dropin, .dropup, .dropdown)").count() == 0
+
+
+@VIEWS
+async def test_a_chat_dropped_on_a_header_files_it_there_folded_too(views: Views, view: str) -> None:
+    """026-AC8: a chat dropped on a section header goes into it, on top of a Manual one, even folded."""
+    views.change("create", "Work", B)
+    views.change("create", "Home", C)
+    work, home = views.sid("Work"), views.sid("Home")
+    views.change("set_order", home, "manual")
+    page = await views.open(view)
+    await _sections_mode(page)
+    await _list_is(page, ["#Work", NAME[B], "#Home", NAME[C], "#Other", NAME[A]])
+    await _drag(page, _row(page, A), _head(page, work))
+    await wait(lambda: views.chats("Work") == [A, B], "filed in Work")
+    await _list_is(page, ["#Work", NAME[A], NAME[B], "#Home", NAME[C], "#Other"])
+    await _head(page, home).locator(".shead").click()
+    await _list_is(page, ["#Work", NAME[A], NAME[B], "#Home ▸", "#Other"])
+    await _drag(page, _row(page, B), _head(page, home))
+    await wait(lambda: views.chats("Home") == [B, C], "on top of Home")
+    await _list_is(page, ["#Work", NAME[A], "#Home ▸", "#Other"])
+
+
+@VIEWS
+async def test_a_chat_dropped_on_a_chat_of_another_section_files_it_there(views: Views, view: str) -> None:
+    """026-AC8, 026-AC13: dropped on a chat of a Recent section it goes in by recency; of a Manual one, at
+    the drop position, above or below that chat."""
+    views.change("create", "Work", B)
+    views.change("create", "Home", C)
+    home = views.sid("Home")
+    views.change("set_order", home, "manual")
+    page = await views.open(view)
+    await _sections_mode(page)
+    await _drag(page, _row(page, A), _row(page, B), "bottom")
+    await wait(lambda: views.chats("Work") == [A, B], "filed in Work")
+    await _list_is(page, ["#Work", NAME[A], NAME[B], "#Home", NAME[C], "#Other"])
+    await _drag(page, _row(page, A), _row(page, C), "bottom")
+    await wait(lambda: views.chats("Home") == [C, A], "below C")
+    await _list_is(page, ["#Work", NAME[B], "#Home", NAME[C], NAME[A], "#Other"])
+    await _drag(page, _row(page, B), _row(page, C), "top")
+    await wait(lambda: views.chats("Home") == [B, C, A], "above C")
+    await _list_is(page, ["#Work", "#Home", NAME[B], NAME[C], NAME[A], "#Other"])
+
+
+@VIEWS
+async def test_a_chat_dragged_in_its_manual_section_lands_at_the_drop(views: Views, view: str) -> None:
+    """026-AC13: in a Manual section a chat lands where dropped, above or below the chat under the mouse;
+    a Recent section ignores the position: recency orders it."""
+    views.change("create", "Work", C)
+    views.change("file", B, views.sid("Work"))
+    views.change("file", A, views.sid("Work"))
+    work = views.sid("Work")
+    page = await views.open(view)
+    await _sections_mode(page)
+    await _list_is(page, ["#Work", NAME[A], NAME[B], NAME[C], "#Other"])
+    await _drops_nothing(page, _row(page, C), _row(page, A), "top")
+    await _list_is(page, ["#Work", NAME[A], NAME[B], NAME[C], "#Other"])
+    views.change("set_order", work, "manual")
+    await _drag(page, _row(page, C), _row(page, A), "top")
+    await wait(lambda: views.chats("Work") == [C, A, B], "C on top")
+    await _list_is(page, ["#Work", NAME[C], NAME[A], NAME[B], "#Other"])
+    await _drag(page, _row(page, C), _row(page, A), "bottom")
+    await wait(lambda: views.chats("Work") == [A, C, B], "C below A")
+    await _drag(page, _row(page, A), _row(page, B), "bottom")
+    await wait(lambda: views.chats("Work") == [C, B, A], "A last")
+    await _list_is(page, ["#Work", NAME[C], NAME[B], NAME[A], "#Other"])
+    await _drops_nothing(page, _row(page, A), _row(page, A), "top")
+    await _drops_nothing(page, _row(page, A), _row(page, B), "bottom")  # its own slot
+    await _drops_nothing(page, _row(page, B), _row(page, C), "bottom")
+    assert views.chats("Work") == [C, B, A]
+
+
+@VIEWS
+async def test_a_chat_dropped_on_other_leaves_its_section(views: Views, view: str) -> None:
+    """026-AC8: dropped on Other's header (shown empty too) or on one of its chats, a chat leaves its
+    section; a chat already in Other dropped there changes nothing."""
+    views.change("create", "Work", B)
+    views.change("file", A, views.sid("Work"))
+    views.change("file", C, views.sid("Work"))
+    page = await views.open(view)
+    await _sections_mode(page)
+    await _list_is(page, ["#Work", NAME[A], NAME[B], NAME[C], "#Other"])
+    await _drag(page, _row(page, B), _head(page, ""))
+    await wait(lambda: views.chats("Work") == [C, A], "B out")
+    await _list_is(page, ["#Work", NAME[A], NAME[C], "#Other", NAME[B]])
+    await _drag(page, _row(page, C), _row(page, B))
+    await wait(lambda: views.chats("Work") == [A], "C out")
+    await _list_is(page, ["#Work", NAME[A], "#Other", NAME[B], NAME[C]])
+    await _drops_nothing(page, _row(page, C), _head(page, ""))
+
+
+@VIEWS
+async def test_a_header_dragged_reorders_the_sections_and_other_stays_last(views: Views, view: str) -> None:
+    """026-AC8: a header dropped on another lands before it, dropped on Other lands last; Other does not
+    drag and nothing lands after it."""
+    for name in ("Home", "Work", "Jobs"):
+        views.change("create", name)
+    home, jobs = views.sid("Home"), views.sid("Jobs")
+    page = await views.open(view)
+    await _sections_mode(page)
+    await _list_is(page, ["#Home", "#Work", "#Jobs", "#Other", NAME[A], NAME[B], NAME[C]])
+    await _drag(page, _head(page, jobs), _head(page, home))
+    await wait(lambda: views.names() == ["Jobs", "Home", "Work"], "Jobs first")
+    await _list_is(page, ["#Jobs", "#Home", "#Work", "#Other", NAME[A], NAME[B], NAME[C]])
+    await _drag(page, _head(page, jobs), _head(page, ""))
+    await wait(lambda: views.names() == ["Home", "Work", "Jobs"], "Jobs last")
+    await _list_is(page, ["#Home", "#Work", "#Jobs", "#Other", NAME[A], NAME[B], NAME[C]])
+    assert await _head(page, "").get_attribute("draggable") == "false"
+    await _drops_nothing(page, _head(page, ""), _head(page, home))
+    await _drops_nothing(page, _head(page, home), _row(page, A))
+    await _drops_nothing(page, _head(page, home), _head(page, views.sid("Work")))  # where it already is
+    await _drops_nothing(page, _head(page, jobs), _head(page, ""))
+    assert views.names() == ["Home", "Work", "Jobs"]
+
+
+@VIEWS
+async def test_a_click_without_a_drag_opens_and_folds_as_before(
+    views: Views, view: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """026-AC8: rows and headers drag only in Sections mode; there a plain click still opens the chat and
+    folds a header, and sends no sections verb."""
+    opened: list[str] = []
+
+    async def spy(thread_id: str, target: str = "app", ws: Any = None, msg_id: str = "") -> bool:
+        opened.append(thread_id)
+        return True
+
+    monkeypatch.setattr(views.board, "open_row", spy)
+    views.board.opener = ["true"]
+    views.change("create", "Work", B)
+    work = views.sid("Work")
+    page = await views.open(view)
+    assert await _row(page, B).get_attribute("draggable") is None
+    await _sections_mode(page)
+    assert await _row(page, B).get_attribute("draggable") == "true"
+    assert await _head(page, work).get_attribute("draggable") == "true"
+    await _row(page, B).locator(".name").click()
+    if view == "widget":
+        await wait(lambda: opened == [B], "opened")
+    else:
+        await until(page, f"location.pathname === {json.dumps('/chat/' + quote(B, safe=''))}")
+    await _head(page, work).locator(".shead").click()
+    await _list_is(page, ["#Work ▸", "#Other", NAME[A], NAME[C]])
+    assert await page.evaluate(SENT) == 0
+
+
+@VIEWS
+async def test_a_broadcast_during_a_drag_waits_for_its_end(views: Views, view: str) -> None:
+    """026-AC8: the list is not rebuilt under a drag (its source would go); the change shows once it ends."""
+    views.change("create", "Work", B)
+    page = await views.open(view)
+    await _sections_mode(page)
+    drag = f"""t => {{ const li = document.querySelector('#rows > li[data-id="{A}"]'); window.__src = li;
+      li.dispatchEvent(new DragEvent(t, {{ bubbles: true, dataTransfer: new DataTransfer() }})); }}"""
+    await page.evaluate(drag, "dragstart")
+    n = await page.evaluate("window.__frames.filter(f => 'rows' in f).length")
+    views.change("rename", views.sid("Work"), "Jobs")
+    await until(page, f"window.__frames.filter(f => 'rows' in f).length > {n}")
+    assert await page.evaluate("window.__src.isConnected")
+    await _list_is(page, ["#Work", NAME[B], "#Other", NAME[A], NAME[C]])
+    await page.evaluate(drag, "dragend")
+    await _list_is(page, ["#Jobs", NAME[B], "#Other", NAME[A], NAME[C]])
+
+
+# A drag step dispatched on an item (`#<sid>` for a header) at `y` (0 top … 1 bottom); true when the page
+# took it (a drop allowed). A drop or dragend whose item is gone goes to the list; any other step needs its
+# item. One DataTransfer per drag, as in a real one.
+DND = """([type, key, y]) => {
+  const li = document.querySelector(key[0] === '#'
+    ? `#rows > li[data-sid="${key.slice(1)}"]` : `#rows > li[data-id="${key}"]`)
+    || (['drop', 'dragend'].includes(type) ? document.querySelector('#rows') : null);
+  if (!li) throw new Error(`no item ${key} for ${type}`);
+  const r = li.getBoundingClientRect();
+  if (type === 'dragstart') window.__dt = new DataTransfer();
+  const e = new DragEvent(type, { bubbles: true, cancelable: true, clientX: r.left + r.width / 2,
+    clientY: r.top + (y ?? 0.5) * r.height, dataTransfer: window.__dt });
+  li.dispatchEvent(e);
+  return e.defaultPrevented;
+}"""
+MARKS = """[...document.querySelectorAll('#rows > li:is(.dropin, .dropup, .dropdown)')]
+  .map(li => (li.dataset.id ?? '#' + li.dataset.sid) + ' '
+    + [...li.classList].filter(c => c.startsWith('drop')).join(' '))"""
+
+
+async def _dnd(page: Page, kind: str, key: str, y: float | None = None) -> bool:
+    return bool(await page.evaluate(DND, [kind, key, y]))
+
+
+@VIEWS
+@pytest.mark.parametrize("case", ["header-on-gone", "chat-on-gone", "gone-header"])
+async def test_a_drop_on_a_section_deleted_mid_drag_sends_nothing(views: Views, view: str, case: str) -> None:
+    """026-AC8: renders wait for a drag, so a section deleted by another view stays on screen: a header or
+    a chat dropped on it, or the dragged header deleted itself, sends no verb (not a move to the top, not
+    a filing into Other)."""
+    for name in ("Home", "Spare", "Jobs"):
+        views.change("create", name)
+    views.change("create", "Work", A)
+    home, spare, jobs = views.sid("Home"), views.sid("Spare"), views.sid("Jobs")
+    item, gone, onto = {
+        "header-on-gone": ("#" + jobs, home, home),
+        "chat-on-gone": (A, spare, spare),
+        "gone-header": ("#" + jobs, jobs, home),
+    }[case]
+    page = await views.open(view)
+    await _sections_mode(page)
+    await _list_is(page, ["#Home", "#Spare", "#Jobs", "#Work", NAME[A], "#Other", NAME[B], NAME[C]])
+    await _dnd(page, "dragstart", item)
+    n = await page.evaluate("window.__frames.filter(f => 'rows' in f).length")
+    views.change("delete", gone)
+    await until(page, f"window.__frames.filter(f => 'rows' in f).length > {n}")
+    assert not await _dnd(page, "dragover", "#" + onto)
+    assert await page.evaluate(MARKS) == []
+    await _dnd(page, "drop", "#" + onto)
+    await _dnd(page, "dragend", item)
+    await page.evaluate("new Promise(r => setTimeout(r, 100))")
+    assert await page.evaluate(SENT) == 0
+    left = {home: "Home", spare: "Spare", jobs: "Jobs"}[gone]
+    assert views.names() == [x for x in ("Home", "Spare", "Jobs", "Work") if x != left]
+    assert views.chats("Work") == [A]
+
+
+@VIEWS
+async def test_drop_markers_show_where_a_chat_would_land(views: Views, view: str) -> None:
+    """026-AC8, 026-AC13: while a chat is dragged, a header it would go into is outlined; a Manual
+    section's chat shows a line above or below, by the half under the mouse; an invalid target none."""
+    views.change("create", "Work", B)
+    views.change("create", "Home", C)
+    views.change("file", A, views.sid("Home"))
+    work, home = views.sid("Work"), views.sid("Home")
+    views.change("set_order", home, "manual")
+    page = await views.open(view)
+    await _sections_mode(page)
+    await _list_is(page, ["#Work", NAME[B], "#Home", NAME[A], NAME[C], "#Other"])
+    await _dnd(page, "dragstart", B)
+    for key, y, marks in (
+        ("#" + home, None, ["#" + home + " dropin"]),
+        (C, 0.2, [C + " dropup"]),
+        (C, 0.8, [C + " dropdown"]),
+        (A, 0.8, [A + " dropdown"]),
+        ("#", None, ["# dropin"]),
+        (B, None, []),
+        ("#" + work, None, []),
+    ):
+        assert await _dnd(page, "dragover", key, y) == bool(marks), key
+        assert await page.evaluate(MARKS) == marks, (key, y)
+    # A selected header shows the drop's dashed outline, not its own solid one.
+    head = f"document.querySelector('#rows > li[data-sid=\"{home}\"]')"
+    await page.evaluate(f"{head}.classList.add('sel')")
+    assert await _dnd(page, "dragover", "#" + home)
+    assert await page.evaluate(f"getComputedStyle({head}).outlineStyle") == "dashed"
+    await _dnd(page, "dragend", B)
+    assert await page.evaluate(MARKS) == []
+
+
+@VIEWS
+async def test_a_chat_dropped_on_its_manual_header_goes_on_top(views: Views, view: str) -> None:
+    """026-AC13: dropped on its own Manual section's header a chat goes first; already first, no verb."""
+    views.change("create", "Work", C)
+    views.change("file", B, views.sid("Work"))
+    work = views.sid("Work")
+    views.change("set_order", work, "manual")
+    page = await views.open(view)
+    await _sections_mode(page)
+    await _list_is(page, ["#Work", NAME[B], NAME[C], "#Other", NAME[A]])
+    await _drag(page, _row(page, C), _head(page, work))
+    await wait(lambda: views.chats("Work") == [C, B], "C first")
+    await _list_is(page, ["#Work", NAME[C], NAME[B], "#Other", NAME[A]])
+    await _drops_nothing(page, _row(page, C), _head(page, work))
+
+
+@VIEWS
+async def test_a_row_drag_carries_only_its_own_type(views: Views, view: str) -> None:
+    """026-AC8: a row's drag carries no link or text: its title dropped on the composer types nothing."""
+    views.change("create", "Work", B)
+    page = await views.open(view)
+    await _sections_mode(page)
+    types = """id => {
+      const dt = new DataTransfer(), li = document.querySelector(`#rows > li[data-id="${id}"]`);
+      dt.setData('text/uri-list', 'https://example.invalid/');
+      dt.setData('text/plain', 'https://example.invalid/');
+      const start = new DragEvent('dragstart', { bubbles: true, dataTransfer: dt });
+      li.querySelector('.name').dispatchEvent(start);
+      const t = [...dt.types];
+      li.dispatchEvent(new DragEvent('dragend', { bubbles: true }));
+      return t; }"""
+    assert await page.evaluate(types, A) == ["application/x-miniteams-item"]
+    if view == "widget":
+        await _row(page, A).hover()
+        await _row(page, A).locator("[data-k=reply]").click()
+    box = page.locator("#reply")
+    await box.wait_for()
+    await _row(page, B).locator(".name").drag_to(box)
+    await page.evaluate("new Promise(r => setTimeout(r, 100))")
+    assert await box.input_value() == ""
+
+
+@VIEWS
+@pytest.mark.parametrize("end", ["move", "drop"])
+async def test_a_drag_with_no_dragend_is_over_at_a_drop_or_a_buttonless_move(
+    views: Views, view: str, end: str
+) -> None:
+    """026-AC8: a drag whose dragend never reached the list (its source gone) stops holding the list at a
+    drop on it or at the first pointer move with no button pressed: a change made meanwhile shows."""
+    views.change("create", "Work", B)
+    page = await views.open(view)
+    await _sections_mode(page)
+    await _dnd(page, "dragstart", A)
+    n = await page.evaluate("window.__frames.filter(f => 'rows' in f).length")
+    views.change("rename", views.sid("Work"), "Jobs")
+    await until(page, f"window.__frames.filter(f => 'rows' in f).length > {n}")
+    await _list_is(page, ["#Work", NAME[B], "#Other", NAME[A], NAME[C]])
+    if end == "move":
+        await page.mouse.move(5, 5)
+        await page.mouse.move(10, 10)
+    else:
+        await _dnd(page, "drop", "#")
+    await _list_is(page, ["#Jobs", NAME[B], "#Other", NAME[A], NAME[C]])
+
+
+@VIEWS
+async def test_a_menu_closed_by_the_focus_gives_its_item_its_drag_back(views: Views, view: str) -> None:
+    """026-AC8: an item drags but while its ⋯ menu is open; the menu closed by the focus leaving it, the row
+    or header drags again at once (no broadcast in between); in Recent mode a row stays undraggable."""
+    views.change("create", "Work", B)
+    work = views.sid("Work")
+    page = await views.open(view)
+    box = await _filter(page)
+
+    async def close_by_focus(item: Any, before: str | None, after: str | None) -> None:
+        await _menu(item)
+        assert await item.get_attribute("draggable") == before
+        n = await page.evaluate("window.__frames.length")
+        await box.focus()
+        await until(page, "!document.querySelector('.rowmenu')")
+        assert await page.evaluate("window.__frames.length") == n
+        assert await item.get_attribute("draggable") == after
+
+    await close_by_focus(_row(page, A), None, None)
+    await _sections_mode(page)
+    await close_by_focus(_row(page, A), "false", "true")
+    await close_by_focus(_head(page, work), "false", "true")

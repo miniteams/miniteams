@@ -176,8 +176,11 @@
       const menu = list.querySelector(".rowmenu");
       if (!open || !menu || menu.parentElement.contains(document.activeElement)) return;
       shut();
-      menu.parentElement.querySelector("[data-k=more]")?.setAttribute("aria-expanded", "false");
+      const li = menu.parentElement;
+      li.querySelector("[data-k=more]")?.setAttribute("aria-expanded", "false");
       menu.remove();
+      // The menu took its drag (sectionList); an item never draggable (Recent mode) has no attribute.
+      if (li.hasAttribute("draggable") && li.dataset.sid !== "") li.draggable = true;
     }));
     const btn = (cls, text, k, act) => { const b = el("button", cls, text); b.dataset.k = k; b.onclick = act; return b; };
     const pick = (on, text, k, act) => { const b = btn(null, (on ? "✓ " : "") + text, k, act); b.setAttribute("aria-pressed", String(on)); return b; };
@@ -275,8 +278,8 @@
         ...(i < all.length - 1 ? [btn(null, "↓ Move down", "down", act({ section_move: s.id, by: 1 }))] : []),
         btn(null, "Delete…", "delete", to("delete"))];
     });
-    // A redraw would move the name box and cancel an IME composition: the page waits for its end.
-    return Object.assign(row, { head, held: () => composing && document.activeElement === typed });
+    // A redraw would move the name box and cancel an IME composition, or drop a drag's source: the page waits for their end.
+    return Object.assign(row, { head, held: () => secs.dragging() || (composing && document.activeElement === typed) });
   };
 
   // The list's sections (spec 026), from the board frame only: a change shows once the server broadcasts
@@ -338,11 +341,12 @@
       // A chat selected in a folded section hands the selection to its header: nothing hidden takes keys.
       const hidden = groups.find(([s, rows]) => (searching ? searched : folded).has(s ? s.id : "") && rows.some((r) => r.id === sel));
       if (hidden) select(sel = "§" + (hidden[0]?.id ?? ""));
-      // Other only with chats to show: it is no drop target in this phase.
+      // Every item drags but Other, and one with its menu open: a drag would take the mouse from its name box.
+      const drags = (li) => { li.draggable = !li.querySelector(".rowmenu") && (li.dataset.sid ?? "x") !== ""; return li; };
       return groups.flatMap(([s, rows]) => {
-        if (!rows.length && (searching || !s)) return [];
+        if (!rows.length && searching) return [];
         const shut = (searching ? searched : folded).has(s ? s.id : "");
-        return [header(s, rows, shut, sel, actions), ...(shut ? [] : rows.map(row))];
+        return [header(s, rows, shut, sel, actions), ...(shut ? [] : rows.map(row))].map(drags);
       });
     };
     // The Recent / Sections switch, in `box`, shown once a section exists.
@@ -383,7 +387,57 @@
       if (seen.includes(id) && next) send({ section_chat_move: id, to: s.chats.indexOf(next) });
       return true;
     };
-    return { set, list: () => sections, holder, items, paint, side, nudge, land };
+    // Drag and drop: `drag` is the dragged item's key. A chat goes into the section of the header or chat
+    // it is dropped on, at the drop position in a Manual section; a header lands before the header it is
+    // dropped on, last on Other. `target` → [verb, item to mark, mark] or null.
+    let drag = "", mark = null;
+    const unmark = () => { mark?.classList.remove("dropin", "dropup", "dropdown"); mark = null; };
+    const target = (li, e) => {
+      const sid = li?.dataset.sid, id = li?.dataset.id, to = sid ? sections.find((x) => x.id === sid) : undefined;
+      // Renders wait for the drag: a section another view deleted meanwhile is still on screen, no target.
+      if (!drag || (sid === undefined && id === undefined) || (sid && !to)) return null;
+      if (drag[0] === "§") {
+        // A header deleted mid-drag, or one dropped where it already is, moves nothing.
+        const h = drag.slice(1), now = sections.findIndex((s) => s.id === h), ids = sections.map((s) => s.id).filter((x) => x !== h);
+        const at = sid ? ids.indexOf(sid) : ids.length;
+        return sid === undefined || sid === h || now < 0 || at === now ? null : [{ section_move: h, to: at }, li, "dropup"];
+      }
+      const from = holder(drag), s = sid !== undefined ? to : holder(id), head = itemOf(list, "§" + (s?.id ?? ""));
+      if (!s) return from ? [{ section_file: drag, section: null }, head, "dropin"] : null;
+      const manual = s.order === "manual";
+      if (sid !== undefined && from === s) return manual && s.chats[0] !== drag ? [{ section_chat_move: drag, to: 0 }, head, "dropin"] : null;
+      if (sid !== undefined || !manual) return from === s ? null : [{ section_file: drag, section: s.id }, head, "dropin"];
+      const r = li.getBoundingClientRect(), below = e.clientY > r.top + r.height / 2, at = s.chats.filter((c) => c !== drag).indexOf(id) + below;
+      if (id === drag || (from === s && at === s.chats.indexOf(drag))) return null;
+      return [from === s ? { section_chat_move: drag, to: at } : { section_file: drag, section: s.id, at }, li, below ? "dropdown" : "dropup"];
+    };
+    const stop = () => { drag = ""; unmark(); render(); };
+    list.addEventListener("dragstart", (e) => {
+      const li = e.target.closest?.("li[draggable=true]");
+      if (!li || !on()) return;
+      drag = itemKey(li);
+      // Only the private type: the title link's URL would land as text in the composer. Firefox starts no drag without data.
+      e.dataTransfer.clearData();
+      e.dataTransfer.setData("application/x-miniteams-item", drag);
+    });
+    list.addEventListener("dragover", (e) => {
+      const t = target(e.target.closest?.("li"), e);
+      unmark();
+      if (!t) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      mark = t[1]; mark?.classList.add(t[2]);
+    });
+    list.addEventListener("dragleave", unmark);
+    list.addEventListener("drop", (e) => {
+      const t = target(e.target.closest?.("li"), e);
+      if (t) { e.preventDefault(); send(t[0]); }
+      if (drag) stop();
+    });
+    list.addEventListener("dragend", stop);
+    // A source removed mid-drag fires its dragend off the list: the first move with no button ends the drag.
+    addEventListener("pointermove", (e) => { if (drag && e.buttons === 0) stop(); });
+    return { set, list: () => sections, holder, items, paint, side, nudge, land, dragging: () => !!drag };
   };
 
   // A textarea exposes no caret coordinates: lay the text out in a hidden copy, the caret's word whole (it wraps with it).
