@@ -19,6 +19,7 @@
 | [015](015-presence.md) | Presence on avatars | shipped |
 | [016](016-custom-reactions.md) | Custom reaction picker (favorites + any emoji) | shipped |
 | [017](017-visible-send-queue.md) | Visible send queue, burst sends from the widget | shipped |
+| [018](018-keyboard-nav.md) | Keyboard navigation in the chat page | approved |
 | [019](019-edit-composer-parity.md) | Editing a message works like composing one | shipped |
 | [020](020-auto-read.md) | Mark a chat read in Teams when it is shown | shipped |
 | [021](021-quote-jump.md) | A reply's quote leads to the quoted message | shipped |
