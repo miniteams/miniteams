@@ -386,13 +386,13 @@ async def test_row_buttons_take_no_width_until_hover_or_focus(split: Split) -> N
 
 async def test_the_chat_header_is_ten_tabs_from_the_filter_with_many_rows(split: Split) -> None:
     """011-AC29: one row name in the Tab order (roving tabindex): with 400 rows, Tab goes filter → tabs →
-    current row (→ ⋯) → separator → ☰ → search within 10 presses."""
+    current row (→ ⋯) → separator → ☰ within 10 presses, then members (022-AC3: its open list) → search."""
     split.fake.rows = _board(400)
     page = await split.open(viewport={"width": 1300, "height": 800})
     assert await page.locator('#rows .name[tabindex="0"]').count() == 1
     await page.locator("#filter").focus()
     path = []
-    for _ in range(10):
+    for _ in range(12):
         await page.keyboard.press("Tab")
         path.append(await _focused(page))
         if path[-1] == "#find":
@@ -406,8 +406,11 @@ async def test_the_chat_header_is_ten_tabs_from_the_filter_with_many_rows(split:
         "k:more",
         "#grip",
         "#menu",
+        "#members",
+        "#mpop",
         "#find",
     ]
+    assert path.index("#menu") < 10
     cur = page.locator("#rows li.cur")
     assert await cur.locator(".name").get_attribute("tabindex") == "0"
 

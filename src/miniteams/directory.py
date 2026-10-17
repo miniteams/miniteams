@@ -183,6 +183,10 @@ class Directory:
         self._threads.pop(thread_id, None)
         self._thread_failed.pop(thread_id, None)
 
+    def known(self, thread_id: str) -> bool:
+        """A copy is cached, stale or a 404: thread() answers it without waiting on a fetch."""
+        return thread_id in self._threads
+
     async def thread(self, thread_id: str, max_age: float | None = None) -> dict[str, Any] | None:
         """Topic, roster and picture of a thread; None when unknown or not fetchable right now.
 

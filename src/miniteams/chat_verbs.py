@@ -88,6 +88,7 @@ ANY_VALUE = frozenset({"preview"})  # verb keys matched on presence, not on a th
 _COMPLETE_ITEMS = 12  # completion list length
 _COMPLETE_Q_MAX = 64
 _ROSTER_TTL = 600.0  # seconds a roster is trusted: members join and leave without a board event
+_MEMBERS_SHOWN = 50  # the members popover's rows (spec 022): a big meeting's roster stays out of the frame
 _ARCHIVE_WORKERS = 4
 _THREAD_PREFIX = "archive"
 _MEDIA_READS = 2  # media pool threads: concurrent media reads
@@ -615,6 +616,17 @@ def _member_items(humans: dict[str, str], thread_id: str, me: str, q: str) -> li
         if name and not is_me(mri, me) and any(p.startswith(prefix) for p in (folded, *folded.split())):
             items.append({"name": name, "mri": mri})
     return items[:_COMPLETE_ITEMS]
+
+
+def _people(members: list[dict[str, Any]] | None, me: str) -> dict[str, Any]:
+    """Spec 022: the roster's people, me first then by name, the first _MEMBERS_SHOWN, their count and
+    the apps' (the label counts both); `people: None` without a roster."""
+    if members is None:
+        return {"people": None}
+    humans = sorted(_humans(members).items(), key=lambda h: (not is_me(h[0], me), fold(h[1]), h[0]))
+    people = [{"name": name, "mri": mri, "me": is_me(mri, me)} for mri, name in humans]
+    apps = sum(1 for m in members if is_app(str(m["mri"])))
+    return {"people": people[:_MEMBERS_SHOWN], "members_total": len(people), "apps": apps}
 
 
 async def reply(ws: ServerConnection, frame: dict[str, Any]) -> None:
@@ -1448,6 +1460,25 @@ class ChatVerbs:
             return None
         info = await self.directory.thread(thread_id, max_age=_ROSTER_TTL)
         return None if info is None else list(info["members"])
+
+    async def roster_now(self, thread_id: str) -> dict[str, Any] | None:
+        """Spec 022: the roster's people from the cache (a stale copy refetched behind it); None when
+        nothing is cached: the fetch must not hold the socket loop."""
+        if self.directory is None:
+            return {"people": None}
+        if not self.directory.known(thread_id):
+            return None
+        return _people(await self._members(thread_id), self.me)
+
+    def roster_later(self, ws: ServerConnection, thread_id: str, following: Callable[[], bool]) -> None:
+        """Spec 022: fetch the roster off the socket loop, then push it while `following` still holds."""
+
+        async def push() -> None:
+            frame = _people(await self._members(thread_id), self.me)
+            if following():  # the page moved on: its next follow asks again
+                await reply(ws, {"members": thread_id, **frame})
+
+        self._background(push())
 
     def _emoji_items(self, prefix: str) -> list[dict[str, Any]]:
         found: list[dict[str, Any]] = [

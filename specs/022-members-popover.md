@@ -1,6 +1,6 @@
 # 022 — The chat's members on hover
 
-**Status**: in progress
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-10-16
 
@@ -16,13 +16,16 @@ and presence when known.
 ## Scope
 
 - **Data.** The server sends the page the chat's roster (names and MRIs, people only: bots and apps
-  left out, as the roster already does for mentions) when the page follows the chat, from the cached
-  roster (`_ROSTER_TTL`), so opening a chat costs no extra Teams call when it is fresh.
+  left out, as the roster already does for mentions, plus their `apps` count) when the page follows a
+  chat whose name carries a member count. The follow answers from the cached roster (`_ROSTER_TTL`;
+  a stale copy is refetched behind it); a roster not cached yet is fetched in the background and
+  arrives in its own `members` frame.
 - **Popover.** Under the header on hover and on keyboard focus of "N members" (made focusable);
   avatar initials or picture as elsewhere on the page, name, presence dot when the page has it;
-  sorted by name, "You" first; at most 50 rows, then "… and N more"; Escape or leaving closes it.
+  sorted by name, "You" first; at most 50 rows, then "… and N more"; "+ N apps" for the bots and
+  apps the count includes; Escape or leaving closes it; a click toggles it.
 - **Count.** "N members" keeps coming from the label; the list may be missing (roster unavailable),
-  then the popover says "members unavailable".
+  then the popover says "members unavailable". With no count, "N members" is hidden.
 
 ## Out of scope
 
@@ -32,12 +35,14 @@ and presence when known.
 
 ## Acceptance criteria
 
-- [ ] **AC1** Following a chat answers its roster's people (name, MRI), bots and apps excluded.
-- [ ] **AC2** Hovering "N members" shows the list sorted by name with "You" first, avatar and
+- [x] **AC1** Following a chat answers its roster's people (name, MRI), bots and apps excluded (counted
+  as `apps`), from the cache; a roster not cached arrives in its own `members` frame.
+- [x] **AC2** Hovering "N members" shows the list sorted by name with "You" first, avatar and
   presence when known; leaving or Escape hides it.
-- [ ] **AC3** "N members" is reachable by Tab and its focus shows the same list.
-- [ ] **AC4** More than 50 members shows 50 rows then "… and N more".
-- [ ] **AC5** With no roster, the popover says "members unavailable"; names are text, never markup.
+- [x] **AC3** "N members" is reachable by Tab and its focus shows the same list.
+- [x] **AC4** More than 50 members shows 50 rows then "… and N more"; the bots and apps the label
+  counts show as "+ N apps", so the lines add up to it.
+- [x] **AC5** With no roster, the popover says "members unavailable"; names are text, never markup.
 
 ## Phases
 
@@ -60,3 +65,5 @@ None.
 
 - A popover, not a native tooltip (user's call, 2026-10-16) — a big meeting's names do not fit a
   `title`.
+- A roster to fetch comes in its own `members` frame, not in the follow answer: the follow must never
+  block the socket loop.

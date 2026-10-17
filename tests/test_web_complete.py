@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +11,22 @@ import pytest
 import structlog
 import structlog.testing
 from conftest import wait
-from test_web_chat import ANN, ME, NOPE, B, C, T, _archive, _at, _chat_socket, _cookie, _m, _send, _served
+from test_web_chat import (
+    ANN,
+    ME,
+    NOPE,
+    B,
+    C,
+    T,
+    _archive,
+    _at,
+    _chat_socket,
+    _cookie,
+    _m,
+    _Recorder,
+    _send,
+    _served,
+)
 
 from miniteams import chat_verbs as CV
 from miniteams import compose, emojis
@@ -19,6 +35,7 @@ from miniteams.config import Settings
 from miniteams.directory import Directory
 
 ELO = "8:orgid:00000000-0000-0000-0000-00000000000d"
+ZOE = "8:orgid:00000000-0000-0000-0000-00000000000f"  # unfolded, "Zoe" sorts before "Élodie"
 BOT = "28:00000000-0000-0000-0000-0000000000ee"
 TRIO = "19:trio0000@thread.v2"  # group of me, Ann and a bot: two humans
 DUO = "19:00000000-0000-0000-0000-00000000000a_00000000-0000-0000-0000-00000000000b@unq.gbl.spaces"
@@ -766,3 +783,119 @@ async def test_a_custom_emoji_item_carries_the_key_the_cli_lists(
     assert listed.partition(";")[2] != OID
     request = CV.parse_act("react", {"react": T, "msg": "1", "key": items[0]["key"]})
     assert isinstance(request, CV.ActRequest) and request.key == listed
+
+
+# --- the follow answer's members (spec 022) ---
+
+
+def _counted(board: W.Board, thread_id: str, n: int) -> None:
+    board.rows[thread_id]["label"] = f"Team · {n}p"  # the popover opens on the label's count
+
+
+async def _pushed(ws: _Recorder) -> dict[str, Any]:
+    await wait(lambda: bool(ws.frames), "members frame")
+    [frame] = ws.frames
+    return frame
+
+
+async def test_follow_answers_at_once_and_pushes_the_people_me_first_then_by_name(
+    board: W.Board, rosters: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """022-AC1: a roster to fetch is not waited on: the follow answers without it, then a `members` frame
+    brings its people (bots counted apart), me first, then by name with accents folded."""
+    monkeypatch.setitem(_ROSTERS, B, [{"mri": ZOE, "name": "Zoe Ray"}, *_ROSTERS[B]])
+    _counted(board, B, 5)
+    ws = _Recorder()
+    answer = await board.follow(ws, B)  # type: ignore[arg-type]
+    assert answer["ok"] and "people" not in answer
+    assert await _pushed(ws) == {
+        "members": B,
+        "people": [
+            {"name": "Me Self", "mri": ME, "me": True},
+            {"name": "Ann Lee", "mri": ANN, "me": False},
+            {"name": "Élodie Martin", "mri": ELO, "me": False},
+            {"name": "Zoe Ray", "mri": ZOE, "me": False},
+        ],
+        "members_total": 4,
+        "apps": 1,
+    }
+    assert rosters == [B]
+
+
+async def test_no_roster_asked_without_a_count_nor_for_a_channel(board: W.Board, rosters: list[str]) -> None:
+    """022-AC1: a label with no member count (1:1, untitled group) or a channel: `people` None, no fetch."""
+    board.rows[C] = _row(C)
+    _counted(board, C, 9)
+    ws = _Recorder()
+    for thread in (DUO, TRIO, C):
+        assert (await board.follow(ws, thread))["people"] is None  # type: ignore[arg-type]
+    await asyncio.sleep(0.05)
+    assert (rosters, ws.frames) == ([], [])
+
+
+async def test_a_roster_landing_after_the_page_moved_on_is_not_pushed(
+    board: W.Board, directory: Directory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """022-AC1: the fetch runs off the socket loop; the page left the chat before it landed: no frame.
+    A roster that cannot be had pushes `people: None` (022-AC5)."""
+    release = asyncio.Event()
+
+    async def slow_fetch(self: Directory, thread_id: str) -> dict[str, Any] | None:
+        await release.wait()
+        return {"topic": None, "members": [dict(m) for m in _ROSTERS[thread_id]]} if thread_id == B else None
+
+    monkeypatch.setattr(Directory, "thread", _THREAD)
+    monkeypatch.setattr(Directory, "_fetch_thread", slow_fetch)
+    _counted(board, B, 4)
+    _counted(board, TRIO, 3)
+    ws = _Recorder()
+    assert "people" not in await board.follow(ws, B)  # type: ignore[arg-type]
+    assert "people" not in await board.follow(ws, TRIO)  # type: ignore[arg-type]
+    release.set()
+    assert await _pushed(ws) == {"members": TRIO, "people": None}
+    await wait(lambda: B in directory._threads, "B's roster cached")
+    assert len(ws.frames) == 1
+
+
+async def test_a_cached_roster_is_answered_inline_and_a_stale_one_refetched(
+    board: W.Board, directory: Directory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """022-AC1, 022-AC4: any cached copy is in the follow answer itself, no `members` frame; a stale one
+    is refetched behind it. A big one sends the first 50 people by name, their count and the apps'."""
+    crowd = [{"mri": f"8:orgid:{i:032x}", "name": f"Zed {i:03d}"} for i in range(120)]
+    bots = [{"mri": f"28:{i:032x}", "name": f"Aa Bot {i}"} for i in range(10)]
+    info = {"topic": None, "members": [*reversed(crowd), *bots]}
+    fetched: list[str] = []
+
+    async def fetch(self: Directory, thread_id: str) -> dict[str, Any]:
+        fetched.append(thread_id)
+        return info
+
+    monkeypatch.setattr(Directory, "thread", _THREAD)
+    monkeypatch.setattr(Directory, "_fetch_thread", fetch)
+    directory._threads[B] = (time.monotonic(), info)
+    _counted(board, B, 130)
+    ws = _Recorder()
+    answer = await board.follow(ws, B)  # type: ignore[arg-type]
+    assert (answer["members_total"], answer["apps"]) == (120, 10)
+    assert [m["name"] for m in answer["people"]] == [f"Zed {i:03d}" for i in range(50)]
+    await asyncio.sleep(0.05)
+    assert fetched == []  # fresh: Teams is not asked
+    directory._threads[B] = (time.monotonic() - CV._ROSTER_TTL - 1, info)
+    assert (await board.follow(ws, B))["members_total"] == 120  # type: ignore[arg-type]
+    await wait(lambda: fetched == [B], "stale roster refetched")
+    assert ws.frames == []
+
+
+async def test_a_cached_404_is_answered_inline_as_no_roster(
+    board: W.Board, directory: Directory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """022-AC5: a roster Teams answered 404 for is cached as such: `people: None` at once, no frame."""
+    monkeypatch.setattr(Directory, "thread", _THREAD)
+    monkeypatch.setattr(Directory, "_fetch_thread", lambda *a: pytest.fail("no roster fetch expected"))
+    directory._threads[B] = (time.monotonic(), None)
+    _counted(board, B, 4)
+    ws = _Recorder()
+    assert (await board.follow(ws, B))["people"] is None  # type: ignore[arg-type]
+    await asyncio.sleep(0.05)
+    assert ws.frames == []

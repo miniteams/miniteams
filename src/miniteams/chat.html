@@ -122,7 +122,15 @@
   }
   h1 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -.01em; }
   #label { flex: 1 1 auto; min-width: 6em; }
-  #members { color: var(--faint); font-size: 12.5px; white-space: nowrap; }
+  #members { color: var(--faint); font-size: 12.5px; white-space: nowrap; border-radius: 4px; }
+  #members:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  /* Spec 022: the members popover; absolute, so opening it moves neither the header nor the list. */
+  #mpop { position: absolute; top: 100%; width: min(280px, 92vw); max-height: 60vh; overflow-y: auto; font-size: 13px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); padding: 4px; }
+  #mpop ul { list-style: none; margin: 0; padding: 0; }
+  #mpop li { display: flex; align-items: center; gap: 8px; padding: 3px 6px; }
+  #mpop .mav { flex: none; width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; font-size: 10px; font-weight: 650; color: #fff; }
+  #mpop .none { color: var(--dim); padding: 3px 6px; }
   #status { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); flex: none; }
   #status.off { background: var(--hot); box-shadow: 0 0 0 3px color-mix(in srgb, var(--hot) 25%, transparent); }
   .btn { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 3px 10px; cursor: pointer; color: var(--dim); font-size: 12.5px; white-space: nowrap; }
@@ -311,7 +319,8 @@
   <button id="menu" class="btn" title="chats" aria-label="chats" aria-controls="side">☰</button>
   <a id="back" href="/?nav=chat" title="back to the chat list">◀</a>
   <h1 id="label" class="truncate">…</h1>
-  <span id="members"></span>
+  <span id="members" role="button" aria-expanded="false" aria-controls="mpop" tabindex="0" hidden></span>
+  <div id="mpop" role="region" aria-label="chat members" tabindex="0" hidden></div>
   <span id="status" class="off" title="connecting…"></span>
   <input id="find" type="search" placeholder="search · Enter" aria-label="search this chat">
   <button id="teams" class="btn" title="open this chat in Teams" aria-label="Open in Teams" disabled><span class="full">Open in Teams</span><span class="icon" aria-hidden="true">↗</span></button>
@@ -1163,6 +1172,60 @@
 
   const renderTyping = () => { $typing.textContent = typing.size ? "✍ " + [...typing].join(", ") + (typing.size > 1 ? " are" : " is") + " typing…" : ""; };
 
+  // Spec 022: the members under "N members", on hover (delayed, the popover hoverable too) or focus.
+  const $mpop = document.getElementById("mpop"), MEMBERS_SHOWN = 50;
+  // roster: undefined while the server fetches it (its own `members` frame follows), null when unavailable.
+  let roster, rosterTotal = 0, rosterApps = 0, mTimer = 0, dismissed = false;
+  const paintMembers = () => {
+    if (!roster) { $mpop.replaceChildren(el("div", "none", roster === null ? "members unavailable" : "loading members…")); return; }
+    const ul = el("ul"), shown = roster.slice(0, MEMBERS_SHOWN);
+    for (const p of shown) {  // the server sends them sorted: me first, then by name
+      const name = p.me ? "You" : p.name || "?", av = el("span", "mav", initials(p.name || name));
+      av.style.background = avatarBg(p.mri); av.dataset.pmri = p.mri.toLowerCase();
+      const li = el("li");
+      li.append(presenceDot(av), Object.assign(el("span", "truncate", name), { dir: "auto" }));
+      ul.append(li);
+    }
+    const more = Math.max(rosterTotal, roster.length) - shown.length;
+    // The label's count includes the bots and apps: the lines add up to it.
+    $mpop.replaceChildren(ul, ...(more > 0 ? [el("div", "none", `… and ${more} more`)] : []),
+      ...(rosterApps > 0 ? [el("div", "none", `+ ${rosterApps} app${rosterApps > 1 ? "s" : ""}`)] : []));
+  };
+  const setRoster = (m) => {
+    roster = Array.isArray(m.people) ? m.people.filter((p) => p && typeof p.name === "string" && typeof p.mri === "string") : null;
+    rosterTotal = Number.isInteger(m.members_total) ? m.members_total : 0;
+    rosterApps = Number.isInteger(m.apps) ? m.apps : 0;
+    if (!$mpop.hidden) paintMembers();
+  };
+  const showMembers = (on) => {
+    clearTimeout(mTimer);
+    if (on === !$mpop.hidden) return;
+    $members.setAttribute("aria-expanded", on);
+    $mpop.hidden = !on;
+    if (!on) return;
+    paintMembers();
+    $mpop.style.left = Math.max(0, Math.min($members.offsetLeft, $mpop.parentElement.clientWidth - $mpop.offsetWidth - 8)) + "px";
+  };
+  // Leaving closes only once neither the pointer nor the focus is on "N members" or the popover.
+  const kept = () => $members.matches(":hover") || $mpop.matches(":hover") || $members === document.activeElement || $mpop.contains(document.activeElement);
+  // Dismissed (Escape, a closing click): a pending timer must not reopen it while the focus stays on it.
+  const membersSoon = (ms) => { clearTimeout(mTimer); mTimer = setTimeout(() => showMembers(kept() && !dismissed), ms); };
+  const toggleMembers = () => { dismissed = !$mpop.hidden; showMembers(!dismissed); };
+  $members.addEventListener("mouseenter", () => { dismissed = false; membersSoon(300); });  // a pointer passing over opens nothing
+  for (const n of [$members, $mpop]) for (const ev of ["mouseleave", "focusout"]) n.addEventListener(ev, () => membersSoon(150));
+  $members.addEventListener("focus", () => { dismissed = false; showMembers(true); });
+  $members.onmousedown = (e) => e.preventDefault();  // a click must not leave the focus there: leaving would not close it
+  $members.onclick = toggleMembers;
+  $members.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleMembers(); } };
+  // Capture: Escape closes the popover first, before the composer or an editor sees it. Focus inside it
+  // goes back to "N members" (its focus handler runs while the popover is still open), not to the body.
+  addEventListener("keydown", (e) => {
+    if (e.key !== "Escape" || $mpop.hidden) return;
+    e.stopPropagation();
+    if ($mpop.contains(document.activeElement)) $members.focus();
+    dismissed = true; showMembers(false);
+  }, true);
+
   const onFollow = (m) => {
     if (m.follow !== thread) return;  // a chat left since
     if (m.error) { hist.followFailed = true; $note.hidden = false; $note.className = "err"; $note.textContent = m.error; return; }
@@ -1182,7 +1245,8 @@
     const label = m.label || thread, n = label.match(/ · (\d+)p$/);
     $label.textContent = n ? label.slice(0, n.index) : label;
     $label.title = thread;
-    $members.textContent = n ? n[1] + " members" : "";
+    $members.textContent = n ? n[1] + " members" : ""; $members.hidden = !n;
+    if ("people" in m) setRoster(m);  // absent: the server pushes it in a `members` frame
     document.title = $label.textContent + " · miniteams";
   };
   const PLACEHOLDER = $reply.placeholder;
@@ -1537,7 +1601,7 @@
     typing.clear(); renderTyping();
     $msgs.replaceChildren(); $note.hidden = false; $note.className = ""; $note.textContent = "loading…";
     closeHits(); $find.value = "";
-    $teams.disabled = true; $members.textContent = "";
+    $teams.disabled = true; $members.textContent = ""; $members.hidden = true; roster = undefined; showMembers(false);
     showLatest();
   };
   const switchTo = (id, push) => {
@@ -1684,6 +1748,7 @@
       }
       else if ("gap" in m) { if (m.gap === thread) resync(); }  // no `thread` key: a gap of a chat left is ignored here
       else if ("follow" in m) onFollow(m);
+      else if ("people" in m) { if (m.members === thread) setRoster(m); }  // a chat left since: dropped
       else if ("history" in m) onHistory(m);
       else if ("search" in m) onSearch(m);
       else if ("complete" in m) { complete.answered(m); esearch.answered(m); for (const w of $msgs.querySelectorAll(".editbox")) w.ed.complete.answered(m); }
