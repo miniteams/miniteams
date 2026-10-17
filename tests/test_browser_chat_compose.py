@@ -612,6 +612,21 @@ async def test_reaction_hover_lists_every_emotion_and_its_people(fake: Fake) -> 
     assert await chips.first.get_attribute("title") == "🚀 — Ann Lee"
 
 
+async def test_custom_reaction_shows_its_image_or_its_name(fake: Fake) -> None:
+    page, _ = _parts(fake)
+    reactions = [
+        {"key": "kekwait;0-a", "emoji": ":kekwait:", "src": "/emoji/0-a", "count": 1, "mine": False},
+        {"key": "partyparrot;0-b", "emoji": ":partyparrot:", "count": 2, "mine": False},
+    ]
+    fake.send({"edit": {**MINE, "reactions": reactions}, "thread": T})
+    await fake.handled()
+    chips = page.locator('[data-id="1"] .reacts > *')
+    assert await chips.nth(0).locator("img.emoji").get_attribute("src") == "/emoji/0-a"
+    assert (await chips.nth(0).inner_text()).strip() == "1"
+    assert await chips.nth(1).locator(".custom-emoji").inner_text() == "partyparrot"
+    assert ":" not in await chips.nth(1).inner_text()
+
+
 async def test_repick_after_reload_keeps_both_short_and_full_mentions(pages: Pages) -> None:
     fake = Fake()
     page = await _open(pages, fake)

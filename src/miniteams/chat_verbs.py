@@ -243,9 +243,10 @@ def chat_record(
     media_dir: Path | None = None,
     custom: frozenset[str] = frozenset(),
     name_for: Callable[[str], str] | None = None,
+    images: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """One message as the chat page shows it (spec 011): sanitised body, reactions, mention kind.
-    `custom`: the custom emoji object ids `/emoji/<id>` serves."""
+    `custom`: the custom emoji object ids `/emoji/<id>` serves; `images`: their reaction key → object id."""
     props = message.get("properties")
     props = props if isinstance(props, dict) else {}
     message = {**message, "properties": props}  # mention_kind reads it too
@@ -284,6 +285,8 @@ def chat_record(
         )
         if users:
             key = str(emotion.get("key") or "")
+            # The emoji cache knows a custom key's image id; else its tail mostly is one.
+            oid = (images or {}).get(key) or key.partition(";")[2]
             reactions.append(
                 {
                     "key": key,
@@ -292,6 +295,7 @@ def chat_record(
                     "mine": any(is_me(u, me) for u in users),
                     "people": [name_for(u) if name_for else u for u in users],
                 }
+                | ({"src": f"/emoji/{oid}"} if oid in custom else {})
             )
     return {
         "id": str(message.get("id") or ""),
@@ -1419,7 +1423,7 @@ class ChatVerbs:
     ) -> list[dict[str, Any]]:
         """Records of a page, on the archive pool: sanitising globs the media folder (NFS)."""
         records = []
-        custom = self.emojis.custom()
+        custom, images = self.emojis.custom(), self.emojis.images()
         for message in messages:
             try:
                 records.append(
@@ -1430,6 +1434,7 @@ class ChatVerbs:
                         media,
                         custom,
                         self.directory.name_for if self.directory else None,
+                        images,
                     )
                 )
             except Exception as exc:  # noqa: BLE001 — one malformed message must not lose the page

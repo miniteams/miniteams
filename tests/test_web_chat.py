@@ -28,7 +28,9 @@ from miniteams import web as W
 from miniteams.archive_store import ChatStore, Index, Page, find_chat_dir
 from miniteams.config import Settings
 from miniteams.directory import Directory
-from miniteams.messages import REACTION_KEY_MAX
+from miniteams.emojis import EmojiCache
+from miniteams.messages import EMOJI, REACTION_KEY_MAX, _reaction_base, reaction_emoji, reaction_key
+from miniteams.teams_emojis import TEAMS_EMOJIS
 
 T = "19:aaaa@thread.v2"  # archived, not on the board
 B = "19:bbbb@thread.v2"  # on the board, not archived
@@ -498,6 +500,8 @@ def test_record_deleted_message_has_no_body() -> None:
         ("270d_writinghand-tone3", "✍🏽"),
         ("1f469-200d-1f4bb_technologist-tone2", "👩🏼‍💻"),
         ("launch-tone1", ":launch-tone1:"),
+        ("bartlett-tone2", "⚽"),  # Teams tones its footballer art, not the ball
+        ("bartlett-tone6", ":bartlett-tone6:"),
         ("party_custom-tone1", ":party_custom-tone1:"),
         ("yes-tone0", ":yes-tone0:"),
         ("yes-tone6", ":yes-tone6:"),
@@ -516,8 +520,19 @@ def test_record_deleted_message_has_no_body() -> None:
         ("ok", "👌"),
         ("pointupindex", "☝️"),
         ("pointupindex-tone2", "☝🏼"),
-        ("fistbump", "👊"),
-        ("fistbump-tone4", "👊🏾"),
+        ("fistbump", "🤜🤛"),
+        ("fistbump-tone4", "🤜🏾🤛🏾"),
+        # Teams' own catalog (teams_emojis.py), keys seen in real chats.
+        ("rock", "🤘"),
+        ("smilingfacewithtear", "🥲"),
+        ("meltingface", "🫠"),
+        ("pinchedfingers", "🤌"),
+        ("pinchedfingers-tone3", "🤌🏽"),
+        ("dance", "🕺"),
+        ("stareyes", "🤩"),
+        ("heartonfire", "❤️\u200d🔥"),
+        ("sad", "😢"),
+        ("rocket;0-frc-d4-0123456789abcdef", ":rocket:"),
         ("heartyellow", "💛"),
         ("hearteyes", "😍"),
         ("seenoevil", "🙈"),
@@ -535,6 +550,60 @@ def test_record_decodes_unicode_reaction_keys(key: str, emoji: str) -> None:
     emotions = [{"key": key, "users": [{"mri": ME}]}]
     record = CV.chat_record(_m("7", _at(7), properties={"emotions": emotions}), T, ME)
     assert record["reactions"] == [{"key": key, "emoji": emoji, "count": 1, "mine": True, "people": [ME]}]
+
+
+def test_record_points_a_known_custom_reaction_at_its_image() -> None:
+    """A custom emoji has no character: its image when the emoji cache serves it, else the page names it."""
+    emotions = [
+        {"key": f"kekwait;{OBJ}", "users": [{"mri": ME}]},
+        {"key": "partyparrot;x9", "users": [{"mri": ME}]},
+    ]
+    record = CV.chat_record(
+        _m("7", _at(7), properties={"emotions": emotions}), T, ME, custom=frozenset({OBJ})
+    )
+    assert [(r["emoji"], r.get("src")) for r in record["reactions"]] == [
+        (":kekwait:", f"/emoji/{OBJ}"),
+        (":partyparrot:", None),
+    ]
+    # The key's tail is not the image id: the emoji cache maps the key to it.
+    emotions = [{"key": "kekwait;0-weu-d1-tail", "users": [{"mri": ME}]}]
+    message = _m("7", _at(7), properties={"emotions": emotions})
+    images = {"kekwait;0-weu-d1-tail": OBJ}
+    record = CV.chat_record(message, T, ME, custom=frozenset({OBJ}), images=images)
+    assert record["reactions"][0]["src"] == f"/emoji/{OBJ}"
+    assert "src" not in CV.chat_record(message, T, ME, custom=frozenset({OBJ}))["reactions"][0]
+
+
+def test_emoji_cache_maps_reaction_keys_to_image_ids() -> None:
+    cache = EmojiCache(None)
+    cache.names = {"kekwait": OBJ, "gone": "0-weu-d1-gone"}
+    cache.keys = {"kekwait": "kekwait;0-weu-d1-tail", "nameless": "nameless;0-weu-d1-x"}
+    assert cache.images() == {"kekwait;0-weu-d1-tail": OBJ}
+
+
+_SENDABLE = sorted({_reaction_base(name) for name in [*EMOJI, *TEAMS_EMOJIS]})
+
+
+def test_a_character_with_themed_variants_goes_as_its_plain_name() -> None:
+    """⚽ is not `bartlett` (a footballer), 🙁 not `saddog`, ♻ not `windturbine`."""
+    assert [reaction_key(codes) for codes in ("26bd", "1f641", "267b-fe0f")] == [
+        "soccerball",
+        "1f641_slightlyfrowningface",
+        "recycle",
+    ]
+
+
+@pytest.mark.parametrize("char", _SENDABLE, ids=ascii)
+def test_a_sent_reaction_shows_the_character_picked(char: str) -> None:
+    """What the page sends for a character (its code points) comes back as that character, so the
+    picker finds the chip again."""
+    key = reaction_key("-".join(f"{ord(c):04x}" for c in char))
+    if char == "\U0001facd":  # 🫍 is newer than Python's Unicode: refused like any unassigned point
+        assert key is None
+        return
+    assert key is not None
+    assert reaction_key(key) == key  # a chip of it can be clicked again
+    assert reaction_emoji(key).replace("\ufe0f", "") == char.replace("\ufe0f", "")
 
 
 def test_record_reactions_count_and_mine() -> None:
@@ -2361,6 +2430,8 @@ def test_react_accepts_the_three_key_shapes_and_sends_teams_keys() -> None:
         "starMSER",
         "1f525_fire",
         "1f9d1-200d-1f4bb_technologist",
+        "happy_person_raising_one_hand-tone3",  # catalog ids outside both shapes
+        "50th_mail",
         custom,
     ):
         assert sent(key) == key
@@ -2369,8 +2440,17 @@ def test_react_accepts_the_three_key_shapes_and_sends_teams_keys() -> None:
         ("2764-fe0f", "heart"),  # ❤️, its presentation selector left out of the lookup
         ("1f44d", "like"),  # not `yes`
         ("1f643", "upsidedownface"),
-        ("1f680", "launch"),  # a _REACTION_ALIASES name
-        ("1f98a", "1f98a_foxface"),  # 🦊: no Teams name
+        ("1f680", "launch"),  # Teams' only name for 🚀
+        ("1f622", "sad"),  # the default reactions keep their names: 😢 is `sad`, not `cry`
+        ("1f621", "angry"),
+        ("1f44f", "clappinghands"),  # TEAMS_PLAIN: not 'sarcastic'
+        ("1f918", "1f918_signofthehorns"),  # the character's own id before `rock`
+        ("1f642", "smile"),  # catalog order: `smile` before `50th_smile`
+        ("1f44a", "1f44a_oncomingfist"),  # 👊, not `fistbump` (🤜🤛)
+        ("1f61b", "1f61b_facewithtongue"),  # 😛, not `tongueout` (😋)
+        ("1f910", "1f910_zippermouthface"),  # 🤐, not `lipssealed` (🤫)
+        ("1f620", "1f620_angryface"),  # 😠: no Teams name shows it (`angry` is 😡 here)
+        ("1f98a", "foxhug"),  # 🦊: Teams' only fox
         ("2665-fe0f", "2665_blackheartsuit"),  # a final U+FE0F dropped, as Teams' own keys do
     ):
         assert sent(key) == teams, key
@@ -2383,6 +2463,8 @@ def test_react_accepts_the_three_key_shapes_and_sends_teams_keys() -> None:
         ";0-abc",
         "name;id;more",
         "1f64f_",
+        "happy_person_raising_one_hand-tone6",
+        "50th_mail-tone1-tone2",
         "d800-0041",  # starts with a letter: not a Unicode key, and not a name
         "0000",  # a control
         "200d",  # a lone joiner: no name to send
@@ -2568,12 +2650,18 @@ async def test_a_hung_media_folder_relays_without_media(
     real = W.chat_record
 
     def record(
-        message: dict[str, Any], thread_id: str, me: str, media: Any, custom: Any, name_for: Any = None
+        message: dict[str, Any],
+        thread_id: str,
+        me: str,
+        media: Any,
+        custom: Any,
+        name_for: Any = None,
+        images: Any = None,
     ) -> dict[str, Any]:
         seen.append(media)
         if media is not None:
             release.wait(5)
-        return real(message, thread_id, me, media, custom, name_for)
+        return real(message, thread_id, me, media, custom, name_for, images)
 
     monkeypatch.setattr(W, "chat_record", record)
     monkeypatch.setitem(CV._DEADLINES, "relay", 0.05)

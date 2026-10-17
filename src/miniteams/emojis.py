@@ -160,6 +160,10 @@ class EmojiCache:
         """Object ids of the custom emojis `/emoji/<id>` serves."""
         return frozenset(self.names.values())
 
+    def images(self) -> dict[str, str]:
+        """{reaction key: object id} of the custom emojis `/emoji/<id>` serves."""
+        return {key: self.names[name] for name, key in self.keys.items() if name in self.names}
+
     async def refresh(
         self, interval: float = _REFRESH, retry: float = _RETRY, retry_max: float = _RETRY_MAX
     ) -> None:

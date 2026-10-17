@@ -1711,7 +1711,7 @@ async def test_reaction_chips_add_or_remove_mine(chat: Pages, calls: list[tuple[
     assert labels == [
         ["👍 1, remove", True],
         ["❤️ 1, add", False],
-        [":party: 1, add", False],
+        ["🥳 1, add", False],  # Teams' own `party`
         [":toString: 1, add", False],
     ]
     assert await page.locator('[data-id="1"] .reacts span').count() == 0
@@ -2322,7 +2322,7 @@ async def test_any_emoji_reacts_at_once_and_leaves_the_favorites(
     key, a custom one as `<name>;<id>`; the favorites stay; Escape closes the search."""
     page = await chat.open(_chat(T))
     await _handled(page, "history")
-    for q in ("fox", "parr"):
+    for q in ("woozy", "parr"):  # 🥴: no Teams name
         await page.locator('[data-id="1"]').hover()
         await _act(page, "1", "react").click()
         await page.locator('[data-id="1"] .picker .more').click()
@@ -2331,7 +2331,8 @@ async def test_any_emoji_reacts_at_once_and_leaves_the_favorites(
         assert await page.locator(".esearch").count() == 0
         assert await page.evaluate("document.activeElement.dataset.id") == "1"  # not <body>
     await _until(calls, 2)
-    assert calls == [("react", T, "1", "1f98a_foxface", False), ("react", T, "1", _PARROT, False)]
+    woozy = "1f974_facewithuneveneyesandwavymouth"
+    assert calls == [("react", T, "1", woozy, False), ("react", T, "1", _PARROT, False)]
     assert await page.evaluate("localStorage.getItem('reactions')") is None
     await page.locator('[data-id="1"]').hover()
     await _act(page, "1", "react").click()
