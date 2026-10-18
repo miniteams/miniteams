@@ -1,6 +1,6 @@
 # 024 — Native widget window and simpler launch
 
-**Status**: in progress
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-10-18
 
@@ -53,29 +53,29 @@ in the same Chromium engine. Launching any page needs no launch file: the token 
 
 ## Acceptance criteria
 
-- [ ] **AC1** With `miniteams web` running, `miniteams widget` opens a window showing the board, signed
+- [x] **AC1** With `miniteams web` running, `miniteams widget` opens a window showing the board, signed
   in through the URL token on first run and through the kept cookie afterwards.
-- [ ] **AC2** The window's `_NET_WM_ICON` holds the 256×256 icon, still after a reload; its window class
+- [x] **AC2** The window's `_NET_WM_ICON` holds the 256×256 icon, still after a reload; its window class
   is `miniteams`.
-- [ ] **AC3** Closing the window hides it; the tray icon shows it again; tray Quit exits the process.
-- [ ] **AC4** The tray icon's badge and tooltip follow the chosen preference (unread, mentions, Inbox,
+- [x] **AC3** Closing the window hides it; the tray icon shows it again; tray Quit exits the process.
+- [x] **AC4** The tray icon's badge and tooltip follow the chosen preference (unread, mentions, Inbox,
   none) and change as the board changes, also while the window is hidden; the filter box does not
   change them.
-- [ ] **AC5** The "Tray" section of ⚙ shows only in the native window; tray → Settings… opens it.
-- [ ] **AC6** A link that would open a new window or tab opens in the system browser; opening a chat
+- [x] **AC5** The "Tray" section of ⚙ shows only in the native window; tray → Settings… opens it.
+- [x] **AC6** A link that would open a new window or tab opens in the system browser; opening a chat
   behaves as today.
-- [ ] **AC7** Without the optional dependencies, `miniteams widget` exits with the command to install
+- [x] **AC7** Without the optional dependencies, `miniteams widget` exits with the command to install
   them; without a running `miniteams web`, it exits naming the address it tried.
-- [ ] **AC8** No launch file is written; `http://<bind>/#<token>` signs a browser in once and the token is
+- [x] **AC8** No launch file is written; `http://<bind>/#<token>` signs a browser in once and the token is
   renewed; `launch_file` / `MINITEAMS_LAUNCH_FILE` are gone from `src/`, `tests/`, `.env.example` and the
   README (past specs and the README's migration note may still name `open.html`).
-- [ ] **AC9** When the bind in `web.json` is taken, `miniteams web` exits non-zero naming it, and
+- [x] **AC9** When the bind in `web.json` is taken, `miniteams web` exits non-zero naming it, and
   `web.json` is unchanged.
-- [ ] **AC10** With notifications on mentions, a new message mentioning me raises one desktop
+- [x] **AC10** With notifications on mentions, a new message mentioning me raises one desktop
   notification (sender, chat, text); with every message, any new message in a non-muted chat does; none
   for my own messages, muted chats (a mention excepted, as on the @ tab) or the chat the focused window
   shows; with none, nothing.
-- [ ] **AC11** The notification's Open button shows the widget and opens that chat as clicking its row
+- [x] **AC11** The notification's Open button shows the widget and opens that chat as clicking its row
   does; dismissing it opens nothing.
 
 ## Phases
