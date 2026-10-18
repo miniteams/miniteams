@@ -30,8 +30,8 @@ in the same Chromium engine. Launching any page needs no launch file: the token 
   The count ignores the text typed in the filter box. "99+" past 99.
 - **Notifications.** A preference picks what raises a desktop notification: none, mentions, or every new
   message in a non-muted chat. Muted and Seen-marked chats follow the tabs' rules; never for my own
-  messages; none while the window is focused on that chat. Clicking one shows the widget and opens
-  the chat, as clicking its row does.
+  messages; none while the window is focused on that chat. Its Open button shows the widget and opens
+  the chat, as clicking its row does; dismissing it opens nothing.
 - **Settings.** A "Tray" section in the widget's ⚙, shown only inside the native window, holds the
   badge and notification preferences. Tray → Settings… shows the window with the ⚙ open.
 - **Links.** Links the page would open in a new window or tab (target=_blank, middle click,
@@ -73,8 +73,10 @@ in the same Chromium engine. Launching any page needs no launch file: the token 
   `web.json` is unchanged.
 - [ ] **AC10** With notifications on mentions, a new message mentioning me raises one desktop
   notification (sender, chat, text); with every message, any new message in a non-muted chat does; none
-  for my own messages, muted chats or the chat the focused window shows; with none, nothing.
-- [ ] **AC11** Clicking a notification shows the widget and opens that chat as clicking its row does.
+  for my own messages, muted chats (a mention excepted, as on the @ tab) or the chat the focused window
+  shows; with none, nothing.
+- [ ] **AC11** The notification's Open button shows the widget and opens that chat as clicking its row
+  does; dismissing it opens nothing.
 
 ## Phases
 
@@ -123,12 +125,26 @@ None.
 - Cost, measured under Xvfb: ~261 MB download (~670 MB installed) for the optional extra; ~770 MB RSS
   with the board loaded vs ~500 MB for today's Chromium window (software rendering under Xvfb; likely
   lower on the desktop).
-- Notifications in scope as phase 3: a none / mentions / every-message preference, a click opens the
-  chat — user's call (2026-10-18, review comment).
-- The "@" badge uses a contrasting colour (the icon's blue made it unreadable at 22 px).
+- Notifications in scope as phase 3: a none / mentions / every-message preference, its Open action opens
+  the chat — user's call (2026-10-18, review comment).
+- Badge colours fixed: red pill white digits for unread/Inbox, amber pill dark digits for mentions — user's
+  call (2026-10-18). Red `#c62828` / white 5.6:1, amber `#f59e0b` / `#171a21` 8.1:1; the two hues stay apart at
+  22 px (a burnt orange was too close to the red), and the icon's blue was unreadable there.
 - Bridge: a QWebChannel, its script injected by the window at document creation; the page reads
   `window.miniteamsTray` (a promise of the `tray` object: `badge(pref, count)` in, `settings` out), absent in a
   browser. Phase 3 adds its notification calls to the same object.
-- Badge default: Unread. With the mentions preference the icon shows "@" (amber), the tooltip the count —
-  overturnable.
+- Badge default: Unread — overturnable. With the mentions preference the icon shows the mention count
+  ("99+" past 99) on the amber pill — user's call (2026-10-18).
 - Profile in `<config dir>/widget` (0700: its cookie store holds the secret), HTTP cache in memory.
+- Notifications default: mentions (**@**) — overturnable. The page decides from two consecutive live board frames
+  (a new mention `msg_id`, a new `last_id` from someone else), so no wire change; nothing from the first frame of a
+  connection nor while the server seeds (`busy`), which also holds the badge at no count.
+- "None while the window is focused on that chat": the native window shows the board, not a chat, so none while the
+  window is shown and active (the user sees the list change) — overturnable.
+- Delivery over `org.freedesktop.Notifications` by `gdbus` (PySide6 cannot type Notify's uint argument), clicks
+  matched by notification id on the session bus (QSystemTrayIcon's messageClicked does not say which one).
+  Only the **Open** action opens the chat; a dismissal (`NotificationClosed` reason 2) or an expiry just forgets
+  the id — user's call (2026-10-18): a dismiss must stay harmless and "clear all" must not open N chats.
+  xfce4-notifyd 0.9.7 reports a body click only as a dismissal, so a body click opens nothing there.
+- A mention in a muted chat notifies (AC10's muted exception), as the @ tab still lists it; a plain message
+  there does not. One live notification per chat: a new one replaces the chat's previous one.

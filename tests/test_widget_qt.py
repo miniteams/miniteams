@@ -21,9 +21,10 @@ pytest.importorskip("PySide6.QtWebEngineWidgets", reason="run with `uv run --ext
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import shiboken6  # noqa: E402
+import structlog  # noqa: E402
 import test_web_chat  # noqa: E402
-from PySide6.QtCore import QEvent, QLockFile, QSize, QTimer, QUrl  # noqa: E402
-from PySide6.QtGui import QCloseEvent, QDesktopServices  # noqa: E402
+from PySide6.QtCore import QEvent, QLockFile, QProcess, QSize, QTimer, QUrl  # noqa: E402
+from PySide6.QtGui import QCloseEvent, QColor, QDesktopServices  # noqa: E402
 from PySide6.QtWebEngineCore import QWebEnginePage  # noqa: E402
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon  # noqa: E402
 from test_web_chat import ME, _archive, _at, _m, _served  # noqa: E402
@@ -37,8 +38,16 @@ A, B, C = "19:qa@thread.v2", "19:qb@thread.v2", "19:qc@thread.v2"
 Reason = QSystemTrayIcon.ActivationReason
 
 
+@pytest.fixture(scope="module", autouse=True)
+def private_bus() -> Iterator[None]:
+    """Never the desktop's session bus: a notification must not reach the user's screen (`gdbus` is faked)."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/miniteams-tests-bus")
+        yield
+
+
 @pytest.fixture(scope="module")
-def app() -> Iterator[QApplication]:
+def app(private_bus: None) -> Iterator[QApplication]:
     """One QApplication per process, set up as `widget_qt.main` does; Chromium reserves far more
     address space than conftest's RLIMIT_AS cap, lifted while its processes start and run."""
     soft, hard = resource.getrlimit(resource.RLIMIT_AS)
@@ -248,6 +257,9 @@ async def test_page_publishes_the_badge_per_preference_also_hidden(
             f"[...document.querySelectorAll('#tray button')].find(b => b.textContent === '{label}').click()",
         )
         await until(lambda tip=tip: window.tray.toolTip() == tip, f"tooltip {tip}")
+        if label == "@":
+            pill = window.tray.icon().pixmap(64, 64).toImage().pixelColor(62, 45)
+            assert pill.name() == "#f59e0b"
 
 
 async def test_tray_settings_opens_the_tray_section(opened: tuple[widget_qt.Window, list[str]]) -> None:
@@ -319,14 +331,33 @@ def test_other_schemes_never_reach_the_desktop(
     widget_qt.dispose(window)
 
 
-def test_badge_pill_per_text(app: QApplication) -> None:
-    """024-AC4: no text keeps the plain icon; a count draws on red, "@" on a contrasting amber."""
+def _luminance(c: QColor) -> float:
+    rgb = (c.redF(), c.greenF(), c.blueF())
+    r, g, b = (x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4 for x in rgb)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def test_badge_pill_per_preference(app: QApplication) -> None:
+    """024-AC4: no text keeps the plain icon; unread and Inbox counts draw on red, the mention count on
+    amber; the digits contrast at least 4.5:1 with either pill."""
     icon = widget_qt.app_icon()
-    assert widget_qt.badged(icon, "") is icon
-    for text, colour in (("7", "#e5484d"), ("99+", "#e5484d"), ("@", "#f5a524")):
-        image = widget_qt.badged(icon, text).pixmap(64, 64).toImage()
-        assert image.pixelColor(62, 45).name() == colour, text  # the pill's right edge, mid-height
+    assert widget_qt.badged(icon, "", "mention") is icon
+    for text, pref, colour in (
+        ("7", "unread", "#c62828"),
+        ("99+", "all", "#c62828"),
+        ("7", "mention", "#f59e0b"),
+        ("99+", "mention", "#f59e0b"),
+    ):
+        image = widget_qt.badged(icon, text, pref).pixmap(64, 64).toImage()
+        fill = image.pixelColor(62, 45)  # the pill's right edge, mid-height
+        assert fill.name() == colour, (text, pref)
         assert image.pixelColor(20, 10) == icon.pixmap(64, 64).toImage().pixelColor(20, 10)  # icon above
+        # The digits: the pixel furthest in luminance from the fill, in a band inside the pill only (its
+        # rounded corners show the icon's dark background).
+        pill = [image.pixelColor(x, y) for x in range(30, 62) for y in range(38, 53)]
+        ink = max(pill, key=lambda c: abs(_luminance(c) - _luminance(fill)))
+        hi, lo = sorted((_luminance(fill), _luminance(ink)), reverse=True)
+        assert (hi + 0.05) / (lo + 0.05) >= 4.5, (text, pref, ink.name())
 
 
 def test_without_a_tray_closing_the_window_quits(
@@ -514,3 +545,252 @@ def test_a_launch_during_startup_waits_for_the_window(
     finally:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(first.pid, signal.SIGKILL)
+
+
+# --- notifications (024-AC10, AC11) ---
+
+DISMISSED = 2  # NotificationClosed's reason: dismissed by the user
+MENTION = {"kind": "me", "by": "Bob Roe", "text": "see <b>this</b> & that", "at": _at(40), "edited": False}
+
+
+@pytest.fixture
+def gdbus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A stand-in `gdbus`: writes its arguments, one per line, to the returned file and answers id 7."""
+    fake, args = tmp_path / "gdbus", tmp_path / "gdbus.args"
+    fake.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {args}\necho '(uint32 7,)'\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(widget_qt, "GDBUS", str(fake))
+    return args
+
+
+async def test_a_notification_from_the_page_and_its_open_action_opens_the_chat(
+    opened: tuple[widget_qt.Window, list[str]], board: W.Board, gdbus: Path
+) -> None:
+    """024-AC10, AC11: a new mention on the board, the window hidden, reaches the desktop's notification
+    service (sender, chat, text as data); its Open action shows the window and opens the chat as its row does
+    (no opener here: its Teams link, in the system browser)."""
+    window, urls = opened
+    await until(lambda: window.tray.toolTip() == "miniteams — 2 unread", "the page's first count")
+    window.hide()
+    board.rows[A]["mention"] = MENTION | {"msg_id": "m9"}
+    board.broadcast()
+    await until(lambda: window.notifier.chats == {7: A}, "a notification sent")
+    args = gdbus.read_text().split("\n")
+    assert args[:10] == [
+        "call",
+        "--session",
+        "--timeout",
+        "5",
+        "--dest",
+        widget_qt.NOTIFICATIONS,
+        "--object-path",
+        widget_qt.NOTIFICATIONS_PATH,
+        "--method",
+        widget_qt.NOTIFICATIONS + ".Notify",
+    ]
+    assert args[10:13] == ["--", "'miniteams'", "0"]  # nothing to replace yet
+    assert args[14:17] == [
+        "'Bob Roe · Fictional A'",
+        "'see &lt;b&gt;this&lt;/b&gt; &amp; that'",
+        "['default', 'Open']",
+    ]
+    window.notifier.invoked(7, "default")
+    assert window.isVisible()
+    link = W.deep_link(A, "30")
+    await until(lambda: link in urls, "the chat's link opened")
+    window.notifier.closed(7, DISMISSED)  # the daemon closes it after the action: no second open
+    await js(window, "1")
+    assert urls.count(link) == 1
+
+
+def test_clicks_route_by_notification_id(app: QApplication) -> None:
+    """024-AC11: only the Open action opens that notification's chat, once; a dismissal (one, or a
+    "clear all" of several), an expiry, another action, an unknown id open nothing and forget the id."""
+    notifier = widget_qt.Notifier(widget_qt.QDBusConnection.sessionBus())
+    got: list[str] = []
+    notifier.clicked.connect(got.append)
+    notifier.chats = {1: A, 2: B, 3: C, 4: A, 5: B, 6: C}
+    notifier.closed(1, 1)  # expired
+    notifier.invoked(2, "other")
+    notifier.invoked(9, "default")
+    notifier.closed(3, DISMISSED)
+    notifier.invoked(4, "default")
+    notifier.closed(4, DISMISSED)
+    for nid in (5, 6):  # "clear all"
+        notifier.closed(nid, DISMISSED)
+    assert got == [A]
+    assert notifier.chats == {}
+
+
+async def test_no_notification_while_the_window_is_in_front(
+    opened: tuple[widget_qt.Window, list[str]], gdbus: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """024-AC10: the window active and shown, the board in view: the page's notification is dropped."""
+    window, _ = opened
+    monkeypatch.setattr(window, "isActiveWindow", lambda: True)
+    window.bridge.notify(A, "t", "b")
+    window.hide()
+    window.bridge.notify(B, "t", "b")
+    await until(lambda: window.notifier.chats, "the hidden window's notification")
+    assert window.notifier.chats == {7: B}
+
+
+async def test_a_failing_or_missing_gdbus_only_logs(
+    app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No notification service (gdbus fails) or no gdbus: nothing kept, nothing held, nothing raised. No gdbus
+    first: a send left marked in flight would hold the next one."""
+    notifier = widget_qt.Notifier(widget_qt.QDBusConnection.sessionBus())
+    failing = tmp_path / "gdbus"
+    failing.write_text("#!/bin/sh\necho 'no service' >&2\nexit 1\n")
+    failing.chmod(0o755)
+    for program in (str(tmp_path / "absent"), str(failing)):
+        monkeypatch.setattr(widget_qt, "GDBUS", program)
+        with structlog.testing.capture_logs() as logs:
+            notifier.show(A, "t", "b")
+            await until(lambda logs=logs: any(e["event"] == "widget_notify_failed" for e in logs), program)
+        assert notifier.pending == {}, program
+    assert notifier.chats == {}
+    QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    assert notifier.findChildren(QProcess) == []
+
+
+def test_gvariant_quotes_what_gdbus_would_unquote() -> None:
+    assert widget_qt.gvariant("it's a \\ 'x'") == "'it\\'s a \\\\ \\'x\\''"
+
+
+@pytest.fixture
+def numbered(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A stand-in `gdbus` answering ids 1, 2, 3…, or the replaces_id it is given, as a daemon does; each
+    call's arguments appended, one call per line; each call sleeps `gdbus.delay` seconds if written."""
+    fake, calls, n = tmp_path / "gdbus", tmp_path / "gdbus.calls", tmp_path / "gdbus.n"
+    delay = tmp_path / "gdbus.delay"
+    fake.write_text(
+        f'#!/bin/sh\necho "$*" >> {calls}\nsleep $(cat {delay} 2>/dev/null || echo 0)\n'
+        "r=$(echo \"$*\" | sed 's/.* -- [^ ]* \\([0-9]*\\) .*/\\1/')\n"
+        f'if [ "$r" != 0 ]; then echo "(uint32 $r,)"; exit; fi\n'
+        f'n=$(( $(cat {n} 2>/dev/null || echo 0) + 1 ))\necho $n > {n}\necho "(uint32 $n,)"\n'
+    )
+    fake.chmod(0o755)
+    monkeypatch.setattr(widget_qt, "GDBUS", str(fake))
+    return calls
+
+
+async def _shown(notifier: widget_qt.Notifier, chat: str, n: int) -> None:
+    notifier.show(chat, "t", "b")
+    await until(lambda: len(notifier.chats) == n and chat in notifier.chats.values(), f"{chat} sent")
+
+
+async def test_a_chat_keeps_one_live_notification(app: QApplication, numbered: Path) -> None:
+    """A newer notification for a chat replaces the chat's live one (replaces_id); other chats keep theirs."""
+    notifier = widget_qt.Notifier(widget_qt.QDBusConnection.sessionBus())
+    await _shown(notifier, A, 1)
+    await _shown(notifier, B, 2)
+    notifier.show(A, "t", "b")
+    await until(lambda: len(_lines(numbered)) == 3 and not notifier.findChildren(QProcess), "A replaced")
+    QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    assert notifier.chats == {2: B, 1: A}
+    assert _replaces(numbered) == ["0", "0", "1"]
+
+
+def _lines(calls: Path) -> list[str]:
+    return calls.read_text().splitlines() if calls.exists() else []
+
+
+def _replaces(calls: Path) -> list[str]:
+    return [line.split(" -- ")[1].split()[1] for line in _lines(calls)]
+
+
+async def test_a_chat_busy_while_its_send_is_in_flight_chains_its_replaces(
+    app: QApplication, numbered: Path
+) -> None:
+    """Shown again while its first send is still out: one more send once that one answers, replacing it with
+    the latest text (no second notification whose Open would be lost); Open on the live id opens the chat."""
+    (numbered.parent / "gdbus.delay").write_text("0.3")
+    notifier = widget_qt.Notifier(widget_qt.QDBusConnection.sessionBus())
+    got: list[str] = []
+    notifier.clicked.connect(got.append)
+    for body in ("b1", "b2", "b3"):
+        notifier.show(A, "t", body)
+    await until(lambda: len(_lines(numbered)) == 2 and not notifier.pending, "chained")
+    assert notifier.chats == {1: A}
+    for _ in range(60):  # no third send turns up
+        QApplication.processEvents()
+        await asyncio.sleep(0.01)
+    lines = numbered.read_text().splitlines()
+    assert _replaces(numbered) == ["0", "1"]
+    assert "'b1'" in lines[0] and "'b3'" in lines[1]
+    notifier.invoked(1, "default")
+    assert got == [A]
+
+
+async def test_another_chat_is_not_held_by_one_in_flight(app: QApplication, numbered: Path) -> None:
+    """Only the same chat waits: B, shown between two A's, goes out at once; A's second send replaces A's."""
+    (numbered.parent / "gdbus.delay").write_text("0.3")
+    notifier = widget_qt.Notifier(widget_qt.QDBusConnection.sessionBus())
+    notifier.show(A, "t", "a1")
+    await until(lambda: len(_lines(numbered)) == 1, "A out")
+    notifier.show(B, "t", "b1")
+    notifier.show(A, "t", "a2")
+    await until(lambda: len(_lines(numbered)) == 2, "B out")
+    assert "'b1'" in _lines(numbered)[1]
+    await until(lambda: len(_lines(numbered)) == 3 and not notifier.pending, "A again")
+    assert set(notifier.chats.values()) == {A, B}
+    assert [ln.split(" -- ")[1].split()[4] for ln in _lines(numbered)] == ["'a1'", "'b1'", "'a2'"]
+    assert _replaces(numbered)[2] == str(next(n for n, c in notifier.chats.items() if c == A))
+
+
+async def test_a_reply_with_another_id_than_replaced_means_a_restarted_daemon(
+    app: QApplication, gdbus: Path
+) -> None:
+    """A daemon answering a replace with a new id (one that issues fresh ids after a restart): every id kept
+    before that reply is dropped, none routes a click or goes out as a stale replaces_id; a first send for
+    a chat (replaces 0) drops nothing. xfce4-notifyd instead adopts any replaces_id: the owner watcher is
+    what clears on its restart."""
+    notifier = widget_qt.Notifier(widget_qt.QDBusConnection.sessionBus())
+    notifier.chats = {5: B}
+    notifier.show(C, "t", "b")
+    await until(lambda: 7 in notifier.chats, "a first send")
+    assert notifier.chats == {5: B, 7: C}
+    notifier.chats = {5: A, 6: B}
+    notifier.show(A, "t", "b")
+    await until(lambda: 7 in notifier.chats, "the replace answered")
+    assert notifier.chats == {7: A}
+
+
+async def test_a_restarted_daemon_forgets_the_ids(app: QApplication, numbered: Path) -> None:
+    """The notification service changing owner (a restarted daemon reuses ids): no old id routes a click."""
+    notifier = widget_qt.Notifier(widget_qt.QDBusConnection.sessionBus())
+    got: list[str] = []
+    notifier.clicked.connect(got.append)
+    await _shown(notifier, A, 1)
+    notifier.watcher.serviceOwnerChanged.emit(widget_qt.NOTIFICATIONS, ":1.4", ":1.9")
+    assert notifier.chats == {}
+    notifier.invoked(1, "default")
+    assert got == []
+
+
+async def test_awaited_clicks_are_capped(app: QApplication, gdbus: Path) -> None:
+    """At most KEPT notifications await a click: past it, the oldest is forgotten."""
+    notifier = widget_qt.Notifier(widget_qt.QDBusConnection.sessionBus())
+    notifier.chats = {1000 + i: f"19:c{i}@thread.v2" for i in range(widget_qt.KEPT)}
+    notifier.show(A, "t", "b")
+    await until(lambda: 7 in notifier.chats, "the new one kept")
+    assert len(notifier.chats) == widget_qt.KEPT
+    assert 1000 not in notifier.chats and 1001 in notifier.chats
+
+
+async def test_a_gdbus_failure_logs_its_error(
+    app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing call logs gdbus' own error, cut to 200 characters."""
+    notifier = widget_qt.Notifier(widget_qt.QDBusConnection.sessionBus())
+    failing = tmp_path / "gdbus"
+    failing.write_text("#!/bin/sh\nprintf 'Error: no service%0300d' 0 >&2\nexit 1\n")
+    failing.chmod(0o755)
+    monkeypatch.setattr(widget_qt, "GDBUS", str(failing))
+    with structlog.testing.capture_logs() as logs:
+        notifier.show(A, "t", "b")
+        await until(lambda: any(e["event"] == "widget_notify_failed" for e in logs), "the failure logged")
+    event = next(e for e in logs if e["event"] == "widget_notify_failed")
+    assert event["stderr"].startswith("Error: no service") and len(event["stderr"]) == 200

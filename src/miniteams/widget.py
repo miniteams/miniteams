@@ -53,11 +53,9 @@ def chat_link(url: str, base: str, fresh: str) -> str:
 
 
 def badge_text(pref: str, count: int) -> str:
-    """What the tray icon's badge shows: nothing, the count ("99+" past 99), or "@" for mentions."""
+    """What the tray icon's badge shows: nothing or the count, "99+" past 99."""
     if pref not in COUNTED or count <= 0:
         return ""
-    if pref == "mention":
-        return "@"
     return "99+" if count > 99 else str(count)
 
 

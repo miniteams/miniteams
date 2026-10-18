@@ -1,12 +1,15 @@
 """The native widget window (spec 024): the board page in QtWebEngine, a tray icon, close-to-tray.
 
 The page and the window talk over a QWebChannel: the page finds `window.miniteamsTray`, a promise of the
-`tray` object below, publishes its badge count through `badge()` and listens to `settings`. A browser has
-no such promise, so the page's tray code stays inert there.
+`tray` object below, publishes its badge count through `badge()`, raises notifications through `notify()`
+and listens to `settings` and `opened`. A browser has no such promise, so the page's tray code stays inert
+there.
 """
 
 import hashlib
+import html
 import os
+import re
 import signal
 from importlib.resources import files
 from pathlib import Path
@@ -14,12 +17,14 @@ from pathlib import Path
 import shiboken6
 import structlog
 from PySide6.QtCore import (
+    SLOT,
     QByteArray,
     QEvent,
     QFile,
     QIODevice,
     QLockFile,
     QObject,
+    QProcess,
     QRectF,
     Qt,
     QTimer,
@@ -27,6 +32,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
+from PySide6.QtDBus import QDBusConnection, QDBusServiceWatcher
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtSvg import QSvgRenderer
@@ -38,7 +44,7 @@ from PySide6.QtWebEngineCore import (
     QWebEngineScript,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
 
 from .widget import badge_text, chat_link, is_board, is_external, token, tooltip
 
@@ -50,6 +56,12 @@ BOOT = (
     "window.miniteamsTray = new Promise((ok) =>"
     " new QWebChannel(qt.webChannelTransport, (c) => ok(c.objects.tray)));"
 )
+
+# org.freedesktop.Notifications, which xfce4-notifyd serves; also its object path and interface.
+NOTIFICATIONS = "org.freedesktop.Notifications"
+NOTIFICATIONS_PATH = "/org/freedesktop/Notifications"
+GDBUS = "gdbus"
+KEPT = 100  # notifications whose click is still awaited; the daemon's closing signal can be missed
 
 log = structlog.get_logger()
 
@@ -68,13 +80,14 @@ def app_icon() -> QIcon:
     return icon
 
 
-def badged(icon: QIcon, text: str) -> QIcon:
-    """`icon` with `text` in a pill at its bottom right; `icon` itself when there is no text."""
+def badged(icon: QIcon, text: str, pref: str) -> QIcon:
+    """`icon` with `text` in a pill at its bottom right: amber with dark digits for mentions, else red with
+    white ones; `icon` itself when there is no text."""
     if not text:
         return icon
     pm = icon.pixmap(BADGE, BADGE)
-    # Contrasting with the dark icon and its blue bubble: an "@" in that blue was unreadable at 22 px.
-    fill, ink = ("#f5a524", "#171a21") if text == "@" else ("#e5484d", "#ffffff")
+    # Digits at 8.1:1 (amber) and 5.6:1 (red), and two hues still apart at 22 px.
+    fill, ink = ("#f59e0b", "#171a21") if pref == "mention" else ("#c62828", "#ffffff")
     p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
     font = QFont()
@@ -99,14 +112,126 @@ def _channel_js() -> str:
     return bytes(f.readAll().data()).decode()
 
 
+def gvariant(text: str) -> str:
+    """`text` as a GVariant string literal: gdbus parses its arguments, and would unquote a bare 'x'."""
+    return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+class Notifier(QObject):
+    """Desktop notifications, each one's Open action routed to its chat (`clicked`).
+
+    Sent by `gdbus`: PySide6 cannot type Notify's uint argument, and QSystemTrayIcon's messageClicked does
+    not say which message was clicked. The clicks come back as session bus signals, matched by id."""
+
+    clicked = Signal(str)
+
+    def __init__(self, bus: QDBusConnection) -> None:
+        super().__init__()
+        self.chats: dict[int, str] = {}  # notification id → chat, one per chat
+        # Chat → its latest text held back while a send for it is out: two sends would both replace id 0.
+        self.pending: dict[str, tuple[str, str] | None] = {}
+        # A restarted daemon numbers from 1 again: the old ids would route a click to the wrong chat.
+        self.watcher = QDBusServiceWatcher(
+            NOTIFICATIONS, bus, QDBusServiceWatcher.WatchModeFlag.WatchForOwnerChange, self
+        )
+        self.watcher.serviceOwnerChanged.connect(lambda *_: self.chats.clear())
+        heard = (("ActionInvoked", "invoked(uint,QString)"), ("NotificationClosed", "closed(uint,uint)"))
+        for name, slot in heard:
+            # The stub says bytes, the binding takes str only.
+            if not bus.connect(NOTIFICATIONS, NOTIFICATIONS_PATH, NOTIFICATIONS, name, self, SLOT(slot)):  # type: ignore[call-overload]
+                log.warning("widget_notify_unheard", signal=name)
+
+    def show(self, chat: str, title: str, body: str) -> None:
+        if chat in self.pending:
+            self.pending[chat] = (title, body)
+            return
+        self.pending[chat] = None
+        proc = QProcess(self)
+        icon = str(files("miniteams").joinpath("favicon.svg"))
+        # The daemon reads the body as markup (xfce4-notifyd does): message text is data.
+        text = html.escape(body, quote=False)
+        # The chat's live notification, replaced: one per chat, however busy it is.
+        replaces = next((nid for nid, c in self.chats.items() if c == chat), 0)
+        proc.setProgram(GDBUS)
+        bus = ["--session", "--timeout", "5", "--dest", NOTIFICATIONS, "--object-path", NOTIFICATIONS_PATH]
+        call = [
+            gvariant(APP),
+            str(replaces),
+            gvariant(icon),
+            gvariant(title),
+            gvariant(text),
+            "['default', 'Open']",
+            "{}",
+            "-1",
+        ]
+        proc.setArguments(
+            ["call", *bus, "--method", NOTIFICATIONS + ".Notify", "--", *call]
+        )  # "--": -1 is no option
+        proc.finished.connect(lambda code, _: self._sent(proc, chat, replaces, code))
+        proc.errorOccurred.connect(lambda err: self._failed(proc, chat, err))
+        proc.start()
+
+    def _sent(self, proc: QProcess, chat: str, replaces: int, code: int) -> None:
+        if not shiboken6.isValid(proc):  # destroyed while running (the app quitting): finished still fires
+            return
+        found = re.search(r"uint32 (\d+)", bytes(proc.readAllStandardOutput().data()).decode())
+        proc.deleteLater()
+        if code or not found:
+            err = bytes(proc.readAllStandardError().data()).decode(errors="replace")[:200]
+            log.warning("widget_notify_failed", exit_code=code, stderr=err)
+        else:
+            nid = int(found[1])
+            # A daemon issuing a new id for a replace restarted: the ids kept are not its. xfce4-notifyd
+            # adopts any replaces_id (aborting once its counter collides); the owner watcher clears it.
+            if replaces and nid != replaces:
+                self.chats.clear()
+            for old in [n for n, c in self.chats.items() if c == chat]:
+                del self.chats[old]
+            self.chats[nid] = chat
+            while len(self.chats) > KEPT:
+                del self.chats[next(iter(self.chats))]
+        self._next(chat)
+
+    def _failed(self, proc: QProcess, chat: str, err: QProcess.ProcessError) -> None:
+        if err == QProcess.ProcessError.FailedToStart:  # no `finished` follows
+            log.warning("widget_notify_failed", error=err.name, program=GDBUS)
+            proc.deleteLater()
+            self._next(chat)
+
+    def _next(self, chat: str) -> None:
+        if held := self.pending.pop(chat, None):
+            self.show(chat, *held)
+
+    @Slot("uint", str)
+    def invoked(self, nid: int, action: str) -> None:
+        chat = self.chats.pop(nid, None)
+        if chat is not None and action == "default":
+            self.clicked.emit(chat)
+
+    @Slot("uint", "uint")
+    def closed(self, nid: int, reason: int) -> None:
+        # Dismissed or expired, nothing opens: a "clear all" must not open every chat.
+        self.chats.pop(nid, None)
+
+
 class Tray(QObject):
-    """The page's side of the tray: `badge(pref, count)` from the page, `settings` to it."""
+    """The page's side of the tray: `badge(pref, count)` and `notify(chat, title, body)` from the page,
+    `settings` and `opened(chat)` to it."""
 
     settings = Signal()
+    opened = Signal(str)
 
-    def __init__(self, icon: QIcon, tray: QSystemTrayIcon) -> None:
+    def __init__(self, icon: QIcon, tray: QSystemTrayIcon, window: QWidget, notifier: Notifier) -> None:
         super().__init__()
         self.icon, self.tray, self.shown = icon, tray, ("", "miniteams")
+        self.window, self.notifier = window, notifier
+
+    @Slot(str, str, str)
+    def notify(self, chat: str, title: str, body: str) -> None:
+        # The window in front shows the board already: the user is looking at what changed.
+        if self.window.isVisible() and self.window.isActiveWindow():
+            return
+        self.notifier.show(chat, title, body)
 
     @Slot(str, int)
     def badge(self, pref: str, count: int) -> None:
@@ -114,7 +239,7 @@ class Tray(QObject):
         if now == self.shown:  # every board broadcast publishes: most change nothing
             return
         self.shown = now
-        self.tray.setIcon(badged(self.icon, now[0]))
+        self.tray.setIcon(badged(self.icon, now[0], pref))
         self.tray.setToolTip(now[1])
 
 
@@ -182,7 +307,9 @@ class Window(QWebEngineView):
         self.setPage(page)
         self.tray = QSystemTrayIcon(icon, self)
         self.tray.setToolTip(APP)
-        self.bridge = Tray(icon, self.tray)
+        self.notifier = Notifier(QDBusConnection.sessionBus())
+        self.notifier.clicked.connect(self.open_chat)
+        self.bridge = Tray(icon, self.tray, self, self.notifier)
         channel = QWebChannel(page)
         channel.registerObject("tray", self.bridge)
         page.setWebChannel(channel)
@@ -216,6 +343,11 @@ class Window(QWebEngineView):
         self.reveal()
         if shiboken6.isValid(self.bridge):  # the page can deleteLater() any object on the channel
             self.bridge.settings.emit()
+
+    def open_chat(self, chat: str) -> None:
+        self.reveal()
+        if shiboken6.isValid(self.bridge):
+            self.bridge.opened.emit(chat)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if not (self.tray.isVisible() and QSystemTrayIcon.isSystemTrayAvailable()):

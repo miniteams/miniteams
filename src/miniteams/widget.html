@@ -154,12 +154,36 @@
   const counts = () => Object.fromEntries(
     Object.entries(filters).map(([k, f]) => [k, rows.filter((r) => f(r) && named(r, query)).length]));
   // The native window (spec 024) injects a promise of its tray before this script; a browser has none.
-  let tray = null, live = false;  // live: a board frame since the socket last closed
+  // live: a seeded board frame since the socket last closed; the seeding ones (`busy`) count nothing yet.
+  let tray = null, live = false, busy = false;
   const BADGES = [["unread", "Unread"], ["mention", "@"], ["all", "Inbox"], ["none", "None"]];
   let badge = BADGES.some(([k]) => k === pref("badge")) ? pref("badge") : "unread";
   // A tab's rule without the filter box: the badge counts what the tab shows once the box is empty.
   // Disconnected: no count, whatever the choice; a stale one would read as live.
   const publish = () => tray?.badge(...(live && badge !== "none" ? [badge, rows.filter(filters[badge]).length] : ["none", 0]));
+  // Desktop notifications: what changed between two live frames, so never the snapshot of a (re)connection.
+  const ALERTS = [["mention", "@"], ["all", "Messages"], ["none", "None"]], YOU = "You";  // web.py's _YOU
+  let alert = ALERTS.some(([k]) => k === pref("notify")) ? pref("notify") : "mention";
+  let before = null;  // id → row of the previous live frame
+  const heard = new Set();  // "chat message" keys notified: one message, one notification
+  const clip = (t, n) => t.length > n ? t.slice(0, n - 1) + "…" : t;
+  const news = () => {
+    const prev = before;
+    before = live ? new Map(rows.map((r) => [r.id, r])) : null;
+    if (!prev || !before || !tray || alert === "none") return;
+    for (const r of rows) {
+      const old = prev.get(r.id), m = r.mention;
+      // A mention surfaces even in a muted chat, as on the @ tab; other messages follow the Inbox's rule.
+      const [id, by, text] = m?.msg_id && m.msg_id !== old?.mention?.msg_id && m.by !== YOU ? [m.msg_id, m.by, m.text]
+        : alert === "all" && r.last_id && r.last_id !== old?.last_id && r.sender && r.sender !== YOU && !r.muted && !isSeen(r)
+          ? [r.last_id, r.sender, r.text] : [];
+      if (!id || heard.has(r.id + " " + id)) continue;
+      heard.add(r.id + " " + id);
+      if (heard.size > 500) heard.delete(heard.values().next().value);  // the page runs for days
+      const chat = rowTitle(r);
+      tray.notify(r.id, clip(by && by !== chat ? by + " · " + chat : chat, 120), clip(text || "", 200));
+    }
+  };
 
   const renderHeader = () => {
     const c = counts();
@@ -198,11 +222,19 @@
       for (const [k, lbl] of BADGES) {
         const b = el("button", badge === k ? "on" : "", lbl); b.onclick = () => { badge = k; keep("badge", k); publish(); render(); }; yseg.append(b);
       }
-      ybox.append(el("h3", null, "Tray"), yseg); menu.append(ybox);
+      const abox = el("div"), aseg = el("div", "seg");
+      abox.id = "notify";
+      for (const [k, lbl] of ALERTS) {
+        const b = el("button", alert === k ? "on" : "", lbl); b.onclick = () => { alert = k; keep("notify", k); render(); }; aseg.append(b);
+      }
+      ybox.append(el("h3", null, "Tray"), yseg); abox.append(el("h3", null, "Notify"), aseg); menu.append(ybox, abox);
     }
     $cog.append(menu);
   };
 
+  // A plain click on a row; null leaves it to its link (the Teams link, in a new tab).
+  const opens = (r) => nav ? () => location.assign(chatPage(r.id))
+    : opener && r.last_id ? () => send({ open: r.id, web: false }) : null;
   const render = () => {
     if (actions.held()) return;
     if (theme === "auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = theme;
@@ -245,8 +277,8 @@
         // Ctrl/⌘ click = middle click: a touchpad has no easy middle button.
         if (ev.ctrlKey || ev.metaKey) { middle(ev); return; }
         if (ev.shiftKey) { if (browser) { ev.preventDefault(); send({ open: r.id, web: true }); } return; }
-        if (nav) { ev.preventDefault(); location.assign(chatPage(r.id)); return; }
-        if (opener && r.last_id) { ev.preventDefault(); send({ open: r.id, web: false }); }
+        const go = opens(r);
+        if (go) { ev.preventDefault(); go(); }
       };
       name.onauxclick = (ev) => { if (ev.button === 1) middle(ev); };
       const replyBtn = el("button", "reply", "✎"); replyBtn.title = "reply (r)"; replyBtn.dataset.k = "reply";
@@ -422,21 +454,30 @@
       if ("opener" in msg) opener = !!msg.opener;
       if ("browser" in msg) browser = !!msg.browser;
       if ("me" in msg) meName = msg.me || "";
-      if ("busy" in msg) $spin.hidden = !msg.busy;
-      if (msg.rows) { rows = msg.rows; live = true; secs.set(msg.sections); render(); publish(); }
+      if ("busy" in msg) { busy = !!msg.busy; $spin.hidden = !busy; }
+      if (msg.rows) { rows = msg.rows; live = !busy; secs.set(msg.sections); render(); publish(); news(); }
       if (msg.presence) paintPresence(msg.presence);
       if (msg.complete) complete.answered(msg);
       if (msg.sent) { if (msg.ok) sends.done(msg.sent); else sends.fail(msg.sent, msg.unsure ? UNSURE : msg.error || "not sent"); }
     };
     ws.onclose = () => {
       $status.title = "disconnected"; $status.classList.add("off");
-      live = false; publish();
+      live = false; before = null; publish();
       sends.lost();
       setTimeout(connect, retry.next());  // server restarts → page recovers alone
     };
   };
   render();
-  window.miniteamsTray?.then((t) => { tray = t; t.settings.connect(() => { menuOpen = true; renderHeader(); }); publish(); renderHeader(); });
+  window.miniteamsTray?.then((t) => {
+    tray = t;
+    t.settings.connect(() => { menuOpen = true; renderHeader(); });
+    // A notification clicked: the window is shown, the chat opens as a click on its row does.
+    t.opened.connect((id) => {
+      const r = rows.find((x) => x.id === id), go = r && opens(r);
+      if (go) go(); else if (r?.link) window.open(r.link, "_blank", "noopener");
+    });
+    publish(); renderHeader();
+  });
   signIn.then(connect);
   setInterval(render, CLOCK_TICK_MS);
 })();

@@ -45,8 +45,9 @@ def _web_json(settings: Settings, **data: Any) -> Path:
         ("unread", 99, "99", "miniteams — 99 unread"),
         ("unread", 100, "99+", "miniteams — 100 unread"),
         ("all", 3, "3", "miniteams — 3 in Inbox"),
-        ("mention", 1, "@", "miniteams — 1 mention"),
-        ("mention", 4, "@", "miniteams — 4 mentions"),
+        ("mention", 1, "1", "miniteams — 1 mention"),
+        ("mention", 4, "4", "miniteams — 4 mentions"),
+        ("mention", 100, "99+", "miniteams — 100 mentions"),
         ("mention", 0, "", "miniteams — 0 mentions"),
         ("none", 5, "", "miniteams"),
         ("seen", 5, "", "miniteams"),  # not a badge choice: no badge
@@ -54,7 +55,7 @@ def _web_json(settings: Settings, **data: Any) -> Path:
     ],
 )
 def test_badge_and_tooltip_follow_the_preference(pref: str, count: int, text: str, tip: str) -> None:
-    """024-AC4: the badge's text and the tooltip per preference; "99+" past 99; "@" for mentions."""
+    """024-AC4: the badge's text and the tooltip per preference; "99+" past 99, mentions included."""
     assert widget.badge_text(pref, count) == text
     assert widget.tooltip(pref, count) == tip
 

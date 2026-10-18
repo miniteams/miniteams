@@ -170,9 +170,19 @@ terminal and it reconnects within seconds (it watches the token cache file).
   the running window and exits (one window per profile).
 - Closing the window hides it to the tray (with no tray to bring it back, closing quits); the tray menu has **Show**,
   **Settings…** and **Quit**. A click on the icon shows the window; on a panel with *menu is primary* (XFCE's default) a left click opens the menu, a middle click shows it.
-- ⚙ → **Tray** (native window only) picks the count on the icon: **Unread**, **@** (an `@` while you are
-  mentioned), **Inbox** or **None**; the tooltip says how many. Counts follow the tabs' rules, ignore the filter box,
-  and keep updating while the window is hidden; disconnected from `web`, the icon shows no count.
+- ⚙ → **Tray** (native window only) picks the count on the icon: **Unread**, **@** (mentions, on an amber
+  pill instead of red), **Inbox** or **None**; "99+" past 99, the tooltip says how many. Counts follow the tabs'
+  rules, ignore the filter box, and keep updating while the window is hidden; disconnected from `web`, or while
+  `web` is still seeding its list, the icon shows no count.
+- ⚙ → **Notify** (native window only) picks what raises a desktop notification: **@** (a new mention, the default,
+  also in a muted chat as on the @ tab), **Messages** (that, plus any new message in a chat the Inbox shows: not
+  muted, not older than its Seen mark) or **None**. Never for your own messages, nor for the board a (re)connection
+  or the seeding loads; none while the window is in front. Title: sender · chat; body: the mentioning message's text
+  for a mention, else the chat's last message, cut to 200 characters. One notification per chat: a newer one
+  replaces it. Sent with `gdbus` (`libglib2.0-bin`) to the desktop's notification service.
+- A notification's **Open** button shows the window and opens the chat as clicking its row does. Dismissing it (or
+  "clear all") opens nothing; xfce4-notifyd reports a body click only as a dismissal, so there a body click opens
+  nothing either.
 - Links that would open a new window or tab (and any page other than the board) open in the system browser;
   rows open chats as in the browser widget. A chat page ("Chat here" without `--browser`) gets `web.json`'s current
   token in its fragment, as with `--browser`, so that browser signs in.
