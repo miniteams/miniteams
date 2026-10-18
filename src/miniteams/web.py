@@ -116,6 +116,7 @@ _SILENT_TYPES = {RECEIPT_EVENT}
 _RELABEL_TYPES = {"ThreadActivity/TopicUpdate", "ThreadActivity/AddMember", "ThreadActivity/DeleteMember"}
 MAX_FRAME = MAX_IMAGE_BYTES + (1 << 20)  # one pasted image per binary frame, plus room for a long JSON verb
 _BIND_ATTEMPTS = 3  # redraws when a first run's drawn port turns out taken
+_CLOSE_GRACE = 12.0  # seconds pages get to close at exit: above websockets' close_timeout (10)
 _RELAY_QUEUE = 256  # live events waiting for their followers; past it one is dropped, the stream never waits
 _RELAY_MAX = 10.0  # seconds one relay may take (name lookups included) before the next one goes
 _MEDIA_BACKOFF = 30.0  # seconds relayed records skip the media folder after a read outlived its deadline
@@ -1830,17 +1831,20 @@ async def run(
         )
         emojis = asyncio.create_task(board.emojis.refresh())
         try:
-            done, pending = await asyncio.wait({server, stream}, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
+            done, _ = await asyncio.wait({server, stream}, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 task.result()  # re-raise a server failure (e.g. bind) instead of exiting 0
             raise RuntimeError("live stream ended — re-run")
         finally:
+            stream.cancel()
             fill.cancel()  # the page is going away; a half-finished walk has nobody to tell
             emojis.cancel()
             renewals.cancel()
             board.close()
+            # Closed here, not by asyncio.run's sweep: that one cancels the socket handlers before they close
+            # their sockets, and the server then waits on the peers (Ctrl-C held until a page goes away).
+            server.cancel()
+            await asyncio.wait({server}, timeout=_CLOSE_GRACE)  # a verb stuck in a handler: left to the sweep
             await receipts.close()  # before the presence close: that one closes the shared cache
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(presence.close(), 5)  # unsubscribe; a hung post must not hold the exit

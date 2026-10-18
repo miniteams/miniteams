@@ -1,10 +1,13 @@
 """Web widget (spec 002): row mapping, scope filter, bind persistence, page + socket serving."""
 
 import asyncio
+import contextlib
+import functools
 import json
 import os
 import re
 import socket
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -14,6 +17,7 @@ import httpx
 import pytest
 import structlog.testing
 import websockets
+import websockets.sync.client
 from conftest import board_socket, cookie_header, wait
 from test_web_chat import _relayed, _send
 
@@ -596,6 +600,101 @@ async def test_web_exits_on_a_taken_persisted_bind(
     finally:
         taken.close()
     assert path.read_bytes() == before
+
+
+def _hung_peer(host: str, secret: str) -> socket.socket:
+    """A page socket that opens, then never writes again: the server's close frame is never answered."""
+    sock = socket.create_connection(W.parse_bind(host))
+    sock.sendall(
+        f"GET /ws HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+        f"Origin: http://{host}\r\nCookie: mt={secret}\r\n\r\n".encode()
+    )
+    head = b""
+    while not head.endswith(b"\r\n\r\n"):
+        head += sock.recv(1)  # byte by byte: the frames after the headers stay for `_close_frame`
+    assert head.startswith(b"HTTP/1.1 101")
+    return sock
+
+
+def _close_frame(sock: socket.socket) -> bytes:
+    """The payload of the first close frame the server sends (unmasked frames), within 2 s."""
+    sock.settimeout(2)
+    stream = sock.makefile("rb")
+    while True:
+        first, size = stream.read(2)
+        size &= 0x7F
+        if size >= 126:
+            size = int.from_bytes(stream.read(2 if size == 126 else 8))
+        payload = stream.read(size)
+        if first == 0x88:
+            return payload
+
+
+@pytest.mark.parametrize("peer", ["board", "chat", "hung", "stuck"])
+def test_a_first_ctrl_c_exits_with_a_page_connected(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, peer: str
+) -> None:
+    """Ctrl-C (the main task cancelled, then asyncio.run's sweep of the rest) with a page connected: the
+    page is closed with 1001 at once and run() returns; a peer that never answers the close holds it
+    the close timeout at most, a verb that never returns the close grace at most."""
+
+    async def idle(*_: Any, **__: Any) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(W, "fill_from_listing", idle)
+    monkeypatch.setattr(W, "run_forever", idle)
+    monkeypatch.setattr(W.EmojiCache, "refresh", idle)  # no token fetch
+    monkeypatch.setattr(W.Board, "_on_seen", idle)  # `stuck`: its handler never returns
+    monkeypatch.setattr(W, "serve", functools.partial(W.serve, close_timeout=0.5))
+    monkeypatch.setattr(W, "_CLOSE_GRACE", 1.0)
+    host = f"127.0.0.1:{_free_port()}"
+    secret = W.load_secret(settings)
+    main: list[asyncio.Task[None]] = []
+
+    async def web() -> None:
+        main.append(asyncio.current_task())  # type: ignore[arg-type]
+        await W.run(settings, "sk", "", None, host, data_dir=tmp_path)
+
+    def serve() -> None:
+        with contextlib.suppress(asyncio.CancelledError):
+            asyncio.run(web())
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    client: Any = None
+    try:
+        for _ in range(250):
+            try:
+                if peer == "hung":
+                    client = _hung_peer(host, secret)
+                else:
+                    client = websockets.sync.client.connect(
+                        f"ws://{host}/ws{'?chat' if peer == 'chat' else ''}",
+                        origin=websockets.Origin(f"http://{host}"),
+                        additional_headers=cookie_header(secret),
+                    )
+                break
+            except ConnectionRefusedError:
+                time.sleep(0.02)
+        assert client is not None, "server never listened"
+        if peer == "stuck":
+            client.send(json.dumps({"seen": "t"}))
+            time.sleep(0.1)  # the verb is in its handler before the Ctrl-C
+        main[0].get_loop().call_soon_threadsafe(main[0].cancel)
+        if peer == "hung":
+            assert _close_frame(client)[:2] == (1001).to_bytes(2)
+        else:
+            with pytest.raises(websockets.ConnectionClosedOK) as closed:
+                while True:
+                    client.recv(timeout=2)  # the board's frames, then the close
+            assert closed.value.rcvd is not None and closed.value.rcvd.code == 1001
+        thread.join(5)
+        assert not thread.is_alive(), "web held the exit with a page connected"
+    finally:
+        if client is not None:
+            client.close()  # releases a hung server, so a failure does not leak its thread
+        thread.join(5)
 
 
 def _unreadable(path: Path) -> None:
