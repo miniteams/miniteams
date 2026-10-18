@@ -2284,7 +2284,8 @@ async def test_a_launch_url_signs_a_fresh_browser_in(
     board: W.Board, settings: Settings, pages: Pages, path: str
 ) -> None:
     """A fresh profile loading `<page>#<token>` (web.json's launch URL, a --browser chat open) trades the
-    token for the cookie under the real CSP: the socket connects, the fragment leaves the address bar."""
+    token for the cookie under the real CSP: the socket connects, the fragment leaves the address bar,
+    the token is renewed (024-AC8)."""
     async with _served(board, settings) as host:
         pages.host = host  # no cookie: the token is the way in
         token = board.token
@@ -2306,14 +2307,31 @@ async def test_a_page_without_the_cookie_says_how_to_sign_in(
         page = await pages.open(path, csp=True)
         hint = page.locator("#signin")
         await hint.wait_for()
-        expected = "open the launch file (~/.config/miniteams/open.html by default) or web.json's URL"
-        expected += " (host, port and #token)"
+        expected = "open http://host:port/#token from web.json (~/.config/miniteams/web.json by default)"
         assert await hint.text_content() == f"Not signed in: {expected}"
         # M3: a banner over the top, not a flex column eating the chat page's row layout.
         box = await hint.bounding_box()
         assert box is not None and box["y"] == 0 and box["height"] < 80
         assert box["width"] == await page.evaluate("document.documentElement.clientWidth")
         assert board.secret not in await page.content() and board.token not in await page.content()
+        await pages.close()
+
+
+async def test_the_native_window_says_to_restart_itself_to_sign_in(
+    board: W.Board, settings: Settings, pages: Pages
+) -> None:
+    """024: inside the native window (its tray promise present), the sign-in hint names its own remedy."""
+
+    async def native(context: Any) -> None:
+        await context.add_init_script("window.miniteamsTray = new Promise(() => {});")
+
+    async with _served(board, settings) as host:
+        pages.host = host
+        page = await pages.open("/", csp=True, prepare=native)
+        hint = page.locator("#signin")
+        await hint.wait_for()
+        expected = "restart `miniteams widget` (it signs in with web.json's token)"
+        assert await hint.text_content() == f"Not signed in: {expected}"
         await pages.close()
 
 

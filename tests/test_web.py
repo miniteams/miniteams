@@ -2,8 +2,12 @@
 
 import asyncio
 import json
+import os
+import re
 import socket
 import time
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -445,26 +449,10 @@ def test_parse_bind_refuses_non_loopback() -> None:
         W.parse_bind("[::]:80")
 
 
-def test_load_bind_draws_then_reads_the_persisted_draw(settings: Settings) -> None:
-    """serve_board persists a draw once bound; load_bind reads the bind back and ignores the token."""
-    host, port = W.load_bind(settings)
+def test_draw_bind_is_a_127_sibling_and_an_ephemeral_port() -> None:
+    host, port = W._draw_bind()
     assert host.startswith("127.0.0.") and 2 <= int(host.rsplit(".", 1)[1]) <= 254
     assert 32768 <= port <= 60999
-    assert not (settings.config_dir / "web.json").exists()
-    W.save_bind(settings, "127.0.0.9", 40000, "tok")
-    assert W.load_bind(settings) == ("127.0.0.9", 40000)  # second run: same URL
-
-
-def test_load_bind_override_wins_and_does_not_persist(settings: Settings) -> None:
-    assert W.load_bind(settings, "127.0.0.9:9999") == ("127.0.0.9", 9999)
-    assert not (settings.config_dir / "web.json").exists()
-
-
-def test_load_bind_recovers_from_corrupt_file(settings: Settings) -> None:
-    settings.config_dir.mkdir(parents=True)
-    (settings.config_dir / "web.json").write_text("{not json")
-    host, _ = W.load_bind(settings)
-    assert host.startswith("127.0.0.")
 
 
 # --- serving ---
@@ -521,33 +509,169 @@ async def test_serve_page_and_initial_rows(settings: Settings) -> None:
             await task
 
 
-async def test_serve_redraws_when_persisted_port_is_taken(settings: Settings, monkeypatch) -> None:
-    """L3: only the port is redrawn: the cookie is scoped to the host, a new one would sign pages out."""
-    host = "127.0.0.33"
+def _taken(host: str) -> tuple[socket.socket, int, int]:
+    """A listening socket on `host`, its port, and a port free on `host`."""
     taken = socket.socket()
     taken.bind((host, 0))
     taken.listen()
-    busy = int(taken.getsockname()[1])
-    W.save_bind(settings, host, busy, "old")
     with socket.socket() as probe:
         probe.bind((host, 0))
         free = int(probe.getsockname()[1])
-    monkeypatch.setattr(W, "_draw_port", lambda: free)
-    monkeypatch.setattr(W, "_draw_bind", lambda: pytest.fail("the host was redrawn"))
-    board = W.Board({})
-    task = asyncio.create_task(W.serve_board(board, settings, None))
+    return taken, int(taken.getsockname()[1]), free
+
+
+async def _serves(board: W.Board, settings: Settings, bind: str | None) -> None:
+    """serve_board until bound and answering, then cancelled."""
+    task = asyncio.create_task(W.serve_board(board, settings, bind))
     try:
         await wait(lambda: board.publish is not None, "bound")
-        saved = {"host": host, "port": free, "token": board.token}
-        assert json.loads((settings.config_dir / "web.json").read_text()) == saved
-        assert board.base_url == f"http://{host}:{free}"
-        async with board_socket(f"{host}:{free}", board.secret) as ws:
+        async with board_socket(board.base_url.removeprefix("http://"), board.secret) as ws:
             assert json.loads(await ws.recv())["rows"] == []
     finally:
-        taken.close()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+async def test_a_first_run_draws_a_bind_and_keeps_it(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """024-AC9: without web.json the bind is drawn, a drawn port found taken is redrawn, and the bound
+    address is persisted for the next run."""
+    host = "127.0.0.33"
+    taken, busy, free = _taken(host)
+    monkeypatch.setattr(W, "_draw_bind", lambda: (host, busy))
+    monkeypatch.setattr(W, "_draw_port", lambda: free)
+    board = W.Board({})
+    try:
+        await _serves(board, settings, None)
+    finally:
+        taken.close()
+    assert board.base_url == f"http://{host}:{free}"
+    saved = {"host": host, "port": free, "token": board.token}
+    assert json.loads((settings.config_dir / "web.json").read_text()) == saved
+
+
+async def test_a_taken_persisted_bind_fails_and_keeps_web_json(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """024-AC9: web.json's address taken: the start fails naming it and web.json, nothing redrawn; the
+    command exits non-zero (`command_failed`, 1) on that error."""
+    taken, busy, _ = _taken("127.0.0.33")
+    W.save_bind(settings, "127.0.0.33", busy, "old")
+    before = (settings.config_dir / "web.json").read_bytes()
+    monkeypatch.setattr(W, "_draw_port", lambda: pytest.fail("the port was redrawn"))
+    monkeypatch.setattr(W, "_draw_bind", lambda: pytest.fail("the bind was redrawn"))
+    board = W.Board({})
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            await asyncio.wait_for(W.serve_board(board, settings, None, W._persisted_bind(settings)), 5)
+    finally:
+        taken.close()
+    message = str(exc.value)
+    assert f"127.0.0.33:{busy}" in message and str(settings.config_dir / "web.json") in message
+    assert "in use: is another miniteams web running? stop it, or delete web.json" in message
+    assert (settings.config_dir / "web.json").read_bytes() == before and board.publish is None
+
+
+async def test_web_exits_on_a_taken_persisted_bind(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """024-AC9 end to end: run() hands web.json's bind to the real serve_board, which fails on it."""
+    taken, busy, _ = _taken("127.0.0.33")
+    W.save_bind(settings, "127.0.0.33", busy, "old")
+    path = settings.config_dir / "web.json"
+    before = path.read_bytes()
+
+    async def idle(*_: Any, **__: Any) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(W, "fill_from_listing", idle)
+    monkeypatch.setattr(W, "run_forever", idle)
+    monkeypatch.setattr(W.EmojiCache, "refresh", idle)  # no token fetch
+    monkeypatch.setattr(W, "_draw_bind", lambda: pytest.fail("the bind was redrawn"))
+    try:
+        with pytest.raises(RuntimeError, match=f"cannot listen on 127.0.0.33:{busy} .*another miniteams web"):
+            await asyncio.wait_for(W.run(settings, "sk", "", None, None, data_dir=tmp_path), 5)
+    finally:
+        taken.close()
+    assert path.read_bytes() == before
+
+
+def _unreadable(path: Path) -> None:
+    path.write_text('{"host": "127.0.0.9", "port": 40000, "token": "t"}')
+    path.chmod(0)
+    if os.access(path, os.R_OK):
+        pytest.skip("running as root")
+
+
+@pytest.mark.parametrize(
+    ("write", "reason"),
+    [
+        (lambda p: p.write_text("{not json"), "Expecting property name"),
+        (_unreadable, "Permission denied"),
+        (lambda p: p.write_text('{"host": "192.168.1.10", "port": 40000}'), "non-loopback"),
+        (lambda p: p.write_text('{"host": "127.0.0.9", "port": 0}'), "expected ADDR:PORT"),
+        (lambda p: p.write_text('{"host": "127.0.0.9", "port": 70000}'), "expected ADDR:PORT"),
+        (lambda p: p.write_text('{"port": 40000}'), 'missing "host"'),
+        (lambda p: p.write_text('{"host": "127.0.0.9"}'), 'missing "port"'),
+        (lambda p: p.write_text("[]"), "list indices"),
+    ],
+    ids=[
+        "not-json",
+        "unreadable",
+        "non-loopback",
+        "port-0",
+        "port-70000",
+        "no-host",
+        "no-port",
+        "not-an-object",
+    ],
+)
+async def test_an_unusable_web_json_fails_and_is_kept(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch, write: Callable[[Path], object], reason: str
+) -> None:
+    """024-AC9: an unusable web.json is an error naming it, never a silent redraw over it; `web` fails on
+    it first thing, before any seeding, token or presence work."""
+    path = settings.config_dir / "web.json"
+    settings.config_dir.mkdir(parents=True)
+    write(path)
+    before = (path.stat().st_mtime_ns, path.stat().st_size)
+    for name in ("_draw_bind", "Directory", "_load_seen", "token_source", "open_cache", "serve_board"):
+        monkeypatch.setattr(W, name, lambda *_, name=name, **__: pytest.fail(f"{name} reached"))
+    with pytest.raises(RuntimeError, match=f"cannot use {re.escape(str(path))}: .*{re.escape(reason)}"):
+        await asyncio.wait_for(W.run(settings, "skype", "bearer", None, None, data_dir=path.parent), 5)
+    assert (path.stat().st_mtime_ns, path.stat().st_size) == before
+    # A --bind run leaves it alone too: its token goes to stderr, not over the unusable file.
+    assert W.publish(settings, "127.0.0.33", 4000, True, "tok") is False
+    assert (path.stat().st_mtime_ns, path.stat().st_size) == before
+
+
+def test_parse_bind_refuses_port_0_and_past_65535() -> None:
+    for bad in ("127.0.0.1:0", "127.0.0.1:65536", "[::1]:0"):
+        with pytest.raises(ValueError, match="expected ADDR:PORT"):
+            W.parse_bind(bad)
+    assert W.parse_bind("127.0.0.1:65535") == ("127.0.0.1", 65535)
+
+
+async def test_a_taken_explicit_bind_fails_as_before(settings: Settings) -> None:
+    """--bind keeps its semantics: a taken address raises the bind error, nothing redrawn nor written."""
+    taken, busy, _ = _taken("127.0.0.33")
+    try:
+        with pytest.raises(OSError, match="in use"):
+            await asyncio.wait_for(W.serve_board(W.Board({}), settings, f"127.0.0.33:{busy}"), 5)
+    finally:
+        taken.close()
+    assert not (settings.config_dir / "web.json").exists()
+
+
+async def test_an_explicit_bind_is_used_over_web_json(settings: Settings) -> None:
+    W.save_bind(settings, "127.0.0.9", 40000, "live")
+    board = W.Board({})
+    taken, _, free = _taken("127.0.0.33")
+    taken.close()
+    await _serves(board, settings, f"127.0.0.33:{free}")
+    assert board.base_url == f"http://127.0.0.33:{free}"
 
 
 # --- live events (phase 2) ---

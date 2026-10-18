@@ -132,6 +132,22 @@ def test_an_unreadable_secret_is_one_clear_error(settings: Settings) -> None:
     assert exc.value.__cause__ is None and exc.value.__suppress_context__
 
 
+def test_an_unwritable_secret_is_one_clear_error(settings: Settings) -> None:
+    settings.config_dir.mkdir(parents=True)
+    settings.config_dir.chmod(0o500)
+    path = settings.config_dir / "web-secret"
+    try:
+        if os.access(settings.config_dir, os.W_OK):
+            pytest.skip("running as root")
+        with pytest.raises(
+            RuntimeError, match=f"cannot write {re.escape(str(path))}: Permission denied"
+        ) as exc:
+            W.load_secret(settings)
+    finally:
+        settings.config_dir.chmod(0o700)
+    assert exc.value.__cause__ is None and exc.value.__suppress_context__ and not path.exists()
+
+
 def test_the_token_files_are_owner_only(settings: Settings) -> None:
     """M10: the skype token, the endpoint ids and the MSAL cache go through write_private."""
     from miniteams import skype, trouter
@@ -198,15 +214,6 @@ def _web_json(settings: Settings) -> dict[str, object]:
     return dict(json.loads(path.read_text()))
 
 
-def _launch_url(settings: Settings) -> str:
-    """The URL the launch file's refresh and link go to (they must agree)."""
-    assert stat.S_IMODE(settings.launch_file.stat().st_mode) == 0o600
-    [refresh] = re.findall(r'content="0;url=([^"]*)"', settings.launch_file.read_text())
-    [link] = re.findall(r'href="([^"]*)"', settings.launch_file.read_text())
-    assert refresh == link
-    return refresh
-
-
 async def _auth(client: httpx.AsyncClient, host: str, *tokens: str, **headers: str) -> httpx.Response:
     sent = [("X-Miniteams-Token", token) for token in tokens] + list(headers.items())
     return await client.get(f"http://{host}/auth", headers=sent)
@@ -215,7 +222,7 @@ async def _auth(client: httpx.AsyncClient, host: str, *tokens: str, **headers: s
 async def test_the_launch_token_buys_the_cookie_once(settings: Settings) -> None:
     """web.json holds host, port and a single-use token: /auth trades it (header only) for the cookie and
     writes a new one; a spent, wrong, missing, doubled or URL-borne token gets 403, a foreign Host 404.
-    Neither the secret nor a token is ever logged."""
+    Neither the secret nor a token is ever logged, and no launch file is written (024-AC8)."""
     board = _board()
     structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG))
     with structlog.testing.capture_logs() as logs:
@@ -223,7 +230,6 @@ async def test_the_launch_token_buys_the_cookie_once(settings: Settings) -> None
             first = board.token
             port = int(host.rsplit(":")[1])
             assert _web_json(settings) == {"host": "127.0.0.1", "port": port, "token": first}
-            assert _launch_url(settings) == f"http://{host}/#{first}"
             got = await _auth(client, host, first, Host="evil.example")
             assert got.status_code == 404 and board.token == first  # not spent
             for bad in ((), ("",), (first[:-1],), (first + "x",), (first, first)):
@@ -239,12 +245,15 @@ async def test_the_launch_token_buys_the_cookie_once(settings: Settings) -> None
                 "no-store",
             )
             assert board.token != first and _web_json(settings)["token"] == board.token
-            assert _launch_url(settings) == f"http://{host}/#{board.token}"
             client.cookies.clear()
             got = await _auth(client, host, first)  # spent
             assert got.status_code == 403 and "set-cookie" not in got.headers
     for secret in (board.secret, first, board.token):
         assert secret not in repr(logs)
+    assert sorted(p.name for p in settings.config_dir.iterdir()) == ["web-secret", "web.json"]
+    [listening] = [e for e in logs if e["event"] == "web_listening"]
+    web_json = str(settings.config_dir / "web.json")
+    assert (listening["url"], listening["token_in"]) == (f"http://{host}/", web_json)
 
 
 async def test_a_failed_web_json_write_keeps_the_token(
@@ -278,16 +287,10 @@ async def test_a_bind_run_leaves_another_servers_web_json(
     board = _board()
     async with _served(board, settings) as host, httpx.AsyncClient() as client:
         assert _web_json(settings) == before
-        assert not settings.launch_file.exists()
         assert capsys.readouterr().err == f"http://{host}/#{board.token}\n"
         assert (await _auth(client, host, board.token)).status_code == 204  # --browser opens still work
-    assert _web_json(settings) == before and not settings.launch_file.exists()
+    assert _web_json(settings) == before
     assert capsys.readouterr().err == f"http://{host}/#{board.token}\n"
-
-
-def test_the_launch_page_brackets_ipv6_and_escapes() -> None:
-    page = W.launch_page("::1", 5, "a&b")
-    assert page.count("http://[::1]:5/#a&amp;b") == 2 and "a&b" not in page
 
 
 async def test_a_re_mint_re_checks_who_publishes(settings: Settings) -> None:
@@ -297,22 +300,9 @@ async def test_a_re_mint_re_checks_who_publishes(settings: Settings) -> None:
     async with _served(board, settings) as host, httpx.AsyncClient() as client:
         assert _web_json(settings)["token"] == board.token
         W.publish(settings, "127.0.0.9", 40000, False, "other")
-        other = (_web_json(settings), _launch_url(settings))
+        other = _web_json(settings)
         assert (await _auth(client, host, board.token)).status_code == 204
-        assert (_web_json(settings), _launch_url(settings)) == other
-
-
-async def test_a_failed_launch_file_write_keeps_the_rotation(settings: Settings) -> None:
-    """The launch file is a convenience: failing to write it logs, and web.json still gets each token."""
-    settings.launch_file.parent.mkdir(parents=True)
-    settings.launch_file.mkdir()  # os.replace cannot put a file over a directory
-    board = _board()
-    with structlog.testing.capture_logs() as logs:
-        async with _served(board, settings) as host, httpx.AsyncClient() as client:
-            first = board.token
-            assert (await _auth(client, host, first)).status_code == 204
-            assert board.token != first and _web_json(settings)["token"] == board.token
-    assert [e["event"] for e in logs if e["event"] == "launch_file_failed"] == ["launch_file_failed"] * 2
+        assert _web_json(settings) == other
 
 
 async def test_non_ascii_token_or_cookie_is_refused_not_a_crash(settings: Settings) -> None:

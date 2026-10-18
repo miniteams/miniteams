@@ -142,7 +142,6 @@ def settings(tmp_path: Any) -> Settings:
     s = Settings(tenant_id="tenant-123")
     s.config_dir = tmp_path / "cfg"
     s.cache_dir = tmp_path / "cache"
-    s.launch_file = s.config_dir / "open.html"  # never the real one, nor a .env override
     return s
 
 

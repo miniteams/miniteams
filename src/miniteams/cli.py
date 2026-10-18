@@ -329,6 +329,13 @@ def cmd_web(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_widget(settings: Settings, args: argparse.Namespace) -> int:
+    """The widget in its own window with a tray icon, on the running `miniteams web` (spec 024)."""
+    from .widget import run
+
+    return run(settings)
+
+
 def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
     """Build/refresh a resumable local archive of chats under data/ (see spec 001)."""
     import asyncio
@@ -748,6 +755,11 @@ def main(argv: list[str] | None = None) -> int:
         "widget (e.g. firefox); default: the page's own browser",
     )
     p_web.set_defaults(func=cmd_web)
+
+    p_widget = sub.add_parser(
+        "widget", help="the widget in its own window with a tray icon (needs `miniteams web` running)"
+    )
+    p_widget.set_defaults(func=cmd_widget)
 
     p_watch = sub.add_parser("watch", help="one JSON line per live event matching the criteria (spec 009)")
     p_watch.add_argument("--event", choices=["message", "reaction"], default="message")

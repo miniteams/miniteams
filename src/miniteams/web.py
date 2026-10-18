@@ -8,11 +8,11 @@ Routes: `/` the board page, `/chat/<thread>` a chat page, `/media/<thread>/<file
 archived and custom-emoji images, `/ws` the socket (`/ws?chat` for a chat page).
 
 Bind is `127.0.0.X:PORT` with X and PORT drawn once and persisted (`web.json`) so the URL
-survives restarts; the whole 127/8 is loopback on Linux, no interface setup needed. Pages are static
-shells; every route carrying data needs the `mt` cookie, the persisted `web-secret`. A browser gets it by
-loading a page with `#<token>`: the page trades the single-use token at `/auth`; `web.json` and the
-launch file (`open.html`) hold the current one. The secret never goes through argv, the terminal or
-the history.
+survives restarts; a persisted bind that is taken fails the start rather than move. The whole 127/8 is
+loopback on Linux, no interface setup needed. Pages are static shells; every route carrying data needs
+the `mt` cookie, the persisted `web-secret`. A browser gets it by loading `http://<bind>/#<token>`: the
+page trades the single-use token at `/auth`; `web.json` (0600) holds the current one. The secret never
+goes through argv, the terminal or the history.
 """
 
 import asyncio
@@ -23,7 +23,6 @@ import errno
 import functools
 import hashlib
 import hmac
-import html
 import ipaddress
 import itertools
 import json
@@ -116,7 +115,7 @@ _SCRIPT_RE = re.compile(r"<script>(.*?)</script>", re.DOTALL)
 _SILENT_TYPES = {RECEIPT_EVENT}
 _RELABEL_TYPES = {"ThreadActivity/TopicUpdate", "ThreadActivity/AddMember", "ThreadActivity/DeleteMember"}
 MAX_FRAME = MAX_IMAGE_BYTES + (1 << 20)  # one pasted image per binary frame, plus room for a long JSON verb
-_BIND_ATTEMPTS = 3  # redraws when the persisted port turns out taken
+_BIND_ATTEMPTS = 3  # redraws when a first run's drawn port turns out taken
 _RELAY_QUEUE = 256  # live events waiting for their followers; past it one is dropped, the stream never waits
 _RELAY_MAX = 10.0  # seconds one relay may take (name lookups included) before the next one goes
 _MEDIA_BACKOFF = 30.0  # seconds relayed records skip the media folder after a read outlived its deadline
@@ -488,7 +487,7 @@ async def _resolve_stub(row: dict[str, Any], recent: list[dict[str, Any]], direc
 def parse_bind(value: str) -> tuple[str, int]:
     host, _, port = value.rpartition(":")
     host = host.removeprefix("[").removesuffix("]")  # [::1]:PORT, the URL form
-    if not host or not port.isdigit():
+    if not host or not port.isdigit() or not 0 < int(port) < 65536:
         raise ValueError(f"expected ADDR:PORT, got {value!r}")
     address = ipaddress.ip_address(host)
     # The cookie travels in clear over plain HTTP: anything but loopback would hand it to the network.
@@ -549,18 +548,29 @@ def _draw_bind() -> tuple[str, int]:
 
 
 def _persisted_bind(settings: Settings) -> tuple[str, int] | None:
+    """web.json's bind; None only when there is no web.json. Unusable, it is an error: redrawing would
+    overwrite it and move the address under every browser and launcher."""
+    found = read_web_json(settings.config_dir)
+    return None if found is None else found[:2]
+
+
+def read_web_json(config_dir: Path) -> tuple[str, int, str] | None:
+    """web.json's validated bind and its launch token ("" when absent); None when there is no web.json,
+    RuntimeError naming the file when it is unusable."""
+    path = config_dir / "web.json"
     try:
-        data = json.loads((settings.config_dir / "web.json").read_text())
-        return str(data["host"]), int(data["port"])
-    except OSError, ValueError, KeyError, TypeError:
+        data = json.loads(path.read_text())
+        host, port = parse_bind(netloc(str(data["host"]), int(data["port"])))
+        return host, port, str(data.get("token") or "")
+    except FileNotFoundError:
         return None
-
-
-def load_bind(settings: Settings, override: str | None = None) -> tuple[str, int]:
-    """`--bind` wins; else the persisted draw; else a new draw (serve_board persists it once bound)."""
-    if override:
-        return parse_bind(override)
-    return _persisted_bind(settings) or _draw_bind()
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        reason = (
+            f'missing "{exc.args[0]}"' if isinstance(exc, KeyError) else getattr(exc, "strerror", None) or exc
+        )
+        raise RuntimeError(
+            f"cannot use {path}: {reason}; fix it, or delete it to draw a new address"
+        ) from None
 
 
 def save_bind(settings: Settings, host: str, port: int, token: str) -> None:
@@ -579,21 +589,16 @@ async def _reap(proc: asyncio.subprocess.Process, opener: str) -> None:
         log.warning("opener_exit", opener=opener, rc=rc, stderr=tail.decode(errors="replace").strip())
 
 
-def launch_page(host: str, port: int, token: str) -> str:
-    url = html.escape(f"http://{netloc(host, port)}/#{token}")
-    return f'<!doctype html><meta http-equiv="refresh" content="0;url={url}"><a href="{url}">miniteams</a>\n'
-
-
 def publish(settings: Settings, host: str, port: int, guarded: bool, token: str) -> bool:
-    """Write `token` into web.json and the launch file; False, writing nothing, when `guarded` (a --bind
-    run) and web.json names another server, whose launch token lives there."""
-    if guarded and _persisted_bind(settings) not in (None, (host, port)):
-        return False
+    """Write `token` into web.json; False, writing nothing, when `guarded` (a --bind run) and web.json
+    names another server, whose launch token lives there."""
+    if guarded:
+        try:
+            if _persisted_bind(settings) not in (None, (host, port)):
+                return False
+        except RuntimeError:  # unusable web.json: not ours to overwrite from a --bind run
+            return False
     save_bind(settings, host, port, token)
-    try:
-        write_private(settings.launch_file, launch_page(host, port, token))
-    except OSError as exc:  # web.json holds the token: rotation must go on
-        log.warning("launch_file_failed", path=str(settings.launch_file), error=str(exc))
     return True
 
 
@@ -921,7 +926,7 @@ class Board:
             self._enqueue_relay(thread_id, functools.partial(self._relay_async, thread_id, frame))
 
     def take_token(self, offered: str) -> bool:
-        """The launch token is good once: a use re-mints it into web.json and the launch file."""
+        """The launch token is good once: a use re-mints it into web.json."""
         if not _same(offered, self.token):
             return False
         token = secrets.token_urlsafe(24)
@@ -1643,11 +1648,16 @@ async def _route(board: Board, ws: ServerConnection, path: str, authorized: bool
     return ws.respond(HTTPStatus.NOT_FOUND, "not found\n")
 
 
-async def serve_board(board: Board, settings: Settings, bind: str | None) -> None:
+async def serve_board(
+    board: Board, settings: Settings, bind: str | None, persisted: tuple[str, int] | None = None
+) -> None:
+    """Serve on `bind`, else on `persisted` (web.json's, read by the caller), else on a fresh draw."""
     for name in ("widget.html", "chat.html"):
         _page(name)  # a missing ui.js / ui.css or marker fails here, not on the first page load
     board.secret = load_secret(settings)  # never logged: it is every route's only credential
-    host, port = load_bind(settings, bind)
+    if bind:
+        persisted = None
+    host, port = parse_bind(bind) if bind else persisted or _draw_bind()
     for attempt in range(_BIND_ATTEMPTS):
         bound = netloc(host, port)
         board.base_url = f"http://{bound}"
@@ -1664,14 +1674,21 @@ async def serve_board(board: Board, settings: Settings, bind: str | None) -> Non
             )
             break
         except OSError as exc:
+            if persisted:
+                # A moved address would sign every browser out and break every launcher: fail, keep web.json.
+                path = settings.config_dir / "web.json"
+                error = f"cannot listen on {bound} (from {path}): {exc.strerror or exc}"
+                if exc.errno == errno.EADDRINUSE:
+                    error += ": is another miniteams web running? stop it, or delete web.json"
+                    error += " to draw a new address"
+                raise RuntimeError(error) from None
             if bind or attempt == _BIND_ATTEMPTS - 1:
                 raise
-            # Persisted port got taken by something else since the draw. Same host: the cookie is
-            # scoped to it, a new address would sign every open page out.
             log.warning("bind_failed", host=host, port=port, error=str(exc))
             port = _draw_port()
     async with server:
-        log.info("web_listening", url=f"{board.base_url}/", launch=f"file://{settings.launch_file}")
+        # The token stays out of the log: it buys the cookie until spent.
+        log.info("web_listening", url=f"{board.base_url}/", token_in=str(settings.config_dir / "web.json"))
         # Once bound: a run failing on the port keeps the live one's web.json.
         board.publish = functools.partial(publish, settings, host, port, bool(bind))
         if not board.publish(board.token):
@@ -1745,6 +1762,8 @@ async def run(
     me: str = "",
     data_dir: Path | None = None,
 ) -> None:
+    # An unusable web.json fails the start before any seeding or presence work.
+    persisted = None if bind else _persisted_bind(settings)
     # Ctrl-C while an archive read hangs on a dead mount must still exit: see `_leave_if_stuck`.
     try:
         directory = Directory(settings)
@@ -1791,7 +1810,7 @@ async def run(
         board._follow_presence()  # the seeded rows' peers, before any event moves a row
         # The stream waits out a dead login (see run_forever) and returns only on failure: a page that
         # silently stops updating is worse than an exit, so the server goes down with it.
-        server = asyncio.create_task(serve_board(board, settings, bind))
+        server = asyncio.create_task(serve_board(board, settings, bind, persisted))
         # The page is up before the listing is walked: it fills in, it does not wait.
         fill = asyncio.create_task(
             fill_from_listing(board, settings, skype_token, directory, cap, me, seen, seed)
