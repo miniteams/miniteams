@@ -153,6 +153,13 @@
   const pick = () => rows.filter((r) => filters[tab](r) && named(r, query));
   const counts = () => Object.fromEntries(
     Object.entries(filters).map(([k, f]) => [k, rows.filter((r) => f(r) && named(r, query)).length]));
+  // The native window (spec 024) injects a promise of its tray before this script; a browser has none.
+  let tray = null, live = false;  // live: a board frame since the socket last closed
+  const BADGES = [["unread", "Unread"], ["mention", "@"], ["all", "Inbox"], ["none", "None"]];
+  let badge = BADGES.some(([k]) => k === pref("badge")) ? pref("badge") : "unread";
+  // A tab's rule without the filter box: the badge counts what the tab shows once the box is empty.
+  // Disconnected: no count, whatever the choice; a stale one would read as live.
+  const publish = () => tray?.badge(...(live && badge !== "none" ? [badge, rows.filter(filters[badge]).length] : ["none", 0]));
 
   const renderHeader = () => {
     const c = counts();
@@ -184,7 +191,16 @@
       const b = el("button", chatnav === k ? "on" : "", lbl); b.onclick = () => { chatnav = k; keep("chatnav", k); render(); }; nseg.append(b);
     }
     nbox.append(el("h3", null, "Chat navigation"), nseg);
-    menu.append(tbox, dbox, mbox, nbox); $cog.append(menu);
+    menu.append(tbox, dbox, mbox, nbox);
+    if (tray) {
+      const ybox = el("div"), yseg = el("div", "seg");
+      ybox.id = "tray";
+      for (const [k, lbl] of BADGES) {
+        const b = el("button", badge === k ? "on" : "", lbl); b.onclick = () => { badge = k; keep("badge", k); publish(); render(); }; yseg.append(b);
+      }
+      ybox.append(el("h3", null, "Tray"), yseg); menu.append(ybox);
+    }
+    $cog.append(menu);
   };
 
   const render = () => {
@@ -407,18 +423,20 @@
       if ("browser" in msg) browser = !!msg.browser;
       if ("me" in msg) meName = msg.me || "";
       if ("busy" in msg) $spin.hidden = !msg.busy;
-      if (msg.rows) { rows = msg.rows; secs.set(msg.sections); render(); }
+      if (msg.rows) { rows = msg.rows; live = true; secs.set(msg.sections); render(); publish(); }
       if (msg.presence) paintPresence(msg.presence);
       if (msg.complete) complete.answered(msg);
       if (msg.sent) { if (msg.ok) sends.done(msg.sent); else sends.fail(msg.sent, msg.unsure ? UNSURE : msg.error || "not sent"); }
     };
     ws.onclose = () => {
       $status.title = "disconnected"; $status.classList.add("off");
+      live = false; publish();
       sends.lost();
       setTimeout(connect, retry.next());  // server restarts → page recovers alone
     };
   };
   render();
+  window.miniteamsTray?.then((t) => { tray = t; t.settings.connect(() => { menuOpen = true; renderHeader(); }); publish(); renderHeader(); });
   signIn.then(connect);
   setInterval(render, CLOCK_TICK_MS);
 })();

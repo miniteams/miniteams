@@ -2317,6 +2317,24 @@ async def test_a_page_without_the_cookie_says_how_to_sign_in(
         await pages.close()
 
 
+async def test_the_native_window_says_to_restart_itself_to_sign_in(
+    board: W.Board, settings: Settings, pages: Pages
+) -> None:
+    """024: inside the native window (its tray promise present), the sign-in hint names its own remedy."""
+
+    async def native(context: Any) -> None:
+        await context.add_init_script("window.miniteamsTray = new Promise(() => {});")
+
+    async with _served(board, settings) as host:
+        pages.host = host
+        page = await pages.open("/", csp=True, prepare=native)
+        hint = page.locator("#signin")
+        await hint.wait_for()
+        expected = "restart `miniteams widget` (it signs in with web.json's token)"
+        assert await hint.text_content() == f"Not signed in: {expected}"
+        await pages.close()
+
+
 @pytest.mark.parametrize("theme", ["light", "dark"])
 async def test_both_settings_menus_share_one_style(chat: Pages, theme: str) -> None:
     """H6: one ⚙ menu style (ui.css) in both pages: the same layer, headings at 4.5:1 or more."""

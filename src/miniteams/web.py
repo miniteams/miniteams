@@ -550,10 +550,18 @@ def _draw_bind() -> tuple[str, int]:
 def _persisted_bind(settings: Settings) -> tuple[str, int] | None:
     """web.json's bind; None only when there is no web.json. Unusable, it is an error: redrawing would
     overwrite it and move the address under every browser and launcher."""
-    path = settings.config_dir / "web.json"
+    found = read_web_json(settings.config_dir)
+    return None if found is None else found[:2]
+
+
+def read_web_json(config_dir: Path) -> tuple[str, int, str] | None:
+    """web.json's validated bind and its launch token ("" when absent); None when there is no web.json,
+    RuntimeError naming the file when it is unusable."""
+    path = config_dir / "web.json"
     try:
         data = json.loads(path.read_text())
-        return parse_bind(netloc(str(data["host"]), int(data["port"])))
+        host, port = parse_bind(netloc(str(data["host"]), int(data["port"])))
+        return host, port, str(data.get("token") or "")
     except FileNotFoundError:
         return None
     except (OSError, ValueError, KeyError, TypeError) as exc:

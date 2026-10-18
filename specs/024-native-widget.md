@@ -126,3 +126,9 @@ None.
 - Notifications in scope as phase 3: a none / mentions / every-message preference, a click opens the
   chat — user's call (2026-10-18, review comment).
 - The "@" badge uses a contrasting colour (the icon's blue made it unreadable at 22 px).
+- Bridge: a QWebChannel, its script injected by the window at document creation; the page reads
+  `window.miniteamsTray` (a promise of the `tray` object: `badge(pref, count)` in, `settings` out), absent in a
+  browser. Phase 3 adds its notification calls to the same object.
+- Badge default: Unread. With the mentions preference the icon shows "@" (amber), the tooltip the count —
+  overturnable.
+- Profile in `<config dir>/widget` (0700: its cookie store holds the secret), HTTP cache in memory.

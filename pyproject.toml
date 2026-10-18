@@ -13,6 +13,10 @@ dependencies = [
     "websockets>=16.0",
 ]
 
+# `miniteams widget`, the native window (spec 024): `uv sync --extra widget`
+[project.optional-dependencies]
+widget = ["pyside6-essentials>=6.12", "pyside6-addons>=6.12", "pyside6-webengine>=6.12"]
+
 [project.scripts]
 miniteams = "miniteams.cli:main"
 
@@ -53,6 +57,11 @@ warn_return_any = true
 module = ["msal.*"]
 ignore_missing_imports = true
 
+# PySide6 is the optional `widget` extra (it ships its own stubs): without it, widget_qt is checked against Any
+[[tool.mypy.overrides]]
+module = ["PySide6.*", "shiboken6"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 addopts = "-v --tb=short"
@@ -60,7 +69,8 @@ markers = ["browser: headless Chrome tests (`uv run --with playwright pytest tes
 
 [tool.coverage.run]
 source = ["miniteams"]
-omit = ["*/__main__.py"]
+# widget_qt needs the optional PySide6: `uv run --extra widget pytest --cov tests/test_widget_qt.py` measures it
+omit = ["*/__main__.py", "*/widget_qt.py"]
 
 [tool.coverage.report]
 show_missing = true

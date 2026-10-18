@@ -66,6 +66,7 @@ uv run miniteams web              # local live page: conversations newest-first 
 uv run miniteams web --limit 0 --bind 127.0.0.5:8765   # load every chat (with an archive that is
                                                        # every archived chat: a heavier page)
 uv run miniteams web --data-dir /srv/teams-archive     # seed rows from an archive kept elsewhere
+uv run --extra widget miniteams widget   # the running web's board in its own window + tray icon (spec 024)
 uv run miniteams mcp              # MCP server over stdio for an agent (spec 008; see below)
 uv run miniteams watch --thread 19:xxx@thread.v2 --once   # one JSON line per matching live event
                                                        # (spec 009; docs/watch.md)
@@ -160,6 +161,25 @@ terminal and it reconnects within seconds (it watches the token cache file).
 - Chat pages opened through `--browser` get the current token in their URL fragment, so a fresh `--browser` profile signs in on the first open.
 - Known limit: the cookie is host-scoped, not port-scoped, so another HTTP server on the same `127.0.0.X` address receives it. `web` draws a dedicated `127.0.0.X` and keeps it across restarts to make that unlikely.
 - Archive reads have a deadline: a hung mount answers `archive unavailable` (history, search, follow) or HTTP 503 (pages, media) and logs one `archive_unavailable` warning per 30 s. A chat page that missed live frames reloads its latest page. At exit, threads stuck on a dead mount do not hold the process.
+
+**Native window** (spec 024)
+- `uv sync --extra widget` once (PySide6 / QtWebEngine, ~260 MB download), then `uv run --extra widget miniteams widget`
+  while `miniteams web` runs. It shows the board in its own window: 256 px icon in Alt-Tab, window class `miniteams`.
+- It signs in with `web.json`'s token, then keeps the cookie in its own profile (`~/.config/miniteams/widget`, `0700`).
+  It exits 1 when `web.json` is missing or nothing answers at its address. Launched again while it runs, it shows
+  the running window and exits (one window per profile).
+- Closing the window hides it to the tray (with no tray to bring it back, closing quits); the tray menu has **Show**,
+  **Settings…** and **Quit**. A click on the icon shows the window; on a panel with *menu is primary* (XFCE's default) a left click opens the menu, a middle click shows it.
+- ⚙ → **Tray** (native window only) picks the count on the icon: **Unread**, **@** (an `@` while you are
+  mentioned), **Inbox** or **None**; the tooltip says how many. Counts follow the tabs' rules, ignore the filter box,
+  and keep updating while the window is hidden; disconnected from `web`, the icon shows no count.
+- Links that would open a new window or tab (and any page other than the board) open in the system browser;
+  rows open chats as in the browser widget. A chat page ("Chat here" without `--browser`) gets `web.json`'s current
+  token in its fragment, as with `--browser`, so that browser signs in.
+- Chromium's sandbox needs unprivileged user namespaces or a setuid `chrome-sandbox`. Where AppArmor restricts the
+  namespaces (`kernel.apparmor_restrict_unprivileged_userns=1`, Ubuntu's default), QtWebEngine uses
+  `$CHROME_DEVEL_SANDBOX`, else `/usr/lib/chromium/chrome-sandbox`, else the chromium snap's; with none of them it fails to start.
+  Never run it with the sandbox disabled.
 
 **Presence** (spec 015)
 - A dot on the avatar of 1:1 rows (widget and split list) and of message authors: green available, red busy or
