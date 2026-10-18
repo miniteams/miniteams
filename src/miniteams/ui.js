@@ -45,7 +45,7 @@
     history.replaceState(null, "", location.pathname + location.search);
     return fetch("/auth", { headers: { "X-Miniteams-Token": token } }).catch(() => {});
   })();
-  const SIGNED_OUT = "Not signed in: open the launch file (~/.config/miniteams/open.html by default) or web.json's URL (host, port and #token)";
+  const SIGNED_OUT = "Not signed in: open http://host:port/#token from web.json (~/.config/miniteams/web.json by default)";
   // A socket refused before it opened hides its status: a plain GET of /ws tells no cookie (403) from a server down.
   const dial = (path) => {
     const sock = new WebSocket(wsUrl(path));

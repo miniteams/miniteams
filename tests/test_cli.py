@@ -4,9 +4,16 @@ import argparse
 from typing import Any
 
 import pytest
+import structlog.testing
 
 from miniteams import cli
 from miniteams.config import Settings
+
+
+@pytest.fixture(autouse=True)
+def _keep_test_logging(monkeypatch: pytest.MonkeyPatch) -> None:
+    # setup_logging caches cli.log on first use, past the reach of a later capture_logs.
+    monkeypatch.setattr(cli, "setup_logging", lambda level: None)
 
 
 def _ns(**kw: Any) -> argparse.Namespace:
@@ -354,6 +361,22 @@ def test_web_passes_self_mri_from_the_access_token(monkeypatch) -> None:
     monkeypatch.setattr(web, "run", fake_run)
     assert C.main(["web", "--bind", "127.0.0.77:47123"]) == 0
     assert (got["me"], got["skype_token"], got["bearer"]) == ("8:orgid:me-guid", "skype", f"h.{body}.s")
+
+
+def test_web_exits_1_on_a_server_error(monkeypatch) -> None:
+    """024-AC9: the RuntimeError a taken web.json bind raises ends `web` with rc 1 and `command_failed`."""
+    from miniteams import web
+
+    monkeypatch.setattr(cli, "_ensure_skype_token", lambda settings: ({"access_token": "a"}, "skype"))
+    error = "cannot listen on 127.0.0.33:4000 (from /cfg/web.json): in use"
+
+    async def fail(*_: Any, **__: Any) -> None:
+        raise RuntimeError(error)
+
+    monkeypatch.setattr(web, "run", fail)
+    with structlog.testing.capture_logs() as logs:
+        assert cli.main(["web"]) == 1
+    assert [e["error"] for e in logs if e["event"] == "command_failed"] == [error]
 
 
 def test_archive_retries_a_transient_aad_error(monkeypatch) -> None:

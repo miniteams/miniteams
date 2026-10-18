@@ -2284,7 +2284,8 @@ async def test_a_launch_url_signs_a_fresh_browser_in(
     board: W.Board, settings: Settings, pages: Pages, path: str
 ) -> None:
     """A fresh profile loading `<page>#<token>` (web.json's launch URL, a --browser chat open) trades the
-    token for the cookie under the real CSP: the socket connects, the fragment leaves the address bar."""
+    token for the cookie under the real CSP: the socket connects, the fragment leaves the address bar,
+    the token is renewed (024-AC8)."""
     async with _served(board, settings) as host:
         pages.host = host  # no cookie: the token is the way in
         token = board.token
@@ -2306,8 +2307,7 @@ async def test_a_page_without_the_cookie_says_how_to_sign_in(
         page = await pages.open(path, csp=True)
         hint = page.locator("#signin")
         await hint.wait_for()
-        expected = "open the launch file (~/.config/miniteams/open.html by default) or web.json's URL"
-        expected += " (host, port and #token)"
+        expected = "open http://host:port/#token from web.json (~/.config/miniteams/web.json by default)"
         assert await hint.text_content() == f"Not signed in: {expected}"
         # M3: a banner over the top, not a flex column eating the chat page's row layout.
         box = await hint.bounding_box()

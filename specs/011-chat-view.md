@@ -406,7 +406,7 @@ None.
   through `--browser` opens `/chat/<id>#<token>`. Each token also goes into a launch file
   (`MINITEAMS_LAUNCH_FILE`, default `~/.config/miniteams/open.html`, `0600`), a page redirecting to
   `http://<host:port>/#<token>`: `chromium --app=file://<launch file>` keeps the token out of argv (a
-  failed launch-file write is logged, rotation goes on). A `--bind` run leaves a `web.json` naming another
+  failed launch-file write is logged, rotation goes on; superseded by spec 024: no launch file). A `--bind` run leaves a `web.json` naming another
   bind alone, re-checked at every re-mint, and prints its launch URL on stderr at start and after each re-mint. Known limit: the jq
   launch and `--browser` middle-click opens put the token in argv; a process reading `/proc` may spend it
   first, and the page then shows "Not signed in".

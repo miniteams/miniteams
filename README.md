@@ -105,7 +105,8 @@ soon as the seed is read and fills in from the live listing afterwards; a small 
 bottom right means that walk is still running, and the rows may reshuffle when it lands. Mentions
 are scanned at startup on the newest rows only (50); older chats surface theirs when the next
 message arrives. It binds a random `127.0.0.X:PORT` drawn once and kept in `~/.config/miniteams/web.json` so the
-URL stays bookmarkable; `--bind` overrides it and refuses anything but loopback (IPv6 as `[::1]:PORT`). Media files, emoji and the WebSocket
+URL stays bookmarkable; when that address is taken, `web` exits with an error naming it and leaves `web.json` as is
+(free the address, or delete `web.json` to draw a new one, then relaunch every browser with a token); `--bind` overrides it and refuses anything but loopback (IPv6 as `[::1]:PORT`). Media files, emoji and the WebSocket
 need the auth cookie, see *First launch*. Clicking a row opens the chat at its last message through `--opener` (default `xdg-open`
 on an `msteams://` deep link, i.e. the desktop client; `--open-scheme https` for Teams web,
 `--opener none` to let the page follow its plain https link); opening does not mark the row
@@ -141,15 +142,17 @@ terminal and it reconnects within seconds (it watches the token cache file).
   Alt+↑/↓ moves a chat within a Manual section. From a filter box, ←/→ act only while it is empty.
 
 **First launch**
-- Launch with the path `web` logs at start (`web_listening … launch=file://…`):
+- Open `http://<bind>/#<token>`, both read from `web.json`; `web` logs the bare URL and the file at start (`web_listening url=… token_in=…`), never the token:
   ```bash
   chromium --class=miniteams --user-data-dir=$HOME/snap/chromium/common/miniteams/profile \
-    --app=file://$HOME/snap/chromium/common/miniteams/open.html
+    --app="$(jq -r '"http://\(if (.host | contains(":")) then "[\(.host)]" else .host end):\(.port)/#\(.token)"' \
+      "${XDG_CONFIG_HOME:-$HOME/.config}/miniteams/web.json")"
   ```
-  `--user-data-dir` gives the widget its own profile and process, so it neither stacks with the other Chromium windows nor reuses their session; `--class=miniteams` gives it its own window class (taskbar entry, window rules). With a non-snap browser use any profile dir and the logged path (default `~/.config/miniteams/open.html`).
-- `web` writes that launch file (`0600`) and `web.json` (`0600`, the bind) with a single-use token; the page trades the token at `/auth` for the `mt` cookie (`HttpOnly; SameSite=Strict`, one year, refreshed on each page load) and drops it from the address bar. `web` writes a new token after each use, so the same command always works, and once a browser holds the cookie the plain `http://host:port/` URL works too.
-- Snap Chromium: its confinement (the snap `home` interface) denies hidden files and directories under `~`, so it cannot open `~/.config/miniteams/open.html`. When `~/snap/chromium` exists (and the config dir is the default one), the launch file defaults to `~/snap/chromium/common/miniteams/open.html` (the snap's own data directory, kept across snap refreshes); `MINITEAMS_LAUNCH_FILE` overrides it.
-- Alternative: `chromium --app="http://$(jq -r '"\(.host):\(.port)/#\(.token)"' ~/.config/miniteams/web.json)"`. It puts the single-use token in argv, where a process reading `/proc` could spend it first; the page then shows `Not signed in`.
+  It needs `jq`; `web.json` lives in the config dir (`$XDG_CONFIG_HOME/miniteams` when set, else `~/.config/miniteams`; `MINITEAMS_CONFIG_DIR` overrides it), and an IPv6 host is bracketed.
+  `--user-data-dir` gives the widget its own profile and process, so it neither stacks with the other Chromium windows nor reuses their session; `--class=miniteams` gives it its own window class (taskbar entry, window rules). With a non-snap browser use any profile dir.
+- `web.json` (`0600`) holds the bind and a single-use token; the page trades the token at `/auth` for the `mt` cookie (`HttpOnly; SameSite=Strict`, one year, refreshed on each page load) and drops it from the address bar. Each launch consumes the token and `web` writes the next one into `web.json`, so the same command always works, and once a browser holds the cookie the plain `http://host:port/` URL works too.
+- An `open.html` left by an older version is no longer written nor read: delete it and switch launchers to the line above.
+- The token sits in argv until the page has traded it, where a process reading `/proc` could spend it first; the page then shows `Not signed in`: relaunch.
 - The secret never appears on a command line, in the terminal or in the browser history.
 - Pages load without the cookie, but show `Not signed in` and stay empty until launched with a token: data (the socket, media, emoji) needs the cookie.
 - Open the page by the bound address: any other `Host` name (e.g. `localhost`) gets 404 (DNS-rebinding guard).
@@ -330,9 +333,9 @@ token expires. Downloaded media (from `stream`) lives under `~/.cache/miniteams/
 All via `MINITEAMS_*` env vars / `.env` (see `.env.example`). `MINITEAMS_ENDPOINT_SUFFIX=-test` gives a
 second `web`, `stream` or `archive --live` its own Trouter endpoint ids, so it does not take the
 deliveries of the one already running; a second `web` also needs its own `--bind` (sharing the config
-dir, it leaves the first one's `web.json` and launch file alone, and prints its own launch URL on
+dir, it leaves the first one's `web.json` alone, and prints its own launch URL on
 stderr at start and after each use: enter it through that URL, or with a cookie a browser already holds for that host).
-`MINITEAMS_LAUNCH_FILE` moves the launch file (default `~/snap/chromium/common/miniteams/open.html` when snap Chromium is installed, else `~/.config/miniteams/open.html`). Defaults are the purple-teams
+Defaults are the purple-teams
 **work/TFW** constants — override only if auth starts returning 4xx, after re-capturing from a
 live browser session. `MINITEAMS_ASYNCGW_HOST` sets the custom emoji host (default `fr-prod.asyncgw.teams.microsoft.com`); set it when your tenant lives in another region.
 

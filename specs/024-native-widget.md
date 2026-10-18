@@ -8,7 +8,7 @@
 
 The widget runs as a `chromium --app` window. Its Alt-Tab icon is Chromium's 16×16 favicon, blurry at
 xfwm4's 64 px; it has no tray icon, so closing it closes it; and it opens through `open.html`, a launch
-file written under the snap's data directory that only spares the single-use token ~100 ms in argv.
+file written under the snap's data directory that only spares the single-use token a short window in argv.
 
 ## Solution
 
@@ -39,7 +39,8 @@ in the same Chromium engine. Launching any page needs no launch file: the token 
   `--browser`).
 - **Simpler launch.** `open.html` and `MINITEAMS_LAUNCH_FILE` go. Pages are reached at
   `http://<bind>/#<token>`, the token read from `web.json` (0600) and renewed after each use, as today;
-  the cookie and the Host check stay. `miniteams web` logs the URL to use; the README gives the
+  the cookie and the Host check stay. `miniteams web` logs the bare URL and where the token is (the token
+  itself never reaches a log); the README gives the
   `chromium --app` line built from `web.json` for those who keep a browser window.
 - **Fixed bind.** When `web.json`'s address is taken, `miniteams web` exits with an error naming it
   instead of moving to a new one (a moved address loses the native window's cookie and every launcher).
@@ -66,7 +67,8 @@ in the same Chromium engine. Launching any page needs no launch file: the token 
 - [ ] **AC7** Without the optional dependencies, `miniteams widget` exits with the command to install
   them; without a running `miniteams web`, it exits naming the address it tried.
 - [ ] **AC8** No launch file is written; `http://<bind>/#<token>` signs a browser in once and the token is
-  renewed; `MINITEAMS_LAUNCH_FILE` is gone from code and docs.
+  renewed; `launch_file` / `MINITEAMS_LAUNCH_FILE` are gone from `src/`, `tests/`, `.env.example` and the
+  README (past specs and the README's migration note may still name `open.html`).
 - [ ] **AC9** When the bind in `web.json` is taken, `miniteams web` exits non-zero naming it, and
   `web.json` is unchanged.
 - [ ] **AC10** With notifications on mentions, a new message mentioning me raises one desktop
@@ -77,10 +79,12 @@ in the same Chromium engine. Launching any page needs no launch file: the token 
 ## Phases
 
 ### Phase 1 — Simpler launch and fixed bind
-- Work: remove the launch file; log the token URL; fail on a taken bind; README launch line.
+- Work: remove the launch file; log the bare URL and where the token is (never the token); fail on a
+  taken bind; README launch line.
 - **Covers**: AC8, AC9
 - **Data model impact**: none
-- **DoD**: unit and browser tests; grep of `open.html` / `launch_file` / `MINITEAMS_LAUNCH_FILE` is zero;
+- **DoD**: unit and browser tests; a test asserts `launch_file` / `MINITEAMS_LAUNCH_FILE` appear nowhere in
+  `src/`, `tests/` (outside that test), `.env.example` or the README;
   full suite and pre-commit green.
 
 ### Phase 2 — Native window with tray
