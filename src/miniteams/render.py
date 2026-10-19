@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
-from .attachments import existing, object_id
+from .attachments import LIVE_HOST_RE, existing, object_id
 from .messages import file_name, json_list, reaction_emoji
 
 _KEPT = frozenset(
@@ -28,7 +28,7 @@ _DROP_CONTENT = frozenset({"script", "style", "iframe"})
 _BLOCKS = _KEPT - frozenset("a b strong i em u s del code span img".split())
 _HTML_MAX = 128 * 1024  # chars, well past a real Teams message body
 _IMG_ATTRS = ("alt", "title")
-_STEM_RE = re.compile(r"[\w-][\w.-]*")  # no glob characters, no leading dot
+STEM_RE = re.compile(r"[\w-][\w.-]*")  # no glob characters, no leading dot
 _NOT_ARCHIVED = "[image not archived]"
 
 
@@ -42,15 +42,26 @@ def _web_url(value: str) -> str | None:
     return url if scheme.lower() in ("http", "https") else None
 
 
-def media_url(thread_id: str, media_dir: Path | None, src: str) -> str | None:
-    """`/media/<thread>/<file>` when the archive holds the object `src` points to, else None."""
+def media_url(thread_id: str, media_dir: Path | None, src: str, live: bool = True) -> str | None:
+    """`/media/<thread>/<file>` when the archive holds the object `src` points to; with `live`, for an
+    asyncgw object it does not hold (yet), `/media/<thread>/<id>?host=<host>`, found or fetched by the
+    server on request; else None."""
     stem = object_id(src)
-    if media_dir is None or "/objects/" not in src or not _STEM_RE.fullmatch(stem):
+    if "/objects/" not in src or not STEM_RE.fullmatch(stem):
         return None
-    found = existing(media_dir, stem)
-    if found is None:
+    thread = quote(thread_id, safe="")
+    found = existing(media_dir, stem) if media_dir is not None else None
+    if found is not None:
+        return f"/media/{thread}/{quote(Path(found).name, safe='')}"
+    if not live:
         return None
-    return f"/media/{quote(thread_id, safe='')}/{quote(Path(found).name, safe='')}"
+    try:
+        parts = urlsplit(src)
+    except ValueError:
+        return None
+    if parts.scheme != "https" or not LIVE_HOST_RE.fullmatch(parts.netloc):
+        return None
+    return f"/media/{thread}/{quote(stem, safe='')}?host={parts.netloc}"
 
 
 def _attr(name: str, value: str) -> str:
@@ -138,7 +149,7 @@ class _Sanitizer(HTMLParser):
 
     def _img(self, a: dict[str, str], emoji: bool) -> None:
         src = a.get("src", "")
-        local = media_url(self.thread_id, self.media_dir, src)
+        local = media_url(self.thread_id, self.media_dir, src, live=not emoji)
         name, _, tail = a.get("itemid", "").partition(";")
         # The itemid's tail need not be the image id, but it is all a `src`-less one has.
         oid = next((o for o in (object_id(src), tail) if o in self.custom), None) if emoji else None
@@ -148,13 +159,7 @@ class _Sanitizer(HTMLParser):
             if emoji:  # no glyph to fall back on: its name, styled apart from the text
                 self.out.append(f'<span class="custom-emoji">{html.escape(name or a.get("alt", ""))}</span>')
                 return
-            url = _web_url(src)
-            if url is None:
-                self.out.append(_NOT_ARCHIVED)
-            else:
-                self.out.append(
-                    f'<a href="{html.escape(url)}" rel="noopener" target="_blank">{_NOT_ARCHIVED}</a>'
-                )
+            self.out.append(_NOT_ARCHIVED)  # a link to Teams' copy would need the token the page lacks
             return
         attrs = _attr("src", local) + (' class="emoji"' if emoji else "")
         attrs += "".join(_attr(k, a[k]) for k in _IMG_ATTRS if k in a)

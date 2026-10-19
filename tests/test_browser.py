@@ -30,7 +30,7 @@ from browser_helpers import (  # skips without playwright
     until,
     wait,
 )
-from test_web_chat import ANN, ME, OBJ, C, T, _archive, _at, _event, _m, _served, _until
+from test_web_chat import ANN, GW, ME, OBJ, C, T, _archive, _at, _event, _m, _served, _until
 
 from miniteams import archive_store, compose
 from miniteams import chat_verbs as CV
@@ -364,6 +364,41 @@ async def test_a_message_image_opens_full_size(board: W.Board, chat: Pages) -> N
         assert await zoom.locator("img").evaluate("i => i.src") == await img.evaluate("i => i.src")
         await (page.keyboard.press("Escape") if close == "Escape" else zoom.click())
         await zoom.wait_for(state="hidden")
+
+
+@pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
+async def test_an_image_the_archive_lacks_is_retried_then_said(
+    board: W.Board, chat: Pages, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC6: a live image /media cannot serve yet is asked again: it shows once the archiver wrote it;
+    one still missing after about 30 s reads "[image not archived]", no link."""
+    asked: list[str] = []
+
+    async def refused(client: Any, token: str, host: str, oid: str) -> None:
+        asked.append(oid)  # Teams refuses: the failure memo answers the retries
+
+    monkeypatch.setattr(CV, "live_image", refused)
+    page = await chat.open(_chat(T))
+    await _handled(page, "follow")
+    await page.clock.install()
+    late, never = "0-frc-d1-late", "0-frc-d1-never"
+    imgs = "".join(f'<img src="https://{GW}/v1/objects/{oid}/views/imgo">' for oid in (late, never))
+    await board.on_event(_event("NewMessage", T, **_m("4", _at(4), f"<p>{imgs}</p>")))
+    shown = page.locator('[data-id="4"] .html')
+    retry = "n => document.querySelectorAll(`[data-id='4'] img[data-retry='${n}']`).length"
+    await page.wait_for_function(f"({retry})(1) === 2")  # both refused once
+    chat_dir = find_chat_dir(data_dir, T)
+    assert chat_dir is not None
+    (chat_dir / "media" / f"{late}.png").write_bytes(PNG)
+    await page.clock.run_for(1000)
+    await page.wait_for_function("document.querySelector(`[data-id='4'] img`).naturalWidth > 0")
+    for n in (2, 3, 4):
+        await page.wait_for_function(f"({retry})({n}) === 1")
+        await page.clock.run_for(20000)
+    await page.wait_for_function("!document.querySelector(`[data-id='4'] img[data-retry='4']`)")
+    assert await shown.inner_text() == "[image not archived]"
+    assert await shown.locator("img").count() == 1 and await shown.locator("a").count() == 0
+    assert sorted(asked) == [late, never]
 
 
 async def test_composer_keys_success_and_failure(

@@ -5,7 +5,8 @@ One process, one port: `websockets.serve` answers `GET /` with the bundled page 
 on every change. No REST layer: the page verbs ride the same socket.
 
 Routes: `/` the board page, `/chat/<thread>` a chat page, `/media/<thread>/<file>` and `/emoji/<id>`
-archived and custom-emoji images, `/ws` the socket (`/ws?chat` for a chat page).
+archived and custom-emoji images (`/media/<thread>/<id>?host=` fetches an image not archived yet), `/ws`
+the socket (`/ws?chat` for a chat page).
 
 Bind is `127.0.0.X:PORT` with X and PORT drawn once and persisted (`web.json`) so the URL
 survives restarts; a persisted bind that is taken fails the start rather than move. The whole 127/8 is
@@ -1615,7 +1616,7 @@ async def _process_request(
     if not (authorized or page_route):
         return ws.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
     try:
-        resp = await _route(board, ws, path, authorized)
+        resp = await _route(board, ws, path, authorized, url.query)
     except ArchiveUnavailable:
         return ws.respond(HTTPStatus.SERVICE_UNAVAILABLE, "archive unavailable\n")
     if authorized and page_route and resp.status_code == HTTPStatus.OK:
@@ -1623,7 +1624,7 @@ async def _process_request(
     return resp
 
 
-async def _route(board: Board, ws: ServerConnection, path: str, authorized: bool) -> Response:
+async def _route(board: Board, ws: ServerConnection, path: str, authorized: bool, query: str) -> Response:
     if path == "/":
         page = _page("widget.html")
         return _respond(ws, page.encode(), _PAGE_HEADERS | {"Content-Security-Policy": _page_csp(page)})
@@ -1635,7 +1636,7 @@ async def _route(board: Board, ws: ServerConnection, path: str, authorized: bool
             page = _page("chat.html")
             return _respond(ws, page.encode(), _PAGE_HEADERS | {"Content-Security-Policy": _page_csp(page)})
     if path.startswith("/media/"):
-        found = await board.chat.media(path)
+        found = await board.chat.media(path, parse_qs(query).get("host", [""])[0])
         if found is not None:
             body, ctype = found
             headers = {"Content-Type": ctype, "Cache-Control": "private, max-age=3600"}

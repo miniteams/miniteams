@@ -30,6 +30,7 @@ ME = "8:orgid:00000000-0000-0000-0000-00000000000a"
 ANN = "8:orgid:00000000-0000-0000-0000-00000000000b"
 OBJ = "0-weu-d1-0123456789abcdef"
 SRC = f"https://eu-api.asm.skype.com/v1/objects/{OBJ}/views/imgo"
+GW = "fr-prod.asyncgw.teams.microsoft.com"
 
 
 @pytest.fixture
@@ -327,13 +328,35 @@ def test_archived_image_is_rewritten_to_media(media: Path) -> None:
     assert sanitize(raw, T, media) == f'<img src="/media/19%3Aaaaa%40thread.v2/{OBJ}.png" width="250">'
 
 
-def test_unarchived_image_becomes_a_link() -> None:
-    """011-AC6: no token on the page, so the browser only gets a link to the original."""
-    raw = f'<img itemtype="http://schema.skype.com/AMSImage" src="{SRC}">'
-    expected = f'<a href="{SRC}" rel="noopener" target="_blank">[image not archived]</a>'
-    assert sanitize(raw, T, None) == expected
-    assert sanitize('<img src="javascript:alert(1)">', T) == "[image not archived]"
-    assert sanitize('<img src="data:image/png;base64,AAAA">', T) == "[image not archived]"
+def test_unarchived_asyncgw_image_goes_through_media(media: Path) -> None:
+    """011-AC6: an image the archiver has not written yet still points at /media, which fetches it."""
+    new = "0-frc-d1-fedcba9876543210"
+    raw = f'<img itemtype="http://schema.skype.com/AMSImage" src="https://{GW}/v1/objects/{new}/views/imgo">'
+    expected = f'<img src="/media/19%3Aaaaa%40thread.v2/{new}?host={GW}">'
+    assert sanitize(raw, T, media) == expected
+    assert sanitize(raw, T, None) == expected  # a chat the archive does not hold
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        SRC,  # not an asyncgw host: no live fetch
+        f"http://{GW}/v1/objects/{OBJ}/views/imgo",
+        f"https://evil.example/v1/objects/{OBJ}/views/imgo",
+        f"https://{GW}.evil.example/v1/objects/{OBJ}/views/imgo",
+        f"https://a.{GW}/v1/objects/{OBJ}/views/imgo",
+        f"https://x@{GW}/v1/objects/{OBJ}/views/imgo",
+        f"https://{GW}:8443/v1/objects/{OBJ}/views/imgo",
+        f"https://FR-PROD.asyncgw.teams.microsoft.com/v1/objects/{OBJ}/views/imgo",
+        "javascript:alert(1)",
+        "data:image/png;base64,AAAA",
+    ],
+)
+def test_unservable_image_is_plain_text(src: str) -> None:
+    """011-AC6: no dead link to Teams' copy (the page has no token): the text alone."""
+    assert sanitize(f'<img itemtype="http://schema.skype.com/AMSImage" src="{src}">', T, None) == (
+        "[image not archived]"
+    )
 
 
 @pytest.mark.parametrize(
@@ -343,6 +366,9 @@ def test_unarchived_image_becomes_a_link() -> None:
         "https://eu-api.asm.skype.com/v1/objects/*/views/imgo",
         "https://eu-api.asm.skype.com/v1/objects/.hidden/views/imgo",
         "https://eu-api.asm.skype.com/v1/objects/%2e%2e/views/imgo",
+        f"https://{GW}/v1/objects/../../secret/views/imgo",
+        f"https://{GW}/v1/objects/*/views/imgo",
+        f"https://{GW}/v1/objects/%2e%2e/views/imgo",
         "https://example.org/no-object-here.png",
     ],
 )

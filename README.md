@@ -217,6 +217,9 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   - ☰ folds the list, or opens it over the chat below 700px.
   - Ctrl+K jumps to the list's filter: ↑/↓ pick a row, Enter opens it. Seen and Muted sit behind ⋯ in a narrow list.
   - **Sections** (see above) work the same here, with their own Recent / Sections choice and folds.
+- **Images**: served from the archive's `media/` folder, else fetched from Teams by `web` (memory only, never written
+  to the archive; archives run with `--no-media` or without `images` in `--media` show theirs this way). One the page cannot load yet is retried
+  for about 30 s, then reads `[image not archived]`.
 - **Mark read in Teams when shown** (⚙, on by default): a chat opened, and each message from someone else landing in
   it, marks it read in Teams once the window is visible, focused and at the latest message, and the archive has caught
   up (no "loading latest messages…"); one `read` a second per chat, the last one sent only if all that still holds.

@@ -5,8 +5,9 @@ the caller down, never crash it. Centralised here so every paged walk inherits t
 """
 
 import asyncio
+import functools
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -103,3 +104,35 @@ async def astream_with_retry(
         log.warning("rate_limited", url=url, attempt=attempt + 1, delay=delay)
         await sleep(delay)
     raise AssertionError("unreachable")  # loop always returns or raises
+
+
+class Downloads[T]:
+    """Downloads a page asks for again and again: one in flight per key, a failed one (None or raised)
+    not retried for `ttl` seconds, the newest `most` failures remembered."""
+
+    def __init__(self, ttl: float, most: int) -> None:
+        self.ttl, self.most = ttl, most
+        self._failed: dict[str, float] = {}  # key → when its download failed
+        self._running: dict[str, asyncio.Task[T | None]] = {}
+
+    async def get(self, key: str, fetch: Callable[[], Coroutine[Any, Any, T | None]]) -> T | None:
+        failed_at = self._failed.get(key)
+        if failed_at is not None and time.monotonic() - failed_at < self.ttl:
+            return None
+        task = self._running.get(key)
+        if task is None:
+            task = asyncio.create_task(fetch())
+            self._running[key] = task
+            task.add_done_callback(functools.partial(self._done, key))
+        # Shielded: the HTTP handler runs under the socket's open timeout, the download and its memo don't.
+        return await asyncio.shield(task)
+
+    def _done(self, key: str, task: asyncio.Task[T | None]) -> None:
+        self._running.pop(key, None)
+        if not task.cancelled() and task.exception() is None and task.result() is not None:
+            return
+        now = time.monotonic()
+        self._failed = {k: at for k, at in self._failed.items() if now - at < self.ttl and k != key}
+        self._failed[key] = now
+        while len(self._failed) > self.most:
+            del self._failed[next(iter(self._failed))]  # oldest first

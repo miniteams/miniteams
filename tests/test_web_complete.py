@@ -665,7 +665,7 @@ async def test_a_failed_emoji_download_is_not_retried_inside_the_window(
     for _ in range(5):
         assert await board.emojis.image(OID) is None
     assert asked == [OID]
-    board.emojis._failed[OID] -= emojis._FAILED_TTL + 1
+    board.emojis._downloads._failed[OID] -= emojis._FAILED_TTL + 1
     assert await board.emojis.image(OID) is None
     assert asked == [OID, OID]
 
@@ -688,8 +688,8 @@ async def test_cancelled_emoji_requests_share_one_download_and_its_failure_memo(
             await asyncio.wait_for(board.emojis.image(OID), 0.05)
     assert asked == [OID]
     release.set()
-    await wait(lambda: OID in board.emojis._failed, "the failure noted")
-    assert OID in board.emojis._failed and not board.emojis._downloads
+    await wait(lambda: OID in board.emojis._downloads._failed, "the failure noted")
+    assert OID in board.emojis._downloads._failed and not board.emojis._downloads._running
     assert await board.emojis.image(OID) is None
     assert asked == [OID]
 
@@ -699,11 +699,11 @@ async def test_failed_emoji_downloads_are_bounded(board: W.Board, monkeypatch: p
         return None
 
     monkeypatch.setattr(emojis, "cached_image", failing)
-    monkeypatch.setattr(emojis, "_FAILED_MAX", 2)
+    board.emojis._downloads.most = 2
     board.emojis.names = {"a": "id-a", "b": "id-b", "c": "id-c"}
     for oid in ("id-a", "id-b", "id-c"):
         await board.emojis.image(oid)
-    assert list(board.emojis._failed) == ["id-b", "id-c"]
+    assert list(board.emojis._downloads._failed) == ["id-b", "id-c"]
 
 
 async def test_a_failed_custom_set_is_retried_with_a_capped_backoff(

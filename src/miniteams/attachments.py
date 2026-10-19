@@ -24,6 +24,7 @@ import httpx
 import structlog
 
 from miniteams.http import aget_with_retry, astream_with_retry
+from miniteams.http import failure as reason
 
 if TYPE_CHECKING:
     from miniteams.archive_store import ChatStore
@@ -33,6 +34,10 @@ log = structlog.get_logger()
 _AMSIMAGE = "http://schema.skype.com/AMSImage"
 # Cookie is valid (and only attached) for these object hosts (teams_contacts.c:373).
 _OBJECT_HOST_RE = re.compile(r"^(api\.asm\.skype\.com|[^.]+\.asyncgw\.teams\.microsoft\.com)$")
+# Hosts a page may name for `live_image`: the token goes there, so one DNS label, no port or userinfo.
+LIVE_HOST_RE = re.compile(r"[a-z0-9-]{1,63}\.asyncgw\.teams\.microsoft\.com")
+_LIVE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+_LIVE_MAX = 10 * 1024 * 1024
 _IMG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 _URIOBJ_RE = re.compile(r"<URIObject\b[^>]*>", re.IGNORECASE)
 # Call-recording messages nest the transcript/video as <item type="amsTranscript" uri="…">.
@@ -296,6 +301,32 @@ async def _stream_to(client: httpx.AsyncClient, url: str, token: str, dest: Path
         # skip-if-exists check. Never leave partial bytes behind.
         dest.unlink(missing_ok=True)
         raise
+
+
+async def live_image(client: httpx.AsyncClient, token: str, host: str, oid: str) -> tuple[bytes, str] | None:
+    """(body, content type) of object `oid`'s `imgo` view on `host` (both checked by the caller), in
+    memory: the web shows an image the archive does not hold (yet) and never writes into it. None when
+    Teams refuses it, or it is no image or too large."""
+    url = f"https://{host}/v1/objects/{quote(oid, safe='')}/views/imgo"
+    try:
+        # One try: a Retry-After wait would hold a fetch slot, and the page retries anyway.
+        async with astream_with_retry(
+            client, url, max_retries=0, headers={"Accept": "*/*"}, cookies={"skypetoken_asm": token}
+        ) as resp:
+            ctype = (resp.headers.get("content-type") or "").split(";")[0].strip()
+            if ctype not in _LIVE_TYPES:  # served from our origin: never HTML or SVG
+                log.info("live_image_refused", host=host, object_id=oid, content_type=ctype)
+                return None
+            body = bytearray()
+            async for chunk in resp.aiter_bytes(65536):
+                body += chunk
+                if len(body) > _LIVE_MAX:
+                    log.info("live_image_refused", host=host, object_id=oid, reason="too_large")
+                    return None
+            return bytes(body), ctype
+    except httpx.HTTPError as exc:
+        log.info("live_image_failed", host=host, object_id=oid, error=reason(exc))
+        return None
 
 
 def existing(media_dir: Path, stem: str) -> str | None:

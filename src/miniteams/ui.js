@@ -4,6 +4,17 @@
   // URL params override the stored choices without replacing them (bookmarks, screenshots).
   const q = new URLSearchParams(location.search), pref = (k) => q.get(k) ?? store(k);
   const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+  // A /media image not served yet (archiver a moment behind, Teams slow) is asked again for about 30 s,
+  // then said. Delegated, in capture: `error` does not bubble, and the CSP forbids inline handlers.
+  const MEDIA_RETRY_MS = [1000, 3000, 7000, 19000];
+  document.addEventListener("error", (e) => {
+    const img = e.target;
+    if (!(img instanceof HTMLImageElement) || !img.getAttribute("src")?.startsWith("/media/")) return;
+    const n = Number(img.dataset.retry || 0);
+    if (n >= MEDIA_RETRY_MS.length) { img.replaceWith("[image not archived]"); return; }
+    img.dataset.retry = n + 1;
+    setTimeout(() => { img.src = img.getAttribute("src"); }, MEDIA_RETRY_MS[n]);
+  }, true);
   // One colour and initials rule for every avatar, rows and messages alike.
   const hue = (s) => [...s].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7);
   const initials = (name) => { const w = name.split(/[ ,]+/).filter((x) => /\p{L}/u.test(x));

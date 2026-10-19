@@ -11,7 +11,6 @@ import functools
 import json
 import mimetypes
 import re
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -26,7 +25,7 @@ from .auth import token_source
 from .compose import EMOJI_NAME_RE
 from .config import Settings
 from .directory import Directory
-from .http import failure
+from .http import Downloads, failure
 
 log = structlog.get_logger()
 
@@ -153,8 +152,7 @@ class EmojiCache:
         self.names: dict[str, str] = {}  # empty until fetched
         # Teams' emoticon id: its tail need not be the image's documentId.
         self.keys: dict[str, str] = {}
-        self._failed: dict[str, float] = {}  # image id → when its download failed
-        self._downloads: dict[str, asyncio.Task[Path | None]] = {}  # image id → download in flight
+        self._downloads: Downloads[Path] = Downloads(_FAILED_TTL, _FAILED_MAX)  # by image id
 
     def custom(self) -> frozenset[str]:
         """Object ids of the custom emojis `/emoji/<id>` serves."""
@@ -192,31 +190,12 @@ class EmojiCache:
         """(body, content type) of a known custom emoji's image, None for anything else."""
         if not _ID_RE.fullmatch(oid) or oid not in self.custom() or self.directory is None:
             return None
-        now = time.monotonic()
-        failed_at = self._failed.get(oid)
-        if failed_at is not None and now - failed_at < _FAILED_TTL:
-            return None
         settings = self.directory.settings
-        task = self._downloads.get(oid)
-        if task is None:
-            task = asyncio.create_task(cached_image(settings, self.directory.skype_token, oid))
-            self._downloads[oid] = task
-            task.add_done_callback(functools.partial(self._downloaded, oid))
-        # Shielded: the HTTP handler runs under the socket's open timeout, the download and its memo don't.
-        path = await asyncio.shield(task)
+        fetch = functools.partial(cached_image, settings, self.directory.skype_token, oid)
+        path = await self._downloads.get(oid, fetch)
         if path is None:
             return None
         return await asyncio.to_thread(_cached_body, settings.cache_dir / "emojis", path)
-
-    def _downloaded(self, oid: str, task: asyncio.Task[Path | None]) -> None:
-        self._downloads.pop(oid, None)
-        if not task.cancelled() and task.exception() is None and task.result() is not None:
-            return
-        now = time.monotonic()
-        self._failed = {k: at for k, at in self._failed.items() if now - at < _FAILED_TTL and k != oid}
-        self._failed[oid] = now
-        while len(self._failed) > _FAILED_MAX:
-            del self._failed[next(iter(self._failed))]  # oldest first
 
 
 def _custom_set(settings: Settings, skype_token: str) -> tuple[dict[str, str], dict[str, str]]:

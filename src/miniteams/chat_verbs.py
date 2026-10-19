@@ -10,6 +10,7 @@ apart), with a deadline.
 import asyncio
 import contextlib
 import functools
+import hashlib
 import html
 import json
 import mimetypes
@@ -32,6 +33,7 @@ from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import ConnectionClosed
 
 from .archive_store import chat_label, find_chat_dir, messages_by_id, read_page, saved_files, search_chat
+from .attachments import LIVE_HOST_RE, existing, live_image
 from .chats import chat_kind
 from .compose import MAX_TEXT, compose_html, reply_quote
 from .decompose import Editable, decompose
@@ -40,7 +42,7 @@ from .dump import epoch_seconds, fetch_history
 from .emoji_table import SHORTCODES
 from .emojis import EmojiCache
 from .files import check_files, my_onedrive, post_files, upload_files
-from .http import failure
+from .http import Downloads, failure
 from .images import (
     MAX_IMAGE_BYTES,
     MAX_IMAGES,
@@ -65,7 +67,7 @@ from .messages import (
     reaction_key,
     snippet,
 )
-from .render import cards_html, file_links, file_urls, files_html, media_url, sanitize
+from .render import STEM_RE, cards_html, file_links, file_urls, files_html, media_url, sanitize
 from .send import attach_images, delete_message, edit_message, message_html, react, send_message, too_long
 
 log = structlog.get_logger()
@@ -81,6 +83,10 @@ _CHAT_PAGE = 100  # history messages per page of the chat view
 _CHAT_PAGE_MAX = 200  # the archive query is cheap, the page's DOM is not
 _SEARCH_HITS = 50  # search hits per answer
 _MEDIA_MAX = 50 * 1024 * 1024  # ponytail: whole-body responses; stream if videos ever get linked
+_LIVE_FAILED_TTL = 60.0  # seconds a failed live image is not asked again: the page retries it
+_LIVE_DEADLINE = 8.0  # slot wait + fetch, under serve()'s 10 s open_timeout: a later answer is never shown
+_LIVE_FAILED_MAX = 512
+_LIVE_CONCURRENCY = 4
 _CURSOR_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z?", re.ASCII)  # a composetime, nothing after
 MSG_ID_RE = re.compile(r"[0-9]{1,20}")  # Teams message ids are ms-epoch digits
 _QUOTE_MAX = 10  # quotes in one reply
@@ -854,6 +860,8 @@ class ChatVerbs:
         self._inflight: dict[tuple[str, str], asyncio.Future[str | None]] = {}
         # (thread, cmid) → set once its message comes back on the stream
         self._echoes: dict[tuple[str, str], asyncio.Event] = {}
+        self._live: Downloads[tuple[bytes, str]] = Downloads(_LIVE_FAILED_TTL, _LIVE_FAILED_MAX)
+        self._live_gate = asyncio.Semaphore(_LIVE_CONCURRENCY)  # a history page can hold dozens
 
     # --- socket wiring ---
 
@@ -1406,7 +1414,7 @@ class ChatVerbs:
             return {"blocked": form}
         srcs = [image.src for image in form.images]
         if srcs:
-            with contextlib.suppress(ArchiveUnavailable):  # the AMS URL, as the page shows an unarchived one
+            with contextlib.suppress(ArchiveUnavailable):  # a hung archive: the AMS URLs
                 srcs = await io("media", self._image_srcs, thread_id, form)
         props = copy.get("properties")
         props = props if isinstance(props, dict) else {}
@@ -1424,7 +1432,7 @@ class ChatVerbs:
         }
 
     def _image_srcs(self, thread_id: str, form: Editable) -> list[str]:
-        """Each kept image's `/media` path when archived, else its AMS URL. Blocking: archive pool."""
+        """Each kept image's `media_url`, else its AMS URL. Blocking: archive pool."""
         chat_dir = archive_dir(self.data_dir, thread_id)
         media = chat_dir / "media" if chat_dir is not None else None
         return [media_url(thread_id, media, image.src) or image.src for image in form.images]
@@ -1546,9 +1554,28 @@ class ChatVerbs:
 
     # --- archive and API reads ---
 
-    async def media(self, path: str) -> tuple[bytes, str] | None:
-        """`media_file` on the media pool; ArchiveUnavailable past its deadline."""
-        return await io("media", self.media_file, path)
+    async def media(self, path: str, host: str = "") -> tuple[bytes, str] | None:
+        """`media_file` on the media pool, else, with the `host` `media_url` gave, the object fetched from
+        Teams; ArchiveUnavailable past the pool's deadline."""
+        found = await io("media", self.media_file, path)
+        thread_id, _, oid = (unquote(part) for part in path.removeprefix("/media/").partition("/"))
+        token = self.directory.skype_token if self.directory is not None else ""
+        if found is not None or not token or not LIVE_HOST_RE.fullmatch(host) or not STEM_RE.fullmatch(oid):
+            return found
+        # ponytail: scope(None, …) sees no follows: a followed chat off the board and not archived gets text.
+        if not self.scope(None, thread_id) and await io("dir", archive_dir, self.data_dir, thread_id) is None:
+            return None
+        # A refusal under an expired token must not outlive its refresh.
+        key = f"{hashlib.sha256(token.encode()).hexdigest()[:16]}/{host}/{oid}"
+        return await self._live.get(key, functools.partial(self._live_image, token, host, oid))
+
+    async def _live_image(self, token: str, host: str, oid: str) -> tuple[bytes, str] | None:
+        try:
+            async with asyncio.timeout(_LIVE_DEADLINE), self._live_gate, httpx.AsyncClient() as client:
+                return await live_image(client, token, host, oid)
+        except TimeoutError:
+            log.info("live_image_failed", host=host, object_id=oid, error="timeout")
+            return None
 
     def media_file(self, path: str) -> tuple[bytes, str] | None:
         """`/media/<thread>/<file>`: (body, content type) of an archived asset, None for anything
@@ -1560,14 +1587,19 @@ class ChatVerbs:
         chat_dir = archive_dir(self.data_dir, thread_id)
         if chat_dir is None:
             return None
-        target = _servable(chat_dir / "media", name)
+        media = chat_dir / "media"
+        target = _servable(media, name)
+        if target is None and STEM_RE.fullmatch(name):  # a `media_url` written before the archiver had it
+            with contextlib.suppress(OSError):
+                found = existing(media, name)
+                target = _servable(media, Path(found).name) if found else None
         if target is None:
             return None
         try:
             body = target.read_bytes()
         except OSError:
             return None
-        return body, mimetypes.guess_type(name)[0] or "application/octet-stream"
+        return body, mimetypes.guess_type(target.name)[0] or "application/octet-stream"
 
     async def _server_copies(self, thread_id: str, ids: list[str]) -> dict[str, dict[str, Any]]:
         """Messages `ids` of the thread as the server holds them, by id: the archive, then the API for
