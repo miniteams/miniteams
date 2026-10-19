@@ -163,6 +163,7 @@ terminal and it reconnects within seconds (it watches the token cache file).
 - Archive reads have a deadline: a hung mount answers `archive unavailable` (history, search, follow) or HTTP 503 (pages, media) and logs one `archive_unavailable` warning per 30 s. A chat page that missed live frames reloads its latest page. At exit, threads stuck on a dead mount do not hold the process.
 
 **Native window** (spec 024)
+- System package (X11): `libxcb-cursor0` (Debian/Ubuntu; Qt's xcb plugin fails to load without it).
 - `uv sync --extra widget` once (PySide6 / QtWebEngine, ~260 MB download), then `uv run --extra widget miniteams widget`
   while `miniteams web` runs. It shows the board in its own window: 256 px icon in Alt-Tab, window class `miniteams`.
 - It signs in with `web.json`'s token, then keeps the cookie in its own profile (`~/.config/miniteams/widget`, `0700`).
