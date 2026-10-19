@@ -1469,6 +1469,135 @@ def test_media_file_stays_inside_the_media_folder(board: W.Board, data_dir: Path
     assert board.chat.media_file(f"/media/{quote(B, safe='')}/{OBJ}.png") is None  # on the board, no archive
 
 
+GW = "fr-prod.asyncgw.teams.microsoft.com"
+
+
+@pytest.fixture
+def live(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str]]:
+    """Stub Teams: `fresh` is an image, anything else refused; returns the (token, host, id) asked."""
+    asked: list[tuple[str, str, str]] = []
+
+    async def fake_live(client: Any, token: str, host: str, oid: str) -> tuple[bytes, str] | None:
+        asked.append((token, host, oid))
+        return (b"\x89PNG-live", "image/png") if oid == "fresh" else None
+
+    monkeypatch.setattr(CV, "live_image", fake_live)
+    return asked
+
+
+async def test_media_route_serves_an_image_archived_after_the_render(
+    board: W.Board, settings: Settings, data_dir: Path, live: list[Any]
+) -> None:
+    """011-AC3: `/media/<thread>/<id>?host=` (rendered before the archiver had it) finds the file by id."""
+    _media(data_dir)
+    async with _served(board, settings) as host, httpx.AsyncClient(headers=_cookie(board)) as client:
+        got = await client.get(f"http://{host}/media/{quote(T, safe='')}/{OBJ}?host={GW}")
+        assert got.status_code == 200 and got.content == b"\x89PNG-fake"
+        assert got.headers["content-type"] == "image/png"
+    assert live == []
+
+
+async def test_media_route_fetches_an_unarchived_image_from_teams(
+    board: W.Board, settings: Settings, live: list[Any]
+) -> None:
+    """011-AC3: an image not archived (yet, or never: media excluded) is fetched with the web's token,
+    sandboxed; a refused one 404s and is not asked again; a foreign host is never contacted."""
+    token = board.chat.directory.skype_token  # type: ignore[union-attr]
+    async with _served(board, settings) as host, httpx.AsyncClient(headers=_cookie(board)) as client:
+        for thread_id in (T, B):  # archived chat, chat without an archive
+            got = await client.get(f"http://{host}/media/{quote(thread_id, safe='')}/fresh?host={GW}")
+            assert got.status_code == 200 and got.content == b"\x89PNG-live"
+            assert got.headers["content-type"] == "image/png"
+            assert got.headers["content-security-policy"] == "sandbox"
+            assert got.headers["x-content-type-options"] == "nosniff"
+        base = f"http://{host}/media/{quote(T, safe='')}"
+        for _ in range(2):
+            assert (await client.get(f"{base}/gone?host={GW}")).status_code == 404
+        assert live == [(token, GW, "fresh"), (token, GW, "fresh"), (token, GW, "gone")]
+        for path in (
+            "/fresh",
+            "/fresh?host=evil.example",
+            f"/fresh?host={GW}.evil.example",
+            f"/fresh?host=x%40{GW}",
+            f"/fresh?host={GW}%3A8443",
+            f"/fresh?host=a.{GW}",
+            f"/%2e%2e?host={GW}",
+            f"/fre*?host={GW}",
+            f"/fresh/x?host={GW}",
+            f"/x%2Ffresh?host={GW}",
+        ):
+            assert (await client.get(f"{base}{path}")).status_code == 404, path
+        assert len(live) == 3  # none of those reached Teams
+        anonymous = await client.get(f"{base}/fresh?host={GW}", headers={"Cookie": ""})
+        assert anonymous.status_code == 403
+
+
+async def test_media_route_fetches_nothing_for_an_unknown_chat(
+    board: W.Board, settings: Settings, live: list[Any]
+) -> None:
+    """011-AC3: a thread neither on the board nor in the archive is a 404, Teams never asked."""
+    async with _served(board, settings) as host, httpx.AsyncClient(headers=_cookie(board)) as client:
+        got = await client.get(f"http://{host}/media/{quote(NOPE, safe='')}/fresh?host={GW}")
+        assert got.status_code == 404
+    assert live == []
+
+
+async def test_media_route_live_fetch_follows_the_token(board: W.Board, live: list[Any]) -> None:
+    """011-AC3: no token, no fetch; a refusal is not asked again under the same token, but is once
+    the token is refreshed (an expired token must not hide images for the memo's whole window)."""
+    directory = board.chat.directory
+    assert directory is not None
+    path = f"/media/{quote(T, safe='')}/gone"
+    directory.set_token("")
+    assert await board.chat.media(path, GW) is None
+    assert live == []
+    directory.set_token("old")
+    for _ in range(2):
+        assert await board.chat.media(path, GW) is None
+    assert live == [("old", GW, "gone")]
+    directory.set_token("new")
+    assert await board.chat.media(path, GW) is None
+    assert live == [("old", GW, "gone"), ("new", GW, "gone")]
+
+
+async def test_media_route_live_fetches_run_four_at_a_time(
+    board: W.Board, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC3: a history page full of unarchived images does not fan out to Teams all at once."""
+    release, started = asyncio.Event(), []
+
+    async def held(client: Any, token: str, host: str, oid: str) -> None:
+        started.append(oid)
+        await release.wait()
+
+    monkeypatch.setattr(CV, "live_image", held)
+    asks = [asyncio.create_task(board.chat.media(f"/media/{quote(T, safe='')}/img{i}", GW)) for i in range(6)]
+    await wait(lambda: len(started) >= 4, "four fetches started")
+    await asyncio.sleep(0.05)
+    assert len(started) == 4
+    release.set()
+    assert await asyncio.gather(*asks) == [None] * 6
+    assert len(started) == 6
+
+
+async def test_media_route_live_fetch_gives_up_inside_the_request_deadline(
+    board: W.Board, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """011-AC3: a fetch slower than the deadline is a failure, not an answer nobody waits for."""
+    asked: list[str] = []
+
+    async def hung(client: Any, token: str, host: str, oid: str) -> None:
+        asked.append(oid)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(CV, "live_image", hung)
+    monkeypatch.setattr(CV, "_LIVE_DEADLINE", 0.05)
+    path = f"/media/{quote(T, safe='')}/slow"
+    for _ in range(2):
+        assert await asyncio.wait_for(board.chat.media(path, GW), 2) is None
+    assert asked == ["slow"]  # the timeout is memoised like any failure
+
+
 def test_media_file_refuses_oversized_files(
     board: W.Board, data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

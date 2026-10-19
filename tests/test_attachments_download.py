@@ -1445,3 +1445,29 @@ async def test_ams_stream_429_is_retried(settings: Settings) -> None:
     path = await A.fetch_image(_AsyncClient(handler), "sk", f"{_OBJ}/imgpsh_fullsize", settings.media_dir, "")
     assert len(calls) == 2
     assert Path(path).read_bytes() == b"IMG"
+
+
+async def test_live_image_rebuilds_the_url_and_keeps_only_images(monkeypatch: pytest.MonkeyPatch) -> None:
+    """011-AC3: the web's live fetch: imgo view of the id on the given host, the token as the AMS cookie,
+    an image body kept in memory; a refusal, a non-image or an oversized body is None."""
+    seen: list[_httpx.Request] = []
+    answers = {
+        "img": _httpx.Response(200, content=b"\x89PNG", headers={"content-type": "image/png"}),
+        "html": _httpx.Response(200, content=b"<script>", headers={"content-type": "text/html"}),
+        "svg": _httpx.Response(200, content=b"<svg/>", headers={"content-type": "image/svg+xml"}),
+        "big": _httpx.Response(200, content=b"x" * 11, headers={"content-type": "image/jpeg"}),
+        "gone": _httpx.Response(403),
+    }
+
+    def handler(request: _httpx.Request) -> _httpx.Response:
+        seen.append(request)
+        return answers[request.url.path.split("/")[3]]
+
+    monkeypatch.setattr(A, "_LIVE_MAX", 10)
+    host = "fr-prod.asyncgw.teams.microsoft.com"
+    async with _httpx.AsyncClient(transport=_httpx.MockTransport(handler)) as client:
+        assert await A.live_image(client, "tok", host, "img") == (b"\x89PNG", "image/png")
+        for oid in ("html", "svg", "big", "gone"):
+            assert await A.live_image(client, "tok", host, oid) is None, oid
+    assert str(seen[0].url) == f"https://{host}/v1/objects/img/views/imgo"
+    assert seen[0].headers["cookie"] == "skypetoken_asm=tok"

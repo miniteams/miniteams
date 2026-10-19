@@ -32,8 +32,12 @@ click opens Teams web (2026-10-14 decision).
   browser (`window.open`, `noopener`).
 - **Route.** `GET /chat/<thread>` serves `chat.html` (new static page next to `widget.html`),
   `GET /media/<thread>/<file>` serves a file from `<data-dir>/<thread>/media/` (read-only, path
-  confined to that directory, 404 otherwise). The thread id is taken from the URL path, url-decoded.
-  A thread not on the board and not in the archive gets a 404.
+  confined to that directory, 404 otherwise). `<file>` may be a bare object id (`media_url` before the
+  archiver wrote it): the file is found by id at request time, else, with
+  `?host=<region>.asyncgw.teams.microsoft.com`, the server fetches the object's `imgo` view with its own
+  token (URL rebuilt from host and id, image types only, memory only, 4 at a time, 8 s at most; a
+  failure is not asked again for 1 min under the same token) and 404s when Teams refuses. The thread id
+  is taken from the URL path, url-decoded. A thread not on the board and not in the archive gets a 404.
 - **History (server).** New WS verb `{"history": "<thread>", "before" | "after" | "around":
   "<composetime>", "limit": N}` (N capped at 200, default 100; no anchor = the latest page).
   `before` pages back, `after` pages forward, `around` returns about N/2 on each side of the
@@ -59,9 +63,10 @@ click opens Teams web (2026-10-14 decision).
   their `alt` character when unicode, else `<img class="emoji" src=…>`; mentions become
   `<span class="mention" data-mri=…>Name</span>` (`mention-me` when it is me). Everything else is
   dropped, text kept. `img src` is rewritten to `/media/<thread>/<file>` when the object id has a
-  file in the archive (`attachments._object_id` + `_existing`); otherwise the image is replaced by a
-  "[image not archived]" link to the original URL (no token on the page, the browser cannot fetch
-  it). Reply quotes (`blockquote itemtype=…/Reply`) render as a quote with the quoted author.
+  file in the archive (`attachments.object_id` + `existing`), else to `/media/<thread>/<id>?host=<host>`
+  for an asyncgw object; any other image is the plain text "[image not archived]" (no link: Teams' copy
+  needs the token the page lacks). The page retries a `/media` image that fails to load for about 30 s,
+  then replaces it with the same text. Reply quotes (`blockquote itemtype=…/Reply`) render as a quote with the quoted author.
 - **Page (`chat.html`).** Header: chat label, member count, an **Open in Teams** button,
   ◀ back to the board. Open in Teams sends the `open` verb for the thread, so it follows the
   server's `--opener` / `--open-scheme` like a plain click on the board (desktop client by
@@ -140,7 +145,8 @@ click opens Teams web (2026-10-14 decision).
   `properties.cards[].content`. The server renders the card body to the same sanitised HTML
   subset, no script, no external fetch: `TextBlock` and `RichTextBlock` (weight, size, wrap;
   the Teams markdown subset bold/italic/links/lists), `Container`, `ColumnSet`/`Column` (as a
-  flex row), `FactSet` (a two-column table), `Image` (archived → `/media`, else alt text),
+  flex row), `FactSet` (a two-column table), `Image` (archived or asyncgw → `/media`, else alt
+  text; a `/media` one that never loads reads "[image not archived]"),
   `Action.OpenUrl` and `selectAction` (http(s) links, `rel=noopener`), `codesnippet` cards
   (`<pre>`). Unknown elements render their `text`/`title` when present, else nothing. A card with
   no renderable body shows its `summary` or `fallbackText`. Rendered inside `div.card` with the
@@ -180,7 +186,8 @@ click opens Teams web (2026-10-14 decision).
 - [x] **AC3** `GET /chat/<id>` returns the chat page for a thread on the board or in the archive,
       404 otherwise (changed by the 2026-10-12 decision: 404 only with the cookie, without it every
       `/chat/<id>` gets the empty shell); `GET /media/<id>/<file>` returns the file for an existing archived asset, 404
-      for a missing one and for any path escaping the media directory (`..`, absolute, encoded).
+      for a missing one and for any path escaping the media directory (`..`, absolute, encoded); a bare
+      object id with an asyncgw `host` is the archived file, else Teams' copy, else 404.
 - [x] **AC4** `history` on an archived thread returns the last `limit` messages oldest-first,
       `older: true` while earlier ones exist; a second call with `before` returns the page before
       it without overlap or gap, `older: false` at the start.
@@ -190,8 +197,8 @@ click opens Teams web (2026-10-14 decision).
 - [x] **AC6** The sanitiser keeps the allowlisted tags, drops `script`, `style`, `iframe`, event
       attributes and `javascript:` hrefs, renders a unicode Teams emoji as its character, a custom
       emoji as `<img class="emoji">` pointing to the archived file, a mention as
-      `span.mention` (`mention-me` for my MRI) and rewrites an archived image to `/media/…`; an
-      unarchived image becomes the "[image not archived]" link.
+      `span.mention` (`mention-me` for my MRI) and rewrites an archived or asyncgw image to `/media/…`;
+      any other image becomes the plain text "[image not archived]".
 - [x] **AC7** With the page open and followed, a new message on that thread appends within one
       event; an edit replaces the message in place with the `edited` marker; a delete shows
       "message deleted"; a reaction updates the reactions line.
