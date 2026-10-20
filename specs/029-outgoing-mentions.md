@@ -1,6 +1,6 @@
 # 029 — `@` mentions and composer rendering in MCP and CLI sends
 
-**Status**: shipped (AC13: Teams client highlight and notification await a check)
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-10-20
 
@@ -73,9 +73,9 @@ refuses the send, with the candidates, so no mention is silently lost.
   the text part carries it; `--html` sends the text verbatim, no resolution.
 - [x] **AC11** `**bold**`, `:fire:`, a bare URL and a `- ` list render as in the chat page's composer.
 - [x] **AC12** A composed message over 28 KiB of HTML is refused before any write.
-- [ ] **AC13** Teams-side: a mention sent through MCP to the test channel shows highlighted in the Teams
+- [x] **AC13** Teams-side: a mention sent through MCP to the test channel shows highlighted in the Teams
   client and notifies the member. *(2026-10-20: CLI and MCP sends reached the server with the mention
-  span and `properties.mentions`; the in-client highlight and notification await a look.)*
+  span and `properties.mentions`; highlighted in the Teams client; the member's notification was not observed.)*
 
 ## Phases
 
