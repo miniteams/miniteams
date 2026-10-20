@@ -1,5 +1,6 @@
 """Teams message HTML → composer markdown (spec 019 phase 1): round trips, escapes, refusals."""
 
+import html
 import json
 import random
 import re
@@ -501,3 +502,71 @@ def test_long_bracket_runs_convert_in_linear_time() -> None:
         decompose(_msg("<p>" + "[" * n + "](" + "</p>"), {})
 
     assert _best_ms(lambda: run(28_000)) / max(_best_ms(lambda: run(7_000)), 0.05) < 8
+
+
+# --- bare URLs as links (spec 028) ---
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "voici https://test.com/.",
+        *(f"https://test.com/a{tail} b" for tail in ".,:;!?*_~)]}…–—«»‹›“”‘’"),
+        "(voir https://test.com/a).",
+        "see https://fr.wikipedia.org/wiki/Foo_(bar)) and https://x.test/a**",
+        "**see https://test.com/a**.",
+        "https://test.com/a\\_b_ and `https://c.test/`",
+        "see https://en.wikipedia.org/wiki/Hitchhiker's_Guide.",
+        "'quoted https://x.test/a'",
+    ],
+)
+def test_a_bare_url_link_edits_back_to_the_text_typed(text: str) -> None:
+    """028-AC3: an edit opens on the bare URL and its punctuation; saved unchanged, it posts the same HTML."""
+    composed = compose_html(text, [], EMOJIS, full=True)[0]
+    assert "<a href=" in composed
+    assert _round_trip(text).text == text
+
+
+@pytest.mark.parametrize("url", ["https://x.test/a.", "https://x.test/a?", "https://x.test/a_*"])
+def test_a_link_to_its_own_address_with_trailing_punctuation_keeps_its_href(url: str) -> None:
+    """028-AC3: a received link whose address ends in punctuation cannot be a bare URL: the cut would
+    change its target."""
+    form = _form(f'<p><a href="{url}">{url}</a></p>')
+    assert form.text == f"[{url}]({url})"
+    assert compose_html(form.text, [], EMOJIS, full=True)[0] == f'<a href="{url}">{url}</a>'
+
+
+def test_a_link_to_its_own_address_ending_in_an_unopened_bracket_is_refused() -> None:
+    """028-AC3: no markdown writes it back (`[x](…a))` ends at the first `)`): refused, not cut."""
+    assert decompose(_msg('<p><a href="https://x.test/a)">https://x.test/a)</a></p>'), EMOJIS) == D.OTHER
+
+
+@pytest.mark.parametrize(
+    ("content", "editable"),
+    [
+        ('<a href="https://x.com">https://x.com</a>\'s docs', True),
+        ('<a href="https://x.com/a b">https://x.com/a b</a>', False),
+        ('<a href="https://x.com/a">https://x.com/a</a>(b)', True),
+        ('<a href="https://x.com/a">https://x.com/a</a>b', True),
+        ('<a href="https://x.com/a">https://x.com/a</a><a href="https://y.com">https://y.com</a>', True),
+    ],
+)
+def test_a_self_titled_link_keeps_its_href_whatever_follows_it(content: str, editable: bool) -> None:
+    """028-AC3: the text after a link to its own address never joins it on save; what no markdown writes
+    back is refused, never altered."""
+    form = decompose(_msg(f"<p>{content}</p>"), EMOJIS)
+    assert isinstance(form, Editable) == editable, form
+    if isinstance(form, Editable):
+        composed = compose_html(form.text, form.picks, EMOJIS, full=True)[0]
+        href = re.compile(r'href="([^"]*)"')
+        assert href.findall(composed) == href.findall(content)
+        assert D._read(composed, {}, EMOJIS) == D._read(f"<p>{content}</p>", {}, EMOJIS)
+
+
+@pytest.mark.parametrize(
+    "text", ["voir https://test.com/a et https://test.com/b.", "https://x.com's docs", "(https://x.com/a)"]
+)
+def test_a_url_sent_as_plain_text_stays_editable(text: str) -> None:
+    """028-AC3: a message sent before links were written (plain-text URLs) still opens in the editor."""
+    form = _form(f"<p>{html.escape(text)}</p>")
+    assert form.text == text

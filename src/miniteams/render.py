@@ -16,6 +16,7 @@ from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from .attachments import LIVE_HOST_RE, existing, object_id
+from .compose import _URL_RE, trim_url
 from .messages import file_name, json_list, reaction_emoji
 
 _KEPT = frozenset(
@@ -197,8 +198,20 @@ class _Sanitizer(HTMLParser):
             self.out.append(f"</{tag}>")
 
     def handle_data(self, data: str) -> None:
-        if not self.hidden:
+        if self.hidden:
+            return
+        if self.counts["a"] or self.counts["code"] or self.counts["pre"]:  # spec 028: no autolink in these
             self.out.append(html.escape(data, quote=False))
+            return
+        pos = 0
+        for m in _URL_RE.finditer(data):  # spec 028: a bare URL links as compose would send it
+            if url := trim_url(m.group()):
+                self.out += (
+                    html.escape(data[pos : m.start()], quote=False),
+                    _link(url, html.escape(url, quote=False)),
+                )
+                pos = m.start() + len(url)
+        self.out.append(html.escape(data[pos:], quote=False))
 
     def result(self) -> str:
         self.close()

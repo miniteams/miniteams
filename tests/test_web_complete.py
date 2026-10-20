@@ -646,7 +646,7 @@ async def test_typed_names_elsewhere_in_the_text_stay_as_typed(board: W.Board, s
     assert await _send(board, B, text, None, None, [{"name": "ann lee", "mri": ANN}]) is None
     [(_, body, _)] = sent
     assert body == (
-        "https://x.com/@ann lee <code>@ann lee</code> "
+        '<a href="https://x.com/@ann">https://x.com/@ann</a> lee <code>@ann lee</code> '
         '<a href="https://y/@ann">@ann lee</a> '
         f'<span itemtype="{MENTION}" itemscope="" itemid="0">Ann Lee</span>'
     )

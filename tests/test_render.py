@@ -4,6 +4,7 @@ import base64
 import gc
 import html
 import json
+import random
 import re
 import time
 from html.parser import HTMLParser
@@ -12,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from miniteams.compose import compose_html
 from miniteams.render import (
     _HTML_MAX,
     _MD_MAX,
@@ -1257,3 +1259,91 @@ def test_a_body_link_matches_whatever_its_query_order_or_host_case(entry_url: st
 
 def _names(url: str) -> dict[str, str]:
     return file_links([_ref(objectUrl=url, fileInfo={})])
+
+
+# --- bare URLs as links (spec 028) ---
+
+
+def _a(url: str) -> str:
+    return f'<a href="{html.escape(url)}" rel="noopener" target="_blank">{html.escape(url, quote=False)}</a>'
+
+
+@pytest.mark.parametrize(
+    ("raw", "out"),
+    [
+        ("<p>voir https://test.com/a).</p>", f"<p>voir {_a('https://test.com/a')}).</p>"),
+        (
+            "<p>https://fr.wikipedia.org/wiki/Foo_(bar)</p>",
+            f"<p>{_a('https://fr.wikipedia.org/wiki/Foo_(bar)')}</p>",
+        ),
+        ("x https://test.com/a?b=1&amp;c=2… y", f"x {_a('https://test.com/a?b=1&c=2')}… y"),
+        ("<b>http://a.test/*</b>*", f"<b>{_a('http://a.test/')}*</b>*"),
+        ("https://x.test/&quot;onmouseover=&quot;x", f'{_a("https://x.test/")}"onmouseover="x'),
+        ("https://x.test/&lt;script&gt;", f"{_a('https://x.test/')}&lt;script&gt;"),
+        ("<p>https://w.test/Hitchhiker's_Guide.</p>", f"<p>{_a("https://w.test/Hitchhiker's_Guide")}.</p>"),
+        ("'quoted https://x.test/a'", f"'quoted {_a('https://x.test/a')}'"),
+        ("see https://x.com's API", f"see {_a('https://x.com')}'s API"),
+        ("https://. www.test.com ftp://test.com javascript:alert(1)", None),
+    ],
+)
+def test_a_bare_url_in_text_becomes_a_link(raw: str, out: str | None) -> None:
+    """028-AC4: cut by compose's rule, http(s) only, everything escaped."""
+    assert sanitize(raw, T) == (out if out is not None else html.escape(raw, quote=False))
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '<a href="https://y.test">see https://x.test/a.</a>',
+        "<code>https://x.test/a</code>",
+        "<pre>https://x.test/a\n<code>https://x.test/b</code></pre>",
+        '<a href="javascript:x">https://x.test/a <b>https://x.test/b</b></a>',
+    ],
+)
+def test_urls_inside_links_and_code_stay_text(raw: str) -> None:
+    """028-AC4: no link inside a link (even one dropped), `<code>` or `<pre>`."""
+    assert sanitize(raw, T).count("<a ") == raw.startswith('<a href="https')
+
+
+@pytest.mark.parametrize(
+    ("text", "urls"),
+    [
+        ("URL:https://x.com/a", ["https://x.com/a"]),
+        ("curl 'https://a.com/x?q=1'|jq", ["https://a.com/x?q=1"]),
+        ("['https://a.com/x','https://b.com/y']", ["https://a.com/x", "https://b.com/y"]),
+    ],
+)
+def test_a_quote_not_before_a_letter_ends_the_url(text: str, urls: list[str]) -> None:
+    """028-AC4: same cut as compose."""
+    assert re.findall(r'href="([^"]*)"', sanitize(html.escape(text), T)) == urls
+
+
+ATOMS = [
+    "https://a.com/",
+    "x",
+    "it's",
+    "'",
+    ":",
+    "fire",
+    "URL",
+    ".",
+    ",",
+    "(",
+    ")",
+    " ",
+    "|",
+    "?q=1",
+    "]",
+    "[",
+]
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_compose_and_render_link_the_same_urls(seed: int) -> None:
+    """028-AC4: a plain text's bare URLs: the links compose sends are the links render shows."""
+    rng = random.Random(seed)
+    href = re.compile(r'href="([^"]*)"')
+    for _ in range(500):
+        text = "".join(rng.choices(ATOMS, k=rng.randint(1, 10)))
+        sent = href.findall(compose_html(text, [], {"fire": "1"})[0])
+        assert sent == href.findall(sanitize(html.escape(text), T)), text

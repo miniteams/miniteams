@@ -29,3 +29,4 @@
 | [025](025-file-attachments.md) | Send any file as an attachment | shipped |
 | [026](026-chat-sections.md) | Chat sections | shipped |
 | [027](027-received-files.md) | Show received files | shipped |
+| [028](028-clean-autolinks.md) | Bare URLs sent as clean links | shipped |
