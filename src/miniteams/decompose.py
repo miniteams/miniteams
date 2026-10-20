@@ -12,7 +12,17 @@ from typing import Any, NamedTuple
 from urllib.parse import urlsplit
 
 from .attachments import object_id
-from .compose import _URL_RE, EMOJI_NAME_RE, ESCAPABLE, _literal, _word, compose_html
+from .compose import (
+    _URL_CLOSERS,
+    _URL_RE,
+    _URL_TRAIL,
+    EMOJI_NAME_RE,
+    ESCAPABLE,
+    _literal,
+    _word,
+    compose_html,
+    trim_url,
+)
 from .images import OBJECT_ID_RE
 from .messages import TEXT_TYPES, json_list
 from .send import MAX_HTML_BYTES
@@ -42,7 +52,7 @@ _BLOCKED = {
 OTHER = "formatting miniteams cannot write"
 IMAGE_IN_TEXT = "an image inside the text"
 
-# ("text", s) | ("b" | "i" | "s", tokens) | ("code", s) | ("a", href, label)
+# ("text", s) | ("b" | "i" | "s", tokens) | ("code", s) | ("a", href, label) | ("url", href)
 # | ("mention", everyone, mri, label) | ("emoji", name, object id)
 type Token = tuple[Any, ...]
 type Block = tuple[str, Any]  # ("line", tokens) | ("blockquote" | "ul" | "ol", lines) | ("pre", code)
@@ -306,7 +316,8 @@ class _Reader(HTMLParser):
             href = frame.attrs.get("href", "")
             if urlsplit(href).scheme not in ("http", "https"):
                 raise _Refused(OTHER)
-            self._inline(("text", href) if text == href else ("a", href, text))
+            # Its own token, never merged: the text after it must not join the address on save.
+            self._inline(("url", href) if text == href else ("a", href, text))
         elif tag == "span" and frame.kind == "raw":
             self._mention(frame.attrs.get("itemid", ""), text)
         elif tag == "pre":
@@ -354,8 +365,30 @@ class _Reader(HTMLParser):
         if len(self.stack) > 1:
             raise _Refused(OTHER)
         self._flush(self.root)
-        blocks: list[Block] = self.root.items
-        return blocks
+        return [
+            (kind, body if kind == "pre" else _urls(body) if kind == "line" else tuple(map(_urls, body)))
+            for kind, body in self.root.items
+        ]
+
+
+def _urls(tokens: tuple[Token, ...]) -> tuple[Token, ...]:
+    """Bare URLs in text as the links compose makes of them: a URL sent as plain text reads as its link."""
+    out: list[Token] = []
+    for token in tokens:
+        if token[0] in _MARKERS:
+            out.append((token[0], _urls(token[1])))
+            continue
+        if token[0] != "text":
+            out.append(token)
+            continue
+        text, pos = token[1], 0
+        for m in _URL_RE.finditer(text):
+            if url := trim_url(m.group()):
+                _add(out, ("text", text[pos : m.start()]))
+                out.append(("url", url))
+                pos = m.start() + len(url)
+        _add(out, ("text", text[pos:]))
+    return tuple(out)
 
 
 def _read(content: str, props: dict[str, Any], emojis: dict[str, str]) -> tuple[list[Block], list[KeptImage]]:
@@ -429,11 +462,46 @@ def _text_md(text: str, wide: bool, line_start: bool, following: str) -> str:
     return "".join(out)
 
 
+_CUTS = "".join(_URL_TRAIL) + "".join(_URL_CLOSERS)
+
+
+def _bare(href: str, out: list[str], following: str) -> bool:
+    """Whether compose reads `href` back whole, no more, from it followed by the markdown in `out` (nearest
+    last). Only a run of trailing punctuation can be cut: the first other character settles it."""
+    right = ""
+    for md in reversed(out):
+        right += md
+        if right.lstrip(_CUTS):
+            break
+    else:
+        right += following
+    m = _URL_RE.match(href + right)
+    return m is not None and trim_url(m.group()) == href
+
+
+def _joined(tokens: tuple[Token, ...]) -> tuple[Token, ...]:
+    """A link to its own address back into the text after it where compose would cut it there again: written
+    as one plain run, the URL keeps the text right after it unescaped, as compose reads it."""
+    out: list[Token] = []
+    for n, token in enumerate(tokens):
+        prev = out[-1] if out else None
+        if token[0] == "text" and prev and prev[0] == "url":
+            run = prev[1] + token[1]
+            ends = n == len(tokens) - 1
+            if (m := _URL_RE.match(run)) and (ends or m.end() < len(run)) and trim_url(m.group()) == prev[1]:
+                out.pop()
+                _add(out, ("text", run))
+                continue
+        _add(out, token)
+    return tuple(out)
+
+
 def _inline_md(
     tokens: tuple[Token, ...], wide: bool, italic: str, line_start: bool = False, following: str = ""
 ) -> str:
     """Right to left: a text's last backslash depends on the markdown that follows it."""
     markers = {**_MARKERS, "i": italic}
+    tokens = _joined(tokens)
     out: list[str] = []
     for n in range(len(tokens) - 1, -1, -1):
         token, after = tokens[n], out[-1][:1] if out else following
@@ -449,6 +517,8 @@ def _inline_md(
             out.append(f"`{token[1]}`")
         elif kind == "a":
             out.append(f"[{token[2]}]({token[1]})")
+        elif kind == "url":
+            out.append(token[1] if _bare(token[1], out, following) else f"[{token[1]}]({token[1]})")
         elif kind == "mention":
             out.append("@everyone" if token[1] else f"@{token[3]}")
         else:

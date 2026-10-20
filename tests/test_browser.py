@@ -284,6 +284,24 @@ async def test_a_pasted_file_link_reads_as_the_file_name(chat: Pages) -> None:
 
 
 @pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
+async def test_a_bare_url_received_is_a_link(board: W.Board, chat: Pages) -> None:
+    """028-AC4: a bare URL in a received message opens in a new tab, its trailing punctuation left out;
+    one in code stays text."""
+    page = await chat.open(_chat(F))
+    await _handled(page, "history")
+    body = "<p>voir https://test.com/a). <code>https://c.test/</code></p>"
+    await board.on_event(_event("NewMessage", F, **_m("9", _at(9), body)))
+    await page.wait_for_selector('[data-id="9"]')
+    links = "ns => ns.map(a => [a.textContent, a.getAttribute('href'), a.target, a.rel])"
+    assert await page.locator('[data-id="9"] .html a').evaluate_all(links) == [
+        ["https://test.com/a", "https://test.com/a", "_blank", "noopener"]
+    ]
+    assert (
+        await page.locator('[data-id="9"] .html').inner_text() == "voir https://test.com/a). https://c.test/"
+    )
+
+
+@pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
 async def test_a_file_card_opens_the_archived_copy(chat: Pages) -> None:
     """027-AC5, AC7: the card of a file the archive holds for its URL links its /media copy, in a new tab with
     noopener, out of Tab outside the focused message (018-AC5); the link serves the file."""

@@ -3,6 +3,7 @@
 import gc
 import html
 import json
+import re
 import time
 from collections.abc import Callable
 from typing import Any
@@ -22,6 +23,10 @@ def _md(text: str, full: bool) -> str:
 
 def _span(n: int, text: str) -> str:
     return f'<span itemtype="http://schema.skype.com/Mention" itemscope="" itemid="{n}">{text}</span>'
+
+
+def _a(url: str) -> str:
+    return f'<a href="{html.escape(url)}">{html.escape(url)}</a>'
 
 
 def _mentions(props: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -150,18 +155,18 @@ def test_no_expansion_inside_code_or_link_labels(text: str, expected: str) -> No
 
 
 @pytest.mark.parametrize(
-    "text",
+    ("text", "expected"),
     [
-        "see https://x.test/a:fire:b now",
-        "see https://x.test/@Ann Lee now",
-        "https://x.test/:zap:",
-        ":fire:https://x.test/:x:",
+        ("see https://x.test/a:fire:b now", f"see {_a('https://x.test/a:fire:b')} now"),
+        ("see https://x.test/@Ann Lee now", f"see {_a('https://x.test/@Ann')} Lee now"),
+        ("https://x.test/:zap:", f"{_a('https://x.test/:zap')}:"),
+        (":fire:https://x.test/:x:", f"🔥{_a('https://x.test/:x')}:"),
     ],
 )
-def test_no_expansion_inside_bare_urls(text: str) -> None:
+def test_no_expansion_inside_bare_urls(text: str, expected: str) -> None:
     html, props = compose_html(text, [ANN], {"x": "1"})
     assert props is None
-    assert html == text.replace(":fire:", "🔥", text.startswith(":fire:"))
+    assert html == expected
     assert compose_html(text + " :fire:", [], {})[0].endswith(" 🔥")
 
 
@@ -257,8 +262,6 @@ def test_unclosed_fence_stays_text() -> None:
         "**a**b",
         "_a_b c",
         "[x](ftp://host)",
-        "[](https://x)",
-        "[x] (https://x)",
         "*a *",
         "**b **",
         "_a _",
@@ -274,7 +277,15 @@ def test_javascript_link_and_typed_html_are_text() -> None:
     assert _md("[x](javascript:alert(1)) <b>hi</b>", True) == (
         "[x](javascript:alert(1)) &lt;b&gt;hi&lt;/b&gt;"
     )
-    assert _md('[x](https://a.test/"onmouseover=y)', False) == "[x](https://a.test/&quot;onmouseover=y)"
+    assert _md('[x](https://a.test/"onmouseover=y)', False) == (
+        f"[x]({_a('https://a.test/')}&quot;onmouseover=y)"
+    )
+
+
+def test_a_rejected_link_leaves_its_url_bare() -> None:
+    """012-AC13, 028-AC1: what is not a `[label](url)` link keeps its URL a bare one."""
+    assert _md("[](https://x)", False) == f"[]({_a('https://x')})"
+    assert _md("[x] (https://x)", False) == f"[x] ({_a('https://x')})"
 
 
 def test_inline_code_is_escaped() -> None:
@@ -286,14 +297,18 @@ def test_link_url_may_hold_one_balanced_paren_pair() -> None:
         '<a href="https://w.test/wiki/Foo_(bar)">w</a> x'
     )
     assert _md("[w](https://w.test/a(b)c) x", False) == '<a href="https://w.test/a(b)c">w</a> x'
-    for literal in ("[w](https://w.test/(a)(b))", "[w](https://w.test/((a))", "[w](https://w.test/(a"):
-        assert _md(literal, False) == literal
+    for literal, url in (
+        ("[w](https://w.test/(a)(b))", "https://w.test/(a)(b)"),
+        ("[w](https://w.test/((a))", "https://w.test/((a))"),
+        ("[w](https://w.test/(a", "https://w.test/(a"),
+    ):
+        assert _md(literal, False) == literal.replace(url, _a(url))
 
 
 @pytest.mark.parametrize("full", [False, True])
 def test_no_markdown_inside_bare_urls(full: bool) -> None:
     assert _md("https://x.test/_a_ https://x.test/*b* *c*", full) == (
-        "https://x.test/_a_ https://x.test/*b* <i>c</i>"
+        f"{_a('https://x.test/_a')}_ {_a('https://x.test/*b')}* <i>c</i>"
     )
     assert _md("https:// _d_", full) == "https:// <i>d</i>"
 
@@ -331,7 +346,7 @@ def test_input_is_capped() -> None:
         (r"\_c\_", "_c_"),
         (r"\~\~d\~\~", "~~d~~"),
         (r"\`e\`", "`e`"),
-        (r"\[f](https://x.test)", "[f](https://x.test)"),
+        (r"\[f](https://x.test)", f"[f]({_a('https://x.test')})"),
         (r"\\\*", "\\*"),
         (r"\\`x`", "\\<code>x</code>"),
         (r"\\*g*", "\\<i>g</i>"),
@@ -416,7 +431,7 @@ def test_a_quote_with_nothing_in_it_is_the_text_typed(text: str, expected: str) 
 def test_escapes_are_not_read_inside_code_link_labels_or_urls() -> None:
     """019-AC5: code, a link's label and a bare URL keep their backslashes."""
     assert _md(r"`a\*b` [l\*](https://x.test) https://x.test/a\_b", True) == (
-        '<code>a\\*b</code> <a href="https://x.test">l\\*</a> https://x.test/a\\_b'
+        f'<code>a\\*b</code> <a href="https://x.test">l\\*</a> {_a("https://x.test/a\\_b")}'
     )
 
 
@@ -488,3 +503,89 @@ def test_reply_quote_preview_skips_every_reply_block_of_the_quoted_message() -> 
     assert '<p itemprop="preview">mine</p>' in compose.reply_quote(own, "Ann")
     only = {"id": "9", "messagetype": "RichText/Html", "content": block(1) + block(2)}
     assert '<p itemprop="preview">Bob quoted 1 Bob quoted 2</p>' in compose.reply_quote(only, "Ann")
+
+
+# --- bare URLs as links (spec 028) ----------------------------------------------------------------
+
+TRAILING = [*".,:;!?*_~'\")]}>", *"…–—«»‹›“”‘’"]
+
+
+@pytest.mark.parametrize("full", [False, True])
+@pytest.mark.parametrize("tail", [*TRAILING, ").", "?!…", "**.", "_~,", "’»."])
+def test_a_bare_url_links_without_its_trailing_punctuation(tail: str, full: bool) -> None:
+    """028-AC1: each trailing punctuation character, and runs of them, stay text after the link."""
+    assert (
+        _md(f"voici https://test.com/{tail}", full) == f"voici {_a('https://test.com/')}{html.escape(tail)}"
+    )
+    assert _md(f"https://test.com/a{tail} b", full) == f"{_a('https://test.com/a')}{html.escape(tail)} b"
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_bare_url_links_keep_what_is_inside_them(full: bool) -> None:
+    """028-AC1: inner punctuation and a trailing `-` stay in the URL; a URL with nothing past its scheme
+    stays text; formatting around a link still applies."""
+    for url in ("https://test.com/a.b,c;d", "https://test.com/a-", "https://x.test/?q=1&r=2#f"):
+        assert _md(f"see {url} now", full) == f"see {_a(url)} now"
+    assert _md("https://. x", full) == "https://. x"
+    assert _md("**see https://test.com/a**.", full) == f"<b>see {_a('https://test.com/a')}</b>."
+    assert _md("_https://test.com/_", full) == f"<i>{_a('https://test.com/')}</i>"
+
+
+@pytest.mark.parametrize(
+    ("text", "url"),
+    [
+        ("https://fr.wikipedia.org/wiki/Foo_(bar)", "https://fr.wikipedia.org/wiki/Foo_(bar)"),
+        ("(voir https://test.com/a)", "https://test.com/a"),
+        ("(voir https://fr.wikipedia.org/wiki/Foo_(bar)).", "https://fr.wikipedia.org/wiki/Foo_(bar)"),
+        ("https://x.test/a[1]]", "https://x.test/a[1]"),
+        ("{https://x.test/{a}}}", "https://x.test/{a}"),
+        ("https://x.test/a_(b)_", "https://x.test/a_(b)"),
+        ("https://x.test/(a)(b))", "https://x.test/(a)(b)"),
+        ("https://[x.test/a", None),
+    ],
+)
+def test_a_closing_bracket_stays_when_the_url_opened_it(text: str, url: str | None) -> None:
+    """028-AC2: GitHub's rule: a trailing `)`, `]`, `}` is cut only while it closes more than the URL opens;
+    a URL no parser reads stays text."""
+    if url is None:
+        assert _md(text, True) == html.escape(text)
+        return
+    start = text.index("http")
+    assert _md(text, True) == (html.escape(text[:start]) + _a(url) + html.escape(text[start + len(url) :]))
+
+
+def test_trailing_cut_stays_linear() -> None:
+    """A URL ending in a long run of closing brackets is cut in one pass."""
+    big, small = ("https://h.t/" + ")" * n for n in (28_000, 7_000))
+    assert _best_ms(lambda: compose.trim_url(big)) / max(_best_ms(lambda: compose.trim_url(small)), 0.05) < 8
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_an_apostrophe_inside_a_url_stays_in_it(full: bool) -> None:
+    """028-AC1: only a trailing `'` is the sentence's: a quoted URL keeps its closing quote outside."""
+    url = "https://en.wikipedia.org/wiki/Hitchhiker's_Guide"
+    assert _md(f"see {url}.", full) == f"see {_a(url)}."
+    assert _md("'quoted https://x.test/a'", full) == f"&#x27;quoted {_a('https://x.test/a')}&#x27;"
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_an_apostrophe_ends_the_host(full: bool) -> None:
+    """028-AC1: `x.com's` is the host and a possessive: no `'` in a host name."""
+    assert _md("see https://x.com's API", full) == f"see {_a('https://x.com')}&#x27;s API"
+    assert _md("https://x.com:8080's", full) == f"{_a('https://x.com:8080')}&#x27;s"
+    assert _md("https://x.com/it's", full) == _a("https://x.com/it's")
+
+
+@pytest.mark.parametrize("full", [False, True])
+@pytest.mark.parametrize(
+    ("text", "urls"),
+    [
+        ("URL:https://x.com/a", ["https://x.com/a"]),
+        ("Lien:https://x.com/a PR:https://y.com/b.", ["https://x.com/a", "https://y.com/b"]),
+        ("curl 'https://a.com/x?q=1'|jq", ["https://a.com/x?q=1"]),
+        ("['https://a.com/x','https://b.com/y']", ["https://a.com/x", "https://b.com/y"]),
+    ],
+)
+def test_a_url_after_a_colon_or_inside_quotes_links_alone(text: str, urls: list[str], full: bool) -> None:
+    """028-AC1: `URL:https://…` is no `:emoji:`; a `'` not followed by a letter or digit ends the URL."""
+    assert re.findall(r'href="([^"]*)"', _md(text, full)) == [html.escape(u) for u in urls]

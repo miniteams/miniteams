@@ -8,6 +8,7 @@ import json
 import re
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlsplit
 
 from .config import Settings
 from .emoji_table import SHORTCODES
@@ -22,10 +23,16 @@ _CUSTOM_EMOJI = "http://schema.skype.com/CustomEmoji"
 _SPECIAL_RE = re.compile(r"[\\`\[*_~]|https?://")
 ESCAPABLE = frozenset("\\*_~`[")  # `\x` gives a literal x; `\\` only where a lone `\` would escape
 _RUN_RE = re.compile(r"\*+|_+|~+")
-_URL_RE = re.compile(r"https?://[^\s<>\"'`]+")
+# `'` only before a word character: `Hitchhiker's_Guide`, not `'https://a.com/x'|jq`.
+_URL_RE = re.compile(r"https?://(?:[^\s<>\"`']|'(?=\w))+")
+# Sentence punctuation after a URL; `-` stays (spec 028). `'"<>` never end a _URL_RE match.
+_URL_TRAIL = frozenset(".,:;!?*_~…–—«»‹›“”‘’")
+_URL_CLOSERS = {")": "(", "]": "[", "}": "{"}
+_URL_HOST_RE = re.compile(r"https?://[^/?#']*")
 _ORDERED_RE = re.compile(r"\d{1,9}\. ")
-# The trailing `:` is a lookahead so an unknown name gives it back: `10:30:fire:` still finds `:fire:`.
-_EMOJI = rf":(?P<emoji>{EMOJI_NAME_RE.pattern})(?=:)"
+# The trailing `:` is a lookahead so an unknown name gives it back: `10:30:fire:` still finds `:fire:`;
+# never a URL's `:` (`URL:https://…`).
+_EMOJI = rf":(?P<emoji>{EMOJI_NAME_RE.pattern})(?=:(?!//))"
 _PREVIEW_LEN = 100  # characters of the quoted message a Reply block carries
 _SPANS = (("**", "b"), ("~~", "s"), ("*", "i"), ("_", "i"))
 MAX_MENTIONS = 50
@@ -36,6 +43,26 @@ type OnText = Callable[[str], str]
 
 def _word(ch: str) -> bool:
     return ch.isalnum() or ch == "_"
+
+
+def trim_url(url: str) -> str:
+    """A bare URL `_URL_RE` matched, without the trailing punctuation of the sentence around it; "" when
+    nothing is left past the scheme. A closing bracket stays while the URL opens as many (GitHub's rule)."""
+    host = _URL_HOST_RE.match(url)
+    if host and url.startswith("'", host.end()):  # no host name holds a `'`: `x.com's API`
+        url = url[: host.end()]
+    unclosed = {c: url.count(c) - url.count(o) for c, o in _URL_CLOSERS.items()}
+    end = len(url)
+    while (ch := url[end - 1]) in _URL_TRAIL or unclosed.get(ch, 0) > 0:
+        if ch in unclosed:
+            unclosed[ch] -= 1
+        end -= 1
+    url = url[:end] if url.find("//") + 2 < end else ""
+    try:
+        urlsplit(url)  # "https://[x": a link no reader could parse back
+    except ValueError:
+        return ""
+    return url
 
 
 def _escaped(line: str, i: int) -> bool:
@@ -79,7 +106,7 @@ def _inline(line: str, on_text: OnText, lead: bool = False, after: str = "") -> 
         i = m.start()
         hit: tuple[str, int] | None = None
         ch = line[i]
-        if ch == "h":  # a bare URL stays plain text, markers and all: Teams links it whole
+        if ch == "h":  # a bare URL is no markup, markers and all: on_text links it
             i = url_m.end() if (url_m := _URL_RE.match(line, i)) else i + 1
             continue
         if ch == "`":
@@ -229,13 +256,16 @@ def compose_html(
     seen: dict[str, int] = {}  # name → occurrences so far
     alternatives = "|".join(re.escape(n) for n in sorted(by_name, key=len, reverse=True))
     mention_re = rf"(?<!\w)@(?P<name>{alternatives})(?!\w)|" if alternatives else ""
-    # Bare URLs go first so Teams still links them whole: no emoji or mention inside a URL.
+    # Bare URLs go first: no emoji or mention inside a URL.
     token_re = re.compile(rf"(?P<url>{_URL_RE.pattern})|" + mention_re + _EMOJI)
     entries: list[dict[str, Any]] = []
 
     def token(m: re.Match[str]) -> str | None:
         if m.group("url") is not None:
-            return html.escape(m.group())
+            if not (url := trim_url(m.group())):
+                return html.escape(m.group())
+            link = html.escape(url)
+            return f'<a href="{link}">{link}</a>{html.escape(m.group()[len(url) :])}'
         if (name := m.group("name") if alternatives else None) is not None:
             picks = by_name[name]
             picked = picks[min(seen.get(name, 0), len(picks) - 1)]

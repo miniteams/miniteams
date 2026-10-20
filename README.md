@@ -230,6 +230,10 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
     `\> ` `\1. ` (or a line that is only `\>`); `\\` is one backslash before another backslash or one of those, or
     (chat page) before a line-start marker; any other backslash stays as typed (`\\srv\share`), and backslashes
     inside `code`, link labels and URLs stay as typed.
+  - A bare `http(s)://` URL is sent as a link (spec 028), without the punctuation that ends the sentence
+    (`. , : ; ! ? * _ ~ ' "`, `… – — « » ‹ › “ ” ‘ ’`, and a closing `) ] } >` unless it closes a bracket opened
+    inside the URL). A `'` is kept only before a letter or digit, and a `'` inside the host ends the URL
+    (`https://x.com's`). Received messages show their bare URLs as links by the same rule.
   - Enter empties the box at once: sends queue one at a time per chat, in order. Queued sends survive a reload or a
     dropped connection and go out in order, an unanswered one checked (their images and files do not survive a reload).
     A chat page in list mode sends only its own chat's: other chats' wait for the widget (◀) or their own page.
