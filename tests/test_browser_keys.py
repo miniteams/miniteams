@@ -643,7 +643,7 @@ async def test_enter_on_a_message_not_editable_here_opens_it_in_teams(split: ux.
     await page.keyboard.press("e")
     await wait(lambda: fake.of("editable") != [], "editable")
     fake.send({"editable": GROUP, "msg": str(MINE), "blocked": "a card"})
-    await page.locator(f'[data-id="{MINE}"] .blocked button').wait_for()
+    await page.locator(f'[data-id="{MINE}"] .blocked a').wait_for()
     await _shown(page, MINE)
     await page.keyboard.press("Enter")
     opened = str(await page.evaluate("window.opened ?? ''"))
@@ -704,10 +704,10 @@ async def test_per_message_controls_leave_the_tab_order(split: ux.Split) -> None
     await page.keyboard.press("e")
     await wait(lambda: fake.of("editable") != [], "editable")
     fake.send({"editable": GROUP, "msg": str(MINE), "blocked": "a card"})
-    await page.locator(f'[data-id="{MINE}"] .blocked button').wait_for()
+    await page.locator(f'[data-id="{MINE}"] .blocked a').wait_for()
     controls = (
-        "#msgs .actions button, #msgs .who, #msgs blockquote[role=link], #msgs .reacts button, #msgs .run,"
-        " #msgs summary, #msgs .blocked button"
+        "#msgs .actions :is(button, a), #msgs .who, #msgs blockquote[role=link], #msgs .reacts button,"
+        " #msgs .run, #msgs summary, #msgs .blocked a"
     )
     kinds = await page.locator(controls).evaluate_all(
         "ns => [...new Set(ns.map(n => n.matches('.who') ? 'who' : n.matches('blockquote') ? 'quote'"

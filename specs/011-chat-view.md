@@ -64,15 +64,20 @@ click opens Teams web (2026-10-14 decision).
   `<span class="mention" data-mri=…>Name</span>` (`mention-me` when it is me). Everything else is
   dropped, text kept. `img src` is rewritten to `/media/<thread>/<file>` when the object id has a
   file in the archive (`attachments.object_id` + `existing`), else to `/media/<thread>/<id>?host=<host>`
-  for an asyncgw object; any other image is the plain text "[image not archived]" (no link: Teams' copy
-  needs the token the page lacks). The page retries a `/media` image that fails to load for about 30 s,
+  for an asyncgw object; another Teams object (`/objects/` on an `asm.skype.com` or asyncgw host) is the plain text "[image not archived]" (no
+  link: Teams' copy needs the token the page lacks); any other http(s) image is a link to it (new tab,
+  `noopener`) reading `[image: <alt>]`, or "[image not archived]" without alt (the CSP keeps it off the
+  page; the text alone inside a link); other schemes are the plain text. The page retries a `/media` image that fails to load for about 30 s,
   then replaces it with the same text. Reply quotes (`blockquote itemtype=…/Reply`) render as a quote with the quoted author.
 - **Page (`chat.html`).** Header: chat label, member count, an **Open in Teams** button,
   ◀ back to the board. Open in Teams sends the `open` verb for the thread, so it follows the
   server's `--opener` / `--open-scheme` like a plain click on the board (desktop client by
   default), and falls back to the https deep link in a new tab when `--opener none`. The `open`
   verb accepts a followed thread even when it is not on the board. Each message also has an
-  "Open in Teams" action that opens the deep link on that message. Messages grouped by sender with avatar initials (same colour rule as
+  "Open in Teams" action that opens the deep link on that message. Each Open in Teams is an `<a>` on
+  the https deep link (Copy link address); a plain click or Enter goes through `openTeams` as above,
+  a modified click is left to the browser. A message's 🔗 action, offered only in a secure context
+  (the loopback bind, or https behind a proxy: the clipboard API's), copies that link, "Copied" for 1.5 s, or says why it could not. Messages grouped by sender with avatar initials (same colour rule as
   the widget), time, `edited` marker, reactions line, the quoted message inside a reply. Opens scrolled to the bottom. Scrolling to
   the top asks `history` with `before` and keeps the scroll position (one request in flight at a
   time, stops when `older` is false); after a jump, scrolling to the bottom asks `after` the same
@@ -146,7 +151,8 @@ click opens Teams web (2026-10-14 decision).
   subset, no script, no external fetch: `TextBlock` and `RichTextBlock` (weight, size, wrap;
   the Teams markdown subset bold/italic/links/lists), `Container`, `ColumnSet`/`Column` (as a
   flex row), `FactSet` (a two-column table), `Image` (archived or asyncgw → `/media`, else alt
-  text; a `/media` one that never loads reads "[image not archived]"),
+  text, never a link to its external `url`, unlike a message `<img>`; a `/media` one that never loads
+  reads "[image not archived]"),
   `Action.OpenUrl` and `selectAction` (http(s) links, `rel=noopener`), `codesnippet` cards
   (`<pre>`). Unknown elements render their `text`/`title` when present, else nothing. A card with
   no renderable body shows its `summary` or `fallbackText`. Rendered inside `div.card` with the
@@ -198,7 +204,8 @@ click opens Teams web (2026-10-14 decision).
       attributes and `javascript:` hrefs, renders a unicode Teams emoji as its character, a custom
       emoji as `<img class="emoji">` pointing to the archived file, a mention as
       `span.mention` (`mention-me` for my MRI) and rewrites an archived or asyncgw image to `/media/…`;
-      any other image becomes the plain text "[image not archived]".
+      another Teams object image becomes the plain text "[image not archived]", any other http(s)
+      image a link to it reading `[image: <alt>]` (the text alone inside a link).
 - [x] **AC7** With the page open and followed, a new message on that thread appends within one
       event; an edit replaces the message in place with the `edited` marker; a delete shows
       "message deleted"; a reaction updates the reactions line.
@@ -234,7 +241,8 @@ click opens Teams web (2026-10-14 decision).
 - [x] **AC19** The header's Open in Teams sends `open` for the thread and the server runs the
       opener on its deep link, also for a thread followed but not on the board; with
       `--opener none` it opens the https deep link in a new tab. A message's Open in Teams opens
-      the deep link on that message id.
+      the deep link on that message id. Each is a link carrying that https deep link, out of Tab
+      on a message; 🔗 copies a message's link.
 - [x] **AC20** With `chatnav` at `list`, the chat page's ◀ opens `/?nav=chat`; there a plain click
       on a row opens that chat in the same tab, a middle click opens it in a new tab (through
       `--browser` when set), Ctrl/⌘ click too, Shift click opens Teams; `/` without `nav` behaves as before.

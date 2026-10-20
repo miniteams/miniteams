@@ -219,7 +219,8 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   - **Sections** (see above) work the same here, with their own Recent / Sections choice and folds.
 - **Images**: served from the archive's `media/` folder, else fetched from Teams by `web` (memory only, never written
   to the archive; archives run with `--no-media` or without `images` in `--media` show theirs this way). One the page cannot load yet is retried
-  for about 30 s, then reads `[image not archived]`.
+  for about 30 s, then reads `[image not archived]`. An external one (a GIF from giphy…) is a link to it, `[image: <alt>]` (`[image not archived]` without alt; the text alone inside a link):
+  the page loads no image from elsewhere.
 - **Mark read in Teams when shown** (⚙, on by default): a chat opened, and each message from someone else landing in
   it, marks it read in Teams once the window is visible, focused and at the latest message, and the archive has caught
   up (no "loading latest messages…"); one `read` a second per chat, the last one sent only if all that still holds.
@@ -279,6 +280,9 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   nothing, never "unread". Kept live from Teams' receipt events on `web`'s Trouter socket, reconciled by one read-only
   GET on chat open and after every reconnect; cached in the presence file so a reopened chat paints at once.
 - **Browsing**: infinite scroll both ways, "↓ latest" when away from the bottom, header search, Open in Teams.
+- **Message links**: every Open in Teams (header, ↗ Teams on a message, can't-edit line) is a real link: right-click,
+  Copy link address. A plain click still goes through `--opener`; a modified (Ctrl, Shift…) or middle click is the browser's. 🔗 on a
+  message copies its https Teams link; it shows only in a secure context (the loopback bind, or https behind a proxy), where the browser offers a clipboard.
 - **Received files** (spec 027): a card per file (icon, name) linking the copy the archive saved for that file's own link (when held and ≤ 50 MiB), else its sharing link, else its objectUrl; a pasted file link reads as the file name.
 - **Reply quotes** (spec 021): click a quote (or Tab to it, Enter) to jump to the quoted message, loading the history around it; "quoted message not found" when it is gone.
 - **Members** (spec 022): hover, click or Tab to "N members" for the people, You first then by name, with avatar and presence when known; 50 rows then "… and N more", bots and apps as "+ N apps", "members unavailable" when the roster cannot be had (a roster not cached is fetched without delaying the page). Escape or leaving closes it.

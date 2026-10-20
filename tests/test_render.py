@@ -344,9 +344,8 @@ def test_unarchived_asyncgw_image_goes_through_media(media: Path) -> None:
     [
         SRC,  # not an asyncgw host: no live fetch
         f"http://{GW}/v1/objects/{OBJ}/views/imgo",
-        f"https://evil.example/v1/objects/{OBJ}/views/imgo",
-        f"https://{GW}.evil.example/v1/objects/{OBJ}/views/imgo",
         f"https://a.{GW}/v1/objects/{OBJ}/views/imgo",
+        f"https://api.asm.skype.com/v1/objects/{OBJ}/views/imgpsh_fullsize",
         f"https://x@{GW}/v1/objects/{OBJ}/views/imgo",
         f"https://{GW}:8443/v1/objects/{OBJ}/views/imgo",
         f"https://FR-PROD.asyncgw.teams.microsoft.com/v1/objects/{OBJ}/views/imgo",
@@ -356,8 +355,57 @@ def test_unarchived_asyncgw_image_goes_through_media(media: Path) -> None:
 )
 def test_unservable_image_is_plain_text(src: str) -> None:
     """011-AC6: no dead link to Teams' copy (the page has no token): the text alone."""
-    assert sanitize(f'<img itemtype="http://schema.skype.com/AMSImage" src="{src}">', T, None) == (
-        "[image not archived]"
+    for alt in ("", ' alt="image"'):
+        assert sanitize(f'<img itemtype="http://schema.skype.com/AMSImage" src="{src}"{alt}>', T, None) == (
+            "[image not archived]"
+        )
+
+
+GIF = "https://media0.giphy.com/media/v1.Y2lk/abc/giphy.gif?a=1&b=2"
+
+
+@pytest.mark.parametrize(
+    ("alt", "text"),
+    [
+        ('Hand In Hand <GIF> by "X"', "[image: Hand In Hand &lt;GIF&gt; by &quot;X&quot;]"),
+        ("", "[image not archived]"),
+        ("  ", "[image not archived]"),
+    ],
+)
+def test_external_image_links_to_its_source(alt: str, text: str) -> None:
+    """011-AC6: an external image the CSP keeps off the page is a link to it, named by its alt."""
+    raw = f'<img src="{html.escape(GIF)}" alt="{html.escape(alt)}" onerror="x()">'
+    expected = f'<a href="{html.escape(GIF)}" rel="noopener" target="_blank">{text}</a>'
+    assert sanitize(raw, T, None) == expected
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        "https://cdn.example.com/objects/cat.gif",  # `/objects/` on a host that is not Teams'
+        f"https://evil.example/v1/objects/{OBJ}/views/imgo",
+        f"https://{GW}.evil.example/v1/objects/{OBJ}/views/imgo",
+        f"https://example.org/x.gif?u=https://{GW}/v1/objects/{OBJ}",
+    ],
+)
+def test_an_objects_path_off_teams_hosts_is_an_external_image(src: str) -> None:
+    """011-AC6: only Teams' media hosts hold objects the page cannot reach."""
+    expected = f'<a href="{html.escape(src)}" rel="noopener" target="_blank">[image not archived]</a>'
+    assert sanitize(f'<img src="{html.escape(src)}">', T, None) == expected
+
+
+def test_external_image_inside_a_dropped_link_keeps_its_own() -> None:
+    """011-AC6: an anchor the sanitiser dropped (javascript:) is no link to nest in."""
+    raw = f'<a href="javascript:x()">see <img src="{html.escape(GIF)}" alt="gif"></a>'
+    expected = f'see <a href="{html.escape(GIF)}" rel="noopener" target="_blank">[image: gif]</a>'
+    assert sanitize(raw, T, None) == expected
+
+
+def test_external_image_inside_a_link_is_not_nested() -> None:
+    """011-AC6: an anchor in an anchor would split the outer link."""
+    raw = f'<a href="https://example.org/">see <img src="{GIF}" alt="gif"></a>'
+    assert sanitize(raw, T, None) == (
+        '<a href="https://example.org/" rel="noopener" target="_blank">see [image: gif]</a>'
     )
 
 
