@@ -340,7 +340,7 @@ async def test_a_reopen_answered_blocked_keeps_the_typed_text(fake: Fake) -> Non
     await err.locator("button", has_text="reopen").click()
     await until(page, 'document.querySelector(\'[data-id="1"] .edit-err\')?.textContent.startsWith("can\'t")')
     assert await err.inner_text() == "can't edit here: a table · Open in Teams"
-    assert await err.locator("button", has_text="Open in Teams").count() == 1
+    assert await err.locator("a", has_text="Open in Teams").count() == 1
     assert await box.input_value() == "my edit"
     assert await box.get_attribute("readonly") is not None
     assert await page.locator('[data-id="1"] .blocked').count() == 0

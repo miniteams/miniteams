@@ -448,7 +448,7 @@ async def test_composer_keys_success_and_failure(
 async def test_open_in_teams_without_opener_opens_the_https_link(board: W.Board, chat: Pages) -> None:
     """011-AC19: with `--opener none` the header button opens the https deep link in a new tab."""
     page = await chat.open(_chat(T))
-    await page.wait_for_selector("#teams:not([disabled])")
+    await page.wait_for_selector("#teams[href]")
     async with page.context.expect_page() as tab:
         await page.click("#teams")
     await (await tab.value).close()
@@ -463,7 +463,7 @@ async def test_open_in_teams_with_opener_runs_it(
     """011-AC19: header and message Open in Teams go through the server's opener, on the right message."""
     board.opener = ["xdg-open"]
     page = await chat.open(_chat(T))
-    await page.wait_for_selector("#teams:not([disabled])")
+    await page.wait_for_selector("#teams[href]")
     await page.click("#teams")
     await _until(launched, 1)
     first = page.locator(".msg").first
@@ -473,6 +473,112 @@ async def test_open_in_teams_with_opener_runs_it(
     scheme = board.open_scheme
     assert launched == [("xdg-open", W.deep_link(T, "3", scheme)), ("xdg-open", W.deep_link(T, "1", scheme))]
     assert len(page.context.pages) == 1
+
+
+_HREFS = "ns => ns.map(n => [n.getAttribute('href'), n.target, n.rel, n.tabIndex])"
+
+
+async def test_open_in_teams_controls_are_links_a_plain_click_still_opens_through_the_server(
+    launched: list[tuple[str, ...]], board: W.Board, chat: Pages
+) -> None:
+    """011-AC19: header, message and can't-edit Open in Teams carry the https link (copy link address);
+    a plain click or Enter still goes through the opener, a Ctrl click is the browser's; no new Tab stop."""
+    board.opener = ["xdg-open"]
+    page = await chat.open(_chat(K))
+    await page.wait_for_selector("#teams[href]")
+    await _handled(page, "history")
+    assert await page.get_attribute("#teams", "role") == "link"  # aria-disabled applies without href
+    # The address follows the last message when a context menu opens on it, or the pointer reaches it.
+    await page.dispatch_event("#teams", "contextmenu")
+    assert await page.get_attribute("#teams", "href") == W.deep_link(K, "3")
+    await page.hover("#teams")
+    assert await page.locator("#teams").evaluate_all(_HREFS) == [
+        [W.deep_link(K, "3"), "_blank", "noopener", 0]
+    ]
+    await page.locator('[data-id="3"]').hover()
+    await _act(page, "3", "edit").click()
+    await page.locator('[data-id="3"] .blocked a').wait_for()
+    links = page.locator('[data-id="3"] :is([data-act=teams], .blocked a)')
+    assert await links.evaluate_all(_HREFS) == [[W.deep_link(K, "3"), "_blank", "noopener", -1]] * 2
+    await page.click("#teams")
+    await page.locator('[data-id="3"]').hover()
+    await _act(page, "3", "teams").click()
+    await page.locator('[data-id="3"] .blocked a').click()
+    await _act(page, "3", "teams").press("Enter")
+    await _until(launched, 4)
+    assert launched == [("xdg-open", W.deep_link(K, "3", board.open_scheme))] * 4
+    assert len(page.context.pages) == 1
+    # Records whether the link's handler let the click through, then stops it: a real tab's first
+    # navigation escapes the context's route.
+    await page.evaluate(
+        "addEventListener('click', e => { window.__passed = !e.defaultPrevented; e.preventDefault(); })"
+    )
+    await page.locator('[data-id="3"]').hover()
+    await _act(page, "3", "teams").click(modifiers=["Control"])
+    assert await page.evaluate("window.__passed") is True
+    await asyncio.sleep(0.2)
+    assert len(launched) == 4
+    await _act(page, "3", "teams").focus()
+    await page.keyboard.press("Escape")  # like the buttons beside it, not like a link in the body
+    assert await page.evaluate("document.activeElement.id") == "reply"
+    await board.on_event(_event("NewMessage", K, **_m("4", _at(4), "<p>live</p>")))
+    await page.wait_for_selector('[data-id="4"]')
+    await page.hover("#teams")
+    assert await page.get_attribute("#teams", "href") == W.deep_link(K, "4")
+
+
+async def test_copy_link_puts_the_message_link_on_the_clipboard(chat: Pages) -> None:
+    """011-AC19: the message's copy-link action writes its https Teams link, says so, then reads as before."""
+    page = await chat.open(_chat(T), permissions=["clipboard-read", "clipboard-write"])
+    await _handled(page, "history")
+    await page.locator('[data-id="1"]').hover()
+    copy = _act(page, "1", "copy")
+    label, name = await copy.inner_text(), await copy.get_attribute("aria-label")
+    await copy.click()
+    await page.wait_for_function("navigator.clipboard.readText().then(t => t.startsWith('https://'))")
+    assert await page.evaluate("navigator.clipboard.readText()") == W.deep_link(T, "1")
+    assert await copy.inner_text() == "Copied"
+    assert await copy.get_attribute("aria-label") == await copy.get_attribute("title") == "Copied"
+    await page.wait_for_function(
+        f"document.querySelector('[data-id=\"1\"] [data-act=copy]').textContent === {label!r}"
+    )
+    assert await copy.get_attribute("aria-label") == await copy.get_attribute("title") == name
+
+
+async def test_copy_link_is_offered_only_where_the_page_has_a_clipboard(chat: Pages) -> None:
+    """011-AC19: outside a secure context (the loopback bind, or https behind a proxy) there is no
+    clipboard API: no 🔗 there."""
+
+    async def insecure(context: Any) -> None:
+        await context.add_init_script("Object.defineProperty(window, 'isSecureContext', { value: false })")
+
+    page = await chat.open(_chat(T), prepare=insecure)
+    await _handled(page, "history")
+    assert await _act(page, "1", "teams").count() == 1
+    assert await _act(page, "1", "copy").count() == 0
+
+
+@pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
+@pytest.mark.parametrize(
+    "script",
+    [
+        "delete Navigator.prototype.clipboard",  # no clipboard API all the same
+        "Clipboard.prototype.writeText = () => Promise.reject(new DOMException('x'))",  # refused
+    ],
+)
+async def test_copy_link_says_when_the_clipboard_refuses(chat: Pages, script: str) -> None:
+    """011-AC19: a clipboard the page cannot write says so instead of failing silently."""
+
+    async def refuse(context: Any) -> None:
+        await context.add_init_script(script)
+
+    page = await chat.open(_chat(T), prepare=refuse)
+    await _handled(page, "history")
+    await page.locator('[data-id="1"]').hover()
+    await _act(page, "1", "copy").click()
+    await page.wait_for_function("document.getElementById('err').textContent !== ''")
+    assert "copy" in await page.locator("#err").inner_text()
+    assert await page.get_attribute("#err", "aria-live") == "polite"
 
 
 async def test_csp_blocks_an_inline_handler_the_sanitiser_let_through(
@@ -718,7 +824,8 @@ async def test_follow_error_is_not_overwritten_by_the_history_error(
     await _handled(page, "follow")
     await _handled(page, "history")
     assert await page.locator("#note").inner_text() == "unknown chat"
-    assert await page.locator("#teams").is_disabled()
+    teams = page.locator("#teams")
+    assert await teams.get_attribute("aria-disabled") == "true" and await teams.get_attribute("href") is None
 
 
 # --- message actions (011 phase 4) ---
@@ -947,7 +1054,7 @@ async def test_a_message_that_cannot_be_edited_here_says_why(
     assert await line.inner_text() == "can't edit here: a card · Open in Teams"
     assert await page.locator(".editor").count() == 0
     async with page.context.expect_page() as tab:
-        await line.locator("button", has_text="Open in Teams").click()
+        await line.locator("a", has_text="Open in Teams").click()
     await (await tab.value).close()
     await _until(chat.external, 1)
     assert chat.external == [W.deep_link(K, "3")]
@@ -1080,7 +1187,7 @@ async def test_actions_reachable_from_the_keyboard_and_picker_closes(chat: Pages
             break
     assert await page.evaluate("document.activeElement.dataset.id") == "3"  # the last message
     assert await page.locator('[data-id="3"] .actions').is_visible()
-    buttons = await page.locator('[data-id="3"] .actions > button').evaluate_all(
+    buttons = await page.locator('[data-id="3"] .actions > :is(button, a)').evaluate_all(
         "bs => bs.map(b => [b.dataset.act, b.ariaLabel, b.tabIndex])"
     )
     assert ["reply", "reply with quote", -1] in buttons

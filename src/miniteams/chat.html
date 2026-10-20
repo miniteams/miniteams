@@ -135,8 +135,9 @@
   #status { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); flex: none; }
   #status.off { background: var(--hot); box-shadow: 0 0 0 3px color-mix(in srgb, var(--hot) 25%, transparent); }
   .btn { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 3px 10px; cursor: pointer; color: var(--dim); font-size: 12.5px; white-space: nowrap; }
-  .btn:disabled { opacity: .5; cursor: default; }
-  .btn:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+  a.btn { text-decoration: none; }
+  .btn:disabled, a.btn:not([href]) { opacity: .5; cursor: default; }
+  .btn:hover:not(:disabled, a:not([href])) { color: var(--accent); border-color: var(--accent); }
 
   #pane { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
   #list { flex: 1; overflow-y: auto; padding: 8px 12px; }
@@ -244,8 +245,8 @@
   .msg:hover .actions, .msg:focus-visible .actions, .msg:focus-within:not(:focus) .actions { display: flex; }
   .msg:has(> .actions > .picker:not([hidden])) .actions { display: flex; }  /* `+` on a message focused by a click */
   .msg:has(.editor) .actions { display: none !important; }  /* outranks the focus-within rule: the editor holds focus */
-  .actions button { border: 0; background: transparent; border-radius: 6px; padding: 0 6px; cursor: pointer; color: var(--dim); font-size: 12.5px; }
-  .actions button:hover { background: var(--panel-2); color: var(--accent); }
+  .actions :is(button, a) { text-decoration: none; border: 0; background: transparent; border-radius: 6px; padding: 0 6px; cursor: pointer; color: var(--dim); font-size: 12.5px; }
+  .actions :is(button, a):hover { background: var(--panel-2); color: var(--accent); }
   .actions .picker { display: grid; grid-template-columns: repeat(4, auto) auto; border-left: 1px solid var(--line); margin-left: 2px; padding-left: 2px; }
   .actions .picker[hidden] { display: none; }
   .actions .picker button.mine { background: var(--accent-soft); }
@@ -259,7 +260,7 @@
   .menu .favtools { display: flex; gap: 4px; margin-bottom: 4px; }
   .menu .favtools button { font-size: 12px; }
   .menu .favtools button:last-child { margin-left: auto; }
-  body.readonly .actions [data-act]:not([data-act="teams"]) { display: none; }
+  body.readonly .actions [data-act]:not([data-act="teams"], [data-act="copy"]) { display: none; }
   /* innerText skips what is not displayed: a quote's line is the message without its own quotes. */
   .plain blockquote.reply, .plain .card { display: none; }
   .editor { display: block; width: 100%; resize: vertical; font: inherit; color: inherit; background: var(--panel);
@@ -270,7 +271,7 @@
   .edit-note { color: var(--dim); }
   .edit-note[hidden] { display: none; }
   .blocked { color: var(--dim); font-size: 12px; }
-  button.link { border: 0; background: none; padding: 0; color: var(--accent); cursor: pointer; font-size: inherit; text-decoration: underline; }
+  :is(button, a).link { border: 0; background: none; padding: 0; color: var(--accent); cursor: pointer; font-size: inherit; text-decoration: underline; }
   #quotes, .editbox .quotes { display: flex; flex-direction: column; gap: 3px; margin-bottom: 4px; }
   #quotes[hidden], .editbox .quotes[hidden] { display: none; }
   .quote { display: flex; align-items: center; gap: 6px; border-left: 3px solid var(--accent); background: var(--panel-2);
@@ -335,7 +336,7 @@
   <div id="mpop" role="region" aria-label="chat members" tabindex="0" hidden></div>
   <span id="status" class="off" title="connecting…"></span>
   <input id="find" type="search" placeholder="search · Enter" aria-label="search this chat">
-  <button id="teams" class="btn" title="open this chat in Teams" aria-label="Open in Teams" disabled><span class="full">Open in Teams</span><span class="icon" aria-hidden="true">↗</span></button>
+  <a id="teams" class="btn" role="link" target="_blank" rel="noopener" title="open this chat in Teams" aria-label="Open in Teams" aria-disabled="true"><span class="full">Open in Teams</span><span class="icon" aria-hidden="true">↗</span></a>
   <div class="cog" id="cog"><button id="gear" title="settings" aria-label="settings" aria-controls="settings" aria-expanded="false">⚙</button></div>
   <div id="hits" hidden></div>
 </header>
@@ -364,7 +365,7 @@
   <div id="imgs" class="imgs" hidden></div>
   <textarea id="reply" rows="1" placeholder="message · Enter sends, Shift+Enter new line" aria-label="message"></textarea>
   <div id="pop" hidden></div>
-  <small id="err"></small>
+  <small id="err" aria-live="polite"></small>
 </footer>
 </div>
 <script>
@@ -490,6 +491,12 @@
     if (opener && send({ open: thread, msg: msgId || "" })) return;
     window.open(teamsLink(msgId), "_blank", "noopener");
   };
+  // A real link, for "Copy link address"; a plain click or Enter still goes through openTeams, a modified one is the browser's.
+  const teamsA = (a, msgId) => {
+    Object.assign(a, { href: teamsLink(msgId()), target: "_blank", rel: "noopener" });
+    a.onclick = (e) => { if (e.button || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey || !a.href) return; e.preventDefault(); openTeams(msgId()); };
+    return a;
+  };
   const lastId = () => $msgs.lastElementChild?.dataset.id || "";
   // The authors on screen, newest first: the server follows their presence (spec 015) while the page shows them.
   let authorsTimer = 0, authorsSent = "";
@@ -502,7 +509,14 @@
     }, 300);
   };
   // Detached by a jump, the last message shown is not the chat's last: open the chat itself.
-  $teams.onclick = () => openTeams(hist.newer ? "" : lastId());
+  const headId = () => hist.newer ? "" : lastId();
+  const teamsOn = (on) => {
+    if (on) { $teams.href = teamsLink(headId()); $teams.removeAttribute("aria-disabled"); }
+    else { $teams.removeAttribute("href"); $teams.setAttribute("aria-disabled", "true"); }
+  };
+  teamsA($teams, headId); teamsOn(false);
+  // The last message changes under it: the address is the one about to be copied or followed.
+  $teams.onpointerenter = $teams.onfocus = $teams.oncontextmenu = () => { if ($teams.href) $teams.href = teamsLink(headId()); };
 
   const near = (px = 40) => $list.scrollHeight - $list.scrollTop - $list.clientHeight < px;
   // Spec 020. `read` has no answer: one per second per chat, the rest collapsed into one trailing send,
@@ -611,12 +625,12 @@
       PageUp: () => all.findLast((n) => y(n) <= y(m) - h) || all[0], PageDown: () => all.find((n) => y(n) >= y(m) + h) || all.at(-1) }[k];
     const act = (a) => readOnly ? null : m.querySelector(`:scope > .actions > [data-act=${a}]`);
     if (move) { const n = move(); if (n) visit(n); else toComposer(); }  // ↓ past the last message
-    else if (k === "Escape") { if (t.matches(PASS)) m.focus(); else toComposer(); }
+    else if (k === "Escape") { if (t.matches(`.html :is(${PASS})`)) m.focus(); else toComposer(); }
     else if (k === " ") byScreen(m, e.shiftKey ? -1 : 1);
     else if (k === "e" || k === "r") act(k === "e" ? "edit" : "reply")?.click();
     else if (k === "+") { const b = act("react"), p = m.querySelector(":scope > .actions > .picker"); if (b) { if (p.hidden) b.click(); p.querySelector("button")?.focus(); } }
     else if (k === "p") { const who = m.querySelector(".head .who"); if (who) dmAsk(who, false); }
-    else if (k === "Enter") { const q = m.querySelector(".html blockquote[role=link]"), run = m.querySelector(":scope > .run"); if (q) quoteJump(q.dataset.msg, true); else if (run) { run.click(); m.focus(); } else m.querySelector(":scope > .body > .blocked > button")?.click(); }
+    else if (k === "Enter") { const q = m.querySelector(".html blockquote[role=link]"), run = m.querySelector(":scope > .run"); if (q) quoteJump(q.dataset.msg, true); else if (run) { run.click(); m.focus(); } else m.querySelector(":scope > .body > .blocked > a")?.click(); }
     else if (k === "/") toFind();
     // Any other character is the reader typing again: it lands at the composer's end.
     else if ([...k].length === 1 && !$reply.disabled) { const at = $reply.value.length; insertText($reply, k, at, at, at + k.length, at + k.length); }
@@ -731,7 +745,8 @@
     }
     const actions = el("div", "actions");
     actions.onmousedown = (e) => e.preventDefault();  // a mouse click must not leave focus on the button and pin the bar
-    const button = (act, text, title, onclick) => { const b = el("button", null, text); b.dataset.act = act; b.title = title; b.setAttribute("aria-label", title); b.onclick = onclick; b.tabIndex = -1; actions.append(b); return b; };
+    const control = (b, act, title) => { b.dataset.act = act; b.title = title; b.setAttribute("aria-label", title); b.tabIndex = -1; actions.append(b); return b; };
+    const button = (act, text, title, onclick) => control(Object.assign(el("button", null, text), { onclick }), act, title);
     if (!r.deleted) {
       // Where `send` takes a quote: a text-type message (`editable`, whoever wrote it) with a sender.
       if (r.editable && r.from) button("reply", "↩", "reply with quote", () => addQuote(r, node));
@@ -757,7 +772,9 @@
         button("delete", "🗑", "delete", () => { if (confirm("Delete this message?")) send({ delete: thread, msg: r.id }) || ($err.textContent = "offline, not deleted"); });
       }
     }
-    button("teams", "↗ Teams", "open this message in Teams", () => openTeams(r.id));
+    control(teamsA(el("a", null, "↗ Teams"), () => r.id), "teams", "open this message in Teams");
+    // Only a secure context (the loopback bind, or https behind a proxy) has a clipboard API.
+    if (window.isSecureContext) { const copy = button("copy", "🔗", "copy this message's link", () => copyLink(copy, r.id)); }
     node.append(av, body, actions);
     return node;
   };
@@ -803,10 +820,22 @@
     if (node && r) redraw(node, r);
   };
   const linkBtn = (text, act) => Object.assign(el("button", "link", text), { onclick: act });
+  const teamsLinkA = (id) => teamsA(el("a", "link", "Open in Teams"), () => id);
+  const COPIED_MS = 1500;
+  const copyLink = (b, id) => {
+    // aria-label names the button, not its text: it says "Copied" too.
+    const said = (text, title) => { b.textContent = text; b.title = title; b.setAttribute("aria-label", title); };
+    const done = () => {
+      b.label ||= [b.textContent, b.title];
+      said("Copied", "Copied"); clearTimeout(b.timer); b.timer = setTimeout(() => said(...b.label), COPIED_MS);
+    };
+    const failed = () => { $err.textContent = "can't copy here: right-click ↗ Teams, Copy link address"; };
+    Promise.resolve().then(() => navigator.clipboard.writeText(teamsLink(id))).then(done, failed);
+  };
   // Not editable here (a table, a card…): the reason, as text, and the way to edit it in Teams.
   const blocked = (id, reason) => {
     const line = el("div", "blocked", `can't edit here: ${reason} · `);
-    line.append(Object.assign(linkBtn("Open in Teams", () => openTeams(id)), { tabIndex: -1 }));  // a per-message control: out of Tab
+    line.append(Object.assign(teamsLinkA(id), { tabIndex: -1 }));  // a per-message control: out of Tab
     byId(id)?.querySelector(":scope > .body").append(line);
   };
   // The server's form, checked like any input: what the editor shows goes in as text only.
@@ -874,7 +903,7 @@
       ed.tries = 0;
       if ("blocked" in m) {
         // A text typed meanwhile stays, read-only, to copy: the reason on its error line, Escape closes.
-        if (ed.keep && box.value !== ed.keep.from) { ed.failed = null; err.replaceChildren(`can't edit here: ${m.blocked} · `, linkBtn("Open in Teams", () => openTeams(r.id))); return; }
+        if (ed.keep && box.value !== ed.keep.from) { ed.failed = null; err.replaceChildren(`can't edit here: ${m.blocked} · `, teamsLinkA(r.id)); return; }
         rerender(r.id); blocked(r.id, String(m.blocked)); return;
       }
       if (!m.ok) { fail(why(m.error) || "not opened", true); return; }
@@ -1355,7 +1384,7 @@
     $reply.placeholder = readOnly ? "read-only chat" : PLACEHOLDER;
     document.body.classList.toggle("readonly", readOnly);
     opener = !!m.opener;
-    $teams.disabled = false;
+    teamsOn(true);
     const label = m.label || thread, n = label.match(/ · (\d+)p$/);
     $label.textContent = n ? label.slice(0, n.index) : label;
     $label.title = thread;
@@ -1723,7 +1752,7 @@
     typing.clear(); renderTyping();
     $msgs.replaceChildren(); $note.hidden = false; $note.className = ""; $note.textContent = "loading…";
     closeHits(); $find.value = "";
-    $teams.disabled = true; $members.textContent = ""; $members.hidden = true; roster = undefined; showMembers(false);
+    teamsOn(false); $members.textContent = ""; $members.hidden = true; roster = undefined; showMembers(false);
     showLatest();
   };
   const switchTo = (id, push) => {
