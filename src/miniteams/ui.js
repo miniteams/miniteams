@@ -534,12 +534,12 @@
     // The word the open list answers, or null once the caret left it.
     const word = () => { const t = token(); return t && t.start === comp.start && t.kind === comp.kind ? t : null; };
     const pick = (m) => ({ name: m.name, mri: m.mri, ...(m.everyone === true ? { everyone: true } : {}) });
-    // The server's mention rule (compose.py): `@` starts a word, the name ends one (Python's Unicode \w),
-    // longest names first. The names of the `@Name`s it would read, in text order.
+    // The server's mention rule (compose.py): `@` starts a word, not escaped by an odd run of `\`, the name
+    // ends one (Python's Unicode \w, or a mark), longest names first. The `@Name`s it would read, in order.
     const scan = (text, names) => {
       const alt = [...new Set(names.filter(Boolean))].sort((a, b) => [...b].length - [...a].length)
         .map((n) => n.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")).join("|");
-      return alt ? [...text.matchAll(new RegExp(`(?<![\\p{L}\\p{N}_])@(${alt})(?![\\p{L}\\p{N}_])`, "gu"))].map((m) => m[1]) : [];
+      return alt ? [...text.matchAll(new RegExp(`(?<![\\p{L}\\p{N}_])(?<=(?:^|[^\\\\])(?:\\\\\\\\)*)@(${alt})(?![\\p{L}\\p{N}_\\p{M}])`, "gu"))].map((m) => m[1]) : [];
     };
     const insert = (t) => {
       const it = comp.items[comp.active], member = comp.kind === "member", text = member ? `@${it.name} ` : it.custom ? `:${it.name}:` : it.char;

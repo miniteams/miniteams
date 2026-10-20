@@ -493,3 +493,235 @@ def test_abbreviated_options_are_refused(monkeypatch, argv: list[str]) -> None:
     monkeypatch.setattr(cli, "cmd_chats", lambda s, a: pytest.fail("ran on an abbreviation"))
     with pytest.raises(SystemExit):
         cli.main(argv)
+
+
+# --- send: composer rendering and @mentions (spec 029) ---
+
+GROUP = "19:grp@thread.v2"
+ME = "8:orgid:me"
+ANN, BOB = "8:orgid:ann", "8:orgid:bob"
+ROSTER = [
+    {"mri": ME, "name": "Me Self"},
+    {"mri": ANN, "name": "Ann Lee"},
+    {"mri": BOB, "name": "Bob Roe"},
+    {"mri": "28:bot", "name": "Bot"},
+]
+
+
+def _span(n: int, label: str) -> str:
+    return f'<span itemtype="http://schema.skype.com/Mention" itemscope="" itemid="{n}">{label}</span>'
+
+
+def _entries(props: dict[str, Any] | None) -> list[tuple[Any, ...]]:
+    import json
+
+    assert props is not None
+    return [(e["itemid"], e["mri"], e["displayName"]) for e in json.loads(props["mentions"])]
+
+
+@pytest.fixture
+def wire(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Signed in as ME; the roster, posts, image and file uploads recorded instead of sent."""
+    from types import SimpleNamespace
+
+    from miniteams import files, send
+    from miniteams.directory import Directory
+
+    seen: dict[str, Any] = {"roster": [], "posts": [], "uploads": [], "members": ROSTER, "bearers": []}
+    seen["aad"] = {"access_token": "aad", "id_token": "idt"}
+    monkeypatch.setattr(cli, "_ensure_skype_token", lambda s: (seen["aad"], "sk"))
+    real_set_token = Directory.set_token
+
+    def set_token(self: Any, skype_token: str, bearer: str = "") -> None:
+        seen["bearers"].append(bearer)
+        real_set_token(self, skype_token, bearer)
+
+    monkeypatch.setattr("miniteams.auth.self_mri", lambda token: ME)
+
+    async def thread(self: Any, thread_id: str, max_age: float | None = None) -> dict[str, Any] | None:
+        seen["roster"].append(thread_id)
+        members = seen["members"]
+        return None if members is None else {"topic": None, "members": members}
+
+    def post(settings: Any, token: str, thread: str, text: str, name: str, **kw: Any) -> dict[str, Any]:
+        seen["posts"].append((thread, text, kw.get("is_html"), kw.get("properties")))
+        return {"clientmessageid": "1", "status": 201}
+
+    def upload_image(*a: Any) -> str:
+        seen["uploads"].append("image")
+        return "0-weu-d1-" + "a" * 32
+
+    def upload_files(*a: Any) -> tuple[list[Any], list[Any]]:
+        seen["uploads"].append("file")
+        return [], []
+
+    def post_files(settings: Any, token: str, thread: str, text: str, name: str, **kw: Any) -> None:
+        seen["posts"].append((thread, text, kw.get("is_html"), kw.get("properties")))
+
+    monkeypatch.setattr(Directory, "thread", thread)
+    monkeypatch.setattr(Directory, "set_token", set_token)
+    monkeypatch.setattr(send, "send_message", post)
+    monkeypatch.setattr(send, "upload_image", upload_image)
+    monkeypatch.setattr(files, "onedrive", lambda *a: seen["uploads"].append("drive"))
+    monkeypatch.setattr(files, "upload_files", upload_files)
+    monkeypatch.setattr(files, "post_files", post_files)
+    monkeypatch.setattr(
+        "miniteams.auth.token_source", lambda s: SimpleNamespace(sharepoint_token=lambda h: "sp")
+    )
+    return seen
+
+
+def _send_ns(text: str | None, **kw: Any) -> argparse.Namespace:
+    return _ns(
+        **{"text": text, "file": None, "thread": GROUP, "html": False, "image": None, "attach": None, **kw}
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "html", "entries"),
+    [
+        ("@Ann Lee hi", f"{_span(0, 'Ann Lee')} hi", [(0, ANN, "Ann Lee")]),
+        (
+            "@bob and **@ann**",
+            f"{_span(0, 'Bob')} and <b>{_span(1, 'Ann')}</b>",
+            [(0, BOB, "Bob"), (1, ANN, "Ann")],
+        ),
+    ],
+)
+def test_send_renders_and_mentions(
+    settings: Settings, wire: dict[str, Any], text: str, html: str, entries: list[tuple[Any, ...]]
+) -> None:
+    """029-AC10: `miniteams send --thread X "@Ann Lee hi"` posts the span and `properties.mentions`."""
+    assert cli.cmd_send(settings, _send_ns(text)) == 0
+    ((thread, body, is_html, props),) = wire["posts"]
+    assert (thread, body, is_html, wire["roster"]) == (GROUP, html, True, [GROUP])
+    assert _entries(props) == entries
+
+
+@pytest.mark.parametrize(
+    ("text", "html", "entries"),
+    [
+        ("@Ann Lee look", f"<p>{_span(0, 'Ann Lee')} look</p>", [(0, ANN, "Ann Lee")]),
+        ("**@bob** ok", f"<p><b>{_span(0, 'Bob')}</b> ok</p>", [(0, BOB, "Bob")]),
+        (
+            "- @bob\n- @ann",
+            f"<ul><li>{_span(0, 'Bob')}</li><li>{_span(1, 'Ann')}</li></ul>",
+            [(0, BOB, "Bob"), (1, ANN, "Ann")],
+        ),
+    ],
+)
+def test_send_with_an_image_carries_the_mention(
+    settings: Settings, wire: dict[str, Any], tmp_path, text: str, html: str, entries: list[tuple[Any, ...]]
+) -> None:
+    """029-AC10: with `--image` the text part carries the span, inline text in its own paragraph, and the
+    properties."""
+    from test_images import png
+
+    image = tmp_path / "a.png"
+    image.write_bytes(png())
+    assert cli.cmd_send(settings, _send_ns(text, image=[str(image)])) == 0
+    ((_, body, is_html, props),) = wire["posts"]
+    assert body.startswith(f"{html}<p><img ") and is_html
+    assert _entries(props) == entries and wire["uploads"] == ["image"]
+
+
+@pytest.mark.parametrize(
+    ("text", "html", "entries"),
+    [
+        ("@bob see :fire:", f"{_span(0, 'Bob')} see 🔥", [(0, BOB, "Bob")]),
+        ("> @Ann Lee", f"<blockquote>{_span(0, 'Ann Lee')}</blockquote>", [(0, ANN, "Ann Lee")]),
+    ],
+)
+def test_send_with_an_attachment_carries_the_mention(
+    settings: Settings, wire: dict[str, Any], tmp_path, text: str, html: str, entries: list[tuple[Any, ...]]
+) -> None:
+    """029-AC10: with `--attach` the text part carries the span and the properties."""
+    doc = tmp_path / "a.pdf"
+    doc.write_bytes(b"%PDF")
+    assert cli.cmd_send(settings, _send_ns(text, attach=[str(doc)])) == 0
+    ((thread, body, is_html, props),) = wire["posts"]
+    assert (thread, body, is_html) == (GROUP, html, True) and _entries(props) == entries
+
+
+@pytest.mark.parametrize("text", ["@Ann Lee <b>x</b>", "**@bob** \\@x"])
+def test_send_html_is_verbatim_with_no_roster_call(
+    settings: Settings, wire: dict[str, Any], text: str
+) -> None:
+    """029-AC10: `--html` sends the text as typed: no rendering, no resolution, no roster call."""
+    assert cli.cmd_send(settings, _send_ns(text, html=True)) == 0
+    assert wire["posts"] == [(GROUP, text, True, None)] and wire["roster"] == []
+
+
+@pytest.mark.parametrize(
+    ("text", "thread", "members", "reason"),
+    [
+        ("@Nobody hi", GROUP, ROSTER, "unknown mention @Nobody"),
+        (
+            "@Ann hi",
+            GROUP,
+            [*ROSTER, {"mri": "8:orgid:moore", "name": "Ann Moore"}],
+            "ambiguous mention @Ann: Ann Lee, Ann Moore",
+        ),
+        ("@Ann hi", GROUP, None, "chat members unavailable"),
+        ("@everyone hi", "19:a_b@unq.gbl.spaces", ROSTER, "@everyone is not available in this chat"),
+        ("@Ann hi", "48:notes", ROSTER, "unknown mention @Ann"),
+    ],
+)
+@pytest.mark.parametrize("extra", ["none", "image", "attach"])
+def test_a_refused_send_exits_2_before_any_upload_or_write(
+    settings: Settings,
+    wire: dict[str, Any],
+    tmp_path,
+    text: str,
+    thread: str,
+    members: list[dict[str, str]] | None,
+    reason: str,
+    extra: str,
+) -> None:
+    """029-AC10: a refusal is logged and exits 2; nothing uploaded or posted, whatever is attached."""
+    from test_images import png
+
+    wire["members"] = members
+    path = tmp_path / ("a.png" if extra == "image" else "a.pdf")
+    path.write_bytes(png())
+    kw = {} if extra == "none" else {extra: [str(path)]}
+    with structlog.testing.capture_logs() as logs:
+        assert cli.cmd_send(settings, _send_ns(text, thread=thread, **kw)) == 2
+    assert [(e["event"], e.get("reason")) for e in logs] == [("send_refused", reason)]
+    assert wire["posts"] == [] and wire["uploads"] == []
+    assert wire["roster"] == ([] if thread == "48:notes" else [thread])
+
+
+@pytest.mark.parametrize(
+    ("text", "body"),
+    [("mail a@b.com", "mail a@b.com"), ("`@Ann` x", "<code>@Ann</code> x"), ("\\@Ann Lee", "@Ann Lee")],
+)
+def test_no_candidate_mention_asks_no_roster(
+    settings: Settings, wire: dict[str, Any], text: str, body: str
+) -> None:
+    """029-AC10: no `@Name` to resolve: no roster call, no properties, `\\@` a literal `@`."""
+    assert cli.cmd_send(settings, _send_ns(text)) == 0
+    assert wire["posts"] == [(GROUP, body, True, None)] and wire["roster"] == []
+
+
+@pytest.mark.parametrize("text", ["https://x.test/" + "a" * 14_400, "<" * 7_200])
+def test_a_text_without_mentions_is_refused_before_auth(settings: Settings, monkeypatch, text: str) -> None:
+    """029-AC10: a rendered text past 28 KB of HTML is refused before any login: no `@Name` to resolve."""
+    monkeypatch.setattr(cli, "_ensure_skype_token", lambda s: pytest.fail("auth before validation"))
+    with structlog.testing.capture_logs() as logs:
+        assert cli.cmd_send(settings, _send_ns(text)) == 2
+    assert [e["event"] for e in logs] == ["send_refused"]
+
+
+@pytest.mark.parametrize(
+    ("aad", "bearer"),
+    [({"access_token": "aad", "id_token": "idt"}, "idt"), ({"access_token": "aad"}, "aad")],
+    ids=["id-token", "access-token-only"],
+)
+def test_the_roster_lookup_gets_the_bearer_every_directory_gets(
+    settings: Settings, wire: dict[str, Any], aad: dict[str, str], bearer: str
+) -> None:
+    """029-AC10: the id token, else the access token, as stream, archive and watch give the Directory."""
+    wire["aad"] = aad
+    assert cli.cmd_send(settings, _send_ns("@Ann Lee hi")) == 0
+    assert wire["bearers"] == [bearer] and wire["roster"] == [GROUP]

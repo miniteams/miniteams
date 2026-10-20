@@ -6,6 +6,7 @@ import os
 import re
 import stat
 import sys
+from collections.abc import Callable
 from datetime import UTC
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -118,10 +119,21 @@ def cmd_send(settings: Settings, args: argparse.Namespace) -> int:
         log.error("send_no_input", hint="provide TEXT, --file, --image or --attach")
         return 2
 
+    from .compose import holds_mention
     from .send import too_long
 
-    if too_long(text, is_html=args.html):  # before auth and uploads: nothing to clean up after
-        log.error("send_too_long", hint="Teams caps a message at 28 KiB of HTML")
+    # Before auth and uploads: nothing to clean up after. An `@Name` needs the roster, hence the token:
+    # that text is rendered in _send, still before any upload.
+    rendered: tuple[str, dict[str, Any] | None] | None = None
+    if args.html:
+        if too_long(text, is_html=True):
+            log.error("send_too_long", hint="Teams caps a message at 28 KiB of HTML")
+            return 2
+    elif (
+        not holds_mention(text)
+        # Without an `@Name` render_outgoing asks neither the roster nor me.
+        and (rendered := _rendered(text, args.thread, lambda: None, lambda: "")) is None
+    ):
         return 2
     with contextlib.ExitStack() as opened:
         images: list[tuple[str, bytes]] = []
@@ -139,28 +151,69 @@ def cmd_send(settings: Settings, args: argparse.Namespace) -> int:
         except ValueError as exc:
             log.error("send_bad_file", error=str(exc))
             return 2
-        return _send(settings, args, text, images, attached)
+        return _send(settings, args, text, rendered, images, attached)
+
+
+def _rendered(
+    text: str, thread_id: str, members: Callable[[], list[dict[str, Any]] | None], me: Callable[[], str]
+) -> tuple[str, dict[str, Any] | None] | None:
+    """`text` rendered and its mentions resolved as MCP sends it (spec 029); None, logged, when refused."""
+    from .compose import render_outgoing
+
+    try:
+        return render_outgoing(text, thread_id, members, me)
+    except ValueError as exc:
+        log.error("send_refused", reason=str(exc))
+        return None
+
+
+def _roster(settings: Settings, skype_token: str, bearer: str, thread_id: str) -> list[dict[str, Any]] | None:
+    """The chat's members from the chat service, as MCP fetches them; None when they cannot be had."""
+    import asyncio
+
+    from .directory import Directory
+
+    directory = Directory(settings)
+    directory.set_token(skype_token, bearer)
+    info = asyncio.run(directory.thread(thread_id))
+    return None if info is None else list(info["members"])
 
 
 def _send(
     settings: Settings,
     args: argparse.Namespace,
     text: str,
+    rendered: tuple[str, dict[str, Any] | None] | None,
     images: list[tuple[str, bytes]],
     attached: list[tuple[str, BinaryIO, int]],
 ) -> int:
-    from .send import images_body, send_images, send_message
+    from .auth import self_mri
+    from .send import before_images, images_body, send_images, send_message
 
     aad, skype_token = _ensure_skype_token(settings)
     display_name = (aad.get("id_token_claims") or {}).get("name") or ""
+    token = str(aad.get("access_token") or "")
+    if not args.html and rendered is None:
+        rendered = _rendered(
+            text,
+            args.thread,
+            lambda: _roster(settings, skype_token, str(aad.get("id_token") or token), args.thread),
+            lambda: self_mri(token),
+        )
+        if rendered is None:
+            return 2
+    props: dict[str, Any] | None = None
+    if rendered is not None:
+        content, props = rendered
+        text = before_images(content) if images else content
+    is_html = args.html or rendered is not None
     if attached:
-        from .auth import self_mri, token_source
+        from .auth import token_source
         from .files import onedrive, send_files
 
-        token = aad["access_token"]
         drive = onedrive(settings, token, token_source(settings).sharepoint_token)
         if images:
-            text = images_body(settings, skype_token, args.thread, text, images, is_html=args.html)
+            text = images_body(settings, skype_token, args.thread, text, images, is_html=is_html)
         send_files(
             settings,
             skype_token,
@@ -170,12 +223,17 @@ def _send(
             text,
             attached,
             display_name,
-            is_html=args.html or bool(images),
+            is_html=is_html or bool(images),
+            properties=props,
         )
     elif images:
-        send_images(settings, skype_token, args.thread, text, images, display_name, is_html=args.html)
+        send_images(
+            settings, skype_token, args.thread, text, images, display_name, is_html=is_html, properties=props
+        )
     else:
-        send_message(settings, skype_token, args.thread, text, display_name, is_html=args.html)
+        send_message(
+            settings, skype_token, args.thread, text, display_name, is_html=is_html, properties=props
+        )
     print(f"sent → {args.thread}", file=sys.stderr)
     return 0
 
@@ -567,7 +625,7 @@ def main(argv: list[str] | None = None) -> int:
     p_send.add_argument(
         "--html",
         action="store_true",
-        help="send content as raw RichText/Html (no escaping) for formatting",
+        help="send TEXT/--file as raw RichText/Html, verbatim: no markdown, no @mention resolution",
     )
     p_send.add_argument(
         "--thread",

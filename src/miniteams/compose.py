@@ -4,15 +4,20 @@ Pure (spec 012). No backtracking regex: closers are found with `str.find`.
 """
 
 import html
+import itertools
 import json
 import re
+import unicodedata
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlsplit
 
+from .chats import chat_kind
 from .config import Settings
+from .directory import humans
 from .emoji_table import SHORTCODES
-from .messages import snippet
+from .messages import fold, is_me, snippet
+from .send import MAX_HTML_BYTES, NOTES_THREAD, too_long
 
 MAX_TEXT = 28 * 1024  # composer characters; send.too_long caps the posted HTML bytes
 _ASYNCGW_HOST: str = Settings.model_fields["asyncgw_host"].default
@@ -21,7 +26,7 @@ EMOJI_NAME_RE = re.compile(r"[A-Za-z0-9_+-]{1,64}")  # what `:name:` expands
 _MENTION = "http://schema.skype.com/Mention"
 _CUSTOM_EMOJI = "http://schema.skype.com/CustomEmoji"
 _SPECIAL_RE = re.compile(r"[\\`\[*_~]|https?://")
-ESCAPABLE = frozenset("\\*_~`[")  # `\x` gives a literal x; `\\` only where a lone `\` would escape
+ESCAPABLE = frozenset("\\*_~`[@")  # `\x` gives a literal x; `\\` only where a lone `\` would escape
 _RUN_RE = re.compile(r"\*+|_+|~+")
 # `'` only before a word character: `Hitchhiker's_Guide`, not `'https://a.com/x'|jq`.
 _URL_RE = re.compile(r"https?://(?:[^\s<>\"`']|'(?=\w))+")
@@ -37,6 +42,17 @@ _PREVIEW_LEN = 100  # characters of the quoted message a Reply block carries
 _SPANS = (("**", "b"), ("~~", "s"), ("*", "i"), ("_", "i"))
 MAX_MENTIONS = 50
 MAX_NAME = 200
+# An `@` compose_html could expand: starting a word, followed by one; URLs matched first to skip theirs.
+_CANDIDATE_RE = re.compile(rf"(?P<url>{_URL_RE.pattern})|(?<!\w)@(?=\w)")
+# What continues a word, so a name cannot end before it: `\w` and the marks (`re` has no \p{M}; ui.js's
+# `scan` reads the same `[\p{L}\p{N}_\p{M}]`). Planes 0, 1 and 14 hold every mark.
+_MARKS = "".join(
+    chr(c)
+    for c in itertools.chain(range(0x20000), range(0xE0000, 0xE1000))
+    if unicodedata.category(chr(c))[0] == "M"
+)
+_JOINS = rf"[\w{_MARKS}]"
+_JOINS_RE = re.compile(_JOINS)
 
 type OnText = Callable[[str], str]
 
@@ -238,7 +254,7 @@ def compose_html(
     `mentions`: picked `{name, mri, label?, everyone?}`, `name` as typed and `label` as shown (default
     `name`), in the order picked: the n-th `@Name` goes to the n-th pick of that name, any further one
     to its last; `emojis`: custom name → AMS object id. `@Name` matches when `@` starts a word and
-    the name is followed by the end or a non-word character; names are tried longest first,
+    the name is followed by the end or neither a word character nor a mark; names are tried longest first,
     case-sensitive, so `@Ann Lee` wins over `@Ann`. Code, link labels and URLs are never expanded.
     A backslash makes ESCAPABLE characters literal, and in full mode a leading block marker (spec 019).
 
@@ -255,7 +271,7 @@ def compose_html(
             by_name.setdefault(name, []).append(mention)
     seen: dict[str, int] = {}  # name → occurrences so far
     alternatives = "|".join(re.escape(n) for n in sorted(by_name, key=len, reverse=True))
-    mention_re = rf"(?<!\w)@(?P<name>{alternatives})(?!\w)|" if alternatives else ""
+    mention_re = rf"(?<!\w)@(?P<name>{alternatives})(?!{_JOINS})|" if alternatives else ""
     # Bare URLs go first: no emoji or mention inside a URL.
     token_re = re.compile(rf"(?P<url>{_URL_RE.pattern})|" + mention_re + _EMOJI)
     entries: list[dict[str, Any]] = []
@@ -267,6 +283,8 @@ def compose_html(
             link = html.escape(url)
             return f'<a href="{link}">{link}</a>{html.escape(m.group()[len(url) :])}'
         if (name := m.group("name") if alternatives else None) is not None:
+            if len(entries) == MAX_MENTIONS:  # a pick stands for every occurrence of its name
+                raise ValueError(f"too many mentions (> {MAX_MENTIONS})")
             picks = by_name[name]
             picked = picks[min(seen.get(name, 0), len(picks) - 1)]
             seen[name] = seen.get(name, 0) + 1
@@ -312,6 +330,103 @@ def compose_html(
 
     content = _render(text, full, on_text)
     return content, ({"mentions": json.dumps(entries, ensure_ascii=False)} if entries else None)
+
+
+def _candidates(text: str) -> list[str]:
+    """The text after each `@` compose_html (full mode) could expand: code, link labels, URLs and `\\@`
+    never reach `on_text`, or are skipped."""
+    found: list[str] = []
+
+    def on_text(seg: str) -> str:
+        # A name past MAX_NAME never matches: the rest of the text is not kept per `@`.
+        found.extend(
+            seg[m.end() : m.end() + MAX_NAME + 1]
+            for m in _CANDIDATE_RE.finditer(seg)
+            if m.group("url") is None
+        )
+        return ""
+
+    _render(text, True, on_text)
+    return found
+
+
+def holds_mention(text: str) -> bool:
+    """Whether `text` holds an `@Name` to resolve: only then is the roster needed (spec 029)."""
+    return bool(_candidates(text))
+
+
+def _joins(ch: str) -> bool:
+    """`ch` continues the word before it: a word character or a mark; compose_html's name end."""
+    return _JOINS_RE.fullmatch(ch) is not None
+
+
+def _typed_len(rest: str, form: str) -> int:
+    """Length of the longest start of `rest` that is `form`, case and accents ignored, and ends a word; 0
+    for none. Grown a character at a time, folded per character: folding changes lengths (`ß` → `ss`,
+    a combining accent → "")."""
+    want, got, best = fold(form), "", 0
+    for k, ch in enumerate(rest, 1):
+        got += fold(ch)
+        if not want.startswith(got):
+            break
+        if got == want and not _joins(rest[k : k + 1] or " "):
+            best = k
+    return best
+
+
+def resolve_mentions(
+    text: str, members: list[dict[str, Any]], thread_id: str, me: str
+) -> list[dict[str, Any]]:
+    """Each `@Name` of `text` (full mode) → a compose_html pick `{name, mri, label?, everyone?}` (spec 029).
+
+    A member's full or first name matches, case and accents ignored, longest first; `name` is the
+    spelling typed, `label` the roster's. Bots, apps and me are no candidates; `@everyone` is the
+    chat's on groups, meetings and channels. ValueError for a name matching nobody or several members,
+    or more than MAX_MENTIONS."""
+    candidates = _candidates(text)
+    if len(candidates) > MAX_MENTIONS:
+        raise ValueError(f"too many mentions (> {MAX_MENTIONS})")
+    roster = humans(members)
+    forms: list[tuple[str, dict[str, Any]]] = []  # (roster spelling, pick)
+    if chat_kind(thread_id) not in ("private", "system"):
+        forms.append(("everyone", {"mri": thread_id, "everyone": True}))
+    for mri, name in roster.items():
+        if name.strip() and not is_me(mri, me):
+            forms += ((form, {"mri": mri, "label": form}) for form in dict.fromkeys((name, name.split()[0])))
+    picks: dict[str, dict[str, Any]] = {}  # typed spelling → pick
+    for rest in candidates:
+        hits = [(n, pick) for form, pick in forms if (n := _typed_len(rest, form))]
+        size = max((n for n, _ in hits), default=0)
+        found = {pick["mri"]: pick for n, pick in hits if n == size}
+        typed = rest[: size or next((i for i, c in enumerate(rest) if not _joins(c)), len(rest))]
+        if not found:
+            if fold(typed) == "everyone":
+                raise ValueError("@everyone is not available in this chat")
+            raise ValueError(f"unknown mention @{typed[:MAX_NAME]}")
+        if len(found) > 1:
+            names = sorted((roster.get(mri, "Everyone") for mri in found), key=fold)
+            raise ValueError(f"ambiguous mention @{typed[:MAX_NAME]}: {', '.join(names)}")
+        picks.setdefault(typed, {"name": typed, **next(iter(found.values()))})
+    return list(picks.values())
+
+
+def render_outgoing(
+    text: str, thread_id: str, members: Callable[[], list[dict[str, Any]] | None], me: Callable[[], str]
+) -> tuple[str, dict[str, Any] | None]:
+    """MCP and CLI text → (HTML, properties) as the chat page's composer renders it, each `@Name` resolved
+    on `members()` (spec 029). `members` and `me` are only called for a text holding an `@Name`, Notes
+    to self has nobody; `members()` None is an unavailable roster. ValueError for every refusal."""
+    mentions: list[dict[str, Any]] = []
+    if holds_mention(text):
+        roster = [] if thread_id == NOTES_THREAD else members()
+        if roster is None:
+            raise ValueError("chat members unavailable")
+        mentions = resolve_mentions(text, roster, thread_id, me())
+    # Built-in shortcodes only: the custom emoji table needs another token and fetch.
+    content, props = compose_html(text, mentions, {}, full=True)
+    if too_long(content, is_html=True):
+        raise ValueError(f"message too long: over Teams' limit of {MAX_HTML_BYTES // 1024} KB once rendered")
+    return content, props
 
 
 def reply_quote(message: dict[str, Any], name: str) -> str:

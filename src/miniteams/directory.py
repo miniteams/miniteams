@@ -57,6 +57,11 @@ def is_app(mri: str) -> bool:
     return mri.rsplit("/", 1)[-1].startswith("28:")
 
 
+def humans(members: list[dict[str, Any]]) -> dict[str, str]:
+    """Roster → {mri: display name} of its people; bots and apps left out."""
+    return {str(m["mri"]): str(m["name"] or "") for m in members if not is_app(str(m["mri"]))}
+
+
 def roster_label(topic: str | None, members: list[dict[str, Any]], me: str) -> str:
     """Topic · N, else the roster's people but me, else its apps, else anyone named; "" for nobody.
 

@@ -458,10 +458,16 @@ def test_non_text_messages_are_refused(msgtype: str) -> None:
     assert isinstance(decompose(_msg("<p>x</p>", msgtype), EMOJIS), str)
 
 
-def test_a_literal_mention_name_refuses_rather_than_mentioning() -> None:
-    """019-AC8: plain `@Ann Lee` next to a real mention of Ann would turn into a mention on save."""
-    content = f"<p>{_span(0, 'Ann Lee')} and @Ann Lee</p>"
-    assert decompose(_msg(content, mentions=_mentions(("8:orgid:ann", "person"))), EMOJIS) == D.OTHER
+def test_a_literal_mention_name_is_escaped_rather_than_mentioning() -> None:
+    """029-AC6: plain `@Ann Lee` next to a real mention of Ann comes back as `\\@Ann Lee`, so a save keeps
+    it text; a `\\` before `@` stays one backslash."""
+    content = f"<p>{_span(0, 'Ann Lee')} and @Ann Lee, a\\@b</p>"
+    form = _form(content, mentions=_mentions(("8:orgid:ann", "person")))
+    assert form.text == "@Ann Lee and \\@Ann Lee, a\\\\\\@b"
+    assert compose_html(form.text, form.picks, EMOJIS, full=True)[0] == content[3:-4].replace(
+        "itemscope ", 'itemscope="" '
+    )
+    assert _form("<p>mail a@b.com or @team</p>").text == "mail a@b.com or @team"
 
 
 def test_a_text_that_needs_every_escape_still_converts() -> None:
@@ -570,3 +576,10 @@ def test_a_url_sent_as_plain_text_stays_editable(text: str) -> None:
     """028-AC3: a message sent before links were written (plain-text URLs) still opens in the editor."""
     form = _form(f"<p>{html.escape(text)}</p>")
     assert form.text == text
+
+
+@pytest.mark.parametrize(("html_", "md"), [("a@b.com", "a@b.com"), ("x_@y", "x\\_@y"), ("é@z", "é@z")])
+def test_escape_everything_leaves_an_email_alone(html_: str, md: str) -> None:
+    """029-AC6: in the escape-everything mode an `@` inside a word (an email) gets no backslash."""
+    form = _form(f"<p>a~<s>b</s> [<a href='https://x.test'>x</a> {html_}</p>")
+    assert form.text == f"a\\~~~b~~ \\[[x](https://x.test) {md}"

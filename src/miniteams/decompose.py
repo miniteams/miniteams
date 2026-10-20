@@ -429,7 +429,8 @@ def _escape(seg: str, wide: bool, line_start: bool, following: str, after_url: b
             out.append(seg[i:j] if inert and not wide else "".join("\\" + c for c in seg[i:j]))
             i = j
             continue
-        if ch == "`" or (ch == "[" and (wide or i < link_end)):
+        at = ch == "@" and wide and not _word(seg[i - 1 : i] or " ")  # a literal `@Name` next to its mention
+        if ch == "`" or (ch == "[" and (wide or i < link_end)) or at:
             out.append("\\" + ch)
         elif ch == "\\":
             j = i
