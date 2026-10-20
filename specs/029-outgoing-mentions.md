@@ -1,6 +1,6 @@
 # 029 — `@` mentions and composer rendering in MCP and CLI sends
 
-**Status**: in progress
+**Status**: shipped (AC13: Teams client highlight and notification await a check)
 **Requested by**: babs
 **Date**: 2026-10-20
 
@@ -54,27 +54,28 @@ refuses the send, with the candidates, so no mention is silently lost.
 
 ## Acceptance criteria
 
-- [ ] **AC1** `send_message` with `@Ann Lee` on a chat where Ann Lee is a member posts
+- [x] **AC1** `send_message` with `@Ann Lee` on a chat where Ann Lee is a member posts
   `<span itemtype="http://schema.skype.com/Mention" itemscope="" itemid="0">Ann Lee</span>` and
   `properties.mentions` with her MRI, `mentionType: person`.
-- [ ] **AC2** `@ann` (lower case, unique first name) mentions Ann Lee with label `Ann`; `@Ann Lee` and
+- [x] **AC2** `@ann` (lower case, unique first name) mentions Ann Lee with label `Ann`; `@Ann Lee` and
   `@Ann` in one text give two entries, `itemid` 0 and 1 in text order.
-- [ ] **AC3** `@Ann` with two members named Ann refuses with both full names; no API write.
-- [ ] **AC4** `@Nobody` refuses `unknown mention @Nobody`; no API write.
-- [ ] **AC5** `@everyone` on a group chat gives `mentionType: everyone`, MRI = thread id, label
+- [x] **AC3** `@Ann` with two members named Ann refuses with both full names; no API write.
+- [x] **AC4** `@Nobody` refuses `unknown mention @Nobody`; no API write.
+- [x] **AC5** `@everyone` on a group chat gives `mentionType: everyone`, MRI = thread id, label
   `Everyone`; on a 1:1 it refuses.
-- [ ] **AC6** A text with no candidate `@` makes no roster call; `a@b.com`, `` `@Ann` `` and `\@Ann`
+- [x] **AC6** A text with no candidate `@` makes no roster call; `a@b.com`, `` `@Ann` `` and `\@Ann`
   make none either and send without mentions (the last as a literal `@Ann`).
-- [ ] **AC7** Roster fetch failure with a candidate `@` refuses `chat members unavailable`.
-- [ ] **AC8** `send_message` with `send_at` writes the draft with the mention span and
+- [x] **AC7** Roster fetch failure with a candidate `@` refuses `chat members unavailable`.
+- [x] **AC8** `send_message` with `send_at` writes the draft with the mention span and
   `properties.mentions`; `update_scheduled` with new text replaces both.
-- [ ] **AC9** `update_message` with `@Ann Lee` edits the message with the mention span and properties.
-- [ ] **AC10** `miniteams send --thread X "@Ann Lee hi"` sends the mention; with `--image` or `--attach`
+- [x] **AC9** `update_message` with `@Ann Lee` edits the message with the mention span and properties.
+- [x] **AC10** `miniteams send --thread X "@Ann Lee hi"` sends the mention; with `--image` or `--attach`
   the text part carries it; `--html` sends the text verbatim, no resolution.
-- [ ] **AC11** `**bold**`, `:fire:`, a bare URL and a `- ` list render as in the chat page's composer.
-- [ ] **AC12** A composed message over 28 KiB of HTML is refused before any write.
+- [x] **AC11** `**bold**`, `:fire:`, a bare URL and a `- ` list render as in the chat page's composer.
+- [x] **AC12** A composed message over 28 KiB of HTML is refused before any write.
 - [ ] **AC13** Teams-side: a mention sent through MCP to the test channel shows highlighted in the Teams
-  client and notifies the member.
+  client and notifies the member. *(2026-10-20: CLI and MCP sends reached the server with the mention
+  span and `properties.mentions`; the in-client highlight and notification await a look.)*
 
 ## Phases
 

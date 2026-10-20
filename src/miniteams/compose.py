@@ -17,6 +17,7 @@ from .config import Settings
 from .directory import humans
 from .emoji_table import SHORTCODES
 from .messages import fold, is_me, snippet
+from .send import MAX_HTML_BYTES, NOTES_THREAD, too_long
 
 MAX_TEXT = 28 * 1024  # composer characters; send.too_long caps the posted HTML bytes
 _ASYNCGW_HOST: str = Settings.model_fields["asyncgw_host"].default
@@ -407,6 +408,25 @@ def resolve_mentions(
             raise ValueError(f"ambiguous mention @{typed[:MAX_NAME]}: {', '.join(names)}")
         picks.setdefault(typed, {"name": typed, **next(iter(found.values()))})
     return list(picks.values())
+
+
+def render_outgoing(
+    text: str, thread_id: str, members: Callable[[], list[dict[str, Any]] | None], me: Callable[[], str]
+) -> tuple[str, dict[str, Any] | None]:
+    """MCP and CLI text → (HTML, properties) as the chat page's composer renders it, each `@Name` resolved
+    on `members()` (spec 029). `members` and `me` are only called for a text holding an `@Name`, Notes
+    to self has nobody; `members()` None is an unavailable roster. ValueError for every refusal."""
+    mentions: list[dict[str, Any]] = []
+    if holds_mention(text):
+        roster = [] if thread_id == NOTES_THREAD else members()
+        if roster is None:
+            raise ValueError("chat members unavailable")
+        mentions = resolve_mentions(text, roster, thread_id, me())
+    # Built-in shortcodes only: the custom emoji table needs another token and fetch.
+    content, props = compose_html(text, mentions, {}, full=True)
+    if too_long(content, is_html=True):
+        raise ValueError(f"message too long: over Teams' limit of {MAX_HTML_BYTES // 1024} KB once rendered")
+    return content, props
 
 
 def reply_quote(message: dict[str, Any], name: str) -> str:

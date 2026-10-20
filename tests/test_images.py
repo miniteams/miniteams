@@ -281,7 +281,8 @@ def test_cli_send_images(settings: Settings, monkeypatch, tmp_path) -> None:
         lambda s, tok, thread, text, imgs, name, **kw: seen.update(thread=thread, text=text, imgs=imgs),
     )
     assert cli.cmd_send(settings, args) == 0
-    assert seen == {"thread": "T", "text": "hello", "imgs": [("a.png", png()), ("b.jpg", jpeg(4, 4))]}
+    # 029-AC10: the text is rendered as the composer does; the posted body is the same `<p>` as before.
+    assert seen == {"thread": "T", "text": "<p>hello</p>", "imgs": [("a.png", png()), ("b.jpg", jpeg(4, 4))]}
 
 
 def test_cli_send_refuses_a_non_image_before_auth(settings: Settings, monkeypatch, tmp_path) -> None:

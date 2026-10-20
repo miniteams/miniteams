@@ -24,7 +24,7 @@ from .archive import RefreshingToken
 from .archive_store import chat_dir_name, find_chat_dir, read_chats, read_meta, search_chat
 from .auth import AuthExpired, AuthUnavailable, TokenSource, self_mri, token_source
 from .chats import chat_kind, is_system, last_activity, parse_when
-from .compose import compose_html, holds_mention, resolve_mentions
+from .compose import render_outgoing
 from .config import Settings
 from .drafts import (
     SCHEDULE_MAX_AHEAD,
@@ -39,7 +39,7 @@ from .drafts import (
 from .http import failure
 from .mcp_api import ApiReader
 from .messages import SNIPPET_LEN, fold, is_deleted, is_edited, json_list, message_text, plain_text
-from .send import MAX_HTML_BYTES, NOTES_THREAD, edit_message, send_message, too_long
+from .send import NOTES_THREAD, edit_message, send_message
 from .watch import note_sent
 
 log = structlog.get_logger()
@@ -545,25 +545,16 @@ def _outgoing_text(args: dict[str, Any]) -> str:
 def _compose(
     server: Server, thread_id: str, text: str, info: dict[str, Any] | None = None
 ) -> tuple[str, dict[str, Any] | None]:
-    """(HTML, properties) of `text` as the chat page's composer renders it, each `@Name` resolved on the
-    chat's roster (spec 029): `info`'s when given, else fetched, only for a text that holds one."""
+    """render_outgoing on the chat's roster: `info`'s when given, else fetched."""
+
+    def members() -> list[dict[str, Any]] | None:
+        found = info or asyncio.run(server.api().directory.thread(thread_id))
+        return None if found is None else list(found["members"])
+
     try:
-        mentions: list[dict[str, Any]] = []
-        if holds_mention(text):
-            if thread_id == NOTES_THREAD:  # nobody to mention, and the alias has no roster to fetch
-                info = {"members": []}
-            elif info is None:
-                info = asyncio.run(server.api().directory.thread(thread_id))
-            if info is None:
-                raise ToolError("chat members unavailable")
-            mentions = resolve_mentions(text, info["members"], thread_id, server.session.mri())
-        # Built-in shortcodes only: the custom emoji table needs another token and fetch.
-        content, props = compose_html(text, mentions, {}, full=True)
+        return render_outgoing(text, thread_id, members, server.session.mri)
     except ValueError as exc:
         raise ToolError(str(exc)) from exc
-    if too_long(content, is_html=True):
-        raise ToolError(f"message too long: over Teams' limit of {MAX_HTML_BYTES // 1024} KB once rendered")
-    return content, props
 
 
 def _known_thread(server: Server, thread_id: str) -> dict[str, Any] | None:
@@ -816,7 +807,7 @@ TOOLS: tuple[Tool, ...] = (
         "Post a message to a chat as you, now or at `send_at` (Teams holds it until then). Get "
         "the chat id from find_chats; `48:notes` is your own Notes. Markdown and :shortcode: render as in "
         "the chat page; `@Full Name` or `@First` mentions a member (`@everyone` the chat), `\\@` is a "
-        "literal @.",
+        "literal @. A name matching no member, or several (listed), is refused: nothing is sent.",
         {
             "thread_id": {"type": "string"},
             "text": {"type": "string"},

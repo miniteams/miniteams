@@ -69,7 +69,16 @@ from .messages import (
     snippet,
 )
 from .render import STEM_RE, cards_html, file_links, file_urls, files_html, media_url, sanitize
-from .send import attach_images, delete_message, edit_message, message_html, react, send_message, too_long
+from .send import (
+    attach_images,
+    before_images,
+    delete_message,
+    edit_message,
+    message_html,
+    react,
+    send_message,
+    too_long,
+)
 
 log = structlog.get_logger()
 
@@ -130,7 +139,6 @@ _UNSURE_ERRORS = (
 )
 UNSURE = "no answer from Teams: the message may have gone out"
 CHANGED = "the message changed since it was opened: reopen it to edit"
-_BLOCK_RE = re.compile(r"<(?:p|div|ul|ol|pre|blockquote|h\d)\b")
 # The page may not load the asyncgw URL (it needs the skype token): previews point at /emoji/<id>.
 _ASYNCGW_SRC_RE = re.compile(
     r'src="https://[^./"]+\.asyncgw\.teams\.microsoft\.com/v1/objects/([\w-]+)/views/imgt2_anim"', re.ASCII
@@ -816,13 +824,6 @@ def _pick_key(mention: dict[str, Any]) -> tuple[str, str, bool]:
     return str(mention.get("mri")), str(mention.get("name")), bool(mention.get("everyone"))
 
 
-def _before_images(content: str) -> str:
-    """Text ahead of images: inline text gets its own paragraph, as the CLI sends it."""
-    if not content.strip():
-        return ""
-    return content if _BLOCK_RE.search(content) else f"<p>{content}</p>"
-
-
 class ChatVerbs:
     """The chat page's verbs on one board: the archive first, the chat service for what it lacks."""
 
@@ -1187,7 +1188,7 @@ class ChatVerbs:
                     return "cannot quote this message"
                 quoted = "".join(self._reply_quote(copies[q]) for q in quote)
             if blobs:
-                body = _before_images(content)
+                body = before_images(content)
                 files = [
                     (f"image.{image.kind}", blob)
                     for image, blob in zip(check_batch(blobs), blobs, strict=True)
@@ -1382,7 +1383,7 @@ class ChatVerbs:
         except ValueError as exc:
             return str(exc)
         if images := "".join(image.html for image in form.images if image.key in request.keep_images):
-            content = _before_images(content) + f"<p>{images}</p>"
+            content = before_images(content) + f"<p>{images}</p>"
         content = "".join(q.html for q in form.quotes if q.key in request.keep_quotes) + content
         if too_long(content, is_html=True):
             return "message too long"

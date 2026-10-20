@@ -394,6 +394,7 @@ def send_files(
     display_name: str,
     *,
     is_html: bool = False,
+    properties: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One message from `me` (MRI): `text` and `files` ((name, readable file, size)) as file cards.
     Nothing is posted unless every file is uploaded and shared (upload_files, post_files)."""
@@ -408,4 +409,5 @@ def send_files(
         entries=entries,
         uploaded=uploaded,
         is_html=is_html,
+        properties=properties,
     )

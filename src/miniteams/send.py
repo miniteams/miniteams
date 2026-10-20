@@ -52,6 +52,16 @@ def message_html(text: str, is_html: bool) -> str:
     return text if is_html else html.escape(text).replace("\n", "<br>")
 
 
+_BLOCK_RE = re.compile(r"<(?:p|div|ul|ol|pre|blockquote|h\d)\b")
+
+
+def before_images(content: str) -> str:
+    """Text ahead of images: inline HTML gets its own paragraph, as plain text does in images_body."""
+    if not content.strip():
+        return ""
+    return content if _BLOCK_RE.search(content) else f"<p>{content}</p>"
+
+
 def too_long(text: str, *, is_html: bool = False) -> bool:
     """Over Teams' limit once posted: the cap is on the HTML bytes, so escaping counts."""
     return len(message_html(text, is_html).encode()) > MAX_HTML_BYTES
@@ -199,6 +209,7 @@ def send_images(
     display_name: str,
     *,
     is_html: bool = False,
+    properties: dict[str, Any] | None = None,
     client_message_id: str | None = None,
 ) -> dict[str, Any]:
     """One message: `text` first, then `images` ((filename, bytes), in order) in one paragraph."""
@@ -210,6 +221,7 @@ def send_images(
         content,
         display_name,
         is_html=True,
+        properties=properties,
         client_message_id=client_message_id,
     )
 

@@ -804,7 +804,7 @@ def test_cli_refuses_too_long_text_before_auth_and_uploads(
     text = "<" * 10_000 if not is_html else "x" * (send.MAX_HTML_BYTES + 1)
     args = argparse.Namespace(text=text, file=None, thread=THREAD, html=is_html, image=None, attach=["a.pdf"])
     assert cli.cmd_send(settings, args) == 2
-    assert logs == ["send_too_long"]
+    assert logs == ["send_too_long" if is_html else "send_refused"]  # 029-AC10: plain text is rendered
 
 
 @pytest.mark.parametrize(
