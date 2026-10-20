@@ -1208,3 +1208,56 @@ async def test_an_empty_page_with_a_cursor_asks_on_from_the_cursor(pages: Pages)
     await page.wait_for_selector('[data-id="0"]')
     assert [v["before"] for v in fake.of("history")] == [None, MINE["at"], GAP]
     await pages.close()
+
+
+@pytest.mark.parametrize(
+    ("backslashes", "sent"), [(1, [ANN2]), (3, [ANN2]), (2, [ANN, ANN2])], ids=["one", "three", "two"]
+)
+async def test_an_escaped_mention_is_no_pick(
+    fake: Fake, backslashes: int, sent: list[dict[str, str]]
+) -> None:
+    """029-AC6: `\\@Ann Lee` (an odd run of `\\`) is text: its namesake pick drops out instead of taking the
+    next `@Ann Lee`; an even run is one backslash before a real mention."""
+    fake.members = [ANN, ANN2]
+    page, box = _parts(fake)
+    await box.press_sequentially("@ann")
+    await shows(page, ["Ann Lee", "Ann Lee"])
+    await box.press("Enter")
+    await box.press_sequentially("and @ann")
+    await shows(page, ["Ann Lee", "Ann Lee"])
+    await box.press("ArrowDown")
+    await box.press("Enter")
+    await box.evaluate("b => b.setSelectionRange(0, 0)")
+    await box.press_sequentially("\\" * backslashes)
+    await box.press("End")
+    await box.press("Enter")
+    await wait(lambda: len(fake.of("send")) == 1)
+    verb = fake.of("send")[0]
+    assert verb["mentions"] == sent
+    _, props = compose_html(verb["text"], verb["mentions"], {}, full=True)
+    assert props is not None
+    assert [m["mri"] for m in json.loads(props["mentions"])] == [m["mri"] for m in sent]
+
+
+async def test_a_mark_after_a_picked_name_unmakes_the_mention(fake: Fake) -> None:
+    """029-AC2: a combining mark glued to `@Ann Lee` continues the word, as on the server: that pick drops
+    out instead of taking the namesake's `@Ann Lee`."""
+    fake.members = [ANN, ANN2]
+    page, box = _parts(fake)
+    await box.press_sequentially("@ann")
+    await shows(page, ["Ann Lee", "Ann Lee"])
+    await box.press("Enter")
+    await box.press_sequentially("and @ann")
+    await shows(page, ["Ann Lee", "Ann Lee"])
+    await box.press("ArrowDown")
+    await box.press("Enter")
+    await box.evaluate("b => b.setSelectionRange(8, 8)")
+    await page.keyboard.insert_text("́")
+    await box.press("End")
+    await box.press("Enter")
+    await wait(lambda: len(fake.of("send")) == 1)
+    verb = fake.of("send")[0]
+    assert verb["mentions"] == [ANN2]
+    _, props = compose_html(verb["text"], verb["mentions"], {}, full=True)
+    assert props is not None
+    assert [m["mri"] for m in json.loads(props["mentions"])] == [ANN2["mri"]]

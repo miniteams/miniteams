@@ -30,3 +30,4 @@
 | [026](026-chat-sections.md) | Chat sections | shipped |
 | [027](027-received-files.md) | Show received files | shipped |
 | [028](028-clean-autolinks.md) | Bare URLs sent as clean links | shipped |
+| [029](029-outgoing-mentions.md) | `@` mentions and composer rendering in MCP and CLI sends | in progress |

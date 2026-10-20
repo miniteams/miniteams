@@ -124,9 +124,14 @@ def draft_payload(
 
 
 def new_draft_message(
-    content_html: str, mri: str, display_name: str, client_message_id: str
+    content_html: str,
+    mri: str,
+    display_name: str,
+    client_message_id: str,
+    properties: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """A fresh draft body. The service rejects a partial property bag, so the whole set goes."""
+    """A fresh draft body; `properties` (`mentions`…) override the defaults. The service rejects a partial
+    property bag, so the whole set goes."""
     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     return {
         "from": mri,
@@ -155,6 +160,7 @@ def new_draft_message(
             "formatVariant": "TEAMS",
             # The clients pair the row with its bubble on this: apart, the draft is drawn as sent.
             "draftId": client_message_id,
+            **(properties or {}),
         },
         "crossPostChannels": [],
     }

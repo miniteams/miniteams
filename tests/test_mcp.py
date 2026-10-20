@@ -849,12 +849,12 @@ def test_api_search_reads_active_chats_and_reports_the_rest(
 def _writes(monkeypatch) -> list[tuple[Any, ...]]:
     calls: list[tuple[Any, ...]] = []
 
-    def fake_send(settings, token, thread, text, name, *, is_html=False):  # noqa: ANN001
-        calls.append(("send", thread, text, name, is_html))
+    def fake_send(settings, token, thread, text, name, *, is_html=False, properties=None):  # noqa: ANN001
+        calls.append(("send", thread, text, name, is_html, properties))
         return {"clientmessageid": "cm1", "status": 201}
 
-    def fake_edit(settings, token, thread, mid, text, *, is_html=False):  # noqa: ANN001
-        calls.append(("edit", thread, mid, text, is_html))
+    def fake_edit(settings, token, thread, mid, text, *, is_html=False, properties=None):  # noqa: ANN001
+        calls.append(("edit", thread, mid, text, is_html, properties))
         return {"status": 200}
 
     monkeypatch.setattr(M, "send_message", fake_send)
@@ -871,8 +871,8 @@ def test_send_and_update_go_out_once_with_the_exact_text(settings: Settings, dat
     out = _call(server, "update_message", thread_id="48:notes", message_id="m9", text="fixed")
     assert out == {"error": False, "thread_id": "48:notes", "message_id": "m9", "status": 200}
     assert calls == [
-        ("send", PRIVATE, "héllo <there>\nline", "", False),
-        ("edit", "48:notes", "m9", "fixed", False),
+        ("send", PRIVATE, "héllo &lt;there&gt;<br>line", "", True, None),
+        ("edit", "48:notes", "m9", "fixed", True, None),
     ]
 
 
@@ -880,7 +880,9 @@ def test_send_and_update_go_out_once_with_the_exact_text(settings: Settings, dat
     ("args", "reason"),
     [
         ({"thread_id": PRIVATE, "text": "   "}, "non-empty"),
-        ({"thread_id": PRIVATE, "text": "<" * 30000}, "28 KB"),
+        ({"thread_id": PRIVATE, "text": "<" * 30000}, "too long"),
+        ({"thread_id": PRIVATE, "text": "<" * 7200}, "28 KB once rendered"),  # 029-AC12: the HTML counts
+        ({"thread_id": PRIVATE, "text": "https://x.test/" + "a" * 14400}, "28 KB once rendered"),
         ({"thread_id": "19:invented@thread.v2", "text": "hi"}, "unknown chat"),
     ],
 )
@@ -939,7 +941,7 @@ def test_teams_errors_become_tool_errors_without_the_token(
     server = _server(settings, data)
     _dead_session(server, monkeypatch, state="live")
 
-    def refused(settings, token, thread, text, name, *, is_html=False):  # noqa: ANN001
+    def refused(settings, token, thread, text, name, **kw):  # noqa: ANN001, ANN003
         req = httpx.Request("POST", "https://msg.example/x")
         raise httpx.HTTPStatusError("403", request=req, response=httpx.Response(403, request=req))
 
@@ -1188,3 +1190,215 @@ def test_scheduling_tools_leave_the_list_under_read_only(settings: Settings, dat
         "update_scheduled",
         "update_message",
     } & set(listed)
+
+
+# --- mentions and rendering (spec 029) ---
+
+ANN, BOB = "8:orgid:ann", "8:orgid:bob"
+ROSTER = [_member(ME, "Me"), _member(ANN, "Ann Lee"), _member(BOB, "Bob Roe"), _member("28:bot", "Bot")]
+
+
+def _span(n: int, label: str) -> str:
+    return f'<span itemtype="http://schema.skype.com/Mention" itemscope="" itemid="{n}">{label}</span>'
+
+
+def _roster(monkeypatch, members: list[dict[str, str]] | None = ROSTER) -> list[str]:
+    """The chat service's roster (None: unavailable); returns the threads asked for."""
+    asked: list[str] = []
+
+    async def thread(self: Any, thread_id: str, max_age: float | None = None) -> dict[str, Any] | None:
+        asked.append(thread_id)
+        return None if members is None else {"topic": None, "members": members}
+
+    monkeypatch.setattr(API.Directory, "thread", thread)
+    monkeypatch.setattr(M, "self_mri", lambda bearer: ME)
+    return asked
+
+
+def _entries(props: dict[str, Any] | None) -> list[tuple[Any, ...]]:
+    assert props is not None
+    return [
+        (e["itemid"], e["mri"], e["mentionType"], e["displayName"]) for e in json.loads(props["mentions"])
+    ]
+
+
+def test_send_mentions_members_by_full_or_first_name(settings: Settings, data: Path, monkeypatch) -> None:
+    """029-AC1, AC2: `@Ann Lee` and `@bob` → two spans in text order, labels as the roster spells them."""
+    server, _, calls = _scheduling(settings, data, monkeypatch)
+    asked = _roster(monkeypatch)
+    assert not _call(server, "send_message", thread_id=GROUP, text="@Ann Lee and @bob: hi")["error"]
+    ((verb, thread, content, _, is_html, props),) = calls
+    assert (verb, thread, is_html, asked) == ("send", GROUP, True, [GROUP])
+    assert content == f"{_span(0, 'Ann Lee')} and {_span(1, 'Bob')}: hi"
+    assert _entries(props) == [(0, ANN, "person", "Ann Lee"), (1, BOB, "person", "Bob")]
+
+
+def test_everyone_mentions_the_group(settings: Settings, data: Path, monkeypatch) -> None:
+    """029-AC5: `@everyone` on a group → mentionType everyone, MRI = thread id, label Everyone."""
+    server, _, calls = _scheduling(settings, data, monkeypatch)
+    _roster(monkeypatch)
+    _call(server, "send_message", thread_id=GROUP, text="@everyone now")
+    assert calls[0][2] == f"{_span(0, 'Everyone')} now"
+    assert _entries(calls[0][5]) == [(0, GROUP, "everyone", "Everyone")]
+
+
+@pytest.mark.parametrize(
+    ("thread", "text", "members", "error"),
+    [
+        (
+            GROUP,
+            "@Ann hi",
+            [*ROSTER, _member("8:orgid:moore", "Ann Moore")],
+            "ambiguous mention @Ann: Ann Lee, Ann Moore",
+        ),
+        (GROUP, "@Nobody hi", ROSTER, "unknown mention @Nobody"),
+        (GROUP, "@Me hi", ROSTER, "unknown mention @Me"),
+        (PRIVATE, "@everyone hi", ROSTER, "@everyone is not available in this chat"),
+        (GROUP, "@Ann hi", None, "chat members unavailable"),
+        (GROUP, "<" * 7200, ROSTER, "message too long: over Teams' limit of 28 KB once rendered"),
+    ],
+)
+@pytest.mark.parametrize("tool", ["send_message", "send_at", "update_message", "update_scheduled"])
+def test_a_refused_mention_writes_nothing(
+    settings: Settings,
+    data: Path,
+    monkeypatch,
+    thread: str,
+    text: str,
+    members: list[dict[str, str]] | None,
+    error: str,
+    tool: str,
+) -> None:
+    """029-AC3, 029-AC4, 029-AC5, 029-AC7, 029-AC12: every refusal answers its reason and nothing is
+    sent, edited or scheduled, on each write tool."""
+    server, drafts, calls = _scheduling(settings, data, monkeypatch)
+    _roster(monkeypatch, members)
+    drafts.add("p1", thread, int(time.time() * 1000) + 3_600_000)
+    args: dict[str, Any] = {"thread_id": thread, "text": text}
+    if tool == "send_at":
+        tool, args["send_at"] = "send_message", _in(days=1)
+    elif tool != "send_message":
+        args["message_id"] = "p1"
+    out = _call(server, tool, **args)
+    assert out == {"error": True, "text": error}
+    assert calls == [] and [r for r in drafts.requests if r[0] not in ("GET",)] == []
+    assert drafts.rows["p1"]["content"] == "<p>hi</p>"
+
+
+@pytest.mark.parametrize(
+    ("text", "content"),
+    [
+        ("plain", "plain"),
+        ("mail a@b.com", "mail a@b.com"),
+        ("`@Ann` x", "<code>@Ann</code> x"),
+        (r"\@Ann Lee", "@Ann Lee"),
+    ],
+)
+def test_no_candidate_mention_asks_no_roster(
+    settings: Settings, data: Path, monkeypatch, text: str, content: str
+) -> None:
+    """029-AC6: an email, code or `\\@` is no mention: no roster call, no properties, `\\@` a literal `@`."""
+    server, _, calls = _scheduling(settings, data, monkeypatch)
+    asked = _roster(monkeypatch)
+    assert not _call(server, "send_message", thread_id=GROUP, text=text)["error"]
+    assert asked == [] and calls == [("send", GROUP, content, "", True, None)]
+
+
+def test_a_scheduled_draft_carries_mentions_and_an_update_replaces_them(
+    settings: Settings, data: Path, monkeypatch
+) -> None:
+    """029-AC8: the draft holds the span and `properties.mentions`; new text replaces both."""
+    server, drafts, calls = _scheduling(settings, data, monkeypatch)
+    _roster(monkeypatch)
+    draft_id = _call(server, "send_message", thread_id=GROUP, text="@Ann Lee later", send_at=_in(days=1))[
+        "scheduled_id"
+    ]
+    row = drafts.rows[str(draft_id)]
+    assert row["content"] == f"{_span(0, 'Ann Lee')} later" and calls == []
+    assert _entries(row["properties"]) == [(0, ANN, "person", "Ann Lee")]
+    assert row["properties"]["draftId"] == row["clientmessageid"] and row["properties"]["files"] == "[]"
+    _call(server, "update_scheduled", thread_id=GROUP, message_id=str(draft_id), text="@Bob instead")
+    row = drafts.rows[str(draft_id)]
+    assert row["content"] == f"{_span(0, 'Bob')} instead"
+    assert _entries(row["properties"]) == [(0, BOB, "person", "Bob")]
+    _call(server, "update_scheduled", thread_id=GROUP, message_id=str(draft_id), text="nobody")
+    row = drafts.rows[str(draft_id)]
+    assert row["content"] == "nobody" and row["properties"]["mentions"] == "[]"
+    assert row["properties"]["draftId"] == row["clientmessageid"]
+
+
+def test_update_message_edits_in_the_mention(settings: Settings, data: Path, monkeypatch) -> None:
+    """029-AC9: the edit carries the span and the properties."""
+    server, _, calls = _scheduling(settings, data, monkeypatch)
+    _roster(monkeypatch)
+    assert not _call(server, "update_message", thread_id=GROUP, message_id="m1", text="@Ann Lee fixed")[
+        "error"
+    ]
+    ((verb, thread, mid, content, is_html, props),) = calls
+    assert (verb, thread, mid, content, is_html) == (
+        "edit",
+        GROUP,
+        "m1",
+        f"{_span(0, 'Ann Lee')} fixed",
+        True,
+    )
+    assert _entries(props) == [(0, ANN, "person", "Ann Lee")]
+
+
+def test_send_renders_like_the_chat_page_composer(settings: Settings, data: Path, monkeypatch) -> None:
+    """029-AC11: bold, a shortcode, a bare URL and a `- ` list, as the composer's full mode."""
+    server, _, calls = _scheduling(settings, data, monkeypatch)
+    _roster(monkeypatch)
+    _call(server, "send_message", thread_id=GROUP, text="**bold** :fire: https://x.test\n- item")
+    assert calls[0][2] == '<b>bold</b> 🔥 <a href="https://x.test">https://x.test</a><ul><li>item</li></ul>'
+
+
+@pytest.mark.parametrize("text", ["@ann " * 51, "@Ann Lee @Bob " * 26])
+def test_more_than_max_mentions_send_nothing(settings: Settings, data: Path, monkeypatch, text: str) -> None:
+    """029 refusals: 51 mentions, of one name or two, refuse with no write."""
+    server, _, calls = _scheduling(settings, data, monkeypatch)
+    _roster(monkeypatch)
+    out = _call(server, "send_message", thread_id=GROUP, text=text)
+    assert out["error"] and "too many mentions" in out["text"] and calls == []
+
+
+@pytest.mark.parametrize(
+    ("text", "error"),
+    [("@x hi", "unknown mention @x"), ("@everyone hi", "@everyone is not available in this chat")],
+)
+@pytest.mark.parametrize("send_at", [False, True])
+def test_notes_has_nobody_to_mention_and_asks_no_roster(
+    settings: Settings, data: Path, monkeypatch, text: str, error: str, send_at: bool
+) -> None:
+    """029-AC4, AC5: Notes to self has no roster to fetch; a mention there is refused, nothing written."""
+    server, drafts, calls = _scheduling(settings, data, monkeypatch)
+    asked = _roster(monkeypatch)
+    args: dict[str, Any] = {"thread_id": "48:notes", "text": text} | (
+        {"send_at": _in(days=1)} if send_at else {}
+    )
+    assert _call(server, "send_message", **args) == {"error": True, "text": error}
+    assert asked == [] and calls == [] and drafts.requests == []
+
+
+@pytest.mark.parametrize(
+    ("tool", "extra"),
+    [("send_message", {}), ("send_message", {"send_at": "days=1"}), ("update_message", {"message_id": "m1"})],
+)
+def test_with_the_archive_gone_one_send_fetches_the_roster_once(
+    settings: Settings, tmp_path: Path, monkeypatch, tool: str, extra: dict[str, str]
+) -> None:
+    """029-AC1: the thread check's lookup is the roster the mentions resolve on."""
+    server = _gone(settings, tmp_path, monkeypatch)
+    calls, drafts = _writes(monkeypatch), _Drafts().install(monkeypatch)
+    asked = _roster(monkeypatch)
+    extra = {k: _in(days=1) if k == "send_at" else v for k, v in extra.items()}
+    assert not _call(server, tool, thread_id=GROUP, text="@Ann Lee hi", **extra)["error"]
+    assert asked == [GROUP] and len(calls) + len(drafts.rows) == 1
+
+
+def test_a_refused_long_mention_answers_a_bounded_error(settings: Settings, data: Path, monkeypatch) -> None:
+    """029-AC4: a 20 000-character `@word` is refused naming 200 characters of it, nothing sent."""
+    server, _, calls = _scheduling(settings, data, monkeypatch)
+    _roster(monkeypatch)
+    out = _call(server, "send_message", thread_id=GROUP, text="@" + "z" * 20_000)
+    assert out == {"error": True, "text": "unknown mention @" + "z" * 200} and calls == []

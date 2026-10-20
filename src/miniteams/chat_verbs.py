@@ -38,6 +38,7 @@ from .chats import chat_kind
 from .compose import MAX_TEXT, compose_html, reply_quote
 from .decompose import Editable, decompose
 from .directory import Directory, is_app
+from .directory import humans as _humans
 from .dump import epoch_seconds, fetch_history
 from .emoji_table import SHORTCODES
 from .emojis import EmojiCache
@@ -745,11 +746,6 @@ def _head_search(verb: dict[str, Any]) -> dict[str, Any]:
 
 def _head_complete(verb: dict[str, Any]) -> dict[str, Any]:
     return {"complete": verb.get("complete"), "q": _q(verb)}
-
-
-def _humans(members: list[dict[str, Any]]) -> dict[str, str]:
-    """Roster → {mri: display name} of its people; bots and apps left out."""
-    return {str(m["mri"]): str(m["name"] or "") for m in members if not is_app(str(m["mri"]))}
 
 
 def _member_items(humans: dict[str, str], thread_id: str, me: str, q: str) -> list[dict[str, Any]]:

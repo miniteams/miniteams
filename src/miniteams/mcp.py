@@ -24,6 +24,7 @@ from .archive import RefreshingToken
 from .archive_store import chat_dir_name, find_chat_dir, read_chats, read_meta, search_chat
 from .auth import AuthExpired, AuthUnavailable, TokenSource, self_mri, token_source
 from .chats import chat_kind, is_system, last_activity, parse_when
+from .compose import compose_html, holds_mention, resolve_mentions
 from .config import Settings
 from .drafts import (
     SCHEDULE_MAX_AHEAD,
@@ -38,7 +39,7 @@ from .drafts import (
 from .http import failure
 from .mcp_api import ApiReader
 from .messages import SNIPPET_LEN, fold, is_deleted, is_edited, json_list, message_text, plain_text
-from .send import MAX_HTML_BYTES, NOTES_THREAD, edit_message, message_html, send_message, too_long
+from .send import MAX_HTML_BYTES, NOTES_THREAD, edit_message, send_message, too_long
 from .watch import note_sent
 
 log = structlog.get_logger()
@@ -538,21 +539,44 @@ def _outgoing_text(args: dict[str, Any]) -> str:
     text = args.get("text")
     if not isinstance(text, str) or not text.strip():
         raise ToolError("text must be a non-empty string")
-    if too_long(text):
-        raise ToolError(f"text is over Teams' limit of {MAX_HTML_BYTES // 1024} KB once escaped")
     return text
 
 
-def _known_thread(server: Server, thread_id: str) -> None:
+def _compose(
+    server: Server, thread_id: str, text: str, info: dict[str, Any] | None = None
+) -> tuple[str, dict[str, Any] | None]:
+    """(HTML, properties) of `text` as the chat page's composer renders it, each `@Name` resolved on the
+    chat's roster (spec 029): `info`'s when given, else fetched, only for a text that holds one."""
+    try:
+        mentions: list[dict[str, Any]] = []
+        if holds_mention(text):
+            if thread_id == NOTES_THREAD:  # nobody to mention, and the alias has no roster to fetch
+                info = {"members": []}
+            elif info is None:
+                info = asyncio.run(server.api().directory.thread(thread_id))
+            if info is None:
+                raise ToolError("chat members unavailable")
+            mentions = resolve_mentions(text, info["members"], thread_id, server.session.mri())
+        # Built-in shortcodes only: the custom emoji table needs another token and fetch.
+        content, props = compose_html(text, mentions, {}, full=True)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    if too_long(content, is_html=True):
+        raise ToolError(f"message too long: over Teams' limit of {MAX_HTML_BYTES // 1024} KB once rendered")
+    return content, props
+
+
+def _known_thread(server: Server, thread_id: str) -> dict[str, Any] | None:
     """Refuse an id nothing vouches for: the index while the archive answers, a thread lookup on
-    the API otherwise. Notes to self is always yours."""
+    the API otherwise, whose info is returned (None when not looked up). Notes to self is always yours."""
     if thread_id == NOTES_THREAD:
-        return
+        return None
     if server.archive.available():
         server.archive.chat_dir(thread_id)  # raises "unknown chat"
-        return
-    if asyncio.run(server.api().directory.thread(thread_id)) is None:
+        return None
+    if (info := asyncio.run(server.api().directory.thread(thread_id))) is None:
         raise ToolError(f"unknown chat: {thread_id}")
+    return info
 
 
 def _write[T](call: Callable[[], T], action: str) -> T:
@@ -592,13 +616,16 @@ def _inner_thread(server: Server, thread_id: str, skype_token: str) -> str:
     return notes_thread_id(server.settings, skype_token) if thread_id == NOTES_THREAD else thread_id
 
 
-def _schedule(server: Server, thread_id: str, text: str, send_at_ms: int) -> dict[str, Any]:
+def _schedule(
+    server: Server, thread_id: str, text: str, send_at_ms: int, info: dict[str, Any] | None
+) -> dict[str, Any]:
+    content, props = _compose(server, thread_id, text, info)
     skype_token, _ = server.session.tokens()
     store = server.drafts()
     inner = _inner_thread(server, thread_id, skype_token)
     client_id = unused_client_id(_write(store.list, "list"), str(int(time.time() * 1000)))
     name = server.session.display_name()
-    message = new_draft_message(message_html(text, False), server.session.mri(), name, client_id)
+    message = new_draft_message(content, server.session.mri(), name, client_id, props)
     draft_id = _write(lambda: store.create(draft_payload(inner, message, send_at_ms)), "schedule")
     note_sent(server.settings, client_id)  # Teams will send it with this client id: a watch on me skips it
     return {"thread_id": thread_id, "scheduled_id": draft_id, "send_at": _iso_ms(send_at_ms)}
@@ -608,12 +635,18 @@ def _send_message(server: Server, args: dict[str, Any]) -> dict[str, Any]:
     text = _outgoing_text(args)
     send_at_ms = _send_at_ms(args["send_at"]) if args.get("send_at") else None
     thread_id = args["thread_id"]
-    _known_thread(server, thread_id)
+    info = _known_thread(server, thread_id)
     if send_at_ms is not None:
-        return _schedule(server, thread_id, text, send_at_ms)
+        return _schedule(server, thread_id, text, send_at_ms, info)
+    content, props = _compose(server, thread_id, text, info)
     skype_token, _ = server.session.tokens()
     name = server.session.display_name()
-    sent = _write(lambda: send_message(server.settings, skype_token, thread_id, text, name), "send")
+    sent = _write(
+        lambda: send_message(
+            server.settings, skype_token, thread_id, content, name, is_html=True, properties=props
+        ),
+        "send",
+    )
     note_sent(server.settings, str(sent.get("clientmessageid") or ""))  # so a watch on me skips it
     return {
         "thread_id": thread_id,
@@ -686,11 +719,16 @@ def _update_scheduled(server: Server, args: dict[str, Any]) -> dict[str, Any]:
     store, draft = _pending_draft(server, args["thread_id"], args["message_id"])
     if send_at_ms is None:
         send_at_ms = int((draft.get("draftDetails") or {}).get("sendAt") or 0)
+    props = draft.get("properties") or {}
+    content = draft.get("content")
+    if text is not None:
+        content, fresh = _compose(server, args["thread_id"], text)
+        props = {**props, "mentions": "[]", **(fresh or {})}  # the old text's mentions go with it
     message = {
         **draft,
-        "content": message_html(text, False) if text is not None else draft.get("content"),
+        "content": content,
         # Editing knocks `draftId` off the client id, and the clients then draw the row as sent.
-        "properties": {**(draft.get("properties") or {}), "draftId": draft.get("clientmessageid")},
+        "properties": {**props, "draftId": draft.get("clientmessageid")},
     }
     payload = draft_payload(str(draft.get("innerThreadId") or ""), message, send_at_ms, args["message_id"])
     _write(lambda: store.update(args["message_id"], payload), "update")
@@ -700,9 +738,15 @@ def _update_scheduled(server: Server, args: dict[str, Any]) -> dict[str, Any]:
 def _update_message(server: Server, args: dict[str, Any]) -> dict[str, Any]:
     text = _outgoing_text(args)
     thread_id, message_id = args["thread_id"], args["message_id"]
-    _known_thread(server, thread_id)
+    info = _known_thread(server, thread_id)
+    content, props = _compose(server, thread_id, text, info)
     skype_token, _ = server.session.tokens()
-    done = _write(lambda: edit_message(server.settings, skype_token, thread_id, message_id, text), "edit")
+    done = _write(
+        lambda: edit_message(
+            server.settings, skype_token, thread_id, message_id, content, is_html=True, properties=props
+        ),
+        "edit",
+    )
     return {"thread_id": thread_id, "message_id": message_id, "status": done.get("status")}
 
 
@@ -769,8 +813,10 @@ TOOLS: tuple[Tool, ...] = (
     ),
     Tool(
         "send_message",
-        "Post a plain-text message to a chat as you, now or at `send_at` (Teams holds it until then). Get "
-        "the chat id from find_chats; `48:notes` is your own Notes.",
+        "Post a message to a chat as you, now or at `send_at` (Teams holds it until then). Get "
+        "the chat id from find_chats; `48:notes` is your own Notes. Markdown and :shortcode: render as in "
+        "the chat page; `@Full Name` or `@First` mentions a member (`@everyone` the chat), `\\@` is a "
+        "literal @.",
         {
             "thread_id": {"type": "string"},
             "text": {"type": "string"},

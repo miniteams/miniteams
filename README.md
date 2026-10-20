@@ -226,8 +226,8 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   up (no "loading latest messages…"); one `read` a second per chat, the last one sent only if all that still holds.
 - **Composer** (also the widget's quick reply): completes `:emoji` and `@member` (`@everyone` on group chats, not 1:1;
   picked members are notified; a mention needs a non-word character before `@`, and two members with the same name map
-  in the order they were picked). Messages are limited to 28 KB.
-  - A backslash keeps markup literal: `\*` `\_` `\~` `` \` `` `\[`, and on the chat page a line starting `\- ` `\* `
+  in the order they were picked). Messages are limited to 28 KB and 50 mentions.
+  - A backslash keeps markup literal: `\*` `\_` `\~` `` \` `` `\[` `\@`, and on the chat page a line starting `\- ` `\* `
     `\> ` `\1. ` (or a line that is only `\>`); `\\` is one backslash before another backslash or one of those, or
     (chat page) before a line-start marker; any other backslash stays as typed (`\\srv\share`), and backslashes
     inside `code`, link labels and URLs stay as typed.
