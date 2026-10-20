@@ -31,6 +31,8 @@ _HTML_MAX = 128 * 1024  # chars, well past a real Teams message body
 _IMG_ATTRS = ("alt", "title")
 STEM_RE = re.compile(r"[\w-][\w.-]*")  # no glob characters, no leading dot
 _NOT_ARCHIVED = "[image not archived]"
+# Where Teams keeps message objects (regional asm hosts included); attachments' cookie list is narrower.
+_TEAMS_MEDIA_RE = re.compile(r"(?:[\w-]+\.)*(?:asm\.skype\.com|asyncgw\.teams\.microsoft\.com)")
 
 
 def _web_url(value: str) -> str | None:
@@ -41,6 +43,11 @@ def _web_url(value: str) -> str | None:
     except ValueError:  # "https://[x": a bad bracket host must not sink the whole message
         return None
     return url if scheme.lower() in ("http", "https") else None
+
+
+def _teams_object(url: str) -> bool:
+    parts = urlsplit(url)
+    return "/objects/" in parts.path and bool(_TEAMS_MEDIA_RE.fullmatch(parts.hostname or ""))
 
 
 def media_url(thread_id: str, media_dir: Path | None, src: str, live: bool = True) -> str | None:
@@ -160,7 +167,18 @@ class _Sanitizer(HTMLParser):
             if emoji:  # no glyph to fall back on: its name, styled apart from the text
                 self.out.append(f'<span class="custom-emoji">{html.escape(name or a.get("alt", ""))}</span>')
                 return
-            self.out.append(_NOT_ARCHIVED)  # a link to Teams' copy would need the token the page lacks
+            url = _web_url(src)
+            if url is None or _teams_object(url):  # Teams' copy needs the token the page lacks: no dead link
+                self.out.append(_NOT_ARCHIVED)
+                return
+            alt = a.get("alt", "").strip()
+            text = html.escape(f"[image: {alt}]" if alt else _NOT_ARCHIVED)
+            # The CSP keeps external images off the page; an anchor in an anchor would split the outer one.
+            self.out.append(
+                text
+                if ("a", True) in self.open  # a dropped anchor (javascript:) is no link to nest in
+                else f'<a{_attr("href", url)} rel="noopener" target="_blank">{text}</a>'
+            )
             return
         attrs = _attr("src", local) + (' class="emoji"' if emoji else "")
         attrs += "".join(_attr(k, a[k]) for k in _IMG_ATTRS if k in a)
