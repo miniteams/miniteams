@@ -343,3 +343,21 @@ async def test_mention_scan_is_bounded_to_the_head_of_the_list(
     # A set: the rows are built concurrently under the fan-out gate, so completion order varies.
     assert set(fetched) == {"19:c0@thread.v2", "19:c1@thread.v2", "19:c2@thread.v2"}
     assert len(fetched) == 3  # and nothing beyond the head is scanned
+
+
+def test_seeded_row_carries_teams_mute(tmp_path: Any) -> None:
+    """030-AC3: the archive's raw conversation mutes the row before the live listing lands."""
+    data_dir = _index_with(
+        tmp_path,
+        [
+            _chat("19:m@thread.v2", raw={"properties": {"alerts": "false"}}),
+            _chat("19:l@thread.v2", raw={"properties": {"alerts": "true"}}),
+            _chat("19:b@thread.v2"),
+        ],
+    )
+    rows = W.seeded_rows(W.seed_from_archive(data_dir, ME), 0)
+    assert {t: r["muted"] for t, r in rows.items()} == {
+        "19:m@thread.v2": True,
+        "19:l@thread.v2": False,
+        "19:b@thread.v2": False,
+    }

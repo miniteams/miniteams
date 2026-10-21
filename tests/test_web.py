@@ -172,6 +172,7 @@ async def test_row_prefers_imdisplayname_then_directory(quiet_directory: Directo
         "read_id": "",
         "read_at": 0,
         "unread": False,
+        "muted": False,
         "mention": None,
         "sender": "Alice",
         "text": "hi",
@@ -1620,18 +1621,138 @@ def test_mute_persists_and_unmute_undoes(settings: Settings) -> None:
     assert board.set_muted("t", True) is False  # already muted
     assert list(json.loads(muted_path.read_text())) == ["t"]
     again = W.Board({"t": dict(rows["t"], muted=False)}, muted_path=muted_path)  # restart
-    assert again.rows["t"]["muted"] is True
-    assert again.set_muted("t", False) is True and json.loads(muted_path.read_text()) == {}
+    assert again.rows["t"]["muted"] is False  # 030: the row's mute is Teams', not the file's
+    assert again.set_muted("t", True) is True and again.set_muted("t", False) is True
+    assert json.loads(muted_path.read_text()) == {}
+    teams_muted = W.Board({"u": dict(rows["t"], id="u", muted=True)}, muted_path=muted_path)
+    assert teams_muted.set_muted("u", False) is True  # muted in Teams only: nothing in the file to drop
     assert board.set_muted("nope", True) is False
 
 
-async def test_live_row_on_a_muted_thread_stays_muted(board: W.Board, settings: Settings) -> None:
-    board.muted_path = settings.config_dir / "muted.json"
-    board._muted["19:new@thread.v2"] = "2026-09-15T00:00:00Z"
+async def test_live_row_on_a_muted_thread_stays_muted(board: W.Board) -> None:
+    """030: a chat the listing has not shown takes its mute from the archive seed."""
+    board.seed["19:new@thread.v2"] = {"label": "New", "muted": True}
     await board.on_event(_msg("19:new@thread.v2", "2026-09-15T13:00:00Z", "yo"))
     assert board.rows["19:new@thread.v2"]["muted"] is True
     await board.on_event(_msg("19:a@thread.v2", "2026-09-15T13:00:00Z", "yo"))
     assert board.rows["19:a@thread.v2"]["muted"] is False
+
+
+@pytest.mark.parametrize("alerts", ["false", "False", False])
+def test_teams_alerts_false_is_muted(alerts: Any) -> None:
+    """030-AC1: Teams sends the string "false"; a boolean or capitalised one means the same."""
+    assert W.is_muted({"alerts": alerts}) is True
+
+
+@pytest.mark.parametrize("props", [None, {}, {"alerts": "true"}, {"alerts": True}, {"alerts": ""}])
+def test_teams_alerts_absent_or_true_is_not_muted(props: dict[str, Any] | None) -> None:
+    """030-AC2"""
+    assert W.is_muted(props) is False
+
+
+async def test_listing_row_carries_teams_mute_through_replace(quiet_directory: Directory) -> None:
+    """030-AC1 / 030-AC2: the listing's `alerts` sets the row, and replace() keeps it."""
+    muted = _conv("19:m@thread.v2", "2026-09-15T10:00:00Z", id="1") | {"properties": {"alerts": "false"}}
+    loud = _conv("19:l@thread.v2", "2026-09-15T10:00:00Z", id="1") | {"properties": {"alerts": "true"}}
+    bare = _conv("19:b@thread.v2", "2026-09-15T10:00:00Z", id="1")
+    rows = {c["id"]: await W.row_from_conversation(c, quiet_directory) for c in (muted, loud, bare)}
+    assert [r["muted"] for r in rows.values()] == [True, False, False]
+    board = W.Board({"19:m@thread.v2": dict(rows["19:m@thread.v2"], muted=False)})
+    board.replace(rows)
+    assert {t: r["muted"] for t, r in board.rows.items()} == {
+        "19:m@thread.v2": True,
+        "19:l@thread.v2": False,
+        "19:b@thread.v2": False,
+    }
+
+
+async def test_conversation_update_alerts_moves_the_mute(board: W.Board, monkeypatch) -> None:
+    """030-AC7: Teams' mute event carries `alerts` and no `consumptionhorizon`."""
+    sent: list[str] = []
+    monkeypatch.setattr(board, "broadcast", lambda: sent.append("b"))
+
+    async def update(props: dict[str, Any], thread_id: str = "19:a@thread.v2") -> None:
+        await board.on_event(_event("ConversationUpdate", thread_id, id=thread_id, properties=props))
+
+    row = board.rows["19:a@thread.v2"]
+    read = (row.get("read_id"), row.get("read_at"), row.get("unread"))
+    await update({"alerts": "false"})
+    assert row["muted"] is True and sent == ["b"]
+    assert (row.get("read_id"), row.get("read_at"), row.get("unread")) == read  # read state untouched
+    await update({"alerts": "true"})
+    assert row["muted"] is False and sent == ["b", "b"]
+    row["muted"] = True
+    horizon = {"consumptionhorizon": "1;1789473600000;1"}
+    await update(horizon)
+    assert row["muted"] is True and row["read_id"] == "1" and sent == ["b", "b", "b"]
+    await update({"topic": "x"})
+    await update({"alerts": "false"}, "19:ghost@thread.v2")
+    assert sent == ["b", "b", "b"] and "19:ghost@thread.v2" not in board.rows
+
+
+async def test_mute_of_an_off_board_chat_survives_a_reseed(board: W.Board) -> None:
+    """030-AC7: a mute for a chat with no row reaches the row a later message builds."""
+    board.seed["19:off@thread.v2"] = {"label": "Off", "muted": False}
+    await board.on_event(
+        _event(
+            "ConversationUpdate", "19:off@thread.v2", id="19:off@thread.v2", properties={"alerts": "false"}
+        )
+    )
+    assert "19:off@thread.v2" not in board.rows
+    board.seed = {"19:off@thread.v2": {"label": "Off", "muted": False}}  # archived_label's index re-read
+    await board.on_event(_msg("19:off@thread.v2", "2026-09-15T13:00:00Z", "yo"))
+    assert board.rows["19:off@thread.v2"]["muted"] is True
+
+
+async def test_mute_of_a_pruned_row_reaches_its_next_row(board: W.Board) -> None:
+    """030-AC7: prune drops a row muted live; the chat's next row is still muted."""
+    board.seed["19:a@thread.v2"] = {"label": "A", "muted": False}
+    await board.on_event(
+        _event("ConversationUpdate", "19:a@thread.v2", id="19:a@thread.v2", properties={"alerts": "false"})
+    )
+    assert board.rows["19:a@thread.v2"]["muted"] is True
+    assert board.prune({"19:b@thread.v2"}, "2026-09-15T10:00:00Z") == 1
+    await board.on_event(_msg("19:a@thread.v2", "2026-09-15T13:00:00Z", "yo"))
+    assert board.rows["19:a@thread.v2"]["muted"] is True
+
+
+async def test_replace_keeps_the_listing_mute_on_a_row_the_stream_moved(board: W.Board) -> None:
+    """030-AC1: the stream's newer row wins the content, the listing still owns the mute."""
+    await board.on_event(_msg("19:new@thread.v2", "2026-09-15T13:00:00Z", "yo"))
+    assert board.rows["19:new@thread.v2"]["muted"] is False
+    older = {"id": "19:new@thread.v2", "last_activity": "2026-09-15T12:00:00Z", "muted": True}
+    board.replace({"19:new@thread.v2": older})
+    row = board.rows["19:new@thread.v2"]
+    assert row["muted"] is True and row["text"] == "yo"
+
+
+@pytest.mark.parametrize("listed_at", ["2026-09-15T12:00:00Z", "2026-09-15T09:00:00Z"])
+async def test_replace_keeps_a_mute_that_landed_during_the_fill(board: W.Board, listed_at: str) -> None:
+    """030-AC7: the listing snapshot predates the mute event; newer listing row, then newer live row."""
+    snapshot = {"id": "19:a@thread.v2", "last_activity": listed_at, "muted": False}
+    await board.on_event(
+        _event("ConversationUpdate", "19:a@thread.v2", id="19:a@thread.v2", properties={"alerts": "false"})
+    )
+    board.replace({"19:a@thread.v2": snapshot})
+    assert board.rows["19:a@thread.v2"]["muted"] is True
+    assert board.rows["19:a@thread.v2"]["muted"] == board._live_mute["19:a@thread.v2"]
+
+
+async def test_unmute_as_a_removed_alerts_property(board: W.Board, monkeypatch) -> None:
+    """030-AC7: `propertiesUpdated` names `alerts` while `properties` no longer holds it."""
+    sent: list[str] = []
+    monkeypatch.setattr(board, "broadcast", lambda: sent.append("b"))
+    row = board.rows["19:a@thread.v2"]
+    row["muted"] = True
+
+    async def update(**resource: Any) -> None:
+        await board.on_event(_event("ConversationUpdate", "19:a@thread.v2", id="19:a@thread.v2", **resource))
+
+    await update(properties={}, propertiesUpdated=["consumptionhorizon"])
+    await update(properties={}, propertiesUpdated="alerts")  # not a list: ignored
+    assert row["muted"] is True and sent == []
+    await update(properties={}, propertiesUpdated=["alerts"])
+    assert row["muted"] is False and sent == ["b"]
 
 
 async def test_bootstrap_gives_a_message_id_to_rows_listed_without_one(
