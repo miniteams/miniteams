@@ -31,4 +31,4 @@
 | [027](027-received-files.md) | Show received files | shipped |
 | [028](028-clean-autolinks.md) | Bare URLs sent as clean links | shipped |
 | [029](029-outgoing-mentions.md) | `@` mentions and composer rendering in MCP and CLI sends | shipped |
-| [030](030-teams-mute.md) | Widget mute is Teams' mute | approved |
+| [030](030-teams-mute.md) | Widget mute is Teams' mute | shipped (AC9: Teams-client check pending) |

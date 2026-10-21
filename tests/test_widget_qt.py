@@ -93,7 +93,7 @@ def board(quiet_directory: Any, tmp_path: Path) -> W.Board:
         C: _row(C, "Fictional C", 10, unread=True),
     }
     board = W.Board(rows, quiet_directory, me=ME, data_dir=data, sections_path=tmp_path / "sections.json")
-    board.set_muted(C, True)
+    board.rows[C]["muted"] = True
     return board
 
 
@@ -235,7 +235,7 @@ async def test_page_publishes_the_badge_per_preference_also_hidden(
     window, _ = opened
     await until(lambda: window.tray.toolTip() == "miniteams — 2 unread", "unread tooltip")
     window.hide()
-    board.set_muted(C, False)  # C now counts as unread
+    board.rows[C]["muted"] = False  # C now counts as unread
     board.broadcast()
     await until(lambda: window.tray.toolTip() == "miniteams — 3 unread", "tooltip after a change, hidden")
     await js(

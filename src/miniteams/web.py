@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
+import httpx
 import structlog
 from websockets.asyncio.server import ServerConnection, broadcast, serve
 from websockets.exceptions import ConnectionClosed
@@ -87,7 +88,7 @@ from .presence import Presence, dm_ids, dm_peer, open_cache, person
 from .receipts import EVENT as RECEIPT_EVENT
 from .receipts import Receipts
 from .sections import Sections
-from .send import mark_read
+from .send import mark_read, set_alerts
 from .stream import run_forever
 
 log = structlog.get_logger()
@@ -615,6 +616,20 @@ def publish(settings: Settings, host: str, port: int, guarded: bool, token: str)
 # --- server ---
 
 
+# Failures that would hit every chat alike: the migration stops and retries on the next start.
+_STOP_MIGRATION = frozenset(
+    {HTTPStatus.UNAUTHORIZED, HTTPStatus.REQUEST_TIMEOUT, HTTPStatus.TOO_MANY_REQUESTS}
+)
+
+
+def _stops_migration(exc: Exception) -> bool:
+    """True for a failure of the token, the network or Teams itself; False for one about this chat only."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return status in _STOP_MIGRATION or status >= HTTPStatus.INTERNAL_SERVER_ERROR
+    return isinstance(exc, httpx.TransportError)
+
+
 class Board:
     """Row table + connected pages. Every mutation ends in a broadcast of the full sorted list."""
 
@@ -703,7 +718,6 @@ class Board:
         }
         self._accepts |= dict.fromkeys(ANY_VALUE, lambda value: True)
         self._seen: dict[str, str] = _load_seen(seen_path)
-        self._muted: dict[str, str] = _load_seen(muted_path)  # thread → when muted (same shape)
         # Unbounded on purpose: one entry per chat whose mute changed live, a few hundred at most.
         self._live_mute: dict[str, bool] = {}
         for row in rows.values():
@@ -969,19 +983,62 @@ class Board:
 
     # --- mute (page verb) ---
 
-    def set_muted(self, thread_id: str, muted: bool) -> bool:
-        """Muted: hidden whatever lands on the chat, until unmuted; a mention still surfaces."""
+    async def set_muted(self, thread_id: str, muted: bool) -> bool:
+        """Page verbs `mute` / `unmute`: Teams' own mute; the row follows once Teams accepted it."""
         row = self.rows.get(thread_id)
-        if row is None or bool(row.get("muted")) == muted:
+        if row is None or bool(row.get("muted")) == muted or self.directory is None:
             return False
-        if muted:
-            self._muted[thread_id] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        else:
-            self._muted.pop(thread_id, None)  # muted in Teams, never in the file
-        row["muted"] = muted
-        _save_marks(self.muted_path, self._muted)
+        try:
+            await asyncio.to_thread(
+                set_alerts, self.directory.settings, self.directory.skype_token, thread_id, not muted
+            )
+        except Exception as exc:  # noqa: BLE001 — a refused mute must not drop the socket
+            log.warning("mute_failed", thread=thread_id, muted=muted, error=failure(exc))
+            return False
+        self._live_mute[thread_id] = muted
+        if row := self.rows.get(thread_id):  # a fill may have swapped the row during the call
+            row["muted"] = muted
         self.broadcast()
         return True
+
+    async def migrate_mutes(self) -> None:
+        """Push the pre-030 local mutes (`muted.json`) to Teams once, then set the file aside."""
+        path = self.muted_path
+        if path is None or self.directory is None or not path.exists():
+            return
+        try:
+            marks = json.loads(path.read_text() or "{}")
+        except OSError, ValueError:
+            marks = None
+        if not isinstance(marks, dict):  # kept: a mute list we cannot read must not be dropped
+            log.warning("mute_migration_unreadable")
+            return
+        settings, token = self.directory.settings, self.directory.skype_token
+        pushed = skipped = 0
+        for thread_id in map(str, marks):
+            try:
+                await asyncio.to_thread(set_alerts, settings, token, thread_id, False)
+            except Exception as exc:  # noqa: BLE001 — kept for the next start, never fatal
+                if _stops_migration(exc):
+                    log.warning("mute_migration_failed", thread=thread_id, error=failure(exc))
+                    if pushed:
+                        self.broadcast()
+                    return
+                # Retrying a chat Teams refuses would block every entry after it on every start.
+                log.warning("mute_migration_skipped", thread=thread_id, error=failure(exc))
+                skipped += 1
+                continue
+            pushed += 1
+            self._live_mute[thread_id] = True
+            if row := self.rows.get(thread_id):
+                row["muted"] = True
+        self.broadcast()
+        try:
+            os.replace(path, path.with_name(path.name + ".migrated"))  # kept: undone by hand
+        except OSError as exc:
+            log.warning("mute_migration_failed", error=failure(exc))
+            return
+        log.info("mute_migration_done", pushed=pushed, skipped=skipped)
 
     # --- live events (stream hook) ---
 
@@ -1397,10 +1454,10 @@ class Board:
         await self.mark_read(verb["read"])
 
     async def _on_mute(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
-        self.set_muted(verb["mute"], True)
+        await self.set_muted(verb["mute"], True)
 
     async def _on_unmute(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
-        self.set_muted(verb["unmute"], False)
+        await self.set_muted(verb["unmute"], False)
 
     def _section_handlers(self) -> dict[str, Handler]:
         """Spec 026 verbs: each names its section (or chat) in its key; a change is saved and broadcast."""
@@ -1855,6 +1912,7 @@ async def run(
             )
         )
         emojis = asyncio.create_task(board.emojis.refresh())
+        migration = asyncio.create_task(board.migrate_mutes())
         try:
             done, _ = await asyncio.wait({server, stream}, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
@@ -1864,6 +1922,7 @@ async def run(
             stream.cancel()
             fill.cancel()  # the page is going away; a half-finished walk has nobody to tell
             emojis.cancel()
+            migration.cancel()
             renewals.cancel()
             board.close()
             # Closed here, not by asyncio.run's sweep: that one cancels the socket handlers before they close

@@ -120,11 +120,13 @@ def _fresh_token_sources() -> Any:
 
 @pytest.fixture(autouse=True)
 def _browser_reads_stay_local(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A real chat page marks its chat read on open (spec 020): its `read` verb must not reach Teams."""
+    """A real chat page marks its chat read on open (spec 020): its `read` and `mute` verbs must not
+    reach Teams."""
     if request.node.get_closest_marker("browser"):
         from miniteams import web
 
         monkeypatch.setattr(web, "mark_read", lambda *args: None)
+        monkeypatch.setattr(web, "set_alerts", lambda *args: None)
 
 
 @pytest.fixture(autouse=True)

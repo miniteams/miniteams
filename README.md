@@ -129,8 +129,10 @@ newer lands on that chat (state in `~/.config/miniteams/seen.json`); the **Seen*
 where ⋯ → ↺ Unseen undoes it. A message that @mentions you gets a blue stripe and an `@ you` tag (`@ all` for an
 @everyone), also when the mention was added by editing an older message; it clears once you mark the row seen
 or read the chat in Teams after the mention. The `@` tab lists mentioned rows, **Unread** follows Teams' own
-read marker. Mute takes a chat out of Inbox whatever lands on it (listed under **Muted** until ⋯ → 🔔 Unmute; mentions still
-surface; state in `muted.json`). `✎` (or `r` on the row selected with the arrow keys, `Tab` from the filter) opens
+read marker. Mute is Teams' own mute, shared with the Teams client and your other devices: it takes a chat out of Inbox
+whatever lands on it (listed under **Muted** until ⋯ → 🔔 Unmute; mentions still surface). The row turns muted once Teams
+accepts the change; a refused one leaves it as it was. On its first start the widget pushes the chats of an older
+local `muted.json` to Teams once, then renames the file `muted.json.migrated` (a chat Teams refuses is skipped; a token, network or Teams-side failure keeps the file for the next start). `✎` (or `r` on the row selected with the arrow keys, `Tab` from the filter) opens
 a reply box under the row: Enter sends it to the chat as you and keeps the box open, Shift+Enter adds a line,
 Escape closes it and keeps the draft; a failed send stays in its queue line with why (sending: see *Composer*). The ⚙ menu picks the theme (system by default), hides avatars for a denser list, and sets
 **Middle click** and **Chat navigation** (see *Chat page*). The

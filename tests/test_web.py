@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import functools
 import json
+import logging
 import os
 import re
 import socket
@@ -1089,9 +1090,11 @@ def test_load_seen_tolerates_missing_or_corrupt(settings: Settings) -> None:
     assert W._load_seen(path) == {"19:a@thread.v2": "2026-09-15T10:00:00Z"}
 
 
-async def test_seen_verb_over_websocket(settings: Settings) -> None:
+async def test_seen_verb_over_websocket(settings: Settings, directory: Directory, monkeypatch) -> None:
+    monkeypatch.setattr(W, "set_alerts", lambda *args: {"status": 200})
     board = W.Board(
         {"t": {"id": "t", "last_activity": "2026-09-15T10:00:00Z", "label": "L", "seen_at": None}},
+        directory,
         seen_path=settings.config_dir / "seen.json",
     )
     port = _free_port()
@@ -1611,22 +1614,222 @@ async def test_read_verb_moves_teams_marker_and_survives_failure(board: W.Board,
     assert board.rows["19:b@thread.v2"].get("unread") is not True  # local state never guessed
 
 
-def test_mute_persists_and_unmute_undoes(settings: Settings) -> None:
-    muted_path = settings.config_dir / "muted.json"
-    rows = {"t": {"id": "t", "last_activity": "2026-09-15T10:00:00Z", "last_id": "1", "seen_at": None}}
-    board = W.Board(rows, muted_path=muted_path)
-    assert rows["t"]["muted"] is False
-    assert board.set_muted("t", False) is False  # nothing to undo
-    assert board.set_muted("t", True) is True and rows["t"]["muted"] is True
-    assert board.set_muted("t", True) is False  # already muted
-    assert list(json.loads(muted_path.read_text())) == ["t"]
-    again = W.Board({"t": dict(rows["t"], muted=False)}, muted_path=muted_path)  # restart
-    assert again.rows["t"]["muted"] is False  # 030: the row's mute is Teams', not the file's
-    assert again.set_muted("t", True) is True and again.set_muted("t", False) is True
-    assert json.loads(muted_path.read_text()) == {}
-    teams_muted = W.Board({"u": dict(rows["t"], id="u", muted=True)}, muted_path=muted_path)
-    assert teams_muted.set_muted("u", False) is True  # muted in Teams only: nothing in the file to drop
-    assert board.set_muted("nope", True) is False
+def _fake_alerts(monkeypatch: pytest.MonkeyPatch, board: W.Board, fail: dict[str, Exception]) -> list[Any]:
+    """Records each Teams mute call with the row's mute at that moment; raises for the ids in `fail`."""
+    calls: list[Any] = []
+
+    def fake(settings: Any, token: str, thread_id: str, alerts: bool) -> dict[str, Any]:
+        row = board.rows.get(thread_id)
+        calls.append((thread_id, alerts, row["muted"] if row else None))
+        if thread_id in fail:
+            raise fail[thread_id]
+        return {"status": 200}
+
+    monkeypatch.setattr(W, "set_alerts", fake)
+    return calls
+
+
+def _status_error(status: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("PUT", "https://example.invalid/")
+    return httpx.HTTPStatusError(
+        "alerts failed", request=request, response=httpx.Response(status, request=request)
+    )
+
+
+async def test_mute_and_unmute_go_through_teams(board: W.Board, monkeypatch) -> None:
+    """030-AC4 / 030-AC6: Teams is asked first, the row and the live mute follow its 2xx, then a broadcast."""
+    calls = _fake_alerts(monkeypatch, board, {})
+    sent: list[str] = []
+    monkeypatch.setattr(board, "broadcast", lambda: sent.append("frame"))
+    assert await board.set_muted("19:a@thread.v2", False) is False  # nothing to undo
+    assert await board.set_muted("19:a@thread.v2", True) is True
+    assert board.rows["19:a@thread.v2"]["muted"] is True and board._live_mute["19:a@thread.v2"] is True
+    assert await board.set_muted("19:a@thread.v2", True) is False  # already muted
+    assert await board.set_muted("19:a@thread.v2", False) is True
+    assert board.rows["19:a@thread.v2"]["muted"] is False and board._live_mute["19:a@thread.v2"] is False
+    assert await board.set_muted("19:nope@thread.v2", True) is False
+    # alerts=False mutes; the row had not moved yet when Teams was called.
+    assert calls == [("19:a@thread.v2", False, False), ("19:a@thread.v2", True, True)]
+    assert sent == ["frame", "frame"]
+
+
+@pytest.mark.parametrize("muted", [True, False])
+@pytest.mark.parametrize("error", [_status_error(403), httpx.ConnectError("down"), RuntimeError("rejected")])
+async def test_refused_mute_leaves_the_row(
+    board: W.Board, monkeypatch, muted: bool, error: Exception
+) -> None:
+    """030-AC5 / 030-AC6: a failed Teams call changes nothing and is logged."""
+    board.rows["19:a@thread.v2"]["muted"] = not muted
+    _fake_alerts(monkeypatch, board, {"19:a@thread.v2": error})
+    sent: list[str] = []
+    monkeypatch.setattr(board, "broadcast", lambda: sent.append("frame"))
+    with structlog.testing.capture_logs() as logs:
+        assert await board.set_muted("19:a@thread.v2", muted) is False
+    assert board.rows["19:a@thread.v2"]["muted"] is (not muted) and "19:a@thread.v2" not in board._live_mute
+    assert sent == []
+    failed = [e for e in logs if e["event"] == "mute_failed"]
+    assert failed == [
+        {
+            "event": "mute_failed",
+            "log_level": "warning",
+            "thread": "19:a@thread.v2",
+            "muted": muted,
+            "error": W.failure(error),
+        }
+    ]
+
+
+async def test_mute_lands_on_the_row_a_fill_swapped_in_meanwhile(board: W.Board, monkeypatch) -> None:
+    """030-AC4: the listing replaces the row while Teams is asked; the shown row still turns muted."""
+    called, release = threading.Event(), threading.Event()
+
+    def slow(settings: Any, token: str, thread_id: str, alerts: bool) -> dict[str, Any]:
+        called.set()
+        release.wait(3)
+        return {"status": 200}
+
+    monkeypatch.setattr(W, "set_alerts", slow)
+    task = asyncio.create_task(board.set_muted("19:a@thread.v2", True))
+    await asyncio.to_thread(called.wait, 3)
+    board.replace({"19:a@thread.v2": dict(board.rows["19:a@thread.v2"], muted=False)}, busy=False)
+    release.set()
+    assert await task is True
+    assert board.rows["19:a@thread.v2"]["muted"] is True
+
+
+def _legacy_mutes(board: W.Board, tmp_path: Path, ids: list[str]) -> Path:
+    path = tmp_path / "muted.json"
+    path.write_text(json.dumps(dict.fromkeys(ids, "2026-09-20T10:00:00Z")))
+    board.muted_path = path
+    return path
+
+
+async def test_migration_pushes_every_local_mute(board: W.Board, tmp_path: Path, monkeypatch) -> None:
+    """030-AC8: each muted.json entry is muted in Teams, rows follow, and the file is set aside."""
+    path = _legacy_mutes(board, tmp_path, ["19:a@thread.v2", "19:gone@thread.v2"])
+    calls = _fake_alerts(monkeypatch, board, {})
+    await board.migrate_mutes()
+    assert [c[:2] for c in calls] == [("19:a@thread.v2", False), ("19:gone@thread.v2", False)]
+    assert board.rows["19:a@thread.v2"]["muted"] is True
+    assert board._live_mute == {"19:a@thread.v2": True, "19:gone@thread.v2": True}  # a later fill keeps it
+    assert not path.exists() and json.loads(path.with_name("muted.json.migrated").read_text())
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _status_error(503),
+        _status_error(429),
+        _status_error(401),
+        _status_error(408),
+        httpx.ConnectError("down"),
+    ],
+)
+@pytest.mark.parametrize("at", [0, 1])
+async def test_migration_keeps_the_file_on_a_transient_failure(
+    board: W.Board, tmp_path: Path, monkeypatch, error: Exception, at: int
+) -> None:
+    """030-AC8: a failure that would hit every chat keeps muted.json for the next start and stops there;
+    the chats pushed before it are shown muted at once."""
+    ids = ["19:a@thread.v2", "19:b@thread.v2"]
+    path = _legacy_mutes(board, tmp_path, [*ids, "19:after@thread.v2"])
+    calls = _fake_alerts(monkeypatch, board, {ids[at]: error})
+    sent: list[str] = []
+    monkeypatch.setattr(board, "broadcast", lambda: sent.append("frame"))
+    with structlog.testing.capture_logs() as logs:
+        await board.migrate_mutes()
+    assert [c[0] for c in calls] == ids[: at + 1]
+    assert path.exists() and not path.with_name("muted.json.migrated").exists()
+    assert [board.rows[i]["muted"] for i in ids] == [i < at for i in range(2)]
+    assert [e["event"] for e in logs] == ["mute_migration_failed"]
+    assert sent == ["frame"] * at
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _status_error(404),
+        _status_error(403),
+        _status_error(410),
+        _status_error(400),
+        RuntimeError("alerts rejected: 1: nope"),  # what _check raises on a 2xx error envelope
+    ],
+)
+async def test_migration_skips_a_chat_teams_refuses(
+    board: W.Board, tmp_path: Path, monkeypatch, error: Exception
+) -> None:
+    """030-AC8: a refusal about one chat only is skipped, the rest goes on, the file is set aside."""
+    path = _legacy_mutes(board, tmp_path, ["19:gone@thread.v2", "19:b@thread.v2"])
+    calls = _fake_alerts(monkeypatch, board, {"19:gone@thread.v2": error})
+    with structlog.testing.capture_logs() as logs:
+        await board.migrate_mutes()
+    assert [c[0] for c in calls] == ["19:gone@thread.v2", "19:b@thread.v2"]
+    assert board.rows["19:b@thread.v2"]["muted"] is True
+    skipped = [e for e in logs if e["event"] == "mute_migration_skipped"]
+    assert [(e["thread"], e["error"]) for e in skipped] == [("19:gone@thread.v2", W.failure(error))]
+    assert not path.exists() and path.with_name("muted.json.migrated").exists()
+
+
+async def test_migration_without_a_file_calls_nothing(board: W.Board, tmp_path: Path, monkeypatch) -> None:
+    """030-AC8"""
+    board.muted_path = tmp_path / "muted.json"
+    calls = _fake_alerts(monkeypatch, board, {})
+    await board.migrate_mutes()
+    assert calls == [] and not board.muted_path.with_name("muted.json.migrated").exists()
+
+
+@pytest.mark.parametrize("content", ["not json", "[1, 2]"])
+async def test_migration_keeps_an_unreadable_file(
+    board: W.Board, tmp_path: Path, monkeypatch, content: str
+) -> None:
+    """030-AC8: a file that does not read as a mute list is kept, never renamed as if migrated."""
+    path = tmp_path / "muted.json"
+    path.write_text(content)
+    board.muted_path = path
+    calls = _fake_alerts(monkeypatch, board, {})
+    with structlog.testing.capture_logs() as logs:
+        await board.migrate_mutes()
+    assert calls == [] and path.exists() and not path.with_name("muted.json.migrated").exists()
+    assert [e["event"] for e in logs] == ["mute_migration_unreadable"]
+
+
+@pytest.mark.parametrize("content", ["{}", ""])
+async def test_migration_sets_aside_an_empty_file(board: W.Board, tmp_path: Path, content: str) -> None:
+    """030-AC8"""
+    path = tmp_path / "muted.json"
+    path.write_text(content)
+    board.muted_path = path
+    await board.migrate_mutes()
+    assert not path.exists() and path.with_name("muted.json.migrated").exists()
+
+
+async def test_migration_logs_a_failed_rename(board: W.Board, tmp_path: Path, monkeypatch) -> None:
+    """030-AC8: the file stays for the next start; the failure is a log line, not a task exception."""
+    path = _legacy_mutes(board, tmp_path, ["19:a@thread.v2"])
+    _fake_alerts(monkeypatch, board, {})
+
+    def denied(*_: Any) -> None:
+        raise PermissionError("read-only")
+
+    monkeypatch.setattr(W.os, "replace", denied)
+    with structlog.testing.capture_logs() as logs:
+        await board.migrate_mutes()
+    assert path.exists() and [e["event"] for e in logs] == ["mute_migration_failed"]
+    assert board.rows["19:a@thread.v2"]["muted"] is True  # Teams has it muted all the same
+
+
+async def test_migration_done_counts_pushed_and_skipped(
+    board: W.Board, tmp_path: Path, monkeypatch, _quiet_logs: None
+) -> None:
+    """030-AC8"""
+    _legacy_mutes(board, tmp_path, ["19:a@thread.v2", "19:gone@thread.v2", "19:b@thread.v2"])
+    _fake_alerts(monkeypatch, board, {"19:gone@thread.v2": _status_error(404)})
+    # conftest keeps WARNING and up: the info event asserted on here would never reach capture_logs.
+    structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG))
+    with structlog.testing.capture_logs() as logs:
+        await board.migrate_mutes()
+    done = [e for e in logs if e["event"] == "mute_migration_done"]
+    assert done == [{"event": "mute_migration_done", "log_level": "info", "pushed": 2, "skipped": 1}]
 
 
 async def test_live_row_on_a_muted_thread_stays_muted(board: W.Board) -> None:
