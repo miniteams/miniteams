@@ -265,6 +265,18 @@ def mark_read(settings: Settings, skype_token: str, thread_id: str, message_id: 
     return result
 
 
+def set_alerts(settings: Settings, skype_token: str, thread_id: str, alerts: bool) -> dict[str, Any]:
+    """Teams' own mute of a chat (every device sees it): `alerts` False mutes, True unmutes."""
+    url = (
+        f"https://{settings.contacts_host}/v1/users/ME/conversations"
+        f"/{quote(thread_id, safe='')}/properties?name=alerts"
+    )
+    body = {"alerts": "true" if alerts else "false"}  # strings, as the Teams client sends them
+    result = _check(_CLIENT.put(url, headers=_headers(skype_token, settings), json=body), "alerts")
+    log.info("alerts_set", thread=thread_id, alerts=alerts, status=result["status"])
+    return result
+
+
 def edit_message(
     settings: Settings,
     skype_token: str,

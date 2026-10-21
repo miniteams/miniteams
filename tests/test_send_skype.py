@@ -204,6 +204,25 @@ def test_mark_read_puts_consumption_horizon(settings: Settings, monkeypatch) -> 
     assert captured["headers"]["X-Skypetoken"] == "sk"
 
 
+@pytest.mark.parametrize(("alerts", "sent"), [(False, "false"), (True, "true")])
+def test_set_alerts_puts_teams_mute(settings: Settings, monkeypatch, alerts: bool, sent: str) -> None:
+    """030-AC4 / 030-AC6: the string the Teams client sends; False mutes."""
+    captured: dict[str, Any] = {}
+
+    def fake_put(url: str, **kw: Any) -> _Resp:
+        captured["url"] = url
+        captured.update(kw)
+        return _Resp({}, status=200, content=b"")
+
+    monkeypatch.setattr(send._CLIENT, "put", fake_put)
+    assert send.set_alerts(settings, "sk", "19:a@thread.v2", alerts) == {"status": 200}
+    assert captured["url"] == (
+        f"https://{settings.contacts_host}/v1/users/ME/conversations/19%3Aa%40thread.v2/properties?name=alerts"
+    )
+    assert captured["json"] == {"alerts": sent}
+    assert captured["headers"]["X-Skypetoken"] == "sk"
+
+
 def test_exchange_skype_token_follows_the_account_region(settings: Settings, monkeypatch) -> None:
     """The APAC default host costs ~2 s a call from the EU; the authz reply names the right one."""
     region = {"chatService": "https://fr.ng.msg.teams.microsoft.com"}

@@ -206,10 +206,11 @@ async def test_the_fill_never_moves_a_row_backwards(
     assert board.rows["19:a@thread.v2"]["text"] == "just arrived"
 
 
-def test_replace_keeps_typing_seen_and_muted(quiet_directory: Directory, tmp_path: Any) -> None:
-    board = W.Board({}, quiet_directory, seen_path=tmp_path / "seen.json", muted_path=tmp_path / "muted.json")
+def test_replace_keeps_typing_and_seen_and_takes_the_listing_mute(
+    quiet_directory: Directory, tmp_path: Any
+) -> None:
+    board = W.Board({}, quiet_directory, seen_path=tmp_path / "seen.json")
     board._seen["19:a@thread.v2"] = "2026-09-20T10:00:00Z"
-    board._muted["19:a@thread.v2"] = "2026-09-20T10:00:00Z"
     board.rows["19:a@thread.v2"] = {
         "id": "19:a@thread.v2",
         "last_activity": "2026-09-20T09:00:00Z",
@@ -222,7 +223,7 @@ def test_replace_keeps_typing_seen_and_muted(quiet_directory: Directory, tmp_pat
     row = board.rows["19:a@thread.v2"]
     assert row["typing"] == ["Jean Martin"]  # only the page knows who is typing
     assert row["seen_at"] == "2026-09-20T10:00:00Z"
-    assert row["muted"] is True
+    assert row["muted"] is False  # 030-AC1: the fresh row's Teams mute
     assert board.busy is True
 
 

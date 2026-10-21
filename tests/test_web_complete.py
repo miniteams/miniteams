@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -533,10 +534,16 @@ def test_custom_emojis_need_the_chat_service_token(
         emojis._custom_set(settings, "SK")
 
 
-async def test_run_cancels_the_emoji_refresh_on_shutdown(
+async def test_run_cancels_the_emoji_refresh_and_the_mute_migration_on_shutdown(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """030-AC8: run() starts the muted.json migration in the background and cancels it on exit."""
     cancelled = asyncio.Event()
+    pushed: list[str] = []
+    release = threading.Event()
+    settings.config_dir.mkdir(parents=True, exist_ok=True)
+    legacy = settings.config_dir / "muted.json"
+    legacy.write_text(json.dumps({"19:a@thread.v2": "2026-09-20T10:00:00Z", "19:b@thread.v2": "x"}))
 
     async def forever(self: emojis.EmojiCache, interval: float = 0) -> None:
         try:
@@ -549,15 +556,25 @@ async def test_run_cancels_the_emoji_refresh_on_shutdown(
         await asyncio.Event().wait()
 
     async def ended(*a: Any, **kw: Any) -> None:
-        return None
+        await wait(lambda: bool(pushed), "migration started")
+
+    def held(settings: Any, token: str, thread_id: str, alerts: bool) -> dict[str, Any]:
+        pushed.append(thread_id)
+        release.wait(3)  # still in flight when run() leaves
+        return {"status": 200}
 
     monkeypatch.setattr(emojis.EmojiCache, "refresh", forever)
     monkeypatch.setattr(W, "serve_board", idle)
     monkeypatch.setattr(W, "fill_from_listing", idle)
     monkeypatch.setattr(W, "run_forever", ended)
+    monkeypatch.setattr(W, "set_alerts", held)
     with pytest.raises(RuntimeError, match="live stream ended"):
         await W.run(settings, "sk", "", None, None)
     await asyncio.wait_for(cancelled.wait(), 2)
+    release.set()
+    await asyncio.sleep(0.2)  # an uncancelled migration would push the next chat and rename the file
+    assert pushed == ["19:a@thread.v2"]
+    assert legacy.exists() and not legacy.with_name("muted.json.migrated").exists()
 
 
 # --- review round: shared fetches, failure windows, roster names ---

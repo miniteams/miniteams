@@ -1650,9 +1650,12 @@ async def test_chat_socket_never_receives_the_board(board: W.Board, settings: Se
             await asyncio.wait_for(chat.recv(), 0.3)
 
 
-async def test_a_split_chat_socket_subscribes_to_the_board(board: W.Board, settings: Settings) -> None:
+async def test_a_split_chat_socket_subscribes_to_the_board(
+    board: W.Board, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """011-AC23: `board` gives a chat socket the widget's payload and every later broadcast; seen and
     mute work from it; a chat socket that did not ask still gets no rows."""
+    monkeypatch.setattr(W, "set_alerts", lambda *args: {"status": 200})  # 030: Teams accepts the mute
     async with _served(board, settings), _chat_socket(board) as split, _chat_socket(board) as plain:
         await split.send(json.dumps({"follow": T}))
         assert (await _frame(split))["follow"] == T

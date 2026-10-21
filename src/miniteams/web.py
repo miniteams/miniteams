@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
+import httpx
 import structlog
 from websockets.asyncio.server import ServerConnection, broadcast, serve
 from websockets.exceptions import ConnectionClosed
@@ -87,7 +88,7 @@ from .presence import Presence, dm_ids, dm_peer, open_cache, person
 from .receipts import EVENT as RECEIPT_EVENT
 from .receipts import Receipts
 from .sections import Sections
-from .send import mark_read
+from .send import mark_read, set_alerts
 from .stream import run_forever
 
 log = structlog.get_logger()
@@ -156,6 +157,11 @@ def read_at_ms(props: dict[str, Any] | None) -> int:
     horizon = str((props or {}).get("consumptionhorizon") or "")
     parts = horizon.split(";")
     return int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+
+
+def is_muted(props: dict[str, Any] | None) -> bool:
+    """Teams' own mute: `alerts` is the string "false"; absent or "true" is not muted."""
+    return str((props or {}).get("alerts", "true")).lower() == "false"
 
 
 def _ms(iso: str | None) -> int:
@@ -260,6 +266,7 @@ def seed_from_archive(data_dir: Path, me: str = "") -> dict[str, dict[str, Any]]
                 else str(last.get("imdisplayname") or ""),
                 "read_id": read_up_to(conv.get("properties")),
                 "read_at": read_at_ms(conv.get("properties")),
+                "muted": is_muted(conv.get("properties")),
                 "last_activity": last_activity(conv),
                 "last_id": str(last.get("id") or ""),
             }
@@ -291,6 +298,7 @@ async def row_from_conversation(
         "read_id": read_id,
         "read_at": read_at_ms(conv.get("properties")),
         "unread": is_unread(last_id, read_id),
+        "muted": is_muted(conv.get("properties")),
         "mention": None,
         "sender": sender,
         "text": snippet(msgtype, str(last.get("content") or ""), last.get("properties")),
@@ -340,6 +348,7 @@ def seeded_rows(seed: dict[str, dict[str, Any]], limit: int) -> dict[str, dict[s
             "read_id": row["read_id"],
             "read_at": row["read_at"],
             "unread": is_unread(row["last_id"], row["read_id"]),
+            "muted": bool(row.get("muted")),
             "mention": None,
             "sender": row["sender"],
             "text": row["text"],
@@ -607,6 +616,20 @@ def publish(settings: Settings, host: str, port: int, guarded: bool, token: str)
 # --- server ---
 
 
+# Failures that would hit every chat alike: the migration stops and retries on the next start.
+_STOP_MIGRATION = frozenset(
+    {HTTPStatus.UNAUTHORIZED, HTTPStatus.REQUEST_TIMEOUT, HTTPStatus.TOO_MANY_REQUESTS}
+)
+
+
+def _stops_migration(exc: Exception) -> bool:
+    """True for a failure of the token, the network or Teams itself; False for one about this chat only."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return status in _STOP_MIGRATION or status >= HTTPStatus.INTERNAL_SERVER_ERROR
+    return isinstance(exc, httpx.TransportError)
+
+
 class Board:
     """Row table + connected pages. Every mutation ends in a broadcast of the full sorted list."""
 
@@ -695,10 +718,11 @@ class Board:
         }
         self._accepts |= dict.fromkeys(ANY_VALUE, lambda value: True)
         self._seen: dict[str, str] = _load_seen(seen_path)
-        self._muted: dict[str, str] = _load_seen(muted_path)  # thread → when muted (same shape)
+        # Unbounded on purpose: one entry per chat whose mute changed live, a few hundred at most.
+        self._live_mute: dict[str, bool] = {}
         for row in rows.values():
             row["seen_at"] = self._seen.get(row["id"])
-            row["muted"] = row["id"] in self._muted
+            row.setdefault("muted", False)
             row.setdefault("mention", None)
 
     async def archived_label(self, thread_id: str) -> str:
@@ -738,12 +762,14 @@ class Board:
         than what the fill saw must survive, or the page would visibly go backwards.
         """
         for thread_id, row in rows.items():
+            # A ConversationUpdate during the fill is newer than the listing's snapshot.
+            row["muted"] = self._live_mute.get(thread_id, bool(row.get("muted")))
             live = self.rows.get(thread_id)
             if live and str(live.get("last_activity") or "") > str(row.get("last_activity") or ""):
+                live["muted"] = row["muted"]  # a new message carries no mute: the snapshot's stands
                 continue  # the stream already knows better than the listing did
             row["typing"] = live["typing"] if live else []
             row["seen_at"] = self._seen.get(thread_id)
-            row["muted"] = thread_id in self._muted
             row.setdefault("mention", None)
             self.rows[thread_id] = row
         self.busy = busy
@@ -957,19 +983,62 @@ class Board:
 
     # --- mute (page verb) ---
 
-    def set_muted(self, thread_id: str, muted: bool) -> bool:
-        """Muted: hidden whatever lands on the chat, until unmuted; a mention still surfaces."""
+    async def set_muted(self, thread_id: str, muted: bool) -> bool:
+        """Page verbs `mute` / `unmute`: Teams' own mute; the row follows once Teams accepted it."""
         row = self.rows.get(thread_id)
-        if row is None or (thread_id in self._muted) == muted:
+        if row is None or bool(row.get("muted")) == muted or self.directory is None:
             return False
-        if muted:
-            self._muted[thread_id] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        else:
-            del self._muted[thread_id]
-        row["muted"] = muted
-        _save_marks(self.muted_path, self._muted)
+        try:
+            await asyncio.to_thread(
+                set_alerts, self.directory.settings, self.directory.skype_token, thread_id, not muted
+            )
+        except Exception as exc:  # noqa: BLE001 — a refused mute must not drop the socket
+            log.warning("mute_failed", thread=thread_id, muted=muted, error=failure(exc))
+            return False
+        self._live_mute[thread_id] = muted
+        if row := self.rows.get(thread_id):  # a fill may have swapped the row during the call
+            row["muted"] = muted
         self.broadcast()
         return True
+
+    async def migrate_mutes(self) -> None:
+        """Push the pre-030 local mutes (`muted.json`) to Teams once, then set the file aside."""
+        path = self.muted_path
+        if path is None or self.directory is None or not path.exists():
+            return
+        try:
+            marks = json.loads(path.read_text() or "{}")
+        except OSError, ValueError:
+            marks = None
+        if not isinstance(marks, dict):  # kept: a mute list we cannot read must not be dropped
+            log.warning("mute_migration_unreadable")
+            return
+        settings, token = self.directory.settings, self.directory.skype_token
+        pushed = skipped = 0
+        for thread_id in map(str, marks):
+            try:
+                await asyncio.to_thread(set_alerts, settings, token, thread_id, False)
+            except Exception as exc:  # noqa: BLE001 — kept for the next start, never fatal
+                if _stops_migration(exc):
+                    log.warning("mute_migration_failed", thread=thread_id, error=failure(exc))
+                    if pushed:
+                        self.broadcast()
+                    return
+                # Retrying a chat Teams refuses would block every entry after it on every start.
+                log.warning("mute_migration_skipped", thread=thread_id, error=failure(exc))
+                skipped += 1
+                continue
+            pushed += 1
+            self._live_mute[thread_id] = True
+            if row := self.rows.get(thread_id):
+                row["muted"] = True
+        self.broadcast()
+        try:
+            os.replace(path, path.with_name(path.name + ".migrated"))  # kept: undone by hand
+        except OSError as exc:
+            log.warning("mute_migration_failed", error=failure(exc))
+            return
+        log.info("mute_migration_done", pushed=pushed, skipped=skipped)
 
     # --- live events (stream hook) ---
 
@@ -1057,17 +1126,28 @@ class Board:
             await self._message_update(thread_id, resource, msgtype)
 
     def _conversation_update(self, thread_id: str, resource: dict[str, Any]) -> None:
-        """Read marker moved (this or another device): Teams' own read state, not our `seen`."""
+        """Read marker or mute moved (this or another device): Teams' own state, not our `seen`."""
         row = self.rows.get(thread_id)
-        read_id = read_up_to(resource.get("properties"))
-        if row is None or not read_id:
+        props = resource.get("properties") or {}
+        updated = resource.get("propertiesUpdated")
+        # A mute change arrives on its own, without `consumptionhorizon`; an unmute may drop `alerts`.
+        touched = "alerts" in props or (isinstance(updated, list) and "alerts" in updated)
+        if touched:  # kept off the row: a reseed or a prune would lose it before the chat's next row
+            self._live_mute[thread_id] = is_muted(props)
+        if row is None:
             return
-        row["read_id"] = read_id
-        row["read_at"] = max(int(row.get("read_at") or 0), read_at_ms(resource.get("properties")))
-        row["unread"] = is_unread(row.get("last_id", ""), read_id)
-        mention = row.get("mention")
-        if mention and _mention_cleared(row, mention["at"]):
-            row["mention"] = None
+        read_id = read_up_to(props)
+        if not (read_id or touched):
+            return
+        if touched:
+            row["muted"] = is_muted(props)
+        if read_id:
+            row["read_id"] = read_id
+            row["read_at"] = max(int(row.get("read_at") or 0), read_at_ms(props))
+            row["unread"] = is_unread(row.get("last_id", ""), read_id)
+            mention = row.get("mention")
+            if mention and _mention_cleared(row, mention["at"]):
+                row["mention"] = None
         self.broadcast()
 
     async def _new_message(self, thread_id: str, resource: dict[str, Any], msgtype: str) -> None:
@@ -1082,7 +1162,8 @@ class Board:
                 "read_id": "",
                 "read_at": 0,
                 "mention": None,
-                "muted": thread_id in self._muted,
+                # Not on the board: a live change beats the archive's mute.
+                "muted": self._live_mute.get(thread_id, bool(self.seed.get(thread_id, {}).get("muted"))),
             }
         sender = "" if is_activity(msgtype) else await sender_of(resource, self.directory)
         # A bare-id label is a failed lookup: retry it (Directory spaces transient retries 60s apart).
@@ -1373,10 +1454,10 @@ class Board:
         await self.mark_read(verb["read"])
 
     async def _on_mute(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
-        self.set_muted(verb["mute"], True)
+        await self.set_muted(verb["mute"], True)
 
     async def _on_unmute(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
-        self.set_muted(verb["unmute"], False)
+        await self.set_muted(verb["unmute"], False)
 
     def _section_handlers(self) -> dict[str, Handler]:
         """Spec 026 verbs: each names its section (or chat) in its key; a change is saved and broadcast."""
@@ -1831,6 +1912,7 @@ async def run(
             )
         )
         emojis = asyncio.create_task(board.emojis.refresh())
+        migration = asyncio.create_task(board.migrate_mutes())
         try:
             done, _ = await asyncio.wait({server, stream}, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
@@ -1840,6 +1922,7 @@ async def run(
             stream.cancel()
             fill.cancel()  # the page is going away; a half-finished walk has nobody to tell
             emojis.cancel()
+            migration.cancel()
             renewals.cancel()
             board.close()
             # Closed here, not by asyncio.run's sweep: that one cancels the socket handlers before they close
