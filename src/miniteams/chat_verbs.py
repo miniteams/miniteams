@@ -33,7 +33,7 @@ from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import ConnectionClosed
 
 from .archive_store import chat_label, find_chat_dir, messages_by_id, read_page, saved_files, search_chat
-from .attachments import LIVE_HOST_RE, existing, live_image
+from .attachments import LIVE_HOST_RE, LIVE_VIEW_RE, existing, giphy, giphy_image, live_image
 from .chats import chat_kind
 from .compose import MAX_TEXT, compose_html, reply_quote
 from .decompose import Editable, decompose
@@ -1551,27 +1551,47 @@ class ChatVerbs:
 
     # --- archive and API reads ---
 
-    async def media(self, path: str, host: str = "") -> tuple[bytes, str] | None:
-        """`media_file` on the media pool, else, with the `host` `media_url` gave, the object fetched from
-        Teams; ArchiveUnavailable past the pool's deadline."""
+    async def media(
+        self, path: str, host: str = "", via: str = "", view: str = ""
+    ) -> tuple[bytes, str] | None:
+        """`media_file` on the media pool, else, with the `host` or Giphy `via` (`<host><path>`) that
+        `media_url` or `giphy_media_url` gave, the image fetched from Teams or Giphy; ArchiveUnavailable past
+        the pool's deadline."""
         found = await io("media", self.media_file, path)
-        thread_id, _, oid = (unquote(part) for part in path.removeprefix("/media/").partition("/"))
-        token = self.directory.skype_token if self.directory is not None else ""
-        if found is not None or not token or not LIVE_HOST_RE.fullmatch(host) or not STEM_RE.fullmatch(oid):
+        if found is not None:
             return found
+        thread_id, _, name = (unquote(part) for part in path.removeprefix("/media/").partition("/"))
+        if via:
+            gif = giphy(f"https://{via}")
+            # Only the exact form giphy_media_url writes: the URL fetched is rebuilt, never the page's.
+            if gif is None or gif.url != f"https://{via}" or name != gif.stem:
+                return None
+            key = f"giphy/{gif.url}"  # no token on the request: one memo for every token
+            fetch = functools.partial(self._live_image, giphy_image, gif.url, giphy=gif.url)
+        else:
+            token = self.directory.skype_token if self.directory is not None else ""
+            if not token or not LIVE_HOST_RE.fullmatch(host) or not STEM_RE.fullmatch(name):
+                return None
+            view = view if LIVE_VIEW_RE.fullmatch(view) else "imgo"
+            # A refusal under an expired token must not outlive its refresh.
+            key = f"{hashlib.sha256(token.encode()).hexdigest()[:16]}/{host}/{name}/{view}"
+            fetch = functools.partial(
+                self._live_image, live_image, token, host, name, view, host=host, object_id=name
+            )
         # ponytail: scope(None, …) sees no follows: a followed chat off the board and not archived gets text.
         if not self.scope(None, thread_id) and await io("dir", archive_dir, self.data_dir, thread_id) is None:
             return None
-        # A refusal under an expired token must not outlive its refresh.
-        key = f"{hashlib.sha256(token.encode()).hexdigest()[:16]}/{host}/{oid}"
-        return await self._live.get(key, functools.partial(self._live_image, token, host, oid))
+        return await self._live.get(key, fetch)
 
-    async def _live_image(self, token: str, host: str, oid: str) -> tuple[bytes, str] | None:
+    async def _live_image(
+        self, fetch: Callable[..., Awaitable[tuple[bytes, str] | None]], *args: str, **where: str
+    ) -> tuple[bytes, str] | None:
+        """`fetch(client, *args)` in a live slot, within the deadline; `where` names it in the log."""
         try:
             async with asyncio.timeout(_LIVE_DEADLINE), self._live_gate, httpx.AsyncClient() as client:
-                return await live_image(client, token, host, oid)
+                return await fetch(client, *args)
         except TimeoutError:
-            log.info("live_image_failed", host=host, object_id=oid, error="timeout")
+            log.info("live_image_failed", **where, error="timeout")
             return None
 
     def media_file(self, path: str) -> tuple[bytes, str] | None:

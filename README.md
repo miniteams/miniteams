@@ -229,8 +229,10 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   - **Sections** (see above) work the same here, with their own Recent / Sections choice and folds.
 - **Images**: served from the archive's `media/` folder, else fetched from Teams by `web` (memory only, never written
   to the archive; archives run with `--no-media` or without `images` in `--media` show theirs this way). One the page cannot load yet is retried
-  for about 30 s, then reads `[image not archived]`. An external one (a GIF from giphy…) is a link to it, `[image: <alt>]` (`[image not archived]` without alt; the text alone inside a link):
-  the page loads no image from elsewhere.
+  for about 30 s, then reads `[image not archived]`. A Giphy GIF (spec 031) shows inline too: the archived copy
+  (`giphy-<id>.<ext>`), else fetched from Giphy by `web` (no token), else loaded by the page from Giphy itself (no
+  referrer), else the link below. Any other external image is a link to it, `[image: <alt>]` (`[image not archived]`
+  without alt; the text alone inside a link): the page loads no other external image.
 - **Mark read in Teams when shown** (⚙, on by default): a chat opened, and each message from someone else landing in
   it, marks it read in Teams once the window is visible, focused and at the latest message, and the archive has caught
   up (no "loading latest messages…"); one `read` a second per chat, the last one sent only if all that still holds.
@@ -336,7 +338,7 @@ types downloaded, comma-separated; the rest of the run is unchanged:
 
 | Type | Downloads |
 |---|---|
-| `images` | inline pictures, full and optimized views; picture `URIObject`s |
+| `images` | inline pictures, full and optimized views; picture `URIObject`s; Giphy GIFs (`giphy-<id>.<ext>`, fetched without any token) |
 | `files` | shared documents (SharePoint, linked in the body or sent as a file card) and other attachments (card and recording thumbnails) |
 | `transcripts` | meeting transcripts, every format served (AMS by content type, SharePoint JSON + VTT) |
 | `videos` | meeting recordings and shared video files (large) |

@@ -10,9 +10,11 @@ import time
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import pytest
 
+from miniteams.attachments import giphy
 from miniteams.compose import compose_html
 from miniteams.render import (
     _HTML_MAX,
@@ -340,6 +342,24 @@ def test_unarchived_asyncgw_image_goes_through_media(media: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    ("view", "query"),
+    [
+        ("imgpsh_mobile_save_anim", "&amp;view=imgpsh_mobile_save_anim"),  # a GIF's animated view (031-AC6)
+        ("imgo", ""),  # the default needs no parameter
+        ("IMGO", ""),  # off the view pattern: the server's default
+        ("a" * 41, ""),
+    ],
+)
+def test_live_image_keeps_the_view_the_message_names(view: str, query: str) -> None:
+    """031-AC6: the web fetches the view the message references: imgo is a still for a Teams GIF."""
+    new = "0-frc-d1-fedcba9876543210"
+    raw = (
+        f'<img itemtype="http://schema.skype.com/AMSImage" src="https://{GW}/v1/objects/{new}/views/{view}">'
+    )
+    assert sanitize(raw, T, None) == f'<img src="/media/19%3Aaaaa%40thread.v2/{new}?host={GW}{query}">'
+
+
+@pytest.mark.parametrize(
     "src",
     [
         SRC,  # not an asyncgw host: no live fetch
@@ -361,7 +381,7 @@ def test_unservable_image_is_plain_text(src: str) -> None:
         )
 
 
-GIF = "https://media0.giphy.com/media/v1.Y2lk/abc/giphy.gif?a=1&b=2"
+GIF = "https://cdn.example.com/media/v1.Y2lk/abc/anim.gif?a=1&b=2"  # not Giphy: external, linked
 
 
 @pytest.mark.parametrize(
@@ -399,6 +419,68 @@ def test_external_image_inside_a_dropped_link_keeps_its_own() -> None:
     raw = f'<a href="javascript:x()">see <img src="{html.escape(GIF)}" alt="gif"></a>'
     expected = f'see <a href="{html.escape(GIF)}" rel="noopener" target="_blank">[image: gif]</a>'
     assert sanitize(raw, T, None) == expected
+
+
+GIPHY_ID = "l0MYt5jPR6QX5pnqM"
+GIPHY = f"https://media2.giphy.com/media/v1.Y2lkPTc5MGI3NjEx/{GIPHY_ID}/giphy.gif"
+GIPHY_SRCS = [
+    GIPHY + "?cid=x&amp;ct=g",  # query dropped: the URL is rebuilt from host and path
+    f"https://media.giphy.com/media/{GIPHY_ID}/giphy.gif",
+    f"https://i.giphy.com/{GIPHY_ID}.webp",
+    f"  {GIPHY}\n",  # padded: read as the archiver reads it
+]
+
+
+@pytest.mark.parametrize("src", GIPHY_SRCS)
+def test_giphy_image_is_shown_through_media(src: str) -> None:
+    """031-AC1: a Giphy image is an <img> fetched by /media, its direct URL kept for the page's fallback."""
+    raw = (
+        f'<img itemtype="http://schema.skype.com/Giphy" src="{src}" alt="Hi &lt;3" width="200" height="150">'
+    )
+    direct = html.unescape(src).strip().split("?")[0]
+    via = quote(direct.removeprefix("https://"), safe="/")
+    assert sanitize(raw, T, None) == (
+        f'<img src="/media/19%3Aaaaa%40thread.v2/giphy-{GIPHY_ID}?giphy={via}" data-giphy="{direct}"'
+        ' alt="Hi &lt;3" width="200" height="150">'
+    )
+
+
+def test_archived_giphy_image_is_served_from_the_archive(media: Path) -> None:
+    """031-AC2: the archived copy is linked by name: the page never asks Giphy."""
+    (media / f"giphy-{GIPHY_ID}.gif").write_bytes(b"GIF89a")
+    assert sanitize(f'<img src="{GIPHY}" alt="a">', T, media) == (
+        f'<img src="/media/19%3Aaaaa%40thread.v2/giphy-{GIPHY_ID}.gif" data-giphy="{GIPHY}" alt="a">'
+    )
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        f"http://media2.giphy.com/media/{GIPHY_ID}/giphy.gif",  # not https
+        f"https://media2.giphy.com:8443/media/{GIPHY_ID}/giphy.gif",
+        f"https://x@media2.giphy.com/media/{GIPHY_ID}/giphy.gif",
+        f"https://MEDIA2.giphy.com/media/{GIPHY_ID}/giphy.gif",
+        f"https://media2.giphy.com.evil.example/media/{GIPHY_ID}/giphy.gif",
+        f"https://evil.giphy.com/media/{GIPHY_ID}/giphy.gif",
+        f"https://giphy.com/media/{GIPHY_ID}/giphy.gif",
+        f"https://media2.giphy.com/media/{GIPHY_ID}/giphy.svg",
+        f"https://media2.giphy.com/media/{GIPHY_ID}/giphy.html",
+        f"https://media2.giphy.com/media/../{GIPHY_ID}/giphy.gif",
+        f"https://media2.giphy.com/gifs/{GIPHY_ID}",
+        f"https://media2.giphy.com/media/{GIPHY_ID}/giphy_s.gif",  # a still: kept apart from the GIF's stem
+        f"https://media2.giphy.com/media/{GIPHY_ID}/480w_s.jpg",
+    ],
+)
+def test_other_hosts_and_paths_are_not_giphy(src: str) -> None:
+    """031-AC5: anything off the allowlist stays the #71 link, never an <img>."""
+    assert "<img" not in sanitize(f'<img src="{src}" alt="a">', T, None)
+    assert giphy(src) is None
+
+
+def test_giphy_inside_a_link_is_still_an_image() -> None:
+    """031-AC1: an <img> in a link is no nested anchor: Giphy's shows inline there too."""
+    out = sanitize(f'<a href="https://example.org/"><img src="{GIPHY}"></a>', T, None)
+    assert out.startswith('<a href="https://example.org/" rel="noopener" target="_blank"><img src="/media/')
 
 
 def test_external_image_inside_a_link_is_not_nested() -> None:

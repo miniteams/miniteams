@@ -1471,3 +1471,226 @@ async def test_live_image_rebuilds_the_url_and_keeps_only_images(monkeypatch: py
             assert await A.live_image(client, "tok", host, oid) is None, oid
     assert str(seen[0].url) == f"https://{host}/v1/objects/img/views/imgo"
     assert seen[0].headers["cookie"] == "skypetoken_asm=tok"
+
+
+GIPHY_ID = "l0MYt5jPR6QX5pnqM"
+GIPHY = f"https://media2.giphy.com/media/v1.Y2lkPTc5MGI3NjEx/{GIPHY_ID}/giphy.gif"
+
+
+@pytest.mark.parametrize(
+    ("names", "expected"),
+    [
+        (["o1.full.png", "o1.gif"], "o1.gif"),  # a pasted Teams GIF: the animated imgo copy
+        (["o1.gif", "o1.full.png"], "o1.gif"),
+        (["o1.full.png", "o1.png"], "o1.png"),  # no GIF: the original before the full view
+        (["o1.png", "o1.full.png"], "o1.png"),
+        (["o1.bmp", "o1.gif"], "o1.gif"),  # an original sorting before the GIF
+        (["o1.full.png", "o1.part", "o1.gif.part"], "o1.full.png"),  # the full view alone, partials never
+        (["o1.part"], None),
+    ],
+)
+def test_existing_prefers_the_gif_then_originals_whatever_the_directory_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, names: list[str], expected: str | None
+) -> None:
+    """031-AC6: several files for one object id: `.gif` first, other originals next, `.full.*` last."""
+    for name in names:
+        (tmp_path / name).write_bytes(b"x")
+    real = Path.glob
+    for order in (lambda found: found, reversed):
+        monkeypatch.setattr(Path, "glob", lambda self, pattern, o=order: iter(o(list(real(self, pattern)))))
+        got = A.existing(tmp_path, "o1")
+        assert (Path(got).name if got else None) == expected
+    monkeypatch.setattr(Path, "glob", real)
+    assert A.existing(tmp_path, "o1.full") == (
+        str(tmp_path / "o1.full.png") if "o1.full.png" in names else None
+    )
+
+
+@pytest.mark.parametrize(
+    ("src", "url", "stem"),
+    [
+        (f"{GIPHY}?cid=x&ct=g", GIPHY, f"giphy-{GIPHY_ID}"),
+        (f"https://media.giphy.com/media/{GIPHY_ID}/giphy.gif", None, f"giphy-{GIPHY_ID}"),
+        (f"https://media4.giphy.com/media/{GIPHY_ID}/200w.webp", None, f"giphy-{GIPHY_ID}"),
+        (f"https://i.giphy.com/{GIPHY_ID}.gif", None, f"giphy-{GIPHY_ID}"),
+        (f"https://i.giphy.com/media/{GIPHY_ID}/giphy.webp", None, f"giphy-{GIPHY_ID}"),
+        (f"  {GIPHY}\n", GIPHY, f"giphy-{GIPHY_ID}"),  # padded: render and extract read it alike
+        (f"https://media2.giphy.com/media/{GIPHY_ID}/200_d.gif", None, f"giphy-{GIPHY_ID}"),
+    ],
+)
+def test_giphy_rebuilds_the_url_from_host_and_path(src: str, url: str | None, stem: str) -> None:
+    """031-AC3: the URL fetched is `https://<host><path>`, never the page's string, named by Giphy's id."""
+    assert A.giphy(src) == A.Giphy(url or src, stem)
+
+
+@pytest.mark.parametrize(
+    "src",
+    [
+        f"http://media2.giphy.com/media/{GIPHY_ID}/giphy.gif",
+        f"https://media2.giphy.com:443/media/{GIPHY_ID}/giphy.gif",
+        f"https://u:p@media2.giphy.com/media/{GIPHY_ID}/giphy.gif",
+        f"https://media2.giphy.com./media/{GIPHY_ID}/giphy.gif",
+        f"https://mediax.giphy.com/media/{GIPHY_ID}/giphy.gif",
+        f"https://i.giphy.com.evil.example/{GIPHY_ID}.gif",
+        f"https://evil.example/media/{GIPHY_ID}/giphy.gif",
+        f"https://media2.giphy.com/media/{GIPHY_ID}/giphy.svg",
+        f"https://media2.giphy.com/media/{GIPHY_ID}/giphy.gif/x",
+        "https://media2.giphy.com/media/%2e%2e/giphy.gif",
+        f"https://media2.giphy.com/media/{GIPHY_ID}/gi phy.gif",
+        f"https://media2.giphy.com/media/{GIPHY_ID}/gi\tphy.gif",
+        # Stills share the animated one's stem: archived first, they would be served in its place.
+        f"https://media2.giphy.com/media/{GIPHY_ID}/giphy_s.gif",
+        f"https://media2.giphy.com/media/v1.Y2lk/{GIPHY_ID}/480w_s.jpg",
+        f"https://media2.giphy.com/media/{GIPHY_ID}/200w_s.gif",
+        "https://[x/media/a/giphy.gif",
+    ],
+)
+def test_giphy_refuses_anything_else(src: str) -> None:
+    """031-AC5: https, the allowlisted hosts alone (no port, userinfo, trailing dot), an image path."""
+    assert A.giphy(src) is None
+
+
+async def test_giphy_image_keeps_only_images_and_sends_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """031-AC3: the web's Giphy fetch: no cookie or token, image types only, size cap, a refusal is None."""
+    seen: list[_httpx.Request] = []
+    answers = {
+        "img": _httpx.Response(200, content=b"GIF89a", headers={"content-type": "image/gif"}),
+        "html": _httpx.Response(200, content=b"<script>", headers={"content-type": "text/html"}),
+        "svg": _httpx.Response(200, content=b"<svg/>", headers={"content-type": "image/svg+xml"}),
+        "big": _httpx.Response(200, content=b"x" * 11, headers={"content-type": "image/gif"}),
+        "gone": _httpx.Response(404),
+        "moved": _httpx.Response(302, headers={"location": "https://evil.example/x.gif"}),
+    }
+
+    def handler(request: _httpx.Request) -> _httpx.Response:
+        seen.append(request)
+        return answers[request.url.path.split("/")[2]]
+
+    monkeypatch.setattr(A, "_LIVE_MAX", 10)
+    async with _httpx.AsyncClient(transport=_httpx.MockTransport(handler)) as client:
+        assert await A.giphy_image(client, "https://media2.giphy.com/media/img/giphy.gif") == (
+            b"GIF89a",
+            "image/gif",
+        )
+        for name in ("html", "svg", "big", "gone", "moved"):
+            assert await A.giphy_image(client, f"https://media2.giphy.com/media/{name}/giphy.gif") is None, (
+                name
+            )
+    assert [r.url.host for r in seen] == ["media2.giphy.com"] * 6  # the redirect is not followed
+    assert not any("cookie" in r.headers or "authorization" in r.headers for r in seen)
+
+
+def _giphy_client(
+    monkeypatch: pytest.MonkeyPatch, seen: list[_httpx.Request], answer: _httpx.Response
+) -> _httpx.AsyncClient:
+    """The archive's shared client; any client the module opens answers alike: nothing leaves the machine."""
+
+    def handler(request: _httpx.Request) -> _httpx.Response:
+        seen.append(request)
+        return answer
+
+    transport = _httpx.MockTransport(handler)
+    real = _httpx.AsyncClient
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: real(*a, **k, transport=transport))
+    return real(transport=transport)
+
+
+async def test_process_archives_a_giphy_image_once_without_token(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """031-AC2: a Giphy <img> is saved once as `giphy-<id>.<ext>`, fetched without the skype token."""
+    seen: list[_httpx.Request] = []
+    content = f'<img src="{GIPHY}?cid=x&amp;ct=g" alt="hi"><img src="{GIPHY}">'
+    async with _giphy_client(
+        monkeypatch, seen, _httpx.Response(200, content=b"GIF89a", headers={"content-type": "image/gif"})
+    ) as c:
+        for _ in range(2):  # a second pass finds the copy: no request
+            notes = await A.process(
+                content, "RichText/Html", "sk", settings.media_dir, download=True, client=c
+            )
+    dest = settings.media_dir / f"giphy-{GIPHY_ID}.gif"
+    assert dest.read_bytes() == b"GIF89a"
+    assert [str(r.url) for r in seen] == [GIPHY]
+    assert "cookie" not in seen[0].headers and "authorization" not in seen[0].headers
+    assert notes == [f"[image: {GIPHY} → {dest.resolve().as_uri()}]"]
+    assert sorted(p.name for p in settings.media_dir.iterdir()) == [dest.name]
+
+
+@pytest.mark.parametrize(
+    ("answer", "status"),
+    [
+        (_httpx.Response(200, content=b"<html>", headers={"content-type": "text/html"}), 415),
+        (_httpx.Response(200, content=b"x" * 11, headers={"content-type": "image/gif"}), 413),
+        (_httpx.Response(404), 404),
+    ],
+)
+async def test_process_giphy_refusal_keeps_nothing_and_is_reported(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch, answer: _httpx.Response, status: int
+) -> None:
+    """031-AC3: a non-image, an oversized body or a refusal leaves no file, and reaches on_fail."""
+    monkeypatch.setattr(A, "_LIVE_MAX", 10)
+    failed: list[tuple[str, int]] = []
+
+    def on_fail(url: str, exc: Exception) -> None:
+        failed.append((url, getattr(exc, "status", None) or exc.response.status_code))  # type: ignore[attr-defined]
+
+    seen: list[_httpx.Request] = []
+    async with _giphy_client(monkeypatch, seen, answer) as client:
+        notes = await A.process(
+            f'<img src="{GIPHY}">', "", "sk", settings.media_dir, True, client=client, on_fail=on_fail
+        )
+    assert notes == [f"[image: {GIPHY}]"]
+    assert failed == [(GIPHY, status)]
+    assert list(settings.media_dir.iterdir()) == []
+
+
+async def test_process_giphy_honours_selection_and_download_flag(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """031-AC2: Giphy images are `images`: deselected, nothing; download off, a reference only."""
+    content = f'<img src="{GIPHY}">'
+    assert A.extract(content, "", frozenset({"files", "transcripts"})) == []
+    assert A.extract(content, "") == [{"kind": "giphy", "url": GIPHY}]
+    assert A.extract(f'<img src="https://evil.example/media/{GIPHY_ID}/giphy.gif">', "") == []
+    assert A.extract(f'<img src=" {GIPHY}\n">', "") == [{"kind": "giphy", "url": GIPHY}]  # padded, as render
+    seen: list[_httpx.Request] = []
+    async with _giphy_client(monkeypatch, seen, _httpx.Response(500)) as client:
+        assert await A.process(content, "", "sk", settings.media_dir, download=False, client=client) == [
+            f"[image: {GIPHY}]"
+        ]
+    assert seen == []
+
+
+async def test_giphy_cookies_never_ride_the_archives_shared_client(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """031-AC3: a cookie Giphy sets is not sent back on the next Giphy download (no tracking across chats)."""
+    seen: list[_httpx.Request] = []
+    answer = _httpx.Response(
+        200,
+        content=b"GIF89a",
+        headers={"content-type": "image/gif", "set-cookie": "x=1; Domain=.giphy.com; Path=/"},
+    )
+    async with _giphy_client(monkeypatch, seen, answer) as shared:
+        for oid in ("aaaaaaaa", "bbbbbbbb"):
+            src = f"https://media1.giphy.com/media/{oid}/giphy.gif"
+            await A.process(f'<img src="{src}">', "", "sk", settings.media_dir, True, client=shared)
+    assert len(seen) == 2 and "cookie" not in seen[1].headers
+
+
+async def test_live_image_builds_the_url_from_the_view() -> None:
+    """031-AC6: the URL is rebuilt from host, id and view (imgo by default)."""
+    seen: list[_httpx.Request] = []
+
+    def handler(request: _httpx.Request) -> _httpx.Response:
+        seen.append(request)
+        return _httpx.Response(200, content=b"GIF89a", headers={"content-type": "image/gif"})
+
+    host = "fr-prod.asyncgw.teams.microsoft.com"
+    async with _httpx.AsyncClient(transport=_httpx.MockTransport(handler)) as client:
+        assert await A.live_image(client, "tok", host, "o1", "imgpsh_mobile_save_anim") is not None
+        assert await A.live_image(client, "tok", host, "o1") is not None
+    assert [str(r.url) for r in seen] == [
+        f"https://{host}/v1/objects/o1/views/imgpsh_mobile_save_anim",
+        f"https://{host}/v1/objects/o1/views/imgo",
+    ]

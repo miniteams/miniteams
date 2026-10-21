@@ -32,3 +32,4 @@
 | [028](028-clean-autolinks.md) | Bare URLs sent as clean links | shipped |
 | [029](029-outgoing-mentions.md) | `@` mentions and composer rendering in MCP and CLI sends | shipped |
 | [030](030-teams-mute.md) | Widget mute is Teams' mute | shipped (AC9: Teams-client check pending) |
+| [031](031-giphy-images.md) | Show Giphy GIFs inline | shipped |

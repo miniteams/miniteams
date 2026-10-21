@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
-from .attachments import LIVE_HOST_RE, existing, object_id
+from .attachments import LIVE_HOST_RE, LIVE_VIEW_RE, Giphy, existing, giphy, object_id
 from .compose import _URL_RE, trim_url
 from .messages import file_name, json_list, reaction_emoji
 
@@ -69,7 +69,20 @@ def media_url(thread_id: str, media_dir: Path | None, src: str, live: bool = Tru
         return None
     if parts.scheme != "https" or not LIVE_HOST_RE.fullmatch(parts.netloc):
         return None
-    return f"/media/{thread}/{quote(stem, safe='')}?host={parts.netloc}"
+    # A pasted GIF's message names its animated view: `imgo`, the server's default, is a still.
+    view = parts.path.rpartition("/views/")[2]
+    named = f"&view={view}" if view != "imgo" and LIVE_VIEW_RE.fullmatch(view) else ""
+    return f"/media/{thread}/{quote(stem, safe='')}?host={parts.netloc}{named}"
+
+
+def giphy_media_url(thread_id: str, media_dir: Path | None, gif: Giphy) -> str:
+    """`/media/<thread>/<file>` of the archived copy, else `/media/<thread>/giphy-<id>?giphy=<host><path>`,
+    which the web fetches from Giphy (spec 031)."""
+    thread = quote(thread_id, safe="")
+    found = existing(media_dir, gif.stem) if media_dir is not None else None
+    if found is not None:
+        return f"/media/{thread}/{quote(Path(found).name, safe='')}"
+    return f"/media/{thread}/{gif.stem}?giphy={quote(gif.url.removeprefix('https://'), safe='/')}"
 
 
 def _attr(name: str, value: str) -> str:
@@ -157,7 +170,12 @@ class _Sanitizer(HTMLParser):
 
     def _img(self, a: dict[str, str], emoji: bool) -> None:
         src = a.get("src", "")
-        local = media_url(self.thread_id, self.media_dir, src, live=not emoji)
+        gif = None if emoji else giphy(src)
+        local = (
+            giphy_media_url(self.thread_id, self.media_dir, gif)
+            if gif
+            else media_url(self.thread_id, self.media_dir, src, live=not emoji)
+        )
         name, _, tail = a.get("itemid", "").partition(";")
         # The itemid's tail need not be the image id, but it is all a `src`-less one has.
         oid = next((o for o in (object_id(src), tail) if o in self.custom), None) if emoji else None
@@ -181,6 +199,7 @@ class _Sanitizer(HTMLParser):
             )
             return
         attrs = _attr("src", local) + (' class="emoji"' if emoji else "")
+        attrs += _attr("data-giphy", gif.url) if gif is not None else ""  # the page's last source (031-AC4)
         attrs += "".join(_attr(k, a[k]) for k in _IMG_ATTRS if k in a)
         attrs += "".join(_attr(k, a[k]) for k in ("width", "height") if a.get(k, "").isdigit())
         self.out.append(f"<img{attrs}>")
