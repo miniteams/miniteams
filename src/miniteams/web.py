@@ -5,8 +5,8 @@ One process, one port: `websockets.serve` answers `GET /` with the bundled page 
 on every change. No REST layer: the page verbs ride the same socket.
 
 Routes: `/` the board page, `/chat/<thread>` a chat page, `/media/<thread>/<file>` and `/emoji/<id>`
-archived and custom-emoji images (`/media/<thread>/<id>?host=` fetches an image not archived yet), `/ws`
-the socket (`/ws?chat` for a chat page).
+archived and custom-emoji images (`/media/<thread>/<id>?host=` or `?giphy=` fetches an image not archived
+yet), `/ws` the socket (`/ws?chat` for a chat page).
 
 Bind is `127.0.0.X:PORT` with X and PORT drawn once and persisted (`web.json`) so the URL
 survives restarts; a persisted bind that is taken fails the start rather than move. The whole 127/8 is
@@ -1600,28 +1600,31 @@ def _page(name: str = "widget.html") -> str:
 
 
 @functools.lru_cache(maxsize=4)
-def _page_csp(page: str) -> str:
+def _page_csp(page: str, giphy: bool = False) -> str:
     """CSP for a served page: only its own script (by hash) runs, so an inline handler cannot.
 
-    Server HTML reaches the pages' DOM (messages, rows): no foreign script, image or socket even if
-    the sanitiser slips.
+    Server HTML reaches the pages' DOM (messages, rows): no foreign script or socket, and no foreign image
+    but Giphy's (chat page), even if the sanitiser slips.
     """
     found = _SCRIPT_RE.search(page)
     digest = hashlib.sha256(found.group(1).encode() if found else b"").digest()
-    # blob: the pasted images' local thumbnails (object URLs), never a remote image.
+    # blob: the pasted images' local thumbnails (object URLs); Giphy, chat page only: a GIF neither the
+    # archive nor the web could serve (spec 031), the only remote image.
     return (
         f"default-src 'none'; script-src 'sha256-{base64.b64encode(digest).decode()}'; "
-        "style-src 'unsafe-inline'; img-src 'self' blob:; connect-src 'self'; base-uri 'none'; "
-        "form-action 'none'; frame-ancestors 'none'"
+        f"style-src 'unsafe-inline'; img-src 'self' blob:{' https://*.giphy.com' if giphy else ''}; "
+        "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     )
 
 
-# Chat contents: no framing, no sniffing, no cross-origin embedding, no disk cache.
+# Chat contents: no framing, no sniffing, no cross-origin embedding, no disk cache, and no referrer: a
+# Giphy fallback or an opened link is not told which chat shows it.
 _PAGE_HEADERS = {
     "Content-Type": "text/html; charset=utf-8",
     "X-Content-Type-Options": "nosniff",
     "Cross-Origin-Resource-Policy": "same-origin",
     "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
 }
 
 
@@ -1715,9 +1718,16 @@ async def _route(board: Board, ws: ServerConnection, path: str, authorized: bool
         known = not authorized or thread_id in board.rows
         if known or await io("dir", archive_dir, board.data_dir, thread_id) is not None:
             page = _page("chat.html")
-            return _respond(ws, page.encode(), _PAGE_HEADERS | {"Content-Security-Policy": _page_csp(page)})
+            csp = _page_csp(page, giphy=True)
+            return _respond(ws, page.encode(), _PAGE_HEADERS | {"Content-Security-Policy": csp})
     if path.startswith("/media/"):
-        found = await board.chat.media(path, parse_qs(query).get("host", [""])[0])
+        params = parse_qs(query)
+        found = await board.chat.media(
+            path,
+            host=params.get("host", [""])[0],
+            via=params.get("giphy", [""])[0],
+            view=params.get("view", [""])[0],
+        )
         if found is not None:
             body, ctype = found
             headers = {"Content-Type": ctype, "Cache-Control": "private, max-age=3600"}

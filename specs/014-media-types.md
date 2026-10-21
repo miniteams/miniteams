@@ -22,7 +22,7 @@ is unchanged. The default stays what it is today.
 
   | Type | Kinds |
   |---|---|
-  | `images` | `image` (AMS images); `file` when the `URIObject` is a picture |
+  | `images` | `image` (AMS images), `giphy` (Giphy GIFs, spec 031); `file` when the `URIObject` is a picture |
   | `files` | `file` (other `URIObject`s), `sp_file` for SharePoint documents |
   | `transcripts` | `transcript`, `sp_transcript`, every rendition and format Teams serves (AMS VTT/JSON/TXT by content type, SharePoint JSON and VTT) |
   | `videos` | `video`, `sp_file` for recordings and shared video files (`:v:` links, video extensions, `onedriveForBusinessVideo`) |

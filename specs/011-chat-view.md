@@ -34,9 +34,14 @@ click opens Teams web (2026-10-14 decision).
   `GET /media/<thread>/<file>` serves a file from `<data-dir>/<thread>/media/` (read-only, path
   confined to that directory, 404 otherwise). `<file>` may be a bare object id (`media_url` before the
   archiver wrote it): the file is found by id at request time, else, with
-  `?host=<region>.asyncgw.teams.microsoft.com`, the server fetches the object's `imgo` view with its own
-  token (URL rebuilt from host and id, image types only, memory only, 4 at a time, 8 s at most; a
-  failure is not asked again for 1 min under the same token) and 404s when Teams refuses. The thread id
+  `?host=<region>.asyncgw.teams.microsoft.com`, the server fetches the object's view with its own token:
+  `&view=` (the view the message's `src` names, `[a-z0-9_]{1,40}`; a pasted GIF's `imgo` is a still), else
+  `imgo` (URL rebuilt from host, id and view, image types only, memory only, 4 at a time, 8 s at most; a
+  failure is not asked again for 1 min under the same token and view) and 404s when Teams refuses. Several files
+  for one id: the `.gif` first (a pasted GIF's animated copy), other originals next, `.full.*` last
+  (spec 031). `giphy-<id>?giphy=<host><path>` is a Giphy image: archived as `giphy-<id>.<ext>`, else
+  fetched from `https://<host><path>` (allowlisted Giphy host and image path, rebuilt, no token; same
+  types, cap, slots, deadline, a failure not asked again for 1 min whatever the token). The thread id
   is taken from the URL path, url-decoded. A thread not on the board and not in the archive gets a 404.
 - **History (server).** New WS verb `{"history": "<thread>", "before" | "after" | "around":
   "<composetime>", "limit": N}` (N capped at 200, default 100; no anchor = the latest page).
@@ -64,11 +69,13 @@ click opens Teams web (2026-10-14 decision).
   `<span class="mention" data-mri=…>Name</span>` (`mention-me` when it is me). Everything else is
   dropped, text kept. `img src` is rewritten to `/media/<thread>/<file>` when the object id has a
   file in the archive (`attachments.object_id` + `existing`), else to `/media/<thread>/<id>?host=<host>`
-  for an asyncgw object; another Teams object (`/objects/` on an `asm.skype.com` or asyncgw host) is the plain text "[image not archived]" (no
+  for an asyncgw object (`&view=<view>` when `src` names another view than `imgo`), to `/media/<thread>/giphy-<id>?giphy=<host><path>` with `data-giphy` for a Giphy
+  image (spec 031); another Teams object (`/objects/` on an `asm.skype.com` or asyncgw host) is the plain text "[image not archived]" (no
   link: Teams' copy needs the token the page lacks); any other http(s) image is a link to it (new tab,
   `noopener`) reading `[image: <alt>]`, or "[image not archived]" without alt (the CSP keeps it off the
   page; the text alone inside a link); other schemes are the plain text. The page retries a `/media` image that fails to load for about 30 s,
-  then replaces it with the same text. Reply quotes (`blockquote itemtype=…/Reply`) render as a quote with the quoted author.
+  then replaces it with the same text; a Giphy one then loads Giphy's own copy (no referrer: every page is `Referrer-Policy: no-referrer`; CSP
+  `img-src` allows `https://*.giphy.com` alone), then reads as the `[image: <alt>]` link. Reply quotes (`blockquote itemtype=…/Reply`) render as a quote with the quoted author.
 - **Page (`chat.html`).** Header: chat label, member count, an **Open in Teams** button,
   ◀ back to the board. Open in Teams sends the `open` verb for the thread, so it follows the
   server's `--opener` / `--open-scheme` like a plain click on the board (desktop client by
@@ -203,7 +210,8 @@ click opens Teams web (2026-10-14 decision).
 - [x] **AC6** The sanitiser keeps the allowlisted tags, drops `script`, `style`, `iframe`, event
       attributes and `javascript:` hrefs, renders a unicode Teams emoji as its character, a custom
       emoji as `<img class="emoji">` pointing to the archived file, a mention as
-      `span.mention` (`mention-me` for my MRI) and rewrites an archived or asyncgw image to `/media/…`;
+      `span.mention` (`mention-me` for my MRI) and rewrites an archived, asyncgw or Giphy (spec 031) image to
+      `/media/…`;
       another Teams object image becomes the plain text "[image not archived]", any other http(s)
       image a link to it reading `[image: <alt>]` (the text alone inside a link).
 - [x] **AC7** With the page open and followed, a new message on that thread appends within one

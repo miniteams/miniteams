@@ -36,8 +36,18 @@ _AMSIMAGE = "http://schema.skype.com/AMSImage"
 _OBJECT_HOST_RE = re.compile(r"^(api\.asm\.skype\.com|[^.]+\.asyncgw\.teams\.microsoft\.com)$")
 # Hosts a page may name for `live_image`: the token goes there, so one DNS label, no port or userinfo.
 LIVE_HOST_RE = re.compile(r"[a-z0-9-]{1,63}\.asyncgw\.teams\.microsoft\.com")
+# The view a page may name: a pasted GIF's `imgo` is a still, its message references the animated view.
+LIVE_VIEW_RE = re.compile(r"[a-z0-9_]{1,40}")
 _LIVE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 _LIVE_MAX = 10 * 1024 * 1024
+# Giphy GIFs (spec 031): fetched with no token, so any of its media hosts; whole netloc, no port or userinfo.
+_GIPHY_HOST_RE = re.compile(r"media[0-9]*\.giphy\.com|i\.giphy\.com")
+# `/media/[v1.<blob>/]<id>/<rendition>.<ext>`, or i.giphy.com's `/<id>.<ext>`: no `..`, no other file type.
+# No `_s` rendition: a still under the GIF's stem would be served in place of the animated one.
+_GIPHY_PATH_RE = re.compile(
+    r"/(?:media/(?:v1\.[\w=-]+/)?([A-Za-z0-9]+)/[\w-]+(?<!_s)|([A-Za-z0-9]+))\.(?:gif|webp|png|jpe?g)",
+    re.ASCII,
+)
 _IMG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 _URIOBJ_RE = re.compile(r"<URIObject\b[^>]*>", re.IGNORECASE)
 # Call-recording messages nest the transcript/video as <item type="amsTranscript" uri="…">.
@@ -76,6 +86,26 @@ def _downloadable(url: str) -> bool:
     except ValueError:  # malformed link: ref-only, the message's other attachments still go
         return False
     return bool(_OBJECT_HOST_RE.match(host))
+
+
+class Giphy(NamedTuple):
+    url: str  # rebuilt from the checked host and path: the only URL ever fetched
+    stem: str  # `giphy-<id>`: the archived copy is `<stem>.<ext>`, found from the page's src alone
+
+
+def giphy(src: str) -> Giphy | None:
+    """The Giphy image `src` names, else None (any other host, scheme or path)."""
+    src = src.strip()
+    if not src.isprintable():
+        return None
+    try:
+        parts = urlsplit(src)
+    except ValueError:
+        return None
+    found = _GIPHY_PATH_RE.fullmatch(parts.path)
+    if parts.scheme != "https" or not _GIPHY_HOST_RE.fullmatch(parts.netloc) or not found:
+        return None
+    return Giphy(f"https://{parts.netloc}{parts.path}", f"giphy-{found.group(1) or found.group(2)}")
 
 
 def object_id(url: str) -> str:
@@ -195,7 +225,7 @@ def media_type(kind: str, url: str, hint: str = "") -> str:
     """The `--media` type of one extracted item. `hint` is the `type` attribute of the tag it came
     from: a `URIObject` (`Picture.1` is a picture) or a recording `<item>` (`onedriveForBusinessVideo`),
     or `video` for a video `properties.files` entry."""
-    if kind == "image" or (kind == "file" and hint.startswith("Picture.")):
+    if kind in ("image", "giphy") or (kind == "file" and hint.startswith("Picture.")):
         return "images"
     if kind in ("transcript", "sp_transcript"):
         return "transcripts"
@@ -238,6 +268,8 @@ def extract(
         attrs = _attrs(tag)
         if attrs.get("itemtype") == _AMSIMAGE and attrs.get("src"):
             _add("image", attrs["src"])
+        elif gif := giphy(html.unescape(attrs.get("src", ""))):
+            _add("giphy", gif.url)
     for tag in _URIOBJ_RE.findall(content):
         attrs = _attrs(tag)
         url = attrs.get("uri") or attrs.get("url_thumbnail")
@@ -303,38 +335,53 @@ async def _stream_to(client: httpx.AsyncClient, url: str, token: str, dest: Path
         raise
 
 
-async def live_image(client: httpx.AsyncClient, token: str, host: str, oid: str) -> tuple[bytes, str] | None:
-    """(body, content type) of object `oid`'s `imgo` view on `host` (both checked by the caller), in
-    memory: the web shows an image the archive does not hold (yet) and never writes into it. None when
-    Teams refuses it, or it is no image or too large."""
-    url = f"https://{host}/v1/objects/{quote(oid, safe='')}/views/imgo"
+async def _live_body(
+    client: httpx.AsyncClient, url: str, cookies: dict[str, str] | None, **where: str
+) -> tuple[bytes, str] | None:
+    """(body, content type) of `url` in memory: the web shows an image the archive does not hold (yet) and
+    never writes into it. None when refused, or no image, or too large."""
     try:
         # One try: a Retry-After wait would hold a fetch slot, and the page retries anyway.
         async with astream_with_retry(
-            client, url, max_retries=0, headers={"Accept": "*/*"}, cookies={"skypetoken_asm": token}
+            client, url, max_retries=0, headers={"Accept": "*/*"}, cookies=cookies
         ) as resp:
             ctype = (resp.headers.get("content-type") or "").split(";")[0].strip()
             if ctype not in _LIVE_TYPES:  # served from our origin: never HTML or SVG
-                log.info("live_image_refused", host=host, object_id=oid, content_type=ctype)
+                log.info("live_image_refused", **where, content_type=ctype)
                 return None
             body = bytearray()
             async for chunk in resp.aiter_bytes(65536):
                 body += chunk
                 if len(body) > _LIVE_MAX:
-                    log.info("live_image_refused", host=host, object_id=oid, reason="too_large")
+                    log.info("live_image_refused", **where, reason="too_large")
                     return None
             return bytes(body), ctype
     except httpx.HTTPError as exc:
-        log.info("live_image_failed", host=host, object_id=oid, error=reason(exc))
+        log.info("live_image_failed", **where, error=reason(exc))
         return None
 
 
+async def live_image(
+    client: httpx.AsyncClient, token: str, host: str, oid: str, view: str = "imgo"
+) -> tuple[bytes, str] | None:
+    """Object `oid`'s `view` on `host` (all checked by the caller)."""
+    url = f"https://{host}/v1/objects/{quote(oid, safe='')}/views/{quote(view, safe='')}"
+    return await _live_body(client, url, {"skypetoken_asm": token}, host=host, object_id=oid)
+
+
+async def giphy_image(client: httpx.AsyncClient, url: str) -> tuple[bytes, str] | None:
+    """Giphy's copy at `url` (a `Giphy.url`), asked with no token or cookie."""
+    return await _live_body(client, url, None, giphy=url)
+
+
 def existing(media_dir: Path, stem: str) -> str | None:
-    """First already-downloaded file for this object id (any extension), else None."""
-    for match in media_dir.glob(f"{stem}.*"):
-        if not match.name.endswith(".part"):
-            return str(match)
-    return None
+    """Already-downloaded file for this object id (any extension), else None: the `.gif` first (a pasted
+    GIF's `imgo` copy is animated, its `.full.png` a still), other originals next, `.full.*` last."""
+    names = sorted(
+        (m.name for m in media_dir.glob(f"{stem}.*") if not m.name.endswith(".part")),
+        key=lambda name: (name != f"{stem}.gif", name.startswith(f"{stem}.full."), name),
+    )
+    return str(media_dir / names[0]) if names else None
 
 
 # Per-destination serialization: the same asset referenced by several messages (duplicate
@@ -380,6 +427,40 @@ async def fetch_image(client: httpx.AsyncClient, token: str, url: str, media_dir
             # info, not debug — videos are rare and huge; one line per FRESH download only
             # (the cached early-return above never reaches here, so loop re-runs stay quiet).
             log.info("video_downloaded", source="ams", path=str(dest), bytes=dest.stat().st_size)
+        return str(dest)
+
+
+async def fetch_giphy(url: str, media_dir: Path) -> str:
+    """Archived copy of the Giphy image `url` (a `Giphy.url`), downloaded once, with no token or cookie."""
+    gif = giphy(url)
+    if gif is None:
+        raise ValueError("not a Giphy image")  # extract() emits only rebuilt URLs: never reached
+    async with _serialized(str(media_dir / gif.stem)):
+        cached = existing(media_dir, gif.stem)
+        if cached:
+            return cached
+        tmp = media_dir / f"{gif.stem}.part"
+        try:
+            # Own client: the archive's shared cookie jar would send a Giphy cookie back on every later GIF.
+            async with (
+                httpx.AsyncClient(timeout=60.0) as client,
+                astream_with_retry(client, gif.url, headers={"Accept": "*/*"}) as resp,
+            ):
+                ctype = (resp.headers.get("content-type") or "").split(";")[0].strip()
+                if ctype not in _LIVE_TYPES:  # served from our origin later: never HTML or SVG
+                    raise _Refused(415, f"unexpected content-type {ctype!r}")
+                size = 0
+                with tmp.open("wb") as fh:
+                    async for chunk in resp.aiter_bytes(65536):
+                        size += len(chunk)
+                        if size > _LIVE_MAX:
+                            raise _Refused(413, "image over the size cap")
+                        fh.write(chunk)
+            dest = media_dir / f"{gif.stem}{_CTYPE_EXT[ctype]}"
+            tmp.rename(dest)
+        except BaseException:
+            tmp.unlink(missing_ok=True)  # a truncated file would look complete to a later skip-if-exists
+            raise
         return str(dest)
 
 
@@ -854,7 +935,7 @@ async def process(
     notes: list[str] = []
     _remote = {"sp_transcript", "sp_file"}
     _ref_label = {"sp_transcript": "transcript(sp)", "sp_file": "file(sp)"}
-    do_fetch = download and any(_downloadable(i["url"]) or i["kind"] in _remote for i in items)
+    do_fetch = download and any(_downloadable(i["url"]) or i["kind"] in _remote | {"giphy"} for i in items)
     if do_fetch:
         media_dir.mkdir(parents=True, exist_ok=True)
         media_dir.chmod(0o700)
@@ -918,6 +999,19 @@ async def process(
                         if on_fail:
                             on_fail(failed, error)
                     notes.append(f"[file(sp): {url}]")  # no bearer, failed, or folder/site/page
+                continue
+            if kind == "giphy":
+                if not download:
+                    notes.append(f"[image: {url}]")
+                    continue
+                try:
+                    path = await fetch_giphy(url, media_dir)
+                    notes.append(f"[image: {url} → {Path(path).resolve().as_uri()}]")
+                except Exception as exc:  # noqa: BLE001 — best-effort; ref-only on failure
+                    log.debug("giphy_download_failed", url=url, error=str(exc))
+                    if on_fail:
+                        on_fail(url, exc)
+                    notes.append(f"[image: {url}]")
                 continue
             if not (download and _downloadable(url)):
                 notes.append(f"[{kind}: {url}]")

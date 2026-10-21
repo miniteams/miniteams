@@ -6,6 +6,7 @@ import contextlib
 import functools
 import hashlib
 import json
+import logging
 import socket
 import sqlite3
 import threading
@@ -1410,10 +1411,18 @@ async def test_chat_route_serves_the_page_for_board_and_archived_chats(
             script = page.text.split("<script>", 1)[1].split("</script>", 1)[0]
             digest = base64.b64encode(hashlib.sha256(script.encode()).digest()).decode()
             assert f"script-src 'sha256-{digest}';" in csp
-            # blob: only for the pasted images' thumbnails (spec 012 phase 5b): no remote image source.
-            assert [d for d in csp.split("; ") if d.startswith("img-src")] == ["img-src 'self' blob:"]
+            # blob: only for the pasted images' thumbnails (spec 012 phase 5b).
+            # Giphy's own copy is the page's last resort (031-AC4); no other remote image source (031-AC5).
+            assert [d for d in csp.split("; ") if d.startswith("img-src")] == [
+                "img-src 'self' blob: https://*.giphy.com"
+            ]
             assert "unsafe-inline" not in csp.split("script-src", 1)[1].split(";", 1)[0]
             assert "/ws?chat" in page.text
+        widget = await client.get(f"http://{host}/")
+        # No page tells another site which chat it shows (a Giphy fallback, a link opened).
+        assert widget.headers["referrer-policy"] == page.headers["referrer-policy"] == "no-referrer"
+        board_csp = widget.headers["content-security-policy"]
+        assert [d for d in board_csp.split("; ") if d.startswith("img-src")] == ["img-src 'self' blob:"]
         for path in (_chat_url(host, NOPE), f"http://{host}/chat/", f"http://{host}/chat/{T}/x"):
             assert (await client.get(path)).status_code == 404, path
 
@@ -1477,7 +1486,9 @@ def live(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str]]:
     """Stub Teams: `fresh` is an image, anything else refused; returns the (token, host, id) asked."""
     asked: list[tuple[str, str, str]] = []
 
-    async def fake_live(client: Any, token: str, host: str, oid: str) -> tuple[bytes, str] | None:
+    async def fake_live(
+        client: Any, token: str, host: str, oid: str, view: str = "imgo"
+    ) -> tuple[bytes, str] | None:
         asked.append((token, host, oid))
         return (b"\x89PNG-live", "image/png") if oid == "fresh" else None
 
@@ -1566,7 +1577,7 @@ async def test_media_route_live_fetches_run_four_at_a_time(
     """011-AC3: a history page full of unarchived images does not fan out to Teams all at once."""
     release, started = asyncio.Event(), []
 
-    async def held(client: Any, token: str, host: str, oid: str) -> None:
+    async def held(client: Any, token: str, host: str, oid: str, view: str = "imgo") -> None:
         started.append(oid)
         await release.wait()
 
@@ -1586,16 +1597,160 @@ async def test_media_route_live_fetch_gives_up_inside_the_request_deadline(
     """011-AC3: a fetch slower than the deadline is a failure, not an answer nobody waits for."""
     asked: list[str] = []
 
-    async def hung(client: Any, token: str, host: str, oid: str) -> None:
+    async def hung(client: Any, token: str, host: str, oid: str, view: str = "imgo") -> None:
         asked.append(oid)
         await asyncio.Event().wait()
 
     monkeypatch.setattr(CV, "live_image", hung)
     monkeypatch.setattr(CV, "_LIVE_DEADLINE", 0.05)
     path = f"/media/{quote(T, safe='')}/slow"
-    for _ in range(2):
-        assert await asyncio.wait_for(board.chat.media(path, GW), 2) is None
+    structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.INFO))
+    with structlog.testing.capture_logs() as logs:
+        for _ in range(2):
+            assert await asyncio.wait_for(board.chat.media(path, GW), 2) is None
     assert asked == ["slow"]  # the timeout is memoised like any failure
+    timeouts = [e for e in logs if e["event"] == "live_image_failed"]
+    assert [(e["host"], e["object_id"], e["error"]) for e in timeouts] == [(GW, "slow", "timeout")]
+
+
+async def test_media_route_live_fetch_asks_the_view_the_message_names(
+    board: W.Board, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """031-AC6: `view=` is the view fetched (a Teams GIF's `imgo` is a still); one off the pattern is imgo.
+    Each view has its own failure memo."""
+    asked: list[tuple[str, str]] = []
+
+    async def fake(client: Any, token: str, host: str, oid: str, view: str = "imgo") -> None:
+        asked.append((oid, view))
+
+    monkeypatch.setattr(CV, "live_image", fake)
+    anim = "imgpsh_mobile_save_anim"
+    async with _served(board, settings) as host, httpx.AsyncClient(headers=_cookie(board)) as client:
+        base = f"http://{host}/media/{quote(T, safe='')}"
+        for i, view in enumerate((anim, "imgo", "..%2Fx", "%2F", "IMGO", "a" * 41, "", "a-b")):
+            assert (await client.get(f"{base}/o{i}?host={GW}&view={view}")).status_code == 404
+        for _ in range(2):  # memoised per view: a refused still never hides the animated one
+            await client.get(f"{base}/same?host={GW}&view={anim}")
+            await client.get(f"{base}/same?host={GW}")
+    assert asked == [("o0", anim)] + [(f"o{i}", "imgo") for i in range(1, 8)] + [
+        ("same", anim),
+        ("same", "imgo"),
+    ]
+
+
+GIPHY_ID = "l0MYt5jPR6QX5pnqM"
+GIPHY_PATH = f"media2.giphy.com/media/v1.Y2lk/{GIPHY_ID}/giphy.gif"
+
+
+@pytest.fixture
+def giphy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Stub Giphy: a GIF for GIPHY_ID, anything else refused; returns the URLs asked."""
+    asked: list[str] = []
+
+    async def fake(client: Any, url: str) -> tuple[bytes, str] | None:
+        asked.append(url)
+        return (b"GIF89a-live", "image/gif") if GIPHY_ID in url else None
+
+    monkeypatch.setattr(CV, "giphy_image", fake)
+    return asked
+
+
+async def test_media_route_serves_an_archived_giphy_image_without_giphy(
+    board: W.Board, settings: Settings, data_dir: Path, giphy: list[str], live: list[Any]
+) -> None:
+    """031-AC2, 031-AC6: the archived copy by id (the `.gif` before a `.full.png`), Giphy never asked."""
+    media = _media(data_dir)
+    (media / f"giphy-{GIPHY_ID}.gif").write_bytes(b"GIF89a-archived")
+    (media / f"{OBJ}.full.png").write_bytes(b"still")
+    (media / f"{OBJ}.gif").write_bytes(b"GIF89a-teams")
+    (media / f"{OBJ}.png").unlink()
+    async with _served(board, settings) as host, httpx.AsyncClient(headers=_cookie(board)) as client:
+        base = f"http://{host}/media/{quote(T, safe='')}"
+        got = await client.get(f"{base}/giphy-{GIPHY_ID}?giphy={GIPHY_PATH}")
+        assert got.status_code == 200 and got.content == b"GIF89a-archived"
+        assert got.headers["content-type"] == "image/gif"
+        got = await client.get(f"{base}/{OBJ}?host={GW}")
+        assert got.content == b"GIF89a-teams"
+    assert giphy == [] and live == []
+
+
+async def test_media_route_fetches_an_unarchived_giphy_image(
+    board: W.Board, settings: Settings, giphy: list[str], live: list[Any]
+) -> None:
+    """031-AC3: fetched from the rebuilt Giphy URL, sandboxed; a refusal 404s and is remembered whatever
+    the token; any other host, path or name never reaches Giphy (nor Teams)."""
+    url = f"https://{GIPHY_PATH}"
+    directory = board.chat.directory
+    assert directory is not None
+    async with _served(board, settings) as host, httpx.AsyncClient(headers=_cookie(board)) as client:
+        for thread_id in (T, B):
+            base = f"http://{host}/media/{quote(thread_id, safe='')}"
+            got = await client.get(f"{base}/giphy-{GIPHY_ID}?giphy={quote(GIPHY_PATH, safe='/')}")
+            assert got.status_code == 200 and got.content == b"GIF89a-live"
+            assert got.headers["content-type"] == "image/gif"
+            assert got.headers["content-security-policy"] == "sandbox"
+        assert giphy == [url, url]
+        gone = "media2.giphy.com/media/gone1234/giphy.gif"
+        for token in ("a", "b"):  # no token on the request: one memo for every token
+            directory.set_token(token)
+            assert (await client.get(f"{base}/giphy-gone1234?giphy={gone}")).status_code == 404
+        assert giphy == [url, url, f"https://{gone}"]
+        for path in (
+            f"/giphy-{GIPHY_ID}?giphy=evil.example/media/{GIPHY_ID}/giphy.gif",
+            f"/giphy-{GIPHY_ID}?giphy=media2.giphy.com.evil.example/media/{GIPHY_ID}/giphy.gif",
+            f"/giphy-{GIPHY_ID}?giphy=x%40media2.giphy.com/media/{GIPHY_ID}/giphy.gif",
+            f"/giphy-{GIPHY_ID}?giphy=media2.giphy.com%3A8443/media/{GIPHY_ID}/giphy.gif",
+            f"/giphy-{GIPHY_ID}?giphy=media2.giphy.com/media/{GIPHY_ID}/giphy.svg",
+            f"/giphy-{GIPHY_ID}?giphy=media2.giphy.com/media/{GIPHY_ID}/giphy.gif%3F",
+            f"/giphy-other?giphy={GIPHY_PATH}",  # the name must be the URL's id
+            f"/{OBJ}x?giphy={GIPHY_PATH}",
+            f"/giphy-{GIPHY_ID}?giphy=//{GIPHY_PATH}",
+            f"/giphy-{GIPHY_ID}/x?giphy={GIPHY_PATH}",
+        ):
+            assert (await client.get(f"{base}{path}")).status_code == 404, path
+        assert len(giphy) == 3 and live == []
+        anonymous = await client.get(f"{base}/giphy-{GIPHY_ID}?giphy={GIPHY_PATH}", headers={"Cookie": ""})
+        assert anonymous.status_code == 403
+        unknown = f"http://{host}/media/{quote(NOPE, safe='')}/giphy-{GIPHY_ID}?giphy={GIPHY_PATH}"
+        assert (await client.get(unknown)).status_code == 404
+    assert len(giphy) == 3
+
+
+async def test_giphy_fetches_share_the_live_slots_and_deadline(
+    board: W.Board, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """031-AC3: Giphy and Teams fetches run four at a time together; a slow one is a remembered failure."""
+    release, started = asyncio.Event(), []
+
+    async def held(client: Any, *args: str) -> None:
+        started.append(args[0] if len(args) == 1 else args[2])  # Giphy's URL, Teams' object id
+        await release.wait()
+
+    monkeypatch.setattr(CV, "giphy_image", held)
+    monkeypatch.setattr(CV, "live_image", held)
+    thread = quote(T, safe="")
+    asks = [
+        asyncio.create_task(
+            board.chat.media(f"/media/{thread}/giphy-id{i}", "", f"media{i}.giphy.com/media/id{i}/giphy.gif")
+        )
+        for i in range(3)
+    ] + [asyncio.create_task(board.chat.media(f"/media/{thread}/img{i}", GW)) for i in range(3)]
+    await wait(lambda: len(started) >= 4, "four fetches started")
+    await asyncio.sleep(0.05)
+    assert len(started) == 4
+    release.set()
+    assert await asyncio.gather(*asks) == [None] * 6
+    monkeypatch.setattr(CV, "_LIVE_DEADLINE", 0.05)
+    release.clear()
+    started.clear()
+    path = f"/media/{thread}/giphy-slow"
+    structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.INFO))
+    with structlog.testing.capture_logs() as logs:
+        for _ in range(2):
+            assert await asyncio.wait_for(board.chat.media(path, "", "i.giphy.com/slow.gif"), 2) is None
+    assert started == ["https://i.giphy.com/slow.gif"]
+    timeouts = [e for e in logs if e["event"] == "live_image_failed"]
+    assert [(e["giphy"], e["error"]) for e in timeouts] == [("https://i.giphy.com/slow.gif", "timeout")]
 
 
 def test_media_file_refuses_oversized_files(

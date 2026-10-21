@@ -36,6 +36,8 @@ REC = (
     f'<item type="onedriveForBusinessVideo" uri="{SP}/:v:/g/personal/x/rec1" />'
     '<OriginalName v="rec.mp4" /></URIObject>'
 )
+GIPHY = "https://media3.giphy.com/media/v1.Y2lk/l0MYt5jPR6QX5pnqM/giphy.gif"
+GIF = f'<img itemtype="http://schema.skype.com/Giphy" src="{GIPHY}?cid=c&amp;ct=g" alt="hi">'
 MESSAGES = [
     ("m1", IMG, "RichText/Html"),
     ("m2", PIC, "RichText/Media_GenericFile"),
@@ -43,9 +45,10 @@ MESSAGES = [
     ("m4", REC, "RichText/Media_CallRecording"),
     ("m5", CLIP, "RichText/Html"),
     ("m6", IMG.replace("img1", "img2") + DOC.replace("doc1", "doc2"), "RichText/Html"),  # mixed types
+    ("m7", GIF, "RichText/Html"),  # spec 031: a Giphy image, fetched without any token
 ]
 SP_STEM = f"sp-{hashlib.sha1(SP_TR.encode()).hexdigest()[:16]}.transcript"
-IMAGES = {"img1.png", "img1.full.png", "img2.png", "img2.full.png", "pic.png"}
+IMAGES = {"img1.png", "img1.full.png", "img2.png", "img2.full.png", "pic.png", "giphy-l0MYt5jPR6QX5pnqM.gif"}
 FILES = {"doc.docx", "doc2.docx"}
 TRANSCRIPTS = {"tr1.transcript.vtt", f"{SP_STEM}.json", f"{SP_STEM}.vtt"}
 VIDEOS = {"rec.mp4", "clip.mp4"}  # the AMS copy is a fallback: the SharePoint one served
@@ -99,6 +102,8 @@ def _serve(url: str, params: dict[str, str] | None) -> _Resp:
     if url == f"{AMS}/pic1/views/original/status":
         view = f"{AMS}/pic1/views/imgpsh_fullsize"
         return _Resp(data={"original_filename": "pic.png", "content_state": "ready", "view_location": view})
+    if url == GIPHY:
+        return _Resp(b"GIF89a", "image/gif")
     if url.endswith("/views/transcript"):
         return _Resp(b"WEBVTT ams", "text/vtt")
     if url.endswith("/views/video"):
@@ -304,7 +309,11 @@ def test_live_and_stream_options_reach_the_run(monkeypatch) -> None:
 
 @pytest.mark.parametrize(
     ("selection", "content", "expected"),
-    [("transcripts", "".join(c for _, c, _ in MESSAGES), TRANSCRIPTS), ("videos", CLIP, {"clip.mp4"})],
+    [
+        ("transcripts", "".join(c for _, c, _ in MESSAGES), TRANSCRIPTS),
+        ("videos", CLIP, {"clip.mp4"}),
+        ("images", GIF + CLIP, {"giphy-l0MYt5jPR6QX5pnqM.gif"}),  # 031-AC2: the live archiver keeps Giphy's
+    ],
 )
 async def test_live_archive_honours_the_selection(
     selection, content, expected, settings: Settings, tmp_path, fetched
@@ -357,7 +366,8 @@ def test_verify_media_fetches_selected_types_only(flag, wired, fetched, tmp_path
     else:
         assert _archive(data, "--verify-media", "--media", "images") == 0
     assert set(_on_disk(data)) == IMAGES
-    assert all("/views/imgo" in u or "imgpsh_fullsize" in u or "/pic1/" in u for u in fetched)
+    assert all("/views/imgo" in u or "imgpsh_fullsize" in u or "/pic1/" in u or u == GIPHY for u in fetched)
+    assert fetched.count(GIPHY) == 1
     store = ChatStore(data, C1)
     try:
         assert store.denied_urls(AR._now_iso()) == set()  # nothing deselected recorded as a failure

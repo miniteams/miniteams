@@ -392,7 +392,7 @@ async def test_an_image_the_archive_lacks_is_retried_then_said(
     one still missing after about 30 s reads "[image not archived]", no link."""
     asked: list[str] = []
 
-    async def refused(client: Any, token: str, host: str, oid: str) -> None:
+    async def refused(client: Any, token: str, host: str, oid: str, view: str = "imgo") -> None:
         asked.append(oid)  # Teams refuses: the failure memo answers the retries
 
     monkeypatch.setattr(CV, "live_image", refused)
@@ -417,6 +417,98 @@ async def test_an_image_the_archive_lacks_is_retried_then_said(
     assert await shown.inner_text() == "[image not archived]"
     assert await shown.locator("img").count() == 1 and await shown.locator("a").count() == 0
     assert sorted(asked) == [late, never]
+
+
+# A 1x1 GIF: the bytes Giphy's stub, the archive and the web's stub answer with.
+GIF = bytes.fromhex("47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b")
+GIPHY_ID = "l0MYt5jPR6QX5pnqM"
+_SHOWN = "document.querySelector(`[data-id='{}'] .html img`)?.naturalWidth > 0"
+
+
+def _giphy(oid: str) -> str:
+    return f"https://media2.giphy.com/media/v1.Y2lk/{oid}/giphy.gif"
+
+
+async def test_giphy_images_show_inline_from_the_archive_and_the_web(
+    board: W.Board, chat: Pages, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """031-AC1, 031-AC2: a Giphy GIF shows inline from history (archived copy) and live (the web's fetch),
+    under the real CSP; the browser never contacts Giphy."""
+    asked: list[str] = []
+
+    async def fetched(client: Any, url: str) -> tuple[bytes, str]:
+        asked.append(url)
+        return GIF, "image/gif"
+
+    monkeypatch.setattr(CV, "giphy_image", fetched)
+    chat_dir = find_chat_dir(data_dir, T)
+    assert chat_dir is not None
+    (chat_dir / "media" / f"giphy-{GIPHY_ID}.gif").write_bytes(GIF)
+    store = ChatStore(data_dir, T)
+    store.insert_page([_m("4", _at(4), f'<p><img src="{_giphy(GIPHY_ID)}?cid=x&amp;ct=g" alt="old"></p>')])
+    store.close()
+    page = await chat.open(_chat(T), csp=True)
+    archived = page.locator('[data-id="4"] .html img')
+    await archived.wait_for()
+    await until(page, _SHOWN.format(4))
+    assert await archived.get_attribute("src") == f"/media/{quote(T, safe='')}/giphy-{GIPHY_ID}.gif"
+    await _handled(page, "follow")
+    live = "liveGif1234"
+    await board.on_event(
+        _event("NewMessage", T, **_m("5", _at(5), f'<p><img src="{_giphy(live)}" alt="new"></p>'))
+    )
+    shown = page.locator('[data-id="5"] .html img')
+    await shown.wait_for()
+    await until(page, _SHOWN.format(5))
+    assert (await shown.get_attribute("src") or "").startswith(
+        f"/media/{quote(T, safe='')}/giphy-{live}?giphy="
+    )
+    assert asked == [_giphy(live)]
+
+
+@pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
+async def test_giphy_falls_back_to_giphy_then_to_the_link(
+    board: W.Board, chat: Pages, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """031-AC4: /media failing past its retries, the page loads Giphy's own copy without a referrer (its zoom
+    too); when Giphy fails too, the `[image: <alt>]` link (new tab, noopener) shows."""
+    monkeypatch.setattr(CV, "giphy_image", lambda client, url: asyncio.sleep(0))  # the web cannot fetch it
+    asked: list[tuple[str, str | None]] = []
+
+    async def giphy(route: Route) -> None:
+        url = route.request.url
+        asked.append((url, await route.request.header_value("referer")))
+        if "/ok" in url:
+            await route.fulfill(status=200, content_type="image/gif", body=GIF)
+        else:
+            await route.abort()
+
+    async def prepare(context: BrowserContext) -> None:
+        await context.route("https://media2.giphy.com/**", giphy)
+
+    page = await chat.open(_chat(T), csp=True, prepare=prepare)  # the real CSP must let Giphy's copy in
+    await until(page, "window.__frames.some(f => 'follow' in f)")
+    await page.clock.install()
+    ok, bad = "okGif12345", "badGif1234"
+    imgs = f'<img src="{_giphy(ok)}" alt="yes">' + f'<img src="{_giphy(bad)}" alt="no &lt;b&gt;">'
+    await board.on_event(_event("NewMessage", T, **_m("4", _at(4), f"<p>{imgs}</p>")))
+    shown = page.locator('[data-id="4"] .html')
+    for n in (1, 2, 3, 4):
+        await until(page, f"document.querySelectorAll(`[data-id='4'] img[data-retry='{n}']`).length === 2")
+        await page.clock.run_for(20000)
+    await until(page, _SHOWN.format(4))
+    await shown.locator("a").wait_for()
+    img = shown.locator("img")
+    assert await img.count() == 1 and await img.get_attribute("src") == _giphy(ok)
+    link = shown.locator("a")
+    assert await link.inner_text() == "[image: no <b>]"
+    assert await link.get_attribute("href") == _giphy(bad)
+    assert await link.get_attribute("target") == "_blank"
+    assert await link.get_attribute("rel") == "noopener"
+    assert sorted(asked) == [(_giphy(bad), None), (_giphy(ok), None)]
+    await img.dispatch_event("click")  # the installed clock stalls a real click's actionability wait
+    await until(page, "document.querySelector('#zoom img')?.naturalWidth > 0")
+    assert {referer for _, referer in asked} == {None}
 
 
 async def test_composer_keys_success_and_failure(
