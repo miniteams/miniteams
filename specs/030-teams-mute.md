@@ -1,6 +1,6 @@
 # 030 — Widget mute is Teams' mute
 
-**Status**: shipped (AC9 awaits a Teams-client check)
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-10-21
 
@@ -56,7 +56,7 @@ push of its entries to Teams.
   Teams, and the file becomes `muted.json.migrated`. Any other refusal about one chat (e.g. 400, 403, 404, 410, a
   2xx carrying an `errorCode`) skips that chat; a failure that would hit every chat (401, 408, 429, 5xx, network) keeps the file, so the
   next start retries.
-- [ ] **AC9** After a widget mute, the Teams client shows the chat as muted (checked by hand).
+- [x] **AC9** After a widget mute, the Teams client shows the chat as muted (checked by hand).
 - [x] **AC10** README describes the mute as Teams' mute; `muted.json` appears only in the migration note.
 
 ## Phases
