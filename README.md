@@ -265,6 +265,7 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
     as a new message.
   - Attach any file with 📎 or by dropping it on the composer (up to 10, 100 MiB each): a chip with its name and size,
     × to drop. A dropped or pasted PNG, JPEG, GIF or WebP stays an inline image; 📎 attaches even those as files.
+    A GIF copied from a web page is re-fetched from its https address (public hosts only) so it stays animated.
     Enter sends them with the text, as Teams does (your OneDrive chat files folder, shared with the chat). The page
     streams them to the local server, which spools them to unnamed temp files under `~/.cache/miniteams/uploads/`.
   - Widget: inline formatting.

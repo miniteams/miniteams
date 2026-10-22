@@ -10,6 +10,7 @@ import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import quote
 
 import browser_helpers
 import pytest
@@ -46,13 +47,14 @@ FREED = """(() => { window.__freed = []; const free = URL.revokeObjectURL.bind(U
     if (window.__throwOnce) { window.__throwOnce = false; throw new Error("boom"); }
     return make(b); }; })();"""
 # Pastes [[hex, type, padding bytes]] (and `text`) on #reply; true when the page took the paste over.
-PASTE = """([files, text]) => {
+PASTE = """([files, text, html]) => {
   const dt = new DataTransfer();
   for (const [hex, type, pad] of files) {
     const bytes = new Uint8Array(hex.match(/../g).map((h) => parseInt(h, 16)));
     dt.items.add(new File([bytes, new Uint8Array(pad)], "pasted", { type }));
   }
   if (text) dt.setData("text/plain", text);
+  if (html) dt.setData("text/html", html);
   const ev = new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true });
   document.getElementById("reply").dispatchEvent(ev);
   return ev.defaultPrevented;
@@ -108,9 +110,9 @@ async def widget(pages: Pages) -> AsyncIterator[Any]:
     assert pages.external == []
 
 
-async def _paste(page: Page, *files: bytes | tuple[bytes, str, int], text: str = "") -> bool:
+async def _paste(page: Page, *files: bytes | tuple[bytes, str, int], text: str = "", html: str = "") -> bool:
     spec = [[f.hex(), "image/png", 0] if isinstance(f, bytes) else [f[0].hex(), f[1], f[2]] for f in files]
-    return bool(await page.evaluate(PASTE, [spec, text]))
+    return bool(await page.evaluate(PASTE, [spec, text, html]))
 
 
 async def _thumbs(page: Page, n: int) -> list[str]:
@@ -647,3 +649,96 @@ async def test_a_burst_of_enters_queues_in_order_from_a_usable_box(pages: Pages)
     assert [v["text"] for v in sent] == ["one", "two", "three"]
     assert ["images" in v for v in sent] == [False, True, False] and fake.frames == [png(4, 2)]
     assert len(set(fake.cmids)) == 3 and all("check" not in v for v in sent)
+
+
+# --- a browser's "Copy image" of a GIF: a still PNG plus the GIF's address in text/html ---
+
+GIF = bytes.fromhex("47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b")
+GIF_URL = "https://gifs.example/media/a.GIF?cid=1"
+COPIED = f'<meta charset="utf-8"><img src="{GIF_URL.replace("&", "&amp;")}" alt="">'
+
+
+async def _gif_route(page: Page, answer: bytes | int | None) -> list[str]:
+    """`/gif` answering `answer` (bytes, a status, None: a network failure); returns the URLs asked."""
+    asked: list[str] = []
+
+    async def handle(route: Any) -> None:
+        asked.append(route.request.url)
+        if answer is None:
+            await route.abort()
+        elif isinstance(answer, int):
+            await route.fulfill(status=answer, body="not found\n")
+        else:
+            await route.fulfill(body=answer, content_type="image/gif")
+
+    await page.route(ORIGIN + "/gif?*", handle)
+    return asked
+
+
+async def test_a_copied_gif_is_pasted_as_the_original_fetched_by_the_server(widget: Any) -> None:
+    """The still PNG is replaced by the GIF `/gif` fetched, even with Enter pressed while it is fetched."""
+    page = widget.page
+    asked = await _gif_route(page, GIF)
+    await page.evaluate(PASTE_ENTER, [[[png(3, 2).hex(), "image/png", 0]], "", COPIED])
+    await wait(lambda: len(widget.frames) == 1)
+    assert asked == [f"{ORIGIN}/gif?url={quote(GIF_URL, safe='')}"]
+    assert widget.of("send")[0]["images"] == [{"w": 1, "h": 1, "size": len(GIF)}]
+    assert widget.frames == [GIF]
+    # Firefox also puts the address in text/plain: still an image copy.
+    assert await _paste(page, png(3, 2), text=GIF_URL, html=COPIED)
+    await _thumbs(page, 1)
+    assert len(asked) == 2
+
+
+@pytest.mark.parametrize("raw", ["https://gifs.example/ä b.gif", "HTTPS://GIFS.example/a.gif"])
+async def test_firefox_text_names_the_gif_unnormalized(widget: Any, raw: str) -> None:
+    """Firefox's text/plain is the address as written: compared once normalized, still an image copy."""
+    page = widget.page
+    asked = await _gif_route(page, GIF)
+    assert await _paste(page, png(3, 2), text=raw, html=f'<img src="{raw}">')
+    await _thumbs(page, 1)
+    assert len(asked) == 1
+
+
+@pytest.mark.parametrize("answer", [404, 500, None])
+async def test_a_failed_gif_fetch_falls_back_to_the_pasted_still(widget: Any, answer: int | None) -> None:
+    """A refusal or a network failure: the still PNG of the clipboard, no error shown."""
+    page, still = widget.page, png(3, 2)
+    asked = await _gif_route(page, answer)
+    assert await _paste(page, still, html=COPIED)
+    await _thumbs(page, 1)
+    await page.locator("#reply").press("Enter")
+    await wait(lambda: len(widget.frames) == 1)
+    assert len(asked) == 1
+    assert widget.frames == [still]
+    assert await page.evaluate("document.querySelector('.composer > small, #err')?.textContent || ''") == ""
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        "",
+        '<img src="https://gifs.example/a.png">',
+        '<img src="http://gifs.example/a.gif">',
+        '<img src="https://gifs.example/a.gif"><img src="https://gifs.example/b.gif">',
+        '<img src="https://gifs.example/a.png?name=a.gif">',
+        '<img src="https://gifs.example/a.gifv">',
+    ],
+)
+async def test_other_image_pastes_keep_the_clipboard_file(widget: Any, html: str) -> None:
+    """No html, a non-GIF, a non-https GIF or two images: the pasted file as before, nothing fetched."""
+    page, still = widget.page, png(3, 2)
+    asked = await _gif_route(page, GIF)
+    assert await _paste(page, still, html=html)
+    await _thumbs(page, 1)
+    await page.locator("#reply").press("Enter")
+    await wait(lambda: len(widget.frames) == 1)
+    assert widget.frames == [still] and asked == []
+
+
+async def test_a_text_paste_naming_another_address_stays_text(widget: Any) -> None:
+    page = widget.page
+    asked = await _gif_route(page, GIF)
+    assert not await _paste(page, png(), text="see https://gifs.example/other.gif", html=COPIED)
+    await widget.settled()
+    assert await page.locator(".imgs .thumb").count() == 0 and asked == []

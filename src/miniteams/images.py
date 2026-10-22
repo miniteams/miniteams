@@ -18,6 +18,8 @@ MAX_OBJECT_ID = 128
 OBJECT_ID_RE = re.compile(rf"[A-Za-z0-9_-]{{1,{MAX_OBJECT_ID}}}")
 
 _AMS_IMAGE = "http://schema.skype.com/AMSImage"
+# Teams serves a GIF's `imgo` as a still: the native client references this animated view (seen live).
+_GIF_VIEW = "imgpsh_mobile_save_anim"
 # JPEG start-of-frame markers; C4 (DHT), C8 (JPG) and CC (DAC) share the range but carry no size.
 _JPEG_SOF = frozenset(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
 
@@ -130,7 +132,8 @@ def images_html(host: str, uploaded: list[tuple[str, Image]]) -> str:
     for object_id, image in uploaded:
         if not OBJECT_ID_RE.fullmatch(object_id):
             raise ValueError("unexpected AMS object id")
-        src = html.escape(f"https://{host}/v1/objects/{object_id}/views/imgo")
+        view = _GIF_VIEW if image.kind == "gif" else "imgo"
+        src = html.escape(f"https://{host}/v1/objects/{object_id}/views/{view}")
         # Bare id: the chat service stores it as `x_<id>` itself (seen live 2026-10-13).
         tags.append(
             f'<img alt="image" height="{image.height}" id="{object_id}" itemid="{object_id}" '

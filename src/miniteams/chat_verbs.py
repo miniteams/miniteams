@@ -33,7 +33,7 @@ from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import ConnectionClosed
 
 from .archive_store import chat_label, find_chat_dir, messages_by_id, read_page, saved_files, search_chat
-from .attachments import LIVE_HOST_RE, LIVE_VIEW_RE, existing, giphy, giphy_image, live_image
+from .attachments import LIVE_HOST_RE, LIVE_VIEW_RE, existing, giphy, giphy_image, live_image, remote_gif
 from .chats import chat_kind
 from .compose import MAX_TEXT, compose_html, reply_quote
 from .decompose import Editable, decompose
@@ -1582,6 +1582,15 @@ class ChatVerbs:
         if not self.scope(None, thread_id) and await io("dir", archive_dir, self.data_dir, thread_id) is None:
             return None
         return await self._live.get(key, fetch)
+
+    async def gif(self, url: str) -> bytes | None:
+        """`remote_gif(url)` in a live slot, within the deadline: the page pastes it in place of its still."""
+        try:
+            async with asyncio.timeout(_LIVE_DEADLINE), self._live_gate:
+                return await remote_gif(url)
+        except TimeoutError:
+            log.info("remote_gif_failed", error="timeout")
+            return None
 
     async def _live_image(
         self, fetch: Callable[..., Awaitable[tuple[bytes, str] | None]], *args: str, **where: str

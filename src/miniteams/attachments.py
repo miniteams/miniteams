@@ -11,20 +11,23 @@ import asyncio
 import base64
 import hashlib
 import html
+import ipaddress
 import re
+import socket
 import sqlite3
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 import structlog
 
 from miniteams.http import aget_with_retry, astream_with_retry
 from miniteams.http import failure as reason
+from miniteams.images import MAX_IMAGE_BYTES, sniff
 
 if TYPE_CHECKING:
     from miniteams.archive_store import ChatStore
@@ -374,9 +377,90 @@ async def giphy_image(client: httpx.AsyncClient, url: str) -> tuple[bytes, str] 
     return await _live_body(client, url, None, giphy=url)
 
 
+_REMOTE_HOPS = 3  # redirects followed, each target vetted like the first
+# IPv6 forms carrying an IPv4 that `is_global` passes whatever it embeds: NAT64, IPv4-compatible.
+_EMBEDS_V4 = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("::/96"))
+
+
+def _public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if ip.version == 6 and any(ip in net for net in _EMBEDS_V4):
+        ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return ip.is_global and not ip.is_multicast
+
+
+async def _pinned(url: str) -> tuple[str, str, str] | None:
+    """(URL on the vetted IP, Host header, TLS name) for an https `url` with no userinfo or port whose host
+    resolves to public addresses only, else None. The caller dials that IP: a second lookup could rebind."""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        if parts.scheme != "https" or "@" in parts.netloc or parts.port is not None or not host.isascii():
+            return None
+        infos = await asyncio.get_running_loop().getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        ips = [ipaddress.ip_address(info[4][0]) for info in infos]
+    except ValueError, OSError:
+        return None
+    if not ips or not all(map(_public, ips)):
+        return None
+    ip = next((ip for ip in ips if ip.version == 4), ips[0])  # an IPv6-less host must still work
+    pin = f"[{ip}]" if ip.version == 6 else str(ip)
+    return parts._replace(netloc=pin, fragment="").geturl(), parts.netloc, host
+
+
+async def remote_gif(url: str, transport: httpx.AsyncBaseTransport | None = None) -> bytes | None:
+    """The GIF at a public https `url` ending in `.gif` (a browser's "Copy image" pastes only its first
+    frame), else None: each hop pinned by `_pinned` on a fresh client (no proxy, cookie or connection carried
+    over), no token, uncompressed, at most MAX_IMAGE_BYTES on the wire, sniffed as a GIF."""
+    try:
+        if not urlsplit(url).path.lower().endswith(".gif"):
+            return None
+    except ValueError:
+        return None
+    for _ in range(_REMOTE_HOPS + 1):
+        pinned = await _pinned(url)
+        if pinned is None:
+            log.info("remote_gif_refused", reason="address")
+            return None
+        target, netloc, host = pinned
+        # identity: a compressed body would inflate past the cap it was counted against.
+        headers = {"Host": netloc, "Accept-Encoding": "identity"}
+        try:
+            async with (
+                httpx.AsyncClient(transport=transport, trust_env=False, timeout=5.0) as client,
+                client.stream("GET", target, headers=headers, extensions={"sni_hostname": host}) as resp,
+            ):
+                if resp.is_redirect:
+                    url = urljoin(url, resp.headers["location"])
+                    continue
+                encoding = resp.headers.get("content-encoding", "identity").strip().lower()
+                if resp.status_code != 200 or encoding != "identity":
+                    log.info("remote_gif_refused", host=host, status=resp.status_code, encoding=encoding)
+                    return None
+                body = bytearray()
+                async for chunk in resp.aiter_raw(65536):
+                    body += chunk
+                    if len(body) > MAX_IMAGE_BYTES:
+                        log.info("remote_gif_refused", host=host, reason="too_large")
+                        return None
+        # ValueError: a Location urljoin cannot parse.
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
+            log.info("remote_gif_failed", host=host, error=reason(exc))
+            return None
+        data = bytes(body)
+        try:
+            if sniff(data).kind == "gif":
+                return data
+        except ValueError:
+            pass
+        log.info("remote_gif_refused", host=host, reason="not_gif")
+        return None
+    log.info("remote_gif_refused", reason="redirects")
+    return None
+
+
 def existing(media_dir: Path, stem: str) -> str | None:
     """Already-downloaded file for this object id (any extension), else None: the `.gif` first (a pasted
-    GIF's `imgo` copy is animated, its `.full.png` a still), other originals next, `.full.*` last."""
+    GIF's animated view, its `.full.png` a still), other originals next, `.full.*` last."""
     names = sorted(
         (m.name for m in media_dir.glob(f"{stem}.*") if not m.name.endswith(".part")),
         key=lambda name: (name != f"{stem}.gif", name.startswith(f"{stem}.full."), name),

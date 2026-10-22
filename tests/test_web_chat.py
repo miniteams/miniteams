@@ -1753,6 +1753,44 @@ async def test_giphy_fetches_share_the_live_slots_and_deadline(
     assert [(e["giphy"], e["error"]) for e in timeouts] == [("https://i.giphy.com/slow.gif", "timeout")]
 
 
+async def test_gif_route_serves_the_pasted_gif_to_the_cookie_holder_only(
+    board: W.Board, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pasted GIF's original: fetched by `remote_gif` (cookie only), sandboxed; a refusal 404s."""
+    asked: list[str] = []
+
+    async def fake(url: str) -> bytes | None:
+        asked.append(url)
+        return b"GIF89a-remote" if "/a.gif" in url else None
+
+    monkeypatch.setattr(CV, "remote_gif", fake)
+    url = "https://gifs.example/a.gif?x=1&y=2"
+    async with _served(board, settings) as host, httpx.AsyncClient(headers=_cookie(board)) as client:
+        got = await client.get(f"http://{host}/gif", params={"url": url})
+        assert got.status_code == 200 and got.content == b"GIF89a-remote"
+        assert got.headers["content-type"] == "image/gif"
+        assert got.headers["content-security-policy"] == "sandbox"
+        assert (
+            await client.get(f"http://{host}/gif", params={"url": "https://gifs.example/b.gif"})
+        ).status_code == 404
+        anonymous = await client.get(f"http://{host}/gif", params={"url": url}, headers={"Cookie": ""})
+        assert anonymous.status_code == 403
+        wrong = await client.get(f"http://{host}/gif", params={"url": url}, headers={"Cookie": "mt=nope"})
+        assert wrong.status_code == 403
+    assert asked == [url, "https://gifs.example/b.gif"]
+
+
+async def test_gif_fetches_share_the_live_deadline(board: W.Board, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hung remote GIF gives up inside the request deadline."""
+
+    async def hung(url: str) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(CV, "remote_gif", hung)
+    monkeypatch.setattr(CV, "_LIVE_DEADLINE", 0.05)
+    assert await asyncio.wait_for(board.chat.gif("https://gifs.example/a.gif"), 2) is None
+
+
 def test_media_file_refuses_oversized_files(
     board: W.Board, data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

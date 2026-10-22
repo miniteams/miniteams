@@ -43,6 +43,10 @@ click opens Teams web (2026-10-14 decision).
   fetched from `https://<host><path>` (allowlisted Giphy host and image path, rebuilt, no token; same
   types, cap, slots, deadline, a failure not asked again for 1 min whatever the token). The thread id
   is taken from the URL path, url-decoded. A thread not on the board and not in the archive gets a 404.
+  `GET /gif?url=<https URL>` (cookie only) serves the original of a GIF copied from a web page, whose paste
+  carries only a still: path ending in `.gif`, https, no userinfo or port, every resolved address public and
+  the vetted one dialled, each redirect re-vetted (3 at most), no token, cookie or proxy, identity encoding,
+  10 MiB on the wire, body sniffed as a GIF; same 4 slots and 8 s as the live fetches, 404 otherwise.
 - **History (server).** New WS verb `{"history": "<thread>", "before" | "after" | "around":
   "<composetime>", "limit": N}` (N capped at 200, default 100; no anchor = the latest page).
   `before` pages back, `after` pages forward, `around` returns about N/2 on each side of the
