@@ -201,7 +201,8 @@ the person (or everyone) is notified and the name shows highlighted in Teams, as
   …/v1/objects/<id>/content/imgpsh`), then send one message: text first, then the images in order
   (`<p>text</p><p><img …></p>`), each `<img>` with `alt`, `height`, `id`, `itemid`, `itemscope`,
   `itemtype="http://schema.skype.com/AMSImage"`, `src="https://<asyncgw host>/v1/objects/<id>/views/imgo"`
-  and `width` (natural pixel size). `send_message` takes the `clientmessageid` as a parameter.
+  (a GIF: `views/imgpsh_mobile_save_anim`, as the native client; its `imgo` is a still) and `width`
+  (natural pixel size). `send_message` takes the `clientmessageid` as a parameter.
 - **Covers**: AC26 (first), the server half of AC24.
 - **Data model impact**: none.
 - **DoD**: two images and text sent in one message to the throwaway 1:1 test chat show in native

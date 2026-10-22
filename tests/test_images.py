@@ -145,6 +145,17 @@ def test_images_html_matches_the_native_shape_in_order() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("kind", "view"),
+    [("gif", "imgpsh_mobile_save_anim"), ("png", "imgo"), ("jpeg", "imgo"), ("webp", "imgo")],
+)
+def test_images_html_references_a_gif_by_its_animated_view(kind: str, view: str) -> None:
+    # Teams serves a GIF's `imgo` as a still; the native client names the animated view, others `imgo`.
+    out = images.images_html("gw.test", [(OID, images.Image(kind, 2, 2))])
+    assert f'itemscope="{kind}" ' in out
+    assert f'src="https://gw.test/v1/objects/{OID}/views/{view}"' in out
+
+
 @pytest.mark.parametrize("bad", ['x" onerror="y', "a/b", "", "a" * 129])
 def test_images_html_refuses_odd_object_ids(bad: str) -> None:
     # 012-AC24: a remote-supplied id never reaches an attribute or a URL unchecked.

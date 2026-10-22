@@ -6,7 +6,8 @@ on every change. No REST layer: the page verbs ride the same socket.
 
 Routes: `/` the board page, `/chat/<thread>` a chat page, `/media/<thread>/<file>` and `/emoji/<id>`
 archived and custom-emoji images (`/media/<thread>/<id>?host=` or `?giphy=` fetches an image not archived
-yet), `/ws` the socket (`/ws?chat` for a chat page).
+yet), `/gif?url=` a pasted GIF fetched from its public https address, `/ws` the socket (`/ws?chat` for a chat
+page).
 
 Bind is `127.0.0.X:PORT` with X and PORT drawn once and persisted (`web.json`) so the URL
 survives restarts; a persisted bind that is taken fails the start rather than move. The whole 127/8 is
@@ -1720,6 +1721,12 @@ async def _route(board: Board, ws: ServerConnection, path: str, authorized: bool
             page = _page("chat.html")
             csp = _page_csp(page, giphy=True)
             return _respond(ws, page.encode(), _PAGE_HEADERS | {"Content-Security-Policy": csp})
+    if path == "/gif":
+        gif = await board.chat.gif(parse_qs(query).get("url", [""])[0])
+        if gif is not None:
+            return _respond(
+                ws, gif, {"Content-Type": "image/gif", "Cache-Control": "no-store"} | _FILE_HEADERS
+            )
     if path.startswith("/media/"):
         params = parse_qs(query)
         found = await board.chat.media(

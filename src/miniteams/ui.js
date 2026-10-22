@@ -797,7 +797,7 @@
     // One paste after the other: a second Ctrl+V must not overtake the first one's measuring. `docs`:
     // every file goes as a file card (the paperclip), images included.
     const add = (id, files, docs = false) => { adding++; chain = chain.then(async () => {
-      for (const file of files) {
+      for (const file of await files) {
         if (docs || !IMG_TYPES.includes(file.type)) {
           const refusal = list(id).filter((it) => !it.url).length >= FILE_MAX ? `at most ${FILE_MAX} files per message`
             : file.size > FILE_BYTES ? `${file.name}: over ${FILE_BYTES >> 20} MiB` : "";
@@ -823,12 +823,29 @@
         render();
       }
     }).catch(() => refuse(id, "could not read the pasted image")).finally(() => { adding--; }); };
+    // A browser's "Copy image" of a GIF carries its first frame as a PNG and the GIF's address in text/html
+    // (Firefox also as text/plain): the https address of a single <img> ending in .gif, else "".
+    const gifOf = (data) => {
+      const imgs = new DOMParser().parseFromString(data.getData("text/html"), "text/html").images;
+      try {
+        const url = new URL(imgs.length === 1 ? imgs[0].getAttribute("src") : "");
+        return url.protocol === "https:" && /\.gif$/i.test(url.pathname) ? url.href : "";
+      } catch { return ""; }
+    };
+    // The original GIF, fetched by the server (the page reaches only its own origin); else the still.
+    const animated = (url, files) => fetch(`/gif?url=${encodeURIComponent(url)}`)
+      .then(async (r) => { if (!r.ok) throw new Error(`/gif answered ${r.status}`); return [new File([await r.blob()], "image.gif", { type: "image/gif" })]; })
+      .catch((err) => { console.info("pasting the still:", err.message); return files; });
     // Files without text: a text paste that also carries a picture of itself (office suites) stays text.
     input.addEventListener("paste", (e) => {
       const files = [...(e.clipboardData?.files || [])];
-      if (!files.length || e.clipboardData.getData("text/plain")) return;
+      if (!files.length) return;
+      const gif = gifOf(e.clipboardData);
+      let text = e.clipboardData.getData("text/plain").trim();
+      try { text = new URL(text).href; } catch {}  // Firefox's raw address against gifOf's normalized one
+      if (text && text !== gif) return;
       e.preventDefault();
-      add(chat(), files);
+      add(chat(), gif ? animated(gif, files) : files);
     });
     if (clip) {
       const pick = Object.assign(el("input"), { type: "file", multiple: true, hidden: true });

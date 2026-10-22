@@ -345,7 +345,7 @@ def test_reply_quotes_and_trailing_images_are_split_off_verbatim() -> None:
     assert [image.html for image in form.images] == tags
     assert [(image.key, image.src, image.alt) for image in form.images] == [
         ("0-weu-d1-aaaa", "https://gw.test/v1/objects/0-weu-d1-aaaa/views/imgo", "image"),
-        ("0-weu-d1-bbbb", "https://gw.test/v1/objects/0-weu-d1-bbbb/views/imgo", "image"),
+        ("0-weu-d1-bbbb", "https://gw.test/v1/objects/0-weu-d1-bbbb/views/imgpsh_mobile_save_anim", "image"),
     ]
     assert _form(pictures).text == ""  # images alone, as miniteams sends them
     # A `> ` quote of my own is text, not a Reply block.
