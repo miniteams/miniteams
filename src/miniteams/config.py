@@ -104,6 +104,8 @@ class Settings(BaseSettings):
     # --- behaviour ---
     use_device_code: bool = True  # False: browser sign-in (`--browser-login`)
     download_media: bool = True  # fetch inbound image/file bytes to media_dir
+    # `archive --live --verify-media`: seconds between two chats, so Teams, SharePoint and the NAS breathe.
+    sweep_pause: float = 5.0
     log_level: str = "INFO"
     config_dir: Path = Field(default_factory=_default_config_dir)  # tokens, epid (state)
     # The registrar keeps one socket per endpoint id: a test run that shares the real instance's id

@@ -424,6 +424,7 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
                     download_avatars=not args.no_avatars,
                     media_types=args.media,
                     reconcile=args.live,
+                    verify_media=args.verify_media,
                 )
             )
         except KeyboardInterrupt:
@@ -731,7 +732,7 @@ def main(argv: list[str] | None = None) -> int:
         "--verify-media",
         action="store_true",
         help="re-check every message's assets against disk (even backfilled chats), "
-        "downloading any that are missing",
+        "downloading any that are missing; with --live, one background sweep, chat by chat",
     )
     p_archive.add_argument(
         "--assets-only",
@@ -864,9 +865,10 @@ def main(argv: list[str] | None = None) -> int:
     # --assets-only never fetches history: the recheck would silently do nothing.
     if getattr(args, "recheck_since", None) and getattr(args, "assets_only", False):
         parser.error("--recheck-since walks history; it cannot be combined with --assets-only")
-    # --live runs forever over every chat: a single thread, a timer or a one-shot recovery contradict it.
+    # --live runs forever over every chat: a single thread, a timer or a one-shot recovery contradict it,
+    # and its passes never retry denied chats.
     if getattr(args, "live", False):
-        flags = ("loop", "thread", "assets_only", "retry_assets", "recheck_since")
+        flags = ("loop", "thread", "assets_only", "retry_denied", "retry_assets", "recheck_since")
         clash = [f for f in flags if getattr(args, f) not in (None, False)]
         if clash:
             parser.error(f"--live cannot be combined with --{clash[0].replace('_', '-')}")
@@ -894,6 +896,8 @@ def main(argv: list[str] | None = None) -> int:
             args.media = frozenset()
         elif args.media is None:
             args.media = DEFAULT_MEDIA | {"videos"} if shorthand else DEFAULT_MEDIA
+        if getattr(args, "live", None) and getattr(args, "verify_media", False) and not args.media:
+            parser.error("--verify-media with --live sweeps media; drop --no-media")
 
     settings = Settings()  # type: ignore[call-arg]  # tenant_id comes from env/.env
     if args.device_code:

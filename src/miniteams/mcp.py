@@ -52,8 +52,9 @@ _PROBE_HOLD = 60.0  # seconds the archive counts as unavailable after a failed p
 _LOGIN_HINT = "An archiver that stopped on the expired credential has to be started again after signing in."
 _INSTRUCTIONS = (
     "miniteams: your own Microsoft Teams chats, read from a local archive. Results carry `source` and, "
-    "from the archive, the archiver's heartbeat (`archiver_seen`, `archiver_state`, `sync_started_at`): "
-    "an old heartbeat means the archive stopped moving. Chat ids come from find_chats; never guess one."
+    "from the archive, the archiver's heartbeat (`archiver_seen`, `archiver_state`, `sync_started_at`, "
+    "`media_sweep` while a media sweep runs): an old heartbeat means the archive stopped moving. "
+    "Chat ids come from find_chats; never guess one."
 )
 
 
@@ -209,8 +210,8 @@ class Archive:
             rows = read_meta(self.data_dir)
         except (OSError, sqlite3.Error) as exc:
             raise self._unavailable(exc) from exc
-        keys = ("archiver_seen", "archiver_state", "sync_started_at")
-        return {"source": "archive", **{k: rows[k] for k in keys if k in rows}}
+        keys = ("archiver_seen", "archiver_state", "sync_started_at", "media_sweep")
+        return {"source": "archive", **{k: rows[k] for k in keys if rows.get(k)}}
 
     def chats(self) -> Iterator[dict[str, Any]]:
         try:

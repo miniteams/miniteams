@@ -679,6 +679,9 @@ async def _sp_rendition(
         tmp.unlink(missing_ok=True)  # never leave partial bytes a later skip would trust
         failures.append((ext, exc))
         return
+    except BaseException:
+        tmp.unlink(missing_ok=True)  # cancelled mid-stream (a live pass takes the chat): same rule
+        raise
     got.append(dest)
 
 

@@ -105,6 +105,7 @@ async def test_a_locked_index_does_not_stop_the_pass(settings: Settings, tmp_pat
     assert [kw["key"] for _, event, kw in events if event == "meta_write_failed"] == [
         "archiver_state",
         "sync_started_at",
+        "media_sweep",
         "archiver_seen",
         "archiver_state",
     ]

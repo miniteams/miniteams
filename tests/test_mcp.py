@@ -193,6 +193,18 @@ def test_a_failing_tool_is_an_error_result_not_a_crash(settings: Settings, data:
     assert _rpc(server, "ping")["result"] == {}
 
 
+def test_heartbeat_says_a_media_sweep_runs(settings: Settings, data: Path) -> None:
+    index = Index(data)
+    index.set_meta("media_sweep", "running")
+    index.close()
+    out = _call(_server(settings, data), "find_chats")
+    assert out["media_sweep"] == "running" and out["archiver_state"] == "following"
+    index = Index(data)
+    index.set_meta("media_sweep", "")  # ended: the key leaves the heartbeat
+    index.close()
+    assert "media_sweep" not in _call(_server(settings, data), "find_chats")
+
+
 # --- find_chats ---
 
 

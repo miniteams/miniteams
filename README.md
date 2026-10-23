@@ -62,6 +62,7 @@ uv run miniteams archive --loop 600                    # re-run forever, sleepin
 uv run miniteams archive --live                        # catch up, then store each message as it
                                                        # arrives, plus a pass every 1800s (--live N);
                                                        # stops on auth expiry (exit 1)
+uv run miniteams archive --live --verify-media         # same, plus one background media sweep
 uv run miniteams archive --recheck-since 2026-09-22    # one-shot: re-walk chats active since the
                                                        # date down to it, filling any hole
 uv run miniteams web              # local live page: conversations newest-first (see below)
@@ -82,7 +83,8 @@ archive: `find_chats` (label, topic, participant, kind), `read_messages` (plain 
 `next_since` cursor), `search_messages` (substring, case and accents ignored, 7 days back by
 default, feeds left out) and `read_transcript` (recordings, then turns). Results say where they come
 from (`source`) and carry the archiver's heartbeat (`archiver_seen`, `archiver_state`,
-`sync_started_at`, written by `archive` into `index.db`), so an agent can tell a stopped archiver
+`sync_started_at`, and `media_sweep: running` during an `archive --live --verify-media` sweep, written
+by `archive` into `index.db`), so an agent can tell a stopped archiver
 from a quiet one. When the archive cannot be reached (no `index.db`, or no answer in 3 s) the
 first three read from the API instead, with `source: "api"`. `send_message` and `update_message`
 write to Teams as you; with `send_at` (ISO 8601 with an offset, 5 seconds to 125 days ahead)
@@ -369,7 +371,18 @@ kept in `message_versions`. Attachments download in the background as each messa
 triggers a new catch-up. A live write stays pending until a pass tops the chat up past it, so a
 message the stream dropped without saying so is still fetched by the next pass. It uses its own Trouter endpoint,
 so it runs beside `web` and `stream`. It cannot be combined with `--loop`, `--thread`,
-`--assets-only`, `--retry-assets` or `--recheck-since`.
+`--assets-only`, `--retry-denied`, `--retry-assets` or `--recheck-since`.
+
+`archive --live --verify-media` (spec 032) adds one media sweep after the first catch-up: chat by
+chat, the `--assets-only` work over what is already archived (missing assets only, `--videos`,
+`--media` and the asset backoff apply; `--no-media` is refused), while live messages keep being written at once.
+It waits while a catch-up pass runs; a pass that starts mid-chat stops that chat, which is redone
+after it. Downloads share the live ones' concurrency limit, and `MINITEAMS_SWEEP_PAUSE` (seconds,
+default 5) spaces the chats. Progress is kept in `index.db`: restarted with `--verify-media` the
+sweep resumes after the last chat done (never past one that failed, so it is retried), restarted
+without it the progress is dropped. A finished
+sweep logs `media_sweep_done` (chats, files, failures, duration) and does not run again until the
+flag is given again.
 
 The top-up stops at the newest message a complete walk reached. `--recheck-since WHEN` lowers
 that bound to WHEN for every chat active since then: a one-shot repair for an archive that holds

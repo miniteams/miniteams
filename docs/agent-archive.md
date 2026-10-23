@@ -48,7 +48,9 @@ chats(id TEXT PK, dir TEXT, label TEXT, topic TEXT, participants TEXT /*JSON*/,
       history_denied_at TEXT, synced_version INT /*conv version at the last complete pass*/)
 meta(key TEXT PK, value TEXT)  -- archiver liveness: archiver_seen (ISO UTC, every 30 s while
                                -- `archive --live` is connected, and at the end of every pass),
-                               -- archiver_state (syncing | following | idle), sync_started_at
+                               -- archiver_state (syncing | following | idle), sync_started_at,
+                               -- media_sweep ('running' during a live media sweep, else ''),
+                               -- media_sweep_after (sweep resume point: last chat id done before any failure)
 
 -- <thread>/messages.db
 messages(id TEXT PK, composetime TEXT /*ISO-8601 UTC*/, raw TEXT /*JSON message*/)

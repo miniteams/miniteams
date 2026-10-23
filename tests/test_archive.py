@@ -1238,3 +1238,188 @@ async def test_recheck_since_applies_to_a_named_thread(settings: Settings, tmp_p
     await _run(settings, data, thread=C1, recheck_since="2026-07-01T00:00:00")
 
     assert _stored_ids(data, C1) == {"m1", "m2", "m3"}
+
+
+async def test_media_scan_lets_the_loop_run_mid_chat(tmp_path) -> None:
+    """`archive --live` sweeps on the stream's loop: a long scan must hand it back as it goes."""
+    import asyncio
+
+    store = ChatStore(tmp_path / "data", C1)
+    n = 1200
+    store.insert_page(
+        [{"id": f"m{i}", "composetime": f"2026-07-01T{i:06d}", "content": "text"} for i in range(n)]
+    )
+    scanned = 0
+    rows = store.iter_messages
+
+    def counting():  # noqa: ANN202
+        nonlocal scanned
+        for message in rows():
+            scanned += 1
+            yield message
+
+    store.iter_messages = counting  # type: ignore[method-assign]
+    seen: list[int] = []
+
+    async def tick() -> None:
+        while True:
+            seen.append(scanned)
+            await asyncio.sleep(0)
+
+    ticker = asyncio.create_task(tick())
+    await asyncio.sleep(0)
+    assert await AR._download_media(store, "sk", "label") == 0
+    ticker.cancel()
+    store.close()
+    assert any(0 < s < n for s in seen)  # the loop ran while the scan was mid-chat
+
+
+async def test_media_pass_opens_no_client_for_a_chat_without_media(tmp_path, monkeypatch) -> None:
+    """The live sweep visits every chat: one without attachments must cost no HTTP client."""
+
+    def no_client(*a: Any, **kw: Any) -> Any:
+        raise AssertionError("httpx client built for a chat without media")
+
+    monkeypatch.setattr(AR.httpx, "AsyncClient", no_client)
+    store = ChatStore(tmp_path / "data", C1)
+    store.insert_page([{"id": "m1", "composetime": "2026-07-01T09:00:00Z", "content": "plain text"}])
+    store.insert_page(
+        [{"id": "m2", "composetime": "2026-07-01T09:01:00Z", "content": "", "messagetype": "Text"}]
+    )
+    assert await AR._download_media(store, "sk", "label") == 0
+    store.close()
+
+
+async def test_media_scan_holds_no_snapshot_across_downloads(tmp_path, monkeypatch) -> None:
+    """A live write to the chat mid-scan must not lock out the scan's own writes (stale WAL snapshot)."""
+    import asyncio
+
+    data = tmp_path / "data"
+    store = ChatStore(data, C1)
+    img = '<img itemtype="http://schema.skype.com/AMSImage" src="https://api.asm.skype.com/v1/objects/o/views/imgo">'
+    store.insert_page(
+        [{"id": f"m{i}", "composetime": f"2026-07-01T09:{i:02d}:00Z", "content": img} for i in range(30)]
+    )
+    store._db.execute("PRAGMA busy_timeout = 100")  # fail fast instead of waiting 5 s
+    errors: list[str] = []
+    live_wrote = asyncio.Event()
+
+    async def fake_process(content, msgtype, token, media_dir, download, **kw):  # noqa: ANN001
+        if not live_wrote.is_set():
+            other = ChatStore(data, C1)  # `archive --live` writing the same chat
+            other.apply_message({"id": "live", "composetime": "2026-07-02T00:00:00Z", "content": "hi"}, "now")
+            other.close()
+            live_wrote.set()
+        try:
+            store.mark_denied(f"k{len(errors)}-{id(content)}", 403, "2026-07-02T00:00:00Z")
+            store.save_file([f"u-{id(content)}"], "f.bin", "")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(str(exc))
+        return []
+
+    monkeypatch.setattr(AR.attachments, "process", fake_process)
+    await AR._download_media(store, "sk", "label")
+    store.close()
+    assert live_wrote.is_set() and errors == []
+
+
+IMG = '<img itemtype="http://schema.skype.com/AMSImage" src="https://api.asm.skype.com/v1/objects/o/views/imgo">'
+
+
+def _image_chat(tmp_path: Path, n: int) -> ChatStore:
+    store = ChatStore(tmp_path / "data", C1)
+    store.insert_page(
+        [{"id": f"m{i:04d}", "composetime": f"2026-07-01T{i:06d}", "content": IMG} for i in range(n)]
+    )
+    return store
+
+
+async def test_media_scan_reads_ahead_only_a_bounded_queue(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    store = _image_chat(tmp_path, 1000)
+    scanned = 0
+    rows = store.iter_messages
+
+    def counting():  # noqa: ANN202
+        nonlocal scanned
+        for message in rows():
+            scanned += 1
+            yield message
+
+    store.iter_messages = counting  # type: ignore[method-assign]
+    entered = 0
+
+    async def blocked(*a: Any, **kw: Any) -> list[str]:
+        nonlocal entered
+        entered += 1
+        await asyncio.Event().wait()
+        return []
+
+    monkeypatch.setattr(AR.attachments, "process", blocked)
+    task = asyncio.create_task(AR._download_media(store, "sk", "label"))
+    async with asyncio.timeout(5):
+        while entered < AR._MEDIA_CONCURRENCY:
+            await asyncio.sleep(0.01)
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.wait({task})
+    store.close()
+    # in the workers' hands, in the queue, and the one the scan waits to put
+    assert scanned <= 2 * AR._MEDIA_CONCURRENCY + 1
+
+
+class _Client:
+    """Stands in for httpx.AsyncClient: records its closes."""
+
+    closed = 0
+
+    def __init__(self, *a: Any, **kw: Any) -> None:
+        pass
+
+    async def aclose(self) -> None:
+        _Client.closed += 1
+
+
+async def test_media_client_is_closed_on_success_and_on_cancel(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    monkeypatch.setattr(AR.httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(_Client, "closed", 0)
+    gate = asyncio.Event()
+    gate.set()
+    entered = asyncio.Event()
+
+    async def process(*a: Any, **kw: Any) -> list[str]:
+        entered.set()
+        await gate.wait()
+        return []
+
+    monkeypatch.setattr(AR.attachments, "process", process)
+    store = _image_chat(tmp_path, 3)
+    await AR._download_media(store, "sk", "label")
+    assert _Client.closed == 1
+    gate.clear()
+    entered.clear()
+    task = asyncio.create_task(AR._download_media(store, "sk", "label"))
+    await asyncio.wait_for(entered.wait(), 5)
+    task.cancel()
+    await asyncio.wait({task})
+    store.close()
+    assert _Client.closed == 2
+
+
+async def test_one_shot_run_clears_a_stale_sweep_heartbeat_but_a_live_pass_does_not(
+    settings: Settings, tmp_path
+) -> None:
+    from miniteams.archive_store import read_meta
+
+    data = tmp_path / "data"
+    for live_pass, left in ((True, "running"), (False, "")):
+        index = Index(data)
+        index.set_meta("media_sweep", "running")
+        index.close()
+        await AR.run_archive(
+            settings, data, token_provider=AR.StaticToken("sk"), assets_only=True, live_pass=live_pass
+        )
+        assert read_meta(data)["media_sweep"] == left

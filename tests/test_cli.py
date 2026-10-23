@@ -392,20 +392,57 @@ def test_archive_retries_a_transient_aad_error(monkeypatch) -> None:
     assert slept == [2.0]
 
 
-@pytest.mark.parametrize(
-    "extra",
-    [
-        ["--loop"],
-        ["--thread", "19:x"],
-        ["--assets-only"],
-        ["--retry-assets"],
-        ["--recheck-since", "2026-09-22"],
-    ],
-)
-def test_archive_live_refuses_contradicting_flags(extra: list[str], capsys) -> None:
+# What `archive --live` does with each `archive` flag: honoured, or refused with its sample value.
+_LIVE_HONOURED = {
+    "--help",
+    "--live",
+    "--data-dir",
+    "--all",
+    "--no-media",
+    "--no-avatars",
+    "--videos",
+    "--media",
+    "--verify-media",
+}
+_LIVE_REFUSED = {
+    "--loop": [],
+    "--thread": ["19:x"],
+    "--assets-only": [],
+    "--retry-denied": [],
+    "--retry-assets": [],
+    "--recheck-since": ["2026-09-22"],
+}
+
+
+def test_every_archive_flag_is_honoured_or_refused_by_live(monkeypatch) -> None:
+    """A new `archive` flag must be wired into `--live` or refused there, never silently ignored."""
+    flags: set[str] = set()
+
+    def record(parser: argparse.ArgumentParser, file: Any = None) -> None:
+        flags.update(s for action in parser._actions for s in action.option_strings)
+
+    monkeypatch.setattr(argparse.ArgumentParser, "print_help", record)
+    with pytest.raises(SystemExit):
+        cli.main(["archive", "--help"])
+    assert flags == _LIVE_HONOURED | set(_LIVE_REFUSED) | {"-h"}
+
+
+def test_archive_live_sweep_refuses_no_media(capsys) -> None:
+    for argv in (
+        ["--live", "--verify-media", "--no-media"],
+        ["--no-media", "--verify-media", "--live", "60"],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["archive", *argv])
+        assert exc.value.code == 2
+    assert capsys.readouterr().err.count("--verify-media with --live sweeps media") == 2
+
+
+@pytest.mark.parametrize("flag", sorted(_LIVE_REFUSED))
+def test_archive_live_refuses_contradicting_flags(flag: str, capsys) -> None:
     with pytest.raises(SystemExit) as exc:
-        cli.main(["archive", "--live", *extra])
-    assert exc.value.code == 2 and "--live cannot be combined" in capsys.readouterr().err
+        cli.main(["archive", "--live", flag, *_LIVE_REFUSED[flag]])
+    assert exc.value.code == 2 and f"--live cannot be combined with {flag}" in capsys.readouterr().err
 
 
 def test_archive_live_exits_1_when_the_refresh_token_dies(monkeypatch) -> None:
@@ -424,7 +461,10 @@ def test_archive_live_exits_1_when_the_refresh_token_dies(monkeypatch) -> None:
     assert calls and calls[0]["download_media"] is False
     assert calls[0]["reconcile"] == 1800
     assert cli.main(["archive", "--live", "60"]) == 1
-    assert calls[1]["reconcile"] == 60
+    assert calls[1]["reconcile"] == 60 and calls[1]["verify_media"] is False
+    assert cli.main(["archive", "--live", "--verify-media", "--videos", "--all", "--no-avatars"]) == 1
+    assert calls[2]["verify_media"] is True and "videos" in calls[2]["media_types"]
+    assert calls[2]["include_all"] is True and calls[2]["download_avatars"] is False
 
 
 def test_recheck_since_is_one_shot_and_validated(capsys) -> None:

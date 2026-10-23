@@ -280,3 +280,23 @@ def test_messages_by_id_skips_unreadable_rows(tmp_path: Path) -> None:
     store._db.commit()
     store.close()
     assert list(messages_by_id(store.dir, ["1", "2", "3"])) == ["1"]
+
+
+def test_iter_messages_pages_every_row_in_order_and_releases_the_db(tmp_path) -> None:
+    """Keyset pages: ties on composetime neither lost nor repeated, and no snapshot held between pages."""
+    store = ChatStore(tmp_path, "19:a@thread.v2")
+    rows = [
+        {"id": i, "composetime": t}
+        for i, t in [("b", "T1"), ("a", "T1"), ("c", "T0"), ("e", "T2"), ("d", "T1")]
+    ]
+    store.insert_page(rows)
+    store._db.execute("PRAGMA busy_timeout = 100")
+    seen = []
+    for message in store.iter_messages(page=2):
+        seen.append(message["id"])
+        other = ChatStore(tmp_path, "19:a@thread.v2")  # a live write lands mid-iteration
+        other.apply_message({"id": f"live-{len(seen)}", "composetime": "T9"}, "now")
+        other.close()
+        store.mark_denied(f"k{len(seen)}", 403, "now")  # still writable
+    assert seen[:5] == ["c", "a", "b", "d", "e"]
+    store.close()
