@@ -68,7 +68,13 @@ def test_colons_that_are_not_a_known_name_stay(text: str) -> None:
 
 
 def test_unknown_name_gives_its_closing_colon_back() -> None:
-    assert compose_html("10:30:fire: :fire::zap:", [], {})[0] == "10:30🔥 🔥⚡"
+    assert compose_html(":nope::fire: :fire::zap:", [], {})[0] == ":nope:🔥 🔥⚡"
+
+
+@pytest.mark.parametrize("text", ["a:b:c", "status:ok: done", "fe80::1:a:b", "10:30:fire:", "C:\\x:y"])
+def test_a_name_glued_to_a_word_stays(text: str) -> None:
+    """Built-in names include `a`, `b`, `ok`, `x`: only a `:` after a space or a mark opens one."""
+    assert compose_html(text, [], {})[0] == text
 
 
 # --- mentions -------------------------------------------------------------------------------------
@@ -864,8 +870,8 @@ def test_the_mark_class_holds_every_mark() -> None:
     assert set(compose._MARKS) == marks
 
 
-def test_teams_names_expand_after_the_custom_set() -> None:
-    """A Teams-only name (`salute`) sends its character; an org custom emoji by that name keeps its image."""
-    assert compose_html(":salute:", [], {})[0] == "🫡"
+def test_custom_emojis_win_their_name() -> None:
+    """An org custom emoji keeps its image over a built-in name; the built-in sends otherwise."""
     assert 'alt="party"' in compose_html(":party:", [], {"party": "x"})[0]
-    assert compose_html(":party:", [], {})[0] == "🥳"
+    assert 'alt="fire"' in compose_html(":fire:", [], {"fire": "x"})[0]
+    assert compose_html(":party: :salute: :smile:", [], {})[0] == "🥳 🫡 🙂"

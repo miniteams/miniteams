@@ -130,17 +130,18 @@ async def test_emoji_prefix_matches_builtin_and_custom_case_insensitive(board: W
     items = answer["items"]
     assert {"name": "fire", "char": "🔥"} in items
     assert {"name": "fiesta", "custom": OID, "src": f"/emoji/{OID}"} in items
-    # The built-in `fire` wins: a custom one by that name would send the built-in character.
-    assert [it for it in items if it["name"] == "fire"] == [{"name": "fire", "char": "🔥"}]
     assert (await _complete(board, "emoji", "FI"))["items"] == items
-    # Teams' names (`firecracker`) sort in among them.
-    assert (await _complete(board, "emoji", "fire"))["items"][:5] == [
+    # Shortest first; a custom and a built-in by one name both list; one name per built-in character.
+    assert (await _complete(board, "emoji", "fire"))["items"][:6] == [
+        {"name": "fire", "custom": "0-weu-d1-shadowed", "src": "/emoji/0-weu-d1-shadowed"},
         {"name": "fire", "char": "🔥"},
-        {"name": "firecracker", "char": "🧨"},
-        {"name": "fireengine", "char": "🚒"},
-        {"name": "fireextinguisher", "char": "🧯"},
         {"name": "Firefly", "custom": "0-weu-d1-f1", "src": "/emoji/0-weu-d1-f1"},
+        {"name": "fireworks", "char": "🎆"},
+        {"name": "fireengine", "char": "🚒"},
+        {"name": "firecracker", "char": "🧨"},
     ]
+    names = [it["name"] for it in (await _complete(board, "emoji", "fire"))["items"]]
+    assert "fire_engine" not in names and "fire_extinguisher" not in names  # same 🚒 🧯 as Teams' names
 
 
 async def test_emoji_list_is_capped_and_unknown_prefix_is_empty(board: W.Board) -> None:
@@ -151,11 +152,12 @@ async def test_emoji_list_is_capped_and_unknown_prefix_is_empty(board: W.Board) 
     assert {"name": "salute", "char": "🫡"} in (await _complete(board, "emoji", "salute"))["items"]
 
 
-async def test_a_custom_emoji_shadows_a_teams_name(board: W.Board) -> None:
-    """A Teams-only name yields to the organisation's emoji by that name, as compose sends it."""
+async def test_a_custom_emoji_and_a_builtin_by_one_name_both_list(board: W.Board) -> None:
+    """Picking the built-in inserts its character, the custom one `:salute:`: both stay reachable."""
     board.emojis.names = {"salute": OID}
     assert (await _complete(board, "emoji", "salute"))["items"] == [
-        {"name": "salute", "custom": OID, "src": f"/emoji/{OID}"}
+        {"name": "salute", "custom": OID, "src": f"/emoji/{OID}"},
+        {"name": "salute", "char": "🫡"},
     ]
 
 
@@ -362,9 +364,9 @@ async def test_plain_text_is_sent_exactly_as_before(board: W.Board, sent: list[A
 
 
 async def test_emojis_expand_with_the_fetched_custom_set(board: W.Board, sent: list[Any]) -> None:
-    assert await _send(board, B, ":fire: :fiesta:") is None
+    assert await _send(board, B, ":zap: :fiesta:") is None
     body = sent[0][1]
-    assert body.startswith('🔥 <img alt="fiesta" itemid="fiesta;0-weu-d1-feedc0ffee"')
+    assert body.startswith('⚡ <img alt="fiesta" itemid="fiesta;0-weu-d1-feedc0ffee"')
 
 
 async def test_compose_errors_answer_the_page(board: W.Board, sent: list[Any]) -> None:
@@ -512,7 +514,7 @@ async def test_custom_set_failure_keeps_the_builtin_set(
             await task
     assert [entry["event"] for entry in logs] == ["custom_emojis_unavailable"]
     assert board.emojis.names == {}
-    items = (await _complete(board, "emoji", "fi"))["items"]
+    items = (await _complete(board, "emoji", "fire"))["items"]
     assert {"name": "fire", "char": "🔥"} in items and not any("custom" in it for it in items)
     task = asyncio.create_task(board.emojis.refresh(interval=3600))
     await wait(lambda: bool(board.emojis.names), "the names fetched")
