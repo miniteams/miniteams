@@ -504,7 +504,11 @@
       // Emoji first: the member pattern's inner space would let `@ann :fi` read as one name.
       const before = input.value.slice(0, at), e = /(?:^|\s):([a-z0-9_+-]{2,})$/i.exec(before);
       const m = e || /(?:^|\s)@([^\s@]*(?: [^\s@]*)?)$/.exec(before);
-      return m && { kind: e ? "emoji" : "member", q: m[1], start: at - m[1].length - 1 };
+      if (!m) return null;
+      // `@{` asks for the Who of a free label until its `|` (spec 032).
+      const brace = !e && m[1].startsWith("{");
+      if (brace && /[|}]/.test(m[1])) return null;
+      return { kind: e ? "emoji" : "member", q: brace ? m[1].slice(1) : m[1], start: at - m[1].length - 1, brace };
     };
     const render = () => {
       pop.hidden = !comp;
@@ -571,7 +575,10 @@
       s.text = now;
     };
     const insert = (t) => {
-      const it = comp.items[comp.active], member = comp.kind === "member", text = member ? `@${it.name} ` : it.custom ? `:${it.name}:` : it.char;
+      const it = comp.items[comp.active], member = comp.kind === "member";
+      // The label starts as the name: one the label rule refuses (compose.plain_label, MAX_NAME), and @everyone, go in plain.
+      const brace = member && t.brace && !it.everyone && [...it.name].length <= 200 && !/[|}]|(?! )[\p{C}\p{Z}]/u.test(it.name);
+      const text = brace ? `@{${it.name}|${it.name}}` : member ? `@${it.name} ` : it.custom ? `:${it.name}:` : it.char;
       const id = chat(), s = picked.get(id) || { text: input.value, picks: [] };
       picked.set(id, s);
       close();
@@ -579,6 +586,7 @@
       put(text, t.start, input.selectionStart, it);
       track("insertReplacementText", true);  // a `put` no input event reported (setRangeText)
       if (member) s.picks = [...s.picks.filter((p) => p.at !== t.start), { ...pick(it), at: t.start }];
+      if (brace) input.setSelectionRange(t.start + it.name.length + 3, t.start + text.length - 1);  // the label, to type over
       edited();
     };
     // Enter with the list open picks, never sends; true when the key was the list's. While a longer

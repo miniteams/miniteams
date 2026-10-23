@@ -242,8 +242,10 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   it, marks it read in Teams once the window is visible, focused and at the latest message, and the archive has caught
   up (no "loading latest messages…"); one `read` a second per chat, the last one sent only if all that still holds.
 - **Composer** (also the widget's quick reply): completes `:emoji` and `@member` (`@everyone` on group chats, not 1:1;
-  picked members are notified; a mention needs a non-word character before `@`). A pick stays on the `@` it was
-  inserted at (spec 032): whatever the edit (selection deleted, Ctrl+Backspace, a word changed in the middle) that
+  picked members are notified; a mention needs a non-word character before `@`; `@{` completes the Who of a free
+  label, the pick inserting `@{Ann Lee|Ann Lee}` with the label selected, or a plain `@Name` when no label can hold
+  the name). A pick stays on the `@` it was inserted at (spec 032): whatever the edit (selection deleted,
+  Ctrl+Backspace, a word changed in the middle) that
   `@` is the picked person while what follows it is one of their forms, `@Ann Lee`, `@Ann` or `@Lee`, case and
   accents ignored, so namesakes shortened to `@Ann` and `@Moore` keep their own; another name there, or a longer
   one of someone else (`@Ann Moore` typed over `@Ann Lee`), reads as unpicked. Bold, italic or a list around it

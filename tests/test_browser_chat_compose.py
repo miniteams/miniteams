@@ -1356,6 +1356,34 @@ async def test_namesakes_shortened_to_different_forms_keep_their_recipients(fake
     assert await _sent_to(fake) == [ANN["mri"], MOORE["mri"]]
 
 
+async def test_a_brace_asks_for_its_who_and_selects_the_label(fake: Fake) -> None:
+    """032: `@{ann l` lists Ann Lee; the pick inserts `@{Ann Lee|Ann Lee}` with the label selected, typed
+    over, and sends her mention. Past the `|` nothing is asked."""
+    fake.members = ROSTER_032[1:]
+    page, box = _parts(fake)
+    await _pick(page, box, "@{ann l", ["Ann Lee"])
+    assert await box.input_value() == "@{Ann Lee|Ann Lee}"
+    assert await box.evaluate("b => [b.selectionStart, b.selectionEnd]") == [10, 17]
+    asked = len(fake.of("complete"))
+    await box.press_sequentially("boss")
+    assert await box.input_value() == "@{Ann Lee|boss}"
+    await box.press("Enter")
+    assert await _sent_to(fake) == [ANN["mri"]]
+    assert len(fake.of("complete")) == asked
+    await box.press_sequentially("@{Ann Lee|b")
+    await page.wait_for_timeout(400)
+    assert len(fake.of("complete")) == asked
+
+
+@pytest.mark.parametrize("name", ["Ann | Sales", "Ann\u00a0Sales", "Ann}Sales"])
+async def test_a_brace_pick_whose_name_no_label_holds_goes_in_plain(fake: Fake, name: str) -> None:
+    """032: a name the label rule refuses (`|`, NBSP, `}`) cannot start a brace's label: plain `@Name `."""
+    fake.members = [{"name": name, "mri": "8:orgid:sales"}]
+    page, box = _parts(fake)
+    await _pick(page, box, "@{ann", [name])
+    assert await box.input_value() == f"@{name} "
+
+
 def _refusal(text: str, roster: list[dict[str, Any]]) -> str:
     """The server's own refusal of `text`, unpicked, on `roster`."""
     with pytest.raises(ValueError) as refused:

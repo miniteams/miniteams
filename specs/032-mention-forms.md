@@ -34,7 +34,8 @@ names.
   before markdown, up to its first `}` (user decision, 2026-10-23): markup characters and URLs in it are
   text, `@` too. `label` is one line of text, not empty, at most MAX_NAME characters: no `|` or `}`, no tab or other blank but the space, no control, format, private-use or unassigned character
   (refused with that rule). Who may hold anything but `}` and a line break, and must name one member
-  whole. `\@` keeps the text literal. In the composer, `@{` does not open the member list.
+  whole. `\@` keeps the text literal. In the composer, `@{` opens the member list on Who; a pick inserts
+  `@{Full Name|Full Name}`, label selected (plain `@Full Name` when the label rule refuses the name).
 - **Composer.** Each pick is anchored at the `@` it was inserted at and travels with that offset. The
   `@` is the picked person while what follows it is one of their forms (full, first, last, or a
   `{Who|label}` whose Who is one), whatever the edits that produced it, so the Backspace shortening is no
@@ -128,11 +129,10 @@ None.
 
 ## Decisions
 
-- The free label is typed by hand, never offered from the member list.
+- The free label is typed by hand; the member list only fills Who (user request, 2026-10-23).
 
 - Last name = the name's last word, first name = its first word: no middle-name handling. Overturnable.
 - The composer refuses an ambiguous unpicked `@form` instead of sending it as plain text, as MCP does.
-- `@{` does not open the member list: the brace form is typed on purpose.
 - Free label in braces, not `@[Who]{label}`: no look-alike of the `[label](url)` link.
 - `@{Who|label}` is read raw before markdown, like a code span (user decision, 2026-10-23): markup
   characters are allowed in a label; `|`, `}`, line breaks and non-printing characters stay refused.
