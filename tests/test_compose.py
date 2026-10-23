@@ -862,3 +862,10 @@ def test_the_mark_class_holds_every_mark() -> None:
 
     marks = {chr(c) for c in range(sys.maxunicode + 1) if unicodedata.category(chr(c))[0] == "M"}
     assert set(compose._MARKS) == marks
+
+
+def test_teams_names_expand_after_the_custom_set() -> None:
+    """A Teams-only name (`salute`) sends its character; an org custom emoji by that name keeps its image."""
+    assert compose_html(":salute:", [], {})[0] == "🫡"
+    assert 'alt="party"' in compose_html(":party:", [], {"party": "x"})[0]
+    assert compose_html(":party:", [], {})[0] == "🥳"

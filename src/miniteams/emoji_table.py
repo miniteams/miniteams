@@ -1,5 +1,9 @@
 """Built-in `:shortcode:` → character table for the composer (GitHub/Slack names, common set)."""
 
+import re
+
+from .teams_emojis import TEAMS_EMOJIS
+
 SHORTCODES: dict[str, str] = {
     "+1": "👍",
     "-1": "👎",
@@ -459,4 +463,14 @@ SHORTCODES: dict[str, str] = {
     "zap": "⚡",
     "zipper_mouth_face": "🤐",
     "zzz": "💤",
+}
+
+# Teams' hex-keyed ids (`1f910_zippermouthface`, `1f415_200d_1f9ba_servicedog`) are typed by their name part.
+_HEX_ID = re.compile(r"[0-9][0-9a-f]{3,5}(?:[-_][0-9a-f]{4,6})*_")
+
+# Teams' names the common set lacks (`salute`): they yield to the organisation's custom emojis.
+TEAMS_NAMES: dict[str, str] = {
+    stripped: char
+    for name, char in reversed(TEAMS_EMOJIS.items())  # the first of two equal names wins
+    if (stripped := _HEX_ID.sub("", name, count=1)) not in SHORTCODES
 }

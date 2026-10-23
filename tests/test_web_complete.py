@@ -130,12 +130,15 @@ async def test_emoji_prefix_matches_builtin_and_custom_case_insensitive(board: W
     items = answer["items"]
     assert {"name": "fire", "char": "🔥"} in items
     assert {"name": "fiesta", "custom": OID, "src": f"/emoji/{OID}"} in items
-    assert {"name": "Firefly", "custom": "0-weu-d1-f1", "src": "/emoji/0-weu-d1-f1"} in items
     # The built-in `fire` wins: a custom one by that name would send the built-in character.
     assert [it for it in items if it["name"] == "fire"] == [{"name": "fire", "char": "🔥"}]
     assert (await _complete(board, "emoji", "FI"))["items"] == items
-    assert (await _complete(board, "emoji", "fir"))["items"][:2] == [
+    # Teams' names (`firecracker`) sort in among them.
+    assert (await _complete(board, "emoji", "fire"))["items"][:5] == [
         {"name": "fire", "char": "🔥"},
+        {"name": "firecracker", "char": "🧨"},
+        {"name": "fireengine", "char": "🚒"},
+        {"name": "fireextinguisher", "char": "🧯"},
         {"name": "Firefly", "custom": "0-weu-d1-f1", "src": "/emoji/0-weu-d1-f1"},
     ]
 
@@ -145,6 +148,15 @@ async def test_emoji_list_is_capped_and_unknown_prefix_is_empty(board: W.Board) 
     many = await _complete(board, "emoji", "s")
     assert len(many["items"]) == 12
     assert (await _complete(board, "emoji", "zzqx"))["items"] == []
+    assert {"name": "salute", "char": "🫡"} in (await _complete(board, "emoji", "salute"))["items"]
+
+
+async def test_a_custom_emoji_shadows_a_teams_name(board: W.Board) -> None:
+    """A Teams-only name yields to the organisation's emoji by that name, as compose sends it."""
+    board.emojis.names = {"salute": OID}
+    assert (await _complete(board, "emoji", "salute"))["items"] == [
+        {"name": "salute", "custom": OID, "src": f"/emoji/{OID}"}
+    ]
 
 
 @pytest.mark.parametrize("q", [None, 3, "", "a" * 65, ["fi"]])

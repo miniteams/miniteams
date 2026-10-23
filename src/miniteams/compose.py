@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 from .chats import chat_kind
 from .config import Settings
 from .directory import humans
-from .emoji_table import SHORTCODES
+from .emoji_table import SHORTCODES, TEAMS_NAMES
 from .messages import fold, is_me, snippet
 from .send import MAX_HTML_BYTES, NOTES_THREAD, too_long
 
@@ -314,7 +314,7 @@ def compose_html(
                 f'src="https://{asyncgw_host}/v1/objects/{oid}/views/imgt2_anim" '
                 'style="width:20px; height:20px">'
             )
-        return None
+        return TEAMS_NAMES.get(emoji)
 
     def on_text(seg: str) -> str:
         out: list[str] = []
