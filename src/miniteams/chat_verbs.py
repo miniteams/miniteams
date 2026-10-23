@@ -40,7 +40,7 @@ from .decompose import Editable, decompose
 from .directory import Directory, is_app
 from .directory import humans as _humans
 from .dump import epoch_seconds, fetch_history
-from .emoji_table import SHORTCODES, TEAMS_NAMES
+from .emoji_table import SHORTCODES
 from .emojis import EmojiCache
 from .files import check_files, my_onedrive, post_files, upload_files
 from .http import Downloads, failure
@@ -1746,12 +1746,8 @@ class ChatVerbs:
         self._background(push())
 
     def _emoji_items(self, prefix: str) -> list[dict[str, Any]]:
-        found: list[dict[str, Any]] = [
-            {"name": name, "char": char} for name, char in SHORTCODES.items() if name.startswith(prefix)
-        ]
-        # A custom name the built-in table shadows would send the built-in character.
         keys = self.emojis.keys
-        found += [
+        found: list[dict[str, Any]] = [
             {
                 "name": name,
                 "custom": oid,
@@ -1759,11 +1755,18 @@ class ChatVerbs:
                 **({"key": keys[name]} if name in keys else {}),
             }
             for name, oid in self.emojis.names.items()
-            if name.casefold().startswith(prefix) and name not in SHORTCODES
+            if name.casefold().startswith(prefix)
         ]
+        # Both list under a shared name: a built-in pick inserts its character, a custom one `:name:`.
         found += [
-            {"name": name, "char": char}
-            for name, char in TEAMS_NAMES.items()
-            if name.startswith(prefix) and name not in self.emojis.names
+            {"name": name, "char": char} for name, char in SHORTCODES.items() if name.startswith(prefix)
         ]
-        return sorted(found, key=lambda it: str(it["name"]).casefold())[:_COMPLETE_ITEMS]
+        # Shortest first (`fi` → `fire`), one name per character (`fireengine`, not `fire_engine` too).
+        found.sort(key=lambda it: (len(it["name"]), str(it["name"]).casefold()))
+        items, seen = [], set()
+        for it in found:
+            char = it.get("char", "").replace("\ufe0f", "")
+            if not char or char not in seen:
+                items.append(it)
+                seen.add(char)
+        return items[:_COMPLETE_ITEMS]

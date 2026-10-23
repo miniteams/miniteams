@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 from .chats import chat_kind
 from .config import Settings
 from .directory import humans
-from .emoji_table import SHORTCODES, TEAMS_NAMES
+from .emoji_table import SHORTCODES
 from .messages import fold, is_me, snippet
 from .send import MAX_HTML_BYTES, NOTES_THREAD, too_long
 
@@ -35,9 +35,9 @@ _URL_TRAIL = frozenset(".,:;!?*_~…–—«»‹›“”‘’")
 _URL_CLOSERS = {")": "(", "]": "[", "}": "{"}
 _URL_HOST_RE = re.compile(r"https?://[^/?#']*")
 _ORDERED_RE = re.compile(r"\d{1,9}\. ")
-# The trailing `:` is a lookahead so an unknown name gives it back: `10:30:fire:` still finds `:fire:`;
-# never a URL's `:` (`URL:https://…`).
-_EMOJI = rf":(?P<emoji>{EMOJI_NAME_RE.pattern})(?=:(?!//))"
+# The trailing `:` is a lookahead so an unknown name gives it back: `:nope::fire:` still finds `:fire:`;
+# never a URL's `:` (`URL:https://…`), nor one glued to a word (`a:b:c`, `fe80::1:a:b`, `10:30:x:`).
+_EMOJI = rf"(?<![A-Za-z0-9]):(?P<emoji>{EMOJI_NAME_RE.pattern})(?=:(?!//))"
 _PREVIEW_LEN = 100  # characters of the quoted message a Reply block carries
 _SPANS = (("**", "b"), ("~~", "s"), ("*", "i"), ("_", "i"))
 MAX_MENTIONS = 50
@@ -304,8 +304,7 @@ def compose_html(
                 f"{html.escape(label)}</span>"
             )
         emoji = m.group("emoji")
-        if emoji in SHORTCODES:
-            return SHORTCODES[emoji]
+        # Custom first: `:name:` is what a custom pick inserts, a built-in pick inserts its character.
         if emoji in emojis:
             name, oid = html.escape(emoji), html.escape(emojis[emoji])
             # alt is the bare name, as in every CustomEmoji Teams wrote to the archive.
@@ -314,7 +313,7 @@ def compose_html(
                 f'src="https://{asyncgw_host}/v1/objects/{oid}/views/imgt2_anim" '
                 'style="width:20px; height:20px">'
             )
-        return TEAMS_NAMES.get(emoji)
+        return SHORTCODES.get(emoji)
 
     def on_text(seg: str) -> str:
         out: list[str] = []
