@@ -653,7 +653,7 @@ def test_record_mentions_and_me() -> None:
 def test_a_mention_shows_its_persons_full_name_on_hover(
     thread: str, mri: str, known: dict[str, str], title: str
 ) -> None:
-    """032-AC9: a mention span carries its person's full name as `title`, from the directory (which holds the
+    """033-AC9: a mention span carries its person's full name as `title`, from the directory (which holds the
     chats' roster names); unknown, or everyone, no title."""
     directory = Directory.__new__(Directory)
     directory._names = dict(known)
@@ -2951,7 +2951,7 @@ def test_parse_send_types_a_valid_verb_and_names_the_first_refusal() -> None:
     [("hi", None), ("hi", True), ("hi", 1.0), ("hi", "1"), ("hi", -1), ("hi", 2), ("😀@A", 1), ("😀@A", 4)],
 )
 def test_a_pick_anchor_must_be_an_offset_of_the_text(text: str, at: Any) -> None:
-    """032: every pick is anchored at an offset of the text, in UTF-16 code units: missing, not an int, past
+    """033: every pick is anchored at an offset of the text, in UTF-16 code units: missing, not an int, past
     the text or inside an emoji's surrogate pair, the verb is refused before any work."""
     pick = {"name": "A", "mri": ANN} | ({} if at is None else {"at": at})
     assert CV.parse_send({"send": T, "text": text, "mentions": [pick]}) == "invalid mention"
@@ -2961,7 +2961,7 @@ def test_a_pick_anchor_must_be_an_offset_of_the_text(text: str, at: Any) -> None
 
 @pytest.mark.parametrize("verb", ["send", "edit"])
 def test_a_long_blank_text_beside_images_is_refused_before_its_picks_are_mapped(verb: str) -> None:
-    """032 review L3: whitespace beside images skips the text check; a megabyte of it with a pick is refused
+    """033 review L3: whitespace beside images skips the text check; a megabyte of it with a pick is refused
     as too long before any offset table is built over it."""
     text, pick = " " * 1_000_000, {"name": "A", "mri": ANN, "at": 0}
     start = time.process_time()
@@ -2984,7 +2984,7 @@ def test_a_long_blank_text_beside_images_is_refused_before_its_picks_are_mapped(
 
 @pytest.mark.parametrize(("text", "unit", "index"), [("😀@A", 2, 1), ("a😀𝐀 @A", 6, 4), ("@A", 0, 0)])
 def test_an_anchor_crosses_from_the_pages_unit_to_the_texts(text: str, unit: int, index: int) -> None:
-    """032: the page anchors a pick in UTF-16 code units (an emoji counts two), the server reads its text by
+    """033: the page anchors a pick in UTF-16 code units (an emoji counts two), the server reads its text by
     character: the `@` after astral characters is the one anchored."""
     request = CV.parse_send({"send": T, "text": text, "mentions": [{"name": "A", "mri": ANN, "at": unit}]})
     assert isinstance(request, CV.SendRequest) and request.mentions[0]["at"] == index

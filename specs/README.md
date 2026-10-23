@@ -34,4 +34,4 @@
 | [030](030-teams-mute.md) | Widget mute is Teams' mute | shipped |
 | [031](031-giphy-images.md) | Show Giphy GIFs inline | shipped |
 | [032](032-live-media-sweep.md) | Media sweep inside `archive --live` | approved |
-| [032](032-mention-forms.md) | Mention by first name, last name or a free label | in progress |
+| [033](033-mention-forms.md) | Mention by first name, last name or a free label | in progress |

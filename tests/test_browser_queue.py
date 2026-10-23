@@ -178,7 +178,7 @@ def _verb(**over: Any) -> str:
 )
 async def test_a_malformed_stored_queue_is_dropped(pages: Pages, stored: str) -> None:
     """017-AC12: what sessionStorage holds is checked like any input: a malformed entry sends nothing and
-    breaks nothing; the page still sends. (A malformed pick alone leaves only itself out, spec 032.)"""
+    breaks nothing; the page still sends. (A malformed pick alone leaves only itself out, spec 033.)"""
     fake = Widget()
     init = f"sessionStorage.setItem({json.dumps('queue:' + T)}, {json.dumps(stored)});"
     page = await open_fake_widget(pages, fake, init)
@@ -447,7 +447,7 @@ async def test_a_stored_paused_queue_says_enter_sends_it(pages: Pages) -> None:
 async def test_a_stored_message_keeps_its_text_when_a_pick_is_not_one(
     pages: Pages, saved: Any, sent: Any
 ) -> None:
-    """032 review L2: a queue stored before anchors (or tampered with) keeps its message: only the picks that
+    """033 review L2: a queue stored before anchors (or tampered with) keeps its message: only the picks that
     are not picks are left out, the rest go as stored, and its `@`s then resolve on the roster."""
     record = {
         "paused": True,

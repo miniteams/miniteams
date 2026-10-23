@@ -492,7 +492,7 @@
     pop.setAttribute("role", "listbox");
     pop.onmousedown = (e) => e.preventDefault();  // its scrollbar too: a press there must not blur the input
     let comp = null, want = null, timer = 0, dismissed = -1;
-    // Spec 032: each pick anchored at the `@` it was inserted at, in the text it was last kept current with.
+    // Spec 033: each pick anchored at the `@` it was inserted at, in the text it was last kept current with.
     // The server reads that `@` as that person while one of their forms follows it, else as unpicked: an
     // edit never moves a pick to another `@`, it can only drop it.
     const picked = new Map();  // chat id → { text, picks: [{ name, mri, everyone?, at }] }
@@ -505,7 +505,7 @@
       const before = input.value.slice(0, at), e = /(?:^|\s):([a-z0-9_+-]{2,})$/i.exec(before);
       const m = e || /(?:^|\s)@([^\s@]*(?: [^\s@]*)?)$/.exec(before);
       if (!m) return null;
-      // `@{` asks for the Who of a free label until its `|` (spec 032).
+      // `@{` asks for the Who of a free label until its `|` (spec 033).
       const brace = !e && m[1].startsWith("{");
       if (brace && /[|}]/.test(m[1])) return null;
       return { kind: e ? "emoji" : "member", q: brace ? m[1].slice(1) : m[1], start: at - m[1].length - 1, brace };
@@ -682,7 +682,7 @@
   // execCommand keeps the edit in the textarea's undo history (Ctrl+Z); setRangeText would not.
   // Its `input` event runs the completion's lookup: an insert settles what it dismisses before calling.
   // `adds`: the [offset, length] spans `text` adds to `[a, b)` without changing it (markers, prefixes), which
-  // move a mention's anchor with its `@` (spec 032). The input event it causes is marked as the page's own.
+  // move a mention's anchor with its `@` (spec 033). The input event it causes is marked as the page's own.
   const insertText = (input, text, a, b, selA, selB, adds = null) => {
     input.focus();
     input.setSelectionRange(a, b);
@@ -1031,7 +1031,7 @@
     };
     // The send in flight, its attempt and images, back on its item: sent again, it goes with its id and the check.
     const hold = (id, e) => { const f = imgs.recall(id); if (f) Object.assign(e, { sent: { cmid: f.cmid, json: f.json }, images: Promise.resolve(f.items) }); };
-    // A mention the server refused (spec 032: ambiguous, unknown…, said with compose.py's `\@` hint) is
+    // A mention the server refused (spec 033: ambiguous, unknown…, said with compose.py's `\@` hint) is
     // the text's to fix: it goes back into the empty composer, its reason on the chat's line.
     const fail = (id, text) => {
       if (!busy(id)) return;
@@ -1074,7 +1074,7 @@
     };
     const edit = (id, e) => { if (!back(id, e)) { e.editing = e.verb.text; changed(id); } };
     // An edit sent from the item: a changed text is a new message (its old id's echo is not its own), an
-    // unchanged one a retry. That editor tracks no anchors (spec 032): picks before the first change stay.
+    // unchanged one a retry. That editor tracks no anchors (spec 033): picks before the first change stay.
     const resend = (id, e, text) => {
       if (text !== e.verb.text) {
         let a = 0;
@@ -1164,7 +1164,7 @@
           if (!verbOk(it?.verb, id)) continue;
           pics ||= it.pics === true;
           if (!it.verb.text.trim()) continue;
-          // A pick that is not one (saved before anchors, spec 032) is left out, never its message: that
+          // A pick that is not one (saved before anchors, spec 033) is left out, never its message: that
           // `@` then resolves on the roster, or the send is refused. Its attempt stays its own, check and all.
           const verb = { ...it.verb, mentions: it.verb.mentions.filter(pick) }, same = verb.mentions.length === it.verb.mentions.length;
           const sent = /^\d+$/.test(it.sent?.cmid) && str(it.sent.json) ? { cmid: it.sent.cmid, json: same ? it.sent.json : JSON.stringify(verb) } : undefined;

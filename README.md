@@ -96,7 +96,7 @@ without `--html`, is rendered as the chat page's composer does (spec 029): markd
 name, case and accents ignored, longest first) mentions that member, shown as the roster spells that form
 (`Ann Lee`, `Ann`, `Lee`); `@{Who|label}` mentions the member Who names (any of those forms, so the full
 name settles a shared one) shown as `label`, the whole `@{Who|label}` read raw, markup and all, up to its
-`}` (the last `|` splits; the label: one line, 1 to 200 characters, no `|` or `}`, no tab or other blank but the space, no control, format, private-use or unassigned character) (spec 032); `@everyone` mentions a group chat; `\@` is a literal `@`, and an email or code is never a mention. A name matching nobody or several members (`ambiguous
+`}` (the last `|` splits; an empty label shows the full name; the label: one line, up to 200 characters, no `|` or `}`, no tab or other blank but the space, no control, format, private-use or unassigned character) (spec 033); `@everyone` mentions a group chat; `\@` is a literal `@`, and an email or code is never a mention. A name matching nobody or several members (`ambiguous
 mention @Lee: Ann Lee, Bob Lee (\@ for a literal @)`), a malformed label, a roster that cannot be fetched, `@everyone` on a 1:1,
 more than 50 mentions or 28 KB of HTML refuse the send (an MCP error, exit 2 for the CLI), nothing written. `--read-only` keeps every writing tool
 out of the list. Nothing needs a token until the
@@ -244,13 +244,13 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
 - **Composer** (also the widget's quick reply): completes `:emoji` and `@member` (`@everyone` on group chats, not 1:1;
   picked members are notified; a mention needs a non-word character before `@`; `@{` completes the Who of a free
   label, the pick inserting `@{Ann Lee|Ann Lee}` with the label selected, or a plain `@Name` when no label can hold
-  the name). A pick stays on the `@` it was inserted at (spec 032): whatever the edit (selection deleted,
+  the name). A pick stays on the `@` it was inserted at (spec 033): whatever the edit (selection deleted,
   Ctrl+Backspace, a word changed in the middle) that
   `@` is the picked person while what follows it is one of their forms, `@Ann Lee`, `@Ann` or `@Lee`, case and
   accents ignored, so namesakes shortened to `@Ann` and `@Moore` keep their own; another name there, or a longer
   one of someone else (`@Ann Moore` typed over `@Ann Lee`), reads as unpicked. Bold, italic or a list around it
   keep the pick; deleting, replacing or pasting over the `@` drops it, and so does an undo. An `@Ann`, `@Lee`,
-  `@Ann Lee` or `@{Ann Lee|label}` with no pick is resolved on the chat's members as MCP does (spec 032, above):
+  `@Ann Lee` or `@{Ann Lee|label}` with no pick is resolved on the chat's members as MCP does (spec 033, above):
   ambiguous or unknown, the send is refused, the text back in the empty composer and the reason on its line.
   Editing a message gives its plain `@word` back as `\@word`, so it stays text, and
   each person mention braced: `@{Full Name|label}`, or `@{label|label}` when the full name is unknown (no
@@ -295,7 +295,7 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   - Widget: inline formatting.
   - Chat page: bold, italic, strike, code, lists, quotes through a toolbar or Ctrl+B / Ctrl+I, plus a preview of the message as posted.
 - **Messages**: hover for actions: reply with a quote, react, edit and delete your own. A mention shows its
-  person's full name on hover when known (spec 032). The picker shows 8 favorites
+  person's full name on hover when known (spec 033). The picker shows 8 favorites
   (default: Teams' 6 reactions plus 🙏 and 🙃) and `…`, which reacts with any emoji found by `:name`, the org's custom ones
   included. Set the favorites in ⚙ **Reactions**: click a slot to replace it, ◀ ▶ move the chosen slot, `Reset`; kept
   in this browser's `localStorage`. An emoji goes as Teams' name for it (`praying`) when it has one, else as its hex key

@@ -105,7 +105,7 @@ async def test_the_editor_completes_like_the_composer_and_posts_the_mention(fake
             "edit": T,
             "msg": "1",
             "text": "mine 🔥 @Ann Lee ",
-            "mentions": [{**ANN, "at": 8}],  # UTF-16: the emoji counts two (spec 032)
+            "mentions": [{**ANN, "at": 8}],  # UTF-16: the emoji counts two (spec 033)
             "keep_quotes": [],
             "keep_images": [],
         }
@@ -507,7 +507,7 @@ async def test_the_message_is_text_in_the_editor(fake: Fake) -> None:
 
 @BOTH
 async def test_backspace_after_a_kept_brace_is_an_ordinary_backspace(fake: Fake) -> None:
-    """032 review: an edit opens with a kept `@{Ann Lee|Ann} `; Backspace at its end deletes the space, never
+    """033 review: an edit opens with a kept `@{Ann Lee|Ann} `; Backspace at its end deletes the space, never
     shortens the brace to `@{Ann`, and the save carries the kept mention."""
     page = fake.page
     assert page is not None
@@ -532,7 +532,7 @@ async def test_backspace_after_a_kept_brace_is_an_ordinary_backspace(fake: Fake)
 async def test_an_undo_in_an_edit_keeps_the_kept_mention_its_own(
     fake: Fake, keys: list[str], other: str, outcome: Any
 ) -> None:
-    """032 review r4/r5: a departed Ann's kept `@{Lee|Lee}`; text typed then undone (or undone and redone),
+    """033 review r4/r5: a departed Ann's kept `@{Lee|Lee}`; text typed then undone (or undone and redone),
     then more typed: the page dropped its anchors; the save, read by the server, still mentions Ann while
     nobody else answers to `Lee`, and is refused when Bob Lee does, never sent to him."""
     page = fake.page

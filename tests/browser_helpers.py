@@ -401,7 +401,7 @@ async def open_fake(
 
 def server_reads(verb: dict[str, Any], members: list[dict[str, Any]]) -> list[str] | str:
     """The MRIs the server mentions, in text order, for a page's `send` verb with `members` in the chat (spec
-    032): parsed, anchored and resolved as a send does it; the refusal when it refuses."""
+    033): parsed, anchored and resolved as a send does it; the refusal when it refuses."""
     request = CV.parse_send(verb)
     if isinstance(request, str):
         return request

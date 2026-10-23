@@ -163,7 +163,7 @@ async def test_backspace_shortens_a_picked_mention_without_losing_the_recipient(
     assert await box.input_value() == "@Ann h"
     await box.press("Enter")
     await wait(lambda: len(fake.of("send")) == 1)
-    assert fake.of("send")[0]["mentions"] == [{**ANN, "at": 0}]  # who was picked, at its `@` (spec 032)
+    assert fake.of("send")[0]["mentions"] == [{**ANN, "at": 0}]  # who was picked, at its `@` (spec 033)
     assert server_reads(fake.of("send")[0], fake.members) == [ANN["mri"]]
 
 
@@ -501,12 +501,12 @@ async def test_a_deleted_pick_does_not_mention_its_namesake(fake: Fake, picks: l
 
 async def test_picks_out_of_text_order_mention_both(fake: Fake) -> None:
     """M1: a mention inserted before an earlier pick still counts, and so does the earlier one; the picks
-    go in text order (spec 032)."""
+    go in text order (spec 033)."""
     assert await pick_out_of_order(fake) == [ANN["mri"], BOB["mri"]]
 
 
 async def test_a_longer_word_leaves_the_first_name_mention(fake: Fake) -> None:
-    """L4, spec 032: `@Ann Leeds` is no `@Ann Lee`, but `@Ann` (her first name, a form of the pick) followed
+    """L4, spec 033: `@Ann Leeds` is no `@Ann Lee`, but `@Ann` (her first name, a form of the pick) followed
     by `Leeds`, as the server reads it."""
     assert await pick_then_glue(fake) == [ANN["mri"]]
 

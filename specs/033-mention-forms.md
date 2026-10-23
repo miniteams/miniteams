@@ -1,4 +1,4 @@
-# 032 — Mention by first name, last name or a free label
+# 033 — Mention by first name, last name or a free label
 
 **Status**: in progress
 **Requested by**: babs
@@ -32,7 +32,8 @@ names.
   disambiguate with the full name), and the mention displays `label` as typed. The last `|` splits them,
   so `Who` may hold a `|` (`@{John Doe | Sales|boss}`). The whole `@{Who|label}` is one token read raw
   before markdown, up to its first `}` (user decision, 2026-10-23): markup characters and URLs in it are
-  text, `@` too. `label` is one line of text, not empty, at most MAX_NAME characters: no `|` or `}`, no tab or other blank but the space, no control, format, private-use or unassigned character
+  text, `@` too. `label` is one line of text, at most MAX_NAME characters (empty or spaces only: the member's full
+  name, user request 2026-10-23): no `|` or `}`, no tab or other blank but the space, no control, format, private-use or unassigned character
   (refused with that rule). Who may hold anything but `}` and a line break, and must name one member
   whole. `\@` keeps the text literal. In the composer, `@{` opens the member list on Who; a pick inserts
   `@{Full Name|Full Name}`, label selected (plain `@Full Name` when the label rule refuses the name).
@@ -61,7 +62,7 @@ names.
   of the name the message knows them by; else refused. Without a
   roster, only `{label|label}` names nobody; any other Who is `roster unavailable`. A brace with no kept label
   takes the roster rule. Regression-tested
-  shapes (spec 032 review): a longer roster name after a kept label (`, ` `/` ` (` NBSP `-`), a longer
+  shapes (spec 033 review): a longer roster name after a kept label (`, ` `/` ` (` NBSP `-`), a longer
   member picked beside it, namesakes deleted, re-picked or preceded by a new pick, a namesake or a member
   bearing a departed person's name picked then deleted, text typed after a kept mention, the roster down
   at opening or at saving, the page's picks anchored as ui.js keeps them: none sends a kept mention to

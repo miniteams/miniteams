@@ -767,7 +767,7 @@ def test_the_roster_lookup_gets_the_bearer_every_directory_gets(
     assert wire["bearers"] == [bearer] and wire["roster"] == [GROUP]
 
 
-# --- send: name forms and free labels (spec 032) ---
+# --- send: name forms and free labels (spec 033) ---
 
 
 @pytest.mark.parametrize(
@@ -782,6 +782,7 @@ def test_the_roster_lookup_gets_the_bearer_every_directory_gets(
             [(0, ANN, "Lee")],
         ),
         ("@{ann|the boss} hi", ROSTER, f"{_span(0, 'the boss')} hi", [(0, ANN, "the boss")]),
+        ("@{ann|} hi", ROSTER, f"{_span(0, 'Ann Lee')} hi", [(0, ANN, "Ann Lee")]),
         (
             "@{John Doe | Sales|boss} hi",
             [*ROSTER, {"mri": "8:orgid:john", "name": "John Doe | Sales"}],
@@ -798,7 +799,7 @@ def test_send_takes_every_name_form_and_free_labels(
     html: str,
     entries: list[tuple[Any, ...]],
 ) -> None:
-    """032-AC4 (AC1–AC3): a last name, or `@{Who|label}`, mentions its member as MCP does."""
+    """033-AC4 (AC1–AC3): a last name, or `@{Who|label}`, mentions its member as MCP does."""
     wire["members"] = members
     assert cli.cmd_send(settings, _send_ns(text)) == 0
     ((_, body, _, props),) = wire["posts"]
@@ -809,7 +810,6 @@ def test_send_takes_every_name_form_and_free_labels(
     ("text", "reason"),
     [
         ("@Lee hi", "ambiguous mention @Lee: Ann Lee, Bob Lee (\\@ for a literal @)"),
-        ("@{Ann Lee|} hi", "empty mention label @{Ann Lee|} (\\@ for a literal @)"),
         (
             "@{Ann Lee|a\tb} hi",
             f"mention label refused @{{Ann Lee|a\tb}}: {compose._LABEL_RULE} (\\@ for a literal @)",
@@ -821,7 +821,7 @@ def test_send_takes_every_name_form_and_free_labels(
 def test_a_refused_form_exits_2_before_any_write(
     settings: Settings, wire: dict[str, Any], tmp_path, text: str, reason: str, extra: str
 ) -> None:
-    """032-AC4: an ambiguous form or a malformed free label is logged and exits 2; nothing uploaded or
+    """033-AC4: an ambiguous form or a malformed free label is logged and exits 2; nothing uploaded or
     posted."""
     from test_images import png
 
@@ -836,6 +836,6 @@ def test_a_refused_form_exits_2_before_any_write(
 
 
 def test_an_escaped_free_label_is_sent_as_typed(settings: Settings, wire: dict[str, Any]) -> None:
-    """032-AC4 (AC3): `\\@{Ann Lee|x}` is literal: no roster call, no properties."""
+    """033-AC4 (AC3): `\\@{Ann Lee|x}` is literal: no roster call, no properties."""
     assert cli.cmd_send(settings, _send_ns(r"\@{Ann Lee|x}")) == 0
     assert wire["posts"] == [(GROUP, "@{Ann Lee|x}", True, None)] and wire["roster"] == []

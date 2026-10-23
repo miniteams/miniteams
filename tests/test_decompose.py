@@ -127,7 +127,7 @@ def test_mentions_come_back_as_picks_in_text_order() -> None:
     form = _round_trip("@Ann Lee and @everyone, again @Ann Lee", [ANN, EVERYONE])
     assert form.text == "@{Ann Lee|Ann Lee} and @everyone, again @{Ann Lee|Ann Lee}"
     braced = {"name": "{Ann Lee|Ann Lee}", "mri": ANN["mri"]}
-    # Each anchored at its own `@` (spec 032).
+    # Each anchored at its own `@` (spec 033).
     ats = [form.text.index("@{"), form.text.index("@every"), form.text.rindex("@{")]
     assert form.picks == [{**braced, "at": ats[0]}, {**EVERYONE, "at": ats[1]}, {**braced, "at": ats[2]}]
 
@@ -476,7 +476,7 @@ def test_a_literal_mention_name_is_escaped_rather_than_mentioning() -> None:
     assert compose_html(form.text, form.picks, EMOJIS, full=True)[0] == content[3:-4].replace(
         "itemscope ", 'itemscope="" '
     )
-    # 032: every sender resolves an unpicked `@team`: kept text only escaped.
+    # 033: every sender resolves an unpicked `@team`: kept text only escaped.
     assert _form("<p>mail a@b.com or @team, @ 5</p>").text == "mail a@b.com or \\@team, @ 5"
 
 
@@ -595,19 +595,19 @@ def test_escape_everything_leaves_an_email_alone(html_: str, md: str) -> None:
     assert form.text == f"a\\~~~b~~ \\[[x](https://x.test) {md}"
 
 
-# --- every kept person mention comes back braced (spec 032, user decision) ---
+# --- every kept person mention comes back braced (spec 033, user decision) ---
 
-ROSTER_032 = [
+ROSTER_033 = [
     {"mri": "8:orgid:me", "name": "Me Self"},
     {"mri": "8:orgid:ann", "name": "Ann Lee"},
     {"mri": "8:orgid:moore", "name": "Ann Moore"},
     {"mri": "8:orgid:leebob", "name": "Lee Bob"},
     {"mri": "8:orgid:john", "name": "John Doe | Sales"},
 ]
-NAMES_032 = {m["mri"]: m["name"] for m in ROSTER_032}
+NAMES_033 = {m["mri"]: m["name"] for m in ROSTER_033}
 
 
-def _saved(text: str, picks: list[dict[str, Any]], roster: list[dict[str, Any]] = ROSTER_032) -> list[Any]:
+def _saved(text: str, picks: list[dict[str, Any]], roster: list[dict[str, Any]] = ROSTER_033) -> list[Any]:
     """What a save resolves for `text` with the editor's picks given back unchanged, as chat_verbs does:
     each the copy's own (kept), anchored at its `@`, read on `roster`."""
     names = humans(roster)
@@ -643,9 +643,9 @@ def _labelled(*spans: tuple[str, str, str]) -> dict[str, Any]:
     ],
 )
 def test_a_person_always_comes_back_braced_with_the_full_name(label: str, typed: str) -> None:
-    """032-AC8: `@{Full Name|label}` whatever the label: one spelling for one person, which no name read on
+    """033-AC8: `@{Full Name|label}` whatever the label: one spelling for one person, which no name read on
     save can extend; the text and picks compose back to the same span and entry."""
-    form = decompose(_labelled(("8:orgid:ann", label, " hi")), {}, NAMES_032)
+    form = decompose(_labelled(("8:orgid:ann", label, " hi")), {}, NAMES_033)
     assert isinstance(form, Editable), form
     assert (form.text, form.picks) == (f"@{typed} hi", [{"name": typed, "mri": "8:orgid:ann", "at": 0}])
     assert _save(form.text, form.picks) == [("8:orgid:ann", label)]
@@ -653,7 +653,7 @@ def test_a_person_always_comes_back_braced_with_the_full_name(label: str, typed:
 
 @pytest.mark.parametrize("names", [{}, {"8:orgid:ann": "  "}])
 def test_with_the_name_unknown_the_label_braces_itself(names: dict[str, str]) -> None:
-    """032 user decision: no name known (no roster, or they left): `@{label|label}`, read by its kept pick
+    """033 user decision: no name known (no roster, or they left): `@{label|label}`, read by its kept pick
     only, so a save, the roster back or not, keeps the same person."""
     form = decompose(_labelled(("8:orgid:ann", "the boss", " hi")), {}, names)
     assert isinstance(form, Editable), form
@@ -664,9 +664,9 @@ def test_with_the_name_unknown_the_label_braces_itself(names: dict[str, str]) ->
 
 
 def test_a_name_holding_a_bar_comes_back_whole() -> None:
-    """032-AC8: `John Doe | Sales` labelled `boss` → `@{John Doe | Sales|boss}`, the last `|` splitting."""
+    """033-AC8: `John Doe | Sales` labelled `boss` → `@{John Doe | Sales|boss}`, the last `|` splitting."""
     composed = compose_html("@x", [{"name": "x", "mri": "8:orgid:john", "label": "boss"}], {}, full=True)
-    form = decompose(_msg(composed[0], **(composed[1] or {})), {}, NAMES_032)
+    form = decompose(_msg(composed[0], **(composed[1] or {})), {}, NAMES_033)
     assert isinstance(form, Editable) and form.text == "@{John Doe | Sales|boss}"
     assert compose_html(form.text, form.picks, {}, full=True) == composed
 
@@ -675,9 +675,9 @@ def test_a_name_holding_a_bar_comes_back_whole() -> None:
     "label", ["snake_case", "a * b", "the *boss*", "a~b", "a`b", "[x]", "[x](https://y.test)", "a\\b"]
 )
 def test_a_label_with_markup_comes_back_braced_and_raw(label: str) -> None:
-    """032 user decision: a `{Who|label}` is read raw, so a Teams label holding markup characters comes back
+    """033 user decision: a `{Who|label}` is read raw, so a Teams label holding markup characters comes back
     braced as typed, and the save sends the same mention under the same label."""
-    form = decompose(_labelled(("8:orgid:ann", label, " hi")), {}, NAMES_032)
+    form = decompose(_labelled(("8:orgid:ann", label, " hi")), {}, NAMES_033)
     assert isinstance(form, Editable), form
     assert form.text == f"@{{Ann Lee|{label}}} hi"
     assert _save(form.text, form.picks) == [("8:orgid:ann", label)]
@@ -685,25 +685,25 @@ def test_a_label_with_markup_comes_back_braced_and_raw(label: str) -> None:
 
 @pytest.mark.parametrize("label", ["a|b", "a}b", "{a*b}", "{x}"])
 def test_a_label_no_brace_can_hold_is_not_offered(label: str) -> None:
-    """032 user decision: a label holding `|` or `}` cannot sit in a `{Who|label}`; bare, it could be read as
+    """033 user decision: a label holding `|` or `}` cannot sit in a `{Who|label}`; bare, it could be read as
     someone else on save, so the message is not offered for editing, and the reason says why."""
-    assert decompose(_labelled(("8:orgid:ann", label, " hi")), {}, NAMES_032) == D.MISREAD
+    assert decompose(_labelled(("8:orgid:ann", label, " hi")), {}, NAMES_033) == D.MISREAD
 
 
 @pytest.mark.parametrize("full", ["Ann } Lee", "Ann\nLee"])
 def test_a_full_name_no_brace_can_hold_braces_the_label_on_itself(full: str) -> None:
-    """032 review: a roster name holding `}` or a line break cannot be Who: `@{label|label}` instead."""
+    """033 review: a roster name holding `}` or a line break cannot be Who: `@{label|label}` instead."""
     form = decompose(_labelled(("8:orgid:ann", "Ann", " hi")), {}, {"8:orgid:ann": full})
     assert isinstance(form, Editable) and form.text == "@{Ann|Ann} hi"
 
 
 @pytest.mark.parametrize("plain", ["@Ann", "@home", "@{x}", "@{Ann Lee|x}", "(@Ann)"])
 def test_a_plain_at_comes_back_escaped(plain: str) -> None:
-    """032: every sender resolves an unpicked `@form`: plain text that would read as one comes back with
+    """033: every sender resolves an unpicked `@form`: plain text that would read as one comes back with
     `\\@`, the real mention braced, and the save sends the same message."""
     picks = [{"name": "x", "mri": "8:orgid:ann", "label": "Lee"}]
     composed = compose_html(f"{plain} and @x", picks, {}, full=True)
-    form = decompose(_msg(composed[0], **(composed[1] or {})), {}, NAMES_032)
+    form = decompose(_msg(composed[0], **(composed[1] or {})), {}, NAMES_033)
     assert isinstance(form, Editable), form
     assert form.text == plain.replace("@", "\\@") + " and @{Ann Lee|Lee}"
     assert compose_html(form.text, _saved(form.text, form.picks), {}, full=True) == composed
@@ -735,17 +735,17 @@ def test_a_plain_at_comes_back_escaped(plain: str) -> None:
 def test_a_save_reads_every_braced_mention_as_its_own_person(
     spans: list[tuple[str, str, str]], text: str
 ) -> None:
-    """032 review regression: whatever follows a label (a surname, another member's name), the braced
+    """033 review regression: whatever follows a label (a surname, another member's name), the braced
     mention is read on save as the copy's own person, under its own label."""
-    form = decompose(_labelled(*spans), {}, NAMES_032)
+    form = decompose(_labelled(*spans), {}, NAMES_033)
     assert isinstance(form, Editable), form
     assert form.text == text
     assert _save(form.text, form.picks) == [(mri, label) for mri, label, _ in spans]
 
 
-@pytest.mark.parametrize("roster", [[], ROSTER_032])
+@pytest.mark.parametrize("roster", [[], ROSTER_033])
 def test_with_no_roster_a_label_and_a_surname_stay_the_same_person(roster: list[dict[str, str]]) -> None:
-    """032 user decision regression: `Ann` (Ann Moore) then ` Lee`, opened with no roster: `@{Ann|Ann} Lee`;
+    """033 user decision regression: `Ann` (Ann Moore) then ` Lee`, opened with no roster: `@{Ann|Ann} Lee`;
     saved with or without the roster, still Ann Moore."""
     form = decompose(_labelled(("8:orgid:moore", "Ann", " Lee")), {}, {})
     assert isinstance(form, Editable) and form.text == "@{Ann|Ann} Lee"
@@ -757,17 +757,17 @@ def test_with_no_roster_a_label_and_a_surname_stay_the_same_person(roster: list[
 @pytest.mark.parametrize(
     ("names", "mris", "want"),
     [
-        (NAMES_032, ("8:orgid:ann", "8:orgid:moore"), "@{Ann Lee|Ann} and @{Ann Moore|Ann}"),
+        (NAMES_033, ("8:orgid:ann", "8:orgid:moore"), "@{Ann Lee|Ann} and @{Ann Moore|Ann}"),
         ({"8:orgid:ann": "Ann Lee"}, ("8:orgid:ann", "8:orgid:moore"), "@{Ann Lee|Ann} and @{Ann|Ann}"),
         ({}, ("8:orgid:ann", "8:orgid:moore"), D.MISREAD),
         ({"8:orgid:moore": "  "}, ("8:orgid:ann", "8:orgid:moore"), D.MISREAD),
-        (NAMES_032, ("8:orgid:ann", "8:orgid:ann"), "@{Ann Lee|Ann} and @{Ann Lee|Ann}"),  # one person twice
+        (NAMES_033, ("8:orgid:ann", "8:orgid:ann"), "@{Ann Lee|Ann} and @{Ann Lee|Ann}"),  # one person twice
     ],
 )
 def test_namesakes_come_back_told_apart_or_not_at_all(
     names: dict[str, str], mris: tuple[str, str], want: str
 ) -> None:
-    """032 review: namesakes both `Ann` come back with their full names; spelled alike still (no name known
+    """033 review: namesakes both `Ann` come back with their full names; spelled alike still (no name known
     for either), the message is not offered for editing."""
     form = decompose(_labelled((mris[0], "Ann", " and "), (mris[1], "Ann", "")), {}, names)
     assert (form.text if isinstance(form, Editable) else form) == want
@@ -778,10 +778,10 @@ def test_namesakes_come_back_told_apart_or_not_at_all(
     [("b", "b**", "**"), ("i", "a*_", "_"), ("s", "x~~", "~~"), ("b", "**", "**"), ("i", "a* b", "_")],
 )
 def test_a_span_around_a_label_holding_its_marker_round_trips(tag: str, label: str, md: str) -> None:
-    """032 review: `<b>x @{…|b**}</b>` and the like are editable: the span closes after the token, and the
+    """033 review: `<b>x @{…|b**}</b>` and the like are editable: the span closes after the token, and the
     text composes back to the same message."""
     content = f"<p><{tag}>x {_span(0, label)}</{tag}></p>"
-    form = decompose(_msg(content, mentions=_mentions(("8:orgid:ann", "person"))), {}, NAMES_032)
+    form = decompose(_msg(content, mentions=_mentions(("8:orgid:ann", "person"))), {}, NAMES_033)
     assert isinstance(form, Editable), form
     assert form.text == f"{md}x @{{Ann Lee|{label}}}{md}"
     assert compose_html(form.text, form.picks, {}, full=True)[0] == content[3:-4].replace(

@@ -503,7 +503,7 @@ async def test_shortened_mentions_keep_distinct_recipients_and_survive_reload(
     assert await box.input_value() == expected
     await box.press("Enter")
     await wait(lambda: len(fake.of("send")) == 1)
-    # Picks travel as who was picked, anchored at their `@` (spec 032), not as the form typed.
+    # Picks travel as who was picked, anchored at their `@` (spec 033), not as the form typed.
     verb = fake.of("send")[0]
     assert [(m["name"], m["at"]) for m in verb["mentions"]] == [
         ("Ann Lee", 0),
@@ -528,7 +528,7 @@ async def test_shortening_an_earlier_mention_keeps_first_names_in_text_order(fak
     await box.press("End")
     await box.press("Enter")
     await wait(lambda: len(fake.of("send")) == 1)
-    # Each pick as picked, still anchored at its own `@` (spec 032).
+    # Each pick as picked, still anchored at its own `@` (spec 033).
     assert fake.of("send")[0]["mentions"] == [{**ANN, "at": 0}, {**other, "at": 9}]
 
 
@@ -1115,7 +1115,7 @@ async def test_a_deleted_pick_does_not_mention_its_namesake(fake: Fake, picks: l
 
 async def test_a_deleted_pick_stays_out_when_its_name_is_typed_again(fake: Fake) -> None:
     """L8: a pick deleted with its text is gone: a later hand-typed `@Ann Lee` revives no namesake; with
-    two Ann Lees it is ambiguous, so the send is refused (spec 032)."""
+    two Ann Lees it is ambiguous, so the send is refused (spec 033)."""
     fake.members = [ANN, ANN2]
     page, box = _parts(fake)
     await box.press_sequentially("@ann")
@@ -1142,12 +1142,12 @@ async def test_a_deleted_pick_stays_out_when_its_name_is_typed_again(fake: Fake)
 
 async def test_picks_out_of_text_order_mention_both(fake: Fake) -> None:
     """M1: a mention inserted before an earlier pick still counts, and so does the earlier one; the picks
-    go in text order (spec 032)."""
+    go in text order (spec 033)."""
     assert await pick_out_of_order(fake) == [ANN["mri"], BOB["mri"]]
 
 
 async def test_a_longer_word_leaves_the_first_name_mention(fake: Fake) -> None:
-    """L4, spec 032: `@Ann Leeds` is no `@Ann Lee`, but `@Ann` (her first name, a form of the pick) followed
+    """L4, spec 033: `@Ann Leeds` is no `@Ann Lee`, but `@Ann` (her first name, a form of the pick) followed
     by `Leeds`, as the server reads it."""
     assert await pick_then_glue(fake) == [ANN["mri"]]
 
@@ -1261,12 +1261,12 @@ async def test_an_escaped_mention_is_no_pick(
     await box.press("End")
     await box.press("Enter")
     await wait(lambda: len(fake.of("send")) == 1)
-    # The escaped `@` reads no mention: its anchor anchors nothing, the next keeps its own (spec 032).
+    # The escaped `@` reads no mention: its anchor anchors nothing, the next keeps its own (spec 033).
     assert server_reads(fake.of("send")[0], fake.members) == [m["mri"] for m in sent]
 
 
 async def test_a_mark_after_a_picked_name_is_an_accent(fake: Fake) -> None:
-    """029-AC2, spec 032: a combining mark glued to `@Ann Lee` is an accent the resolver ignores, as the
+    """029-AC2, spec 033: a combining mark glued to `@Ann Lee` is an accent the resolver ignores, as the
     page does: `@Ann Leé` stays her mention, and the namesake keeps her own `@Ann Lee`."""
     fake.members = [ANN, ANN2]
     page, box = _parts(fake)
@@ -1287,7 +1287,7 @@ async def test_a_mark_after_a_picked_name_is_an_accent(fake: Fake) -> None:
 
 MOORE = {"name": "Ann Moore", "mri": "8:orgid:moore"}
 # `@Ann` and `@Lee` alone name two people each: only the picks tell who a shortened mention is.
-ROSTER_032 = [
+ROSTER_033 = [
     {"name": "Me Self", "mri": "8:orgid:me"},
     ANN,
     MOORE,
@@ -1298,7 +1298,7 @@ ROSTER_032 = [
 async def _sent_to(fake: Fake, n: int = 1) -> list[str] | str:
     """The MRIs the server mentions for the n-th send, with the page's anchored picks."""
     await wait(lambda: len(fake.of("send")) == n)
-    return server_reads(fake.of("send")[n - 1], ROSTER_032)
+    return server_reads(fake.of("send")[n - 1], ROSTER_033)
 
 
 async def _pick(page: Page, box: Any, typed: str, shown: list[str], down: int = 0) -> None:
@@ -1316,9 +1316,9 @@ async def _pick(page: Page, box: Any, typed: str, shown: list[str], down: int = 
 async def test_a_picked_mention_edited_to_another_form_still_mentions_its_person(
     fake: Fake, gesture: str, text: str
 ) -> None:
-    """032-AC5: Ann Lee picked, then `@Ann Lee` turned into `@Ann` by a selection deleted, by Ctrl+Backspace,
+    """033-AC5: Ann Lee picked, then `@Ann Lee` turned into `@Ann` by a selection deleted, by Ctrl+Backspace,
     or into `@Lee` by deleting `Ann ` in the middle: the send mentions her each time."""
-    fake.members = ROSTER_032[1:]
+    fake.members = ROSTER_033[1:]
     page, box = _parts(fake)
     await _pick(page, box, "@ann l", ["Ann Lee"])
     assert await box.input_value() == "@Ann Lee "
@@ -1339,9 +1339,9 @@ async def test_a_picked_mention_edited_to_another_form_still_mentions_its_person
 
 
 async def test_namesakes_shortened_to_different_forms_keep_their_recipients(fake: Fake) -> None:
-    """032-AC7: Ann Lee and Ann Moore picked, shortened to `@Ann` (Backspace) and `@Moore` (`Ann ` deleted):
+    """033-AC7: Ann Lee and Ann Moore picked, shortened to `@Ann` (Backspace) and `@Moore` (`Ann ` deleted):
     each mention goes to its own person, though `@Ann` is a form of both."""
-    fake.members = ROSTER_032[1:]
+    fake.members = ROSTER_033[1:]
     page, box = _parts(fake)
     await _pick(page, box, "@ann l", ["Ann Lee"])
     await _pick(page, box, "and @ann m", ["Ann Moore"])
@@ -1357,9 +1357,9 @@ async def test_namesakes_shortened_to_different_forms_keep_their_recipients(fake
 
 
 async def test_a_brace_asks_for_its_who_and_selects_the_label(fake: Fake) -> None:
-    """032: `@{ann l` lists Ann Lee; the pick inserts `@{Ann Lee|Ann Lee}` with the label selected, typed
+    """033: `@{ann l` lists Ann Lee; the pick inserts `@{Ann Lee|Ann Lee}` with the label selected, typed
     over, and sends her mention. Past the `|` nothing is asked."""
-    fake.members = ROSTER_032[1:]
+    fake.members = ROSTER_033[1:]
     page, box = _parts(fake)
     await _pick(page, box, "@{ann l", ["Ann Lee"])
     assert await box.input_value() == "@{Ann Lee|Ann Lee}"
@@ -1377,7 +1377,7 @@ async def test_a_brace_asks_for_its_who_and_selects_the_label(fake: Fake) -> Non
 
 @pytest.mark.parametrize("name", ["Ann | Sales", "Ann\u00a0Sales", "Ann}Sales"])
 async def test_a_brace_pick_whose_name_no_label_holds_goes_in_plain(fake: Fake, name: str) -> None:
-    """032: a name the label rule refuses (`|`, NBSP, `}`) cannot start a brace's label: plain `@Name `."""
+    """033: a name the label rule refuses (`|`, NBSP, `}`) cannot start a brace's label: plain `@Name `."""
     fake.members = [{"name": name, "mri": "8:orgid:sales"}]
     page, box = _parts(fake)
     await _pick(page, box, "@{ann", [name])
@@ -1395,7 +1395,7 @@ def _refusal(text: str, roster: list[dict[str, Any]]) -> str:
 async def test_a_refused_mention_leaves_the_text_in_the_composer_with_the_reason(
     fake: Fake, typed: str
 ) -> None:
-    """032-AC6: a typed `@Bob` with two Bobs in the chat (or an unknown `@Zed`) is refused by the server:
+    """033-AC6: a typed `@Bob` with two Bobs in the chat (or an unknown `@Zed`) is refused by the server:
     the text comes back into the composer, the reason with both names on the error line, no failed bubble."""
     bobs = [{"name": "Bob Lee", "mri": "8:orgid:boblee"}, {"name": "Bob Roe", "mri": "8:orgid:bob"}]
     fake.send_error = _refusal(typed, [*bobs, ANN])
@@ -1416,7 +1416,7 @@ async def test_a_refused_mention_leaves_the_text_in_the_composer_with_the_reason
 
 
 async def test_a_refusal_with_text_in_the_composer_stays_a_failed_bubble(fake: Fake) -> None:
-    """032-AC6: a newer text in the composer is never overwritten: the refused message waits as a failed
+    """033-AC6: a newer text in the composer is never overwritten: the refused message waits as a failed
     bubble with its reason, its ✎ brings it back."""
     fake.send_error = _refusal("@Bob hi", [{"name": "Bob Lee", "mri": "8:orgid:boblee"}, BOB])
     fake.hold = True
@@ -1430,7 +1430,7 @@ async def test_a_refusal_with_text_in_the_composer_stays_a_failed_bubble(fake: F
     assert await box.input_value() == "next"
 
 
-# --- anchors (spec 032): a pick stays at the `@` it was inserted at, or is dropped ---
+# --- anchors (spec 033): a pick stays at the `@` it was inserted at, or is dropped ---
 
 BOTH = pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
 
@@ -1445,7 +1445,7 @@ async def _sent_picks(fake: Fake) -> list[tuple[str, str]]:
 
 @BOTH
 async def test_text_typed_before_a_pick_moves_its_anchor(fake: Fake) -> None:
-    """032: Ann Lee picked, then text typed before her (and an emoji, two UTF-16 units): her pick moves
+    """033: Ann Lee picked, then text typed before her (and an emoji, two UTF-16 units): her pick moves
     with her `@`."""
     page, box = _parts(fake)
     await _pick(page, box, "@ann l", ["Ann Lee"])
@@ -1460,7 +1460,7 @@ async def test_text_typed_before_a_pick_moves_its_anchor(fake: Fake) -> None:
 @BOTH
 @pytest.mark.parametrize("over", ["@Bob Roe ", "x", "@Bob @Ann Lee ", "@@Ann Lee ", "@Lee hi Ann Lee "])
 async def test_a_pick_typed_over_is_dropped(fake: Fake, over: str) -> None:
-    """032: Ann Lee picked, then her mention selected and typed over (by another name, anything, or her own
+    """033: Ann Lee picked, then her mention selected and typed over (by another name, anything, or her own
     text with another `@` before it): her pick is dropped, never moved onto what replaced it."""
     page, box = _parts(fake)
     await _pick(page, box, "@ann l", ["Ann Lee"])
@@ -1474,7 +1474,7 @@ async def test_a_pick_typed_over_is_dropped(fake: Fake, over: str) -> None:
 @BOTH
 @pytest.mark.parametrize("deleted", ["first", "second"])
 async def test_an_undo_drops_the_anchors_rather_than_guess(fake: Fake, deleted: str) -> None:
-    """032: namesakes picked, one deleted, then Ctrl+Z puts her text back: an undo cannot be placed, so
+    """033: namesakes picked, one deleted, then Ctrl+Z puts her text back: an undo cannot be placed, so
     the anchors go and no pick sits on the other's `@` (the send then resolves, or refuses, on the
     roster)."""
     fake.members = [ANN, ANN2]
@@ -1494,7 +1494,7 @@ async def test_an_undo_drops_the_anchors_rather_than_guess(fake: Fake, deleted: 
 
 @BOTH
 async def test_a_refused_send_comes_back_with_its_picks_whole(fake: Fake) -> None:
-    """032-AC6 + review M2: a send refused for an unpicked ambiguous `@Bob` comes back into the composer
+    """033-AC6 + review M2: a send refused for an unpicked ambiguous `@Bob` comes back into the composer
     with Ann Lee's pick as picked (her full name, at her `@`); fixed and sent again, it carries her."""
     fake.send_error = "ambiguous mention @Bob: Bob Lee, Bob Roe (\\@ for a literal @)"
     page, box = _parts(fake)
@@ -1520,7 +1520,7 @@ async def test_a_refused_send_comes_back_with_its_picks_whole(fake: Fake) -> Non
 async def test_a_failed_message_edited_in_place_keeps_only_the_picks_before_the_change(
     fake: Fake, edit: str
 ) -> None:
-    """032: the failed bubble's editor tracks no anchors: a change before (or on) the `@` drops its pick,
+    """033: the failed bubble's editor tracks no anchors: a change before (or on) the `@` drops its pick,
     a change after the mention keeps it."""
     page, box = _parts(fake)
     await _pick(page, box, "@ann l", ["Ann Lee"])
@@ -1551,7 +1551,7 @@ async def test_a_failed_message_edited_in_place_keeps_only_the_picks_before_the_
 @pytest.mark.parametrize("then", ["send", "type"])
 @pytest.mark.parametrize("write", ["'@Bob ' + b.value", "'@Bob Roe hi'"])
 async def test_a_write_no_input_event_reports_drops_the_anchors(fake: Fake, then: str, write: str) -> None:
-    """032: the text changed under the page's back (a script setting the value, no input event): sent at
+    """033: the text changed under the page's back (a script setting the value, no input event): sent at
     once or typed into first, its anchors are not trusted, so no pick lands on a shifted `@`."""
     page, box = _parts(fake)
     await _pick(page, box, "@ann l", ["Ann Lee"])
@@ -1568,7 +1568,7 @@ async def test_a_write_no_input_event_reports_drops_the_anchors(fake: Fake, then
 async def test_deleting_the_first_of_two_identical_mentions_keeps_the_seconds_pick(
     fake: Fake, how: str
 ) -> None:
-    """032: twins Ann Lee picked twice, `@Ann Lee @Ann Lee `: the first deleted (forwards, or Backspace
+    """033: twins Ann Lee picked twice, `@Ann Lee @Ann Lee `: the first deleted (forwards, or Backspace
     char by char from her end) leaves text identical to before at its start; the caret places the change,
     so the one left is the second's, never the first's."""
     fake.members = [ANN, ANN2]
@@ -1596,9 +1596,9 @@ async def test_deleting_the_first_of_two_identical_mentions_keeps_the_seconds_pi
 async def test_a_wrap_around_a_picked_mention_keeps_its_pick(
     fake: Fake, select: str, fmt: str, text: str
 ) -> None:
-    """032 review L1: markers wrapped around a picked mention only add text around its `@`: Ann Lee,
+    """033 review L1: markers wrapped around a picked mention only add text around its `@`: Ann Lee,
     shortened to `@Ann`, then bolded or italicised, is still hers though `@Ann` alone names two people."""
-    fake.members = ROSTER_032[1:]
+    fake.members = ROSTER_033[1:]
     page, box = _parts(fake)
     await _pick(page, box, "@ann l", ["Ann Lee"])
     await box.press("Backspace")
@@ -1613,8 +1613,8 @@ async def test_a_wrap_around_a_picked_mention_keeps_its_pick(
 
 @BOTH
 async def test_a_list_made_of_a_line_with_a_pick_keeps_it(fake: Fake) -> None:
-    """032 review L1: the list button prefixes the line: the pick moves with its `@`."""
-    fake.members = ROSTER_032[1:]
+    """033 review L1: the list button prefixes the line: the pick moves with its `@`."""
+    fake.members = ROSTER_033[1:]
     page, box = _parts(fake)
     await box.press_sequentially("hi ")
     await _pick(page, box, "@ann l", ["Ann Lee"])
@@ -1634,7 +1634,7 @@ async def test_a_list_made_of_a_line_with_a_pick_keeps_it(fake: Fake) -> None:
     "event", ["new Event('input')", "new InputEvent('input', {inputType: 'deleteContentBackward'})"]
 )
 async def test_an_input_no_beforeinput_placed_drops_the_anchors(fake: Fake, event: str) -> None:
-    """032 review M1: twins Ann Lee at 0 and 9; a script deletes the first and reports it with an input event
+    """033 review M1: twins Ann Lee at 0 and 9; a script deletes the first and reports it with an input event
     no `beforeinput` announced, the caret elsewhere: the change cannot be placed, so no anchor moves (the
     second's would land on the first's `@`); the send then refuses as ambiguous."""
     fake.members = [ANN, ANN2]
@@ -1658,7 +1658,7 @@ async def test_an_input_no_beforeinput_placed_drops_the_anchors(fake: Fake, even
 async def test_the_toolbar_moves_anchors_by_what_it_adds(
     fake: Fake, steps: str, text: str, ats: list[int]
 ) -> None:
-    """032 review H1: the toolbar's own wraps and prefixes shift each anchor by the markers they add before
+    """033 review H1: the toolbar's own wraps and prefixes shift each anchor by the markers they add before
     it; nothing is matched in the text."""
     page, box = _parts(fake)
     await _pick(page, box, "@ann l", ["Ann Lee"])
@@ -1682,7 +1682,7 @@ async def test_the_toolbar_moves_anchors_by_what_it_adds(
 
 
 async def test_an_ime_composition_after_a_pick_keeps_it(fake: Fake) -> None:
-    """032 review M1: text composed with an input method (`beforeinput` announces each step) is placed like
+    """033 review M1: text composed with an input method (`beforeinput` announces each step) is placed like
     typing: the pick before it stays."""
     page, box = _parts(fake)
     await _pick(page, box, "@ann l", ["Ann Lee"])
@@ -1700,7 +1700,7 @@ async def test_an_ime_composition_after_a_pick_keeps_it(fake: Fake) -> None:
     "event", ["new Event('input')", "new InputEvent('input', {inputType: 'deleteContentBackward'})"]
 )
 async def test_a_cancelled_beforeinput_places_no_later_change(fake: Fake, event: str) -> None:
-    """032 review M1: a `beforeinput` the page cancels (no input follows) says nothing about a later scripted
+    """033 review M1: a `beforeinput` the page cancels (no input follows) says nothing about a later scripted
     change: twins, the first deleted by a script, keep no anchor on the wrong `@`."""
     fake.members = [ANN, ANN2]
     page, box = _parts(fake)
@@ -1717,7 +1717,7 @@ async def test_a_cancelled_beforeinput_places_no_later_change(fake: Fake, event:
 @BOTH
 @pytest.mark.parametrize("then", [None, "Control+Shift+z"])
 async def test_an_at_typed_over_a_picked_at_drops_the_pick(fake: Fake, then: str | None) -> None:
-    """032 review r3 H1: the picked `@` selected and replaced by a typed `@` (the text comes out the same):
+    """033 review r3 H1: the picked `@` selected and replaced by a typed `@` (the text comes out the same):
     the replacement drops the pick, and a redo after it does not bring it back."""
     page, box = _parts(fake)
     await _pick(page, box, "@ann l", ["Ann Lee"])
@@ -1738,7 +1738,7 @@ async def test_an_at_typed_over_a_picked_at_drops_the_pick(fake: Fake, then: str
 async def test_a_multi_line_toolbar_edit_moves_the_anchor_once(
     fake: Fake, fmt: str, text: str, ats: list[int]
 ) -> None:
-    """032 review r3: one toolbar edit over two lines (Chrome reports it with several input events): the
+    """033 review r3: one toolbar edit over two lines (Chrome reports it with several input events): the
     anchor moves by what it adds, once."""
     page, box = _parts(fake)
     await _pick(page, box, "@ann l", ["Ann Lee"])
@@ -1776,7 +1776,7 @@ async def test_an_ime_composition_is_placed_once_it_commits(
     text: str,
     sent: list[tuple[str, str]],
 ) -> None:
-    """032 review r3 M1: a composition is placed when it commits, over the selection it started on, wherever
+    """033 review r3 M1: a composition is placed when it commits, over the selection it started on, wherever
     the caret sat inside its preedit: a pick before it stays, one under it goes."""
     page, box = _parts(fake)
     await _pick(page, box, "@ann l", ["Ann Lee"])
@@ -1799,7 +1799,7 @@ async def test_an_ime_composition_is_placed_once_it_commits(
 @BOTH
 @pytest.mark.parametrize("edit", ["type", "paste"])
 async def test_a_composition_that_never_ends_leaves_no_stuck_state(fake: Fake, edit: str) -> None:
-    """032 review r3 M1: a `compositionstart` with no `compositionend` (a lost one): the next ordinary input
+    """033 review r3 M1: a `compositionstart` with no `compositionend` (a lost one): the next ordinary input
     drops what cannot be placed, and later picks are tracked as usual again."""
     page, box = _parts(fake)
     await box.evaluate("b => b.dispatchEvent(new CompositionEvent('compositionstart'))")
@@ -1816,10 +1816,10 @@ async def test_a_composition_that_never_ends_leaves_no_stuck_state(fake: Fake, e
 @BOTH
 @pytest.mark.parametrize("start", [1, 6])
 async def test_a_composition_committed_away_from_its_start_drops_the_anchors(fake: Fake, start: int) -> None:
-    """032 review r4 M1: `\\@Ann @Ann ` with Ann Lee at 1 and Ann Moore at 6; a composition starts at `start`
+    """033 review r4 M1: `\\@Ann @Ann ` with Ann Lee at 1 and Ann Moore at 6; a composition starts at `start`
     but its text lands at the end (the caret never there): it cannot be placed, so no pick slides onto the
     other's `@`."""
-    fake.members = ROSTER_032[1:]
+    fake.members = ROSTER_033[1:]
     page, box = _parts(fake)
     await _pick(page, box, "@ann l", ["Ann Lee"])
     await box.press("Backspace")
@@ -1846,7 +1846,7 @@ async def test_a_composition_committed_away_from_its_start_drops_the_anchors(fak
     "event", ["new Event('input')", "new InputEvent('input', {inputType: 'insertText'})"]
 )
 async def test_a_scripts_input_after_a_beforeinput_in_its_task_places_nothing(fake: Fake, event: str) -> None:
-    """032 review r4: a script's `beforeinput` then its own change and input event, in one task: the input is
+    """033 review r4: a script's `beforeinput` then its own change and input event, in one task: the input is
     not the browser's, so it announces nothing; the twins' anchors go rather than land on the wrong `@`."""
     fake.members = [ANN, ANN2]
     page, box = _parts(fake)

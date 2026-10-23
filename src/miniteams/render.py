@@ -273,7 +273,7 @@ def sanitize(
     """Teams HTML → allowlisted HTML; `mentions` maps a Mention span's `itemid` to its MRI, `custom`
     holds the custom emoji object ids `/emoji/<id>` serves. A link whose `_link_key` is in `names` reads as
     that file name instead of its content; its key is added to `named`. `titles`: MRI → the full name a
-    mention of that person shows on hover (spec 032).
+    mention of that person shows on hover (spec 033).
 
     Input past `_HTML_MAX` chars is cut off: the parser's cost must stay bounded per message."""
     parser = _Sanitizer(thread_id, media_dir, me, mentions or {}, custom, names, named, titles)

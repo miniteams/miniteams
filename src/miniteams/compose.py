@@ -45,7 +45,7 @@ _SPANS = (("**", "b"), ("~~", "s"), ("*", "i"), ("_", "i"))
 MAX_MENTIONS = 50
 MAX_NAME = 200
 _FREE_LEN = MAX_FREE_NAME = 2 * MAX_NAME + 3  # `{Who|label}`, each part at most MAX_NAME
-# What `plain_label` refuses (spec 032): a `{Who|label}` is read raw, markup and all, up to its `}`.
+# What `plain_label` refuses (spec 033): a `{Who|label}` is read raw, markup and all, up to its `}`.
 _LABEL_RULE = (
     "the label is one line of text: no | or }, no tab or other blank but the space, no control, format, "
     "private-use or unassigned character"
@@ -146,7 +146,7 @@ def _inline(line: str, on_text: OnText, lead: bool = False, after: str = "", bas
             i = url_m.end() if (url_m := _URL_RE.match(line, i)) else i + 1
             continue
         if ch == "@":
-            # `@{Who|label}` starting a word is read raw up to its `}`, before any markup (spec 032): its own
+            # `@{Who|label}` starting a word is read raw up to its `}`, before any markup (spec 033): its own
             # run, so a mention's label or a URL inside it is never split by `*`, `_`, `[`…
             if (end := _token_end(line, i)) > 0:
                 out.append(
@@ -212,7 +212,7 @@ _ATOM_RE = re.compile(r"https?://|[\\`]|@\{")  # what `_inline` reads whole befo
 def _token_end(line: str, i: int, lo: int = 0, opened: bool = False) -> int:
     """The `}` ending the `@{Who|label}` token `_inline` reads at `i`, else -1: `@{` at a word start (the
     run's start `lo` or after a non-word character) or, with `opened`, right after a `_` that opens a span
-    there (`a _@{…}_`), closed on the line (spec 032)."""
+    there (`a _@{…}_`), closed on the line (spec 033)."""
 
     def starts(k: int) -> bool:
         return k <= lo or not _word(line[k - 1])
@@ -334,7 +334,7 @@ def compose_html(
     """Composer text → (content HTML, message `properties` or None).
 
     `mentions`: picked `{name, mri, label?, everyone?}`, `name` as typed and `label` as shown (default
-    `name`, or the label of a `{Who|label}` name, spec 032), in the order picked: the n-th `@Name` goes to
+    `name`, or the label of a `{Who|label}` name, spec 033), in the order picked: the n-th `@Name` goes to
     the n-th pick of that name, any further one to its last; `emojis`: custom name → AMS object id.
     `@Name` matches when `@` starts a word and the name is followed by the end or neither a word character
     nor a mark (a `{Who|label}` name ends at its `}`, whatever follows); names are tried longest first,
@@ -432,7 +432,7 @@ def shown_label(name: str) -> str:
         source, _, label = free_label(name)
     except ValueError:
         return name
-    return label if source == name else name
+    return label if source == name and label else name
 
 
 def _segments(text: str, full: bool = True) -> list[tuple[str, int]]:
@@ -474,7 +474,7 @@ def _joins(ch: str) -> bool:
 
 
 def forms(name: str) -> list[str]:
-    """The forms a member is mentioned by (spec 032): full name, first word, last word, the last two
+    """The forms a member is mentioned by (spec 033): full name, first word, last word, the last two
     without the punctuation around them (`Doe, John` → `Doe`; `(Sales)` → `Sales`)."""
     words = name.split()
     if not words:
@@ -490,7 +490,7 @@ def _word_key(text: str) -> str:
 
 
 def plain_label(label: str) -> bool:
-    """Whether a `{Who|label}` can hold `label` (spec 032, _LABEL_RULE): no `|` or `}`, and nothing in
+    """Whether a `{Who|label}` can hold `label` (spec 033, _LABEL_RULE): no `|` or `}`, and nothing in
     Unicode's C or Z categories (line break, tab, blanks, control, format, private-use, unassigned) but the
     space."""
     return not any(c in "|}" or c != " " and unicodedata.category(c)[0] in "CZ" for c in label)
@@ -498,8 +498,9 @@ def plain_label(label: str) -> bool:
 
 def free_label(rest: str) -> tuple[str, str, str]:
     """`rest` opening a `{Who|label}` → (that source, Who, label): up to the first `}`, the last `|`
-    splitting (spec 032). Who may hold anything but `}` and a line break. ValueError for an unclosed one,
-    or a missing, empty, too long or refused label."""
+    splitting (spec 033). Who may hold anything but `}` and a line break. A label of spaces only is ""
+    (shown as the member's full name). ValueError for an unclosed one, or a missing, too long or refused
+    label."""
     end = rest.find("}")
     if end < 0:
         raise ValueError(
@@ -509,8 +510,8 @@ def free_label(rest: str) -> tuple[str, str, str]:
     who, bar, label = source[1:-1].rpartition("|")
     if not bar:
         raise ValueError(f"mention @{source} has no label: write @{{Who|label}}{_LITERAL}")
-    if not label.strip():
-        raise ValueError(f"empty mention label @{source}{_LITERAL}")
+    if not label.strip(" "):
+        return source, who.strip(), ""
     if not plain_label(label):
         raise ValueError(f"mention label refused @{source}: {_LABEL_RULE}{_LITERAL}")
     if len(label) > MAX_NAME:
@@ -541,7 +542,7 @@ def _fold(text: str) -> str:
 
 
 def _anchored(rest: str, pick: dict[str, Any]) -> tuple[str, str] | None:
-    """What an anchored pick reads at its `@` (spec 032): (the text read, its label) when `rest` starts with
+    """What an anchored pick reads at its `@` (spec 033): (the text read, its label) when `rest` starts with
     one of its `forms` (the longest, as the roster spells it) or a `{Who|label}` whose Who is one of them
     or of its `whos` (shown as typed); else None."""
     if rest.startswith("{"):
@@ -602,7 +603,7 @@ def resolve_mentions(
     full: bool = True,
     picks: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Each `@Name` of `text` → a compose_html pick `{name, mri, label?, everyone?}` (specs 029, 032).
+    """Each `@Name` of `text` → a compose_html pick `{name, mri, label?, everyone?}` (specs 029, 033).
 
     A member's full, first or last name matches, case and accents ignored, longest first; `name` is the
     spelling typed, `label` the roster's. `@{Who|label}` names the member Who matches whole, shown as
@@ -648,7 +649,7 @@ def resolve_mentions(
                 raise ValueError(f"too many @ to check (> {_SCANS}){_LITERAL}")
             if len(out) == MAX_MENTIONS:
                 raise ValueError(f"too many mentions (> {MAX_MENTIONS})")
-            # The roster's reading of this `@` decides whether a pick there stands (spec 032): while no one
+            # The roster's reading of this `@` decides whether a pick there stands (spec 033): while no one
             # else reads longer there (namesakes reading as far: the pick decides), or, at a brace, while its
             # Who names no other member whole; a kept brace given back unchanged is the message's own.
             if brace := rest.startswith("{"):
@@ -679,6 +680,8 @@ def resolve_mentions(
             else:
                 typed = rest[: size or next((i for i, c in enumerate(rest) if not _joins(c)), len(rest))]
                 found = one(typed, {p["mri"]: p for n, p in hits if n == size})
+            if brace and not label:  # `@{Ann|}`: the full name
+                found["label"] = roster.get(found["mri"]) or who
             at += len(typed)  # compose_html resumes past the name: an `@` inside it is that name's
             out.append({**found, "name": typed})
     return out
@@ -703,13 +706,13 @@ def mention_reads(text: str, full: bool = True) -> list[tuple[int, str]]:
 
 def mention_ats(text: str, full: bool = True) -> list[int]:
     """Where each `@` resolve_mentions reads in `text` is (roster-free, see mention_reads): the offsets an
-    edit's kept mentions are anchored at (spec 032)."""
+    edit's kept mentions are anchored at (spec 033)."""
     return [at for at, _ in mention_reads(text, full)]
 
 
 def utf16_units(text: str) -> list[int]:
     """Each index of `text`, and its end, as the page's offset in UTF-16 code units (an astral character
-    counts two): the unit mention anchors travel in (spec 032)."""
+    counts two): the unit mention anchors travel in (spec 033)."""
     return list(itertools.accumulate((2 if ord(c) > 0xFFFF else 1 for c in text), initial=0))
 
 

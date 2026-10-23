@@ -1423,7 +1423,7 @@ def test_a_refused_long_mention_answers_a_bounded_error(settings: Settings, data
     )
 
 
-# --- name forms and free labels (spec 032) ---
+# --- name forms and free labels (spec 033) ---
 
 LEE2 = "8:orgid:boblee"
 
@@ -1434,7 +1434,7 @@ LEE2 = "8:orgid:boblee"
 def test_send_mentions_by_first_last_or_full_name(
     settings: Settings, data: Path, monkeypatch, text: str, label: str
 ) -> None:
-    """032-AC1: one Lee in the chat: each form mentions Ann Lee with the roster spelling of that form."""
+    """033-AC1: one Lee in the chat: each form mentions Ann Lee with the roster spelling of that form."""
     server, _, calls = _scheduling(settings, data, monkeypatch)
     _roster(monkeypatch)
     assert not _call(server, "send_message", thread_id=GROUP, text=f"{text} hi")["error"]
@@ -1446,7 +1446,7 @@ def test_send_mentions_by_first_last_or_full_name(
 def test_a_shared_last_name_is_refused_on_every_write_tool(
     settings: Settings, data: Path, monkeypatch, tool: str
 ) -> None:
-    """032-AC2: two Lees: `@Lee` refuses with both full names, nothing written."""
+    """033-AC2: two Lees: `@Lee` refuses with both full names, nothing written."""
     server, drafts, calls = _scheduling(settings, data, monkeypatch)
     _roster(monkeypatch, [*ROSTER, _member(LEE2, "Bob Lee")])
     drafts.add("p1", GROUP, int(time.time() * 1000) + 3_600_000)
@@ -1467,6 +1467,7 @@ def test_a_shared_last_name_is_refused_on_every_write_tool(
     [
         ("@{Ann Lee|Lee} hi", [_member(LEE2, "Bob Lee")], (0, ANN, "person", "Lee")),
         ("@{Ann Lee|the boss} hi", [], (0, ANN, "person", "the boss")),
+        ("@{Lee|} hi", [], (0, ANN, "person", "Ann Lee")),
         (
             "@{John Doe | Sales|boss} hi",
             [_member("8:orgid:john", "John Doe | Sales")],
@@ -1482,7 +1483,7 @@ def test_a_free_label_sends_the_label_with_the_members_mri(
     members: list[dict[str, str]],
     entry: tuple[Any, ...],
 ) -> None:
-    """032-AC2, AC3: `@{Who|label}` → a span showing the label, the entry with Who's MRI and the label as
+    """033-AC2, AC3: `@{Who|label}` → a span showing the label, the entry with Who's MRI and the label as
     displayName; the last `|` splits."""
     server, _, calls = _scheduling(settings, data, monkeypatch)
     _roster(monkeypatch, [*ROSTER, *members])
@@ -1494,9 +1495,11 @@ def test_a_free_label_sends_the_label_with_the_members_mri(
 @pytest.mark.parametrize(
     ("text", "error"),
     [
-        ("@{Ann Lee|} hi", "empty mention label @{Ann Lee|} (\\@ for a literal @)"),
         ("@{Ann Lee} hi", "mention @{Ann Lee} has no label: write @{Who|label} (\\@ for a literal @)"),
-        ("@{Ann Lee|\t } hi", "empty mention label @{Ann Lee|\t } (\\@ for a literal @)"),
+        (
+            "@{Ann Lee|\t } hi",
+            f"mention label refused @{{Ann Lee|\t }}: {compose._LABEL_RULE} (\\@ for a literal @)",
+        ),
         ("@{Ann Lee|a|b} hi", "unknown mention @{Ann Lee|a|b} (\\@ for a literal @)"),
         (
             "@{Ann Lee|a\tb} hi",
@@ -1513,7 +1516,7 @@ def test_a_free_label_sends_the_label_with_the_members_mri(
 def test_a_malformed_free_label_writes_nothing(
     settings: Settings, data: Path, monkeypatch, text: str, error: str
 ) -> None:
-    """032-AC3: an empty label, one with `|`, `}` or a line break, or over MAX_NAME: refused, no write."""
+    """033-AC3: an empty label, one with `|`, `}` or a line break, or over MAX_NAME: refused, no write."""
     server, _, calls = _scheduling(settings, data, monkeypatch)
     _roster(monkeypatch)
     assert _call(server, "send_message", thread_id=GROUP, text=text) == {"error": True, "text": error}
@@ -1523,7 +1526,7 @@ def test_a_malformed_free_label_writes_nothing(
 def test_an_escaped_free_label_stays_literal_and_asks_no_roster(
     settings: Settings, data: Path, monkeypatch
 ) -> None:
-    """032-AC3: `\\@{Ann Lee|x}` is sent as typed, no `\\`, no roster call, no properties."""
+    """033-AC3: `\\@{Ann Lee|x}` is sent as typed, no `\\`, no roster call, no properties."""
     server, _, calls = _scheduling(settings, data, monkeypatch)
     asked = _roster(monkeypatch)
     assert not _call(server, "send_message", thread_id=GROUP, text=r"\@{Ann Lee|x}")["error"]

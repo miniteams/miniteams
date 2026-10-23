@@ -42,7 +42,7 @@ _EMOJI_TAG = frozenset(("id", "alt", "title"))
 _EMOJI_SPAN = frozenset(("itemscope", "itemtype", "itemid", "title"))
 _ANIMATED = frozenset(("class", "itemscope", "title", "type"))  # Teams' animated emoji around its <img>
 _MENTION_SPAN = frozenset(("itemscope", "itemtype", "itemid"))
-# After an `@` starting a word, what compose reads as a mention (spec 032).
+# After an `@` starting a word, what compose reads as a mention (spec 033).
 _NAMES_START = re.compile(r"[\w{]")
 _LINK = frozenset(("href", "rel", "target", "title", "itemtype", "itemid"))
 _HYPERLINK = "http://schema.skype.com/HyperLink"  # a Teams link (its preview lives in properties)
@@ -346,7 +346,7 @@ class _Reader(HTMLParser):
         if entry is None or kind not in ("person", "everyone"):
             raise _Refused("a tag or team mention" if entry else OTHER)
         mri = str(entry.get("mri") or "")
-        # Spec 032: a person always comes back braced, `{Full Name|label}`, or `{label|label}` with the name
+        # Spec 033: a person always comes back braced, `{Full Name|label}`, or `{label|label}` with the name
         # unknown (or one a `{…}` cannot hold): one spelling for one person, which no name read on save can
         # extend. A label no `{…}` can hold would come back bare, readable as someone else: not offered.
         if kind == "person" and not plain_label(label):
@@ -446,7 +446,7 @@ def _escape(seg: str, wide: bool, line_start: bool, following: str, after_url: b
             out.append(seg[i:j] if inert and not wide else "".join("\\" + c for c in seg[i:j]))
             i = j
             continue
-        # A literal `@Name`: since spec 032 every sender resolves an unpicked one, so it must not read as one.
+        # A literal `@Name`: since spec 033 every sender resolves an unpicked one, so it must not read as one.
         at = (
             ch == "@"
             and not _word(seg[i - 1 : i] or " ")
@@ -572,7 +572,7 @@ def _markdown(blocks: list[Block], wide: bool, italic: str) -> str:
 
 
 def brace_name(name: str) -> str:
-    """`name` as the Who of a kept `{Who|label}` (spec 032), or "" when it cannot be one: blank, or holding
+    """`name` as the Who of a kept `{Who|label}` (spec 033), or "" when it cannot be one: blank, or holding
     a `}` (which closes the token) or a line break. Then the label braces itself."""
     return name if name.strip() and "}" not in name and "\n" not in name else ""
 
@@ -673,7 +673,7 @@ def decompose(
 
     `emojis`: custom name → AMS object id, as `compose_html` takes it; `names`: MRI → full name, from the
     chat's roster: each person mention comes back as `@{Full Name|label}`, or `@{label|label}` with the
-    name unknown (spec 032). Two people still spelled alike (namesakes, no name known) refuse the edit."""
+    name unknown (spec 033). Two people still spelled alike (namesakes, no name known) refuse the edit."""
     props = message.get("properties")
     props = props if isinstance(props, dict) else {}
     msgtype, content = str(message.get("messagetype") or ""), str(message.get("content") or "")
@@ -713,7 +713,7 @@ def decompose(
 
 
 def _anchor(text: str, picks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Each pick anchored at its `@` in `text` (spec 032): the `@`s read, in order, each the next pick's
+    """Each pick anchored at its `@` in `text` (spec 033): the `@`s read, in order, each the next pick's
     when it spells it (an `@` an escape leaves at a run's start, `x\\_@y`, is no mention's)."""
     ats = iter(mention_ats(text))
     try:

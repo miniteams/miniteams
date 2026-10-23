@@ -554,7 +554,7 @@ def _mention_shape(mention: Any) -> bool:
         and isinstance(mri := mention.get("mri"), str)
         and len(mri) <= _MAX_MRI
         and isinstance(mention.get("everyone", False), bool)
-        and type(mention.get("at")) is int  # the `@` it was picked at (spec 032), never a bool
+        and type(mention.get("at")) is int  # the `@` it was picked at (spec 033), never a bool
     )
 
 
@@ -844,7 +844,7 @@ async def answer(ws: ServerConnection, head: dict[str, Any], work: Awaitable[dic
 def _anchored_picks(
     thread_id: str, humans: dict[str, str], picks: list[dict[str, Any]], kept: list[dict[str, Any] | None]
 ) -> list[dict[str, Any]] | str:
-    """The page's picks as resolve_mentions anchors them (spec 032): each read at its `@` by the forms of
+    """The page's picks as resolve_mentions anchors them (spec 033): each read at its `@` by the forms of
     its person's roster name, a kept one (`kept[i]`, the edit's copy's own) by its braced Who and label
     too, everyone by `everyone`. "unknown mention" for a new pick of no member, or an everyone pick not
     this chat's."""
@@ -868,7 +868,7 @@ def _anchored_picks(
 
 
 def _spellings(kept: dict[str, Any], names: dict[str, str]) -> set[str]:
-    """The names a page may give the copy's `kept` mention back under (spec 032): as decompose spelled it,
+    """The names a page may give the copy's `kept` mention back under (spec 033): as decompose spelled it,
     `{label|label}`, or `{Full Name|label}` with the roster's name for its own MRI, whichever roster the
     editor opened with. Any other is a new pick, checked on the roster; the MRI stays the copy's."""
     if kept.get("everyone"):
@@ -887,7 +887,7 @@ def _kept_unpicked(
     me: str,
 ) -> list[dict[str, Any]] | str:
     """The copy's own picks at the `@{Who|label}`s the page sent none for (its anchors lost: an undo), spec
-    032: a brace whose label is a kept mention's is about the kept people so labelled. Its Who, read on the
+    033: a brace whose label is a kept mention's is about the kept people so labelled. Its Who, read on the
     whole roster (me and apps too), naming one of them is that one, unless another so labelled is absent
     from the roster (it could be them); naming nobody on it, it is the one so labelled, if only one and Who
     is the label or a form of the copy's name for them; else it refuses. Without a roster only
@@ -1493,7 +1493,7 @@ class ChatVerbs:
         # The copy's own pick, never the page's: a kept mention brings no label or person of its choosing.
         members = await self._members(request.thread) if form.picks else None
         names = _humans(members or [])
-        # Braced, each kept mention names one person and reads as itself on save (spec 032).
+        # Braced, each kept mention names one person and reads as itself on save (spec 033).
         mine = _kept(request.mentions, form.picks, names)
         unpicked = _kept_unpicked(
             request.text, request.mentions, form.picks, members, request.thread, self.me
@@ -1857,7 +1857,7 @@ class ChatVerbs:
         picks: list[dict[str, Any]],
         kept: list[dict[str, Any] | None] | None = None,
     ) -> list[dict[str, Any]] | str:
-        """The picks compose_html gets for `text`, or the refusal (spec 032). `picks`: the page's, each
+        """The picks compose_html gets for `text`, or the refusal (spec 033). `picks`: the page's, each
         anchored at its `@`; `kept[i]`: an edit's copy's own pick standing for `picks[i]`, else None for a new
         one, checked on the roster. resolve_mentions then reads each `@` once, as its pick's person or from
         the roster. No roster is asked without a pick or an `@`; without one, kept picks alone still read
@@ -1880,7 +1880,7 @@ class ChatVerbs:
 
     async def _decompose(self, thread_id: str, copy: dict[str, Any]) -> Editable | str:
         """decompose with the chat's roster names, to brace each mention with its person's full name (spec
-        032); the roster asked only when the copy mentions someone."""
+        033); the roster asked only when the copy mentions someone."""
         props = copy.get("properties")
         mentions = json_list((props if isinstance(props, dict) else {}).get("mentions"))
         members = (await self._members(thread_id) if mentions else None) or []

@@ -1113,7 +1113,7 @@ async def test_edit_round_trips_the_message_less_a_dropped_quote(
     board: W.Board, chat: Pages, data_dir: Path, calls: list[tuple[Any, ...]]
 ) -> None:
     """019-AC4 + 019-AC6: the editor opens on the composer's markdown of the message, its mention picked
-    (braced, spec 032), its reply quote as a chip; ✕ drops the quote and the saved message is the same one
+    (braced, spec 033), its reply quote as a chip; ✕ drops the quote and the saved message is the same one
     without it."""
     content, props = compose.compose_html(_RICH, [{"name": "Ann Lee", "mri": ANN}], {}, full=True)
     assert props is not None
