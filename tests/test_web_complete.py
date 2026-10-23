@@ -271,12 +271,15 @@ async def test_send_refuses_a_mention_outside_the_roster(
     """012-AC6: an mri the thread does not hold (or a bot, or a malformed entry) is refused, no API call."""
     stranger = "8:orgid:00000000-0000-0000-0000-0000000000ff"
     for mentions, error in (
-        ([{"name": "Zed", "mri": stranger}], "unknown mention"),
-        ([{"name": "Ann Lee", "mri": ANN}, {"name": "Zed", "mri": stranger}], "unknown mention"),
-        ([{"name": "Helper Bot", "mri": BOT}], "unknown mention"),
-        ([{"name": "everyone", "mri": DUO, "everyone": True}], "unknown mention"),  # not this thread
-        ([{"name": "Ann Lee"}], "invalid mention"),
-        ([{"name": "Ann Lee", "mri": ANN, "everyone": "yes"}], "invalid mention"),
+        ([{"name": "Zed", "mri": stranger, "at": 3}], "unknown mention"),
+        (
+            [{"name": "Ann Lee", "mri": ANN, "at": 3}, {"name": "Zed", "mri": stranger, "at": 3}],
+            "unknown mention",
+        ),
+        ([{"name": "Helper Bot", "mri": BOT, "at": 3}], "unknown mention"),
+        ([{"name": "everyone", "mri": DUO, "everyone": True, "at": 3}], "unknown mention"),  # not this thread
+        ([{"name": "Ann Lee", "at": 3}], "invalid mention"),
+        ([{"name": "Ann Lee", "mri": ANN, "everyone": "yes", "at": 3}], "invalid mention"),
         ({"name": "Ann Lee", "mri": ANN}, "invalid mention"),
         (["Ann Lee"], "invalid mention"),
     ):
@@ -286,7 +289,7 @@ async def test_send_refuses_a_mention_outside_the_roster(
 
 async def test_everyone_on_a_one_to_one_is_refused(board: W.Board, sent: list[Any]) -> None:
     """012-AC6: a 1:1 has no everyone, even with its own thread id."""
-    everyone = [{"name": "everyone", "mri": DUO, "everyone": True}]
+    everyone = [{"name": "everyone", "mri": DUO, "everyone": True, "at": 0}]
     assert await _send(board, DUO, "@everyone hi", None, None, everyone) == "unknown mention"
     assert sent == []
 
@@ -295,7 +298,7 @@ async def test_mentions_without_a_roster_are_refused(board: W.Board, sent: list[
     """L5: no roster to check a mention against is its own refusal, not an "unknown mention"."""
     ws = object()
     assert (await board.follow(ws, T))["ok"]  # type: ignore[arg-type]
-    mention = [{"name": "Ann Lee", "mri": ANN}]
+    mention = [{"name": "Ann Lee", "mri": ANN, "at": 0}]
     assert await _send(board, T, "@Ann Lee", ws, None, mention) == "roster unavailable"
     assert await _send(board, T, "no mention", ws) is None  # the roster only matters to a mention
     assert [thread for thread, *_ in sent] == [T]
@@ -303,8 +306,11 @@ async def test_mentions_without_a_roster_are_refused(board: W.Board, sent: list[
 
 async def test_send_with_mentions_posts_spans_and_properties(board: W.Board, sent: list[Any]) -> None:
     """012-AC4/AC5 through `send`: Mention spans in text order, the JSON property, everyone on a group."""
-    mentions = [{"name": "Ann Lee", "mri": ANN}, {"name": "everyone", "mri": B, "everyone": True}]
-    assert await _send(board, B, "@everyone ping @Ann Lee <3", None, None, mentions) is None
+    text = "@everyone ping @Ann Lee <3"
+    mentions = _anchor(
+        text, {"name": "everyone", "mri": B, "everyone": True}, {"name": "Ann Lee", "mri": ANN}
+    )
+    assert await _send(board, B, text, None, None, mentions) is None
     [(thread, body, kw)] = sent
     assert thread == B
     assert body == (
@@ -325,12 +331,12 @@ async def test_send_over_the_socket_carries_mentions_and_format(
         verb = {
             "send": B,
             "text": "- @Ann Lee",
-            "mentions": [{"name": "Ann Lee", "mri": ANN}],
+            "mentions": [{"name": "Ann Lee", "mri": ANN, "at": 2}],
             "format": "full",
         }
         await ws.send(json.dumps(verb))
         assert json.loads(await asyncio.wait_for(ws.recv(), 2)) == {"sent": B, "ok": True}
-        await ws.send(json.dumps({**verb, "mentions": [{"name": "Zed", "mri": "8:orgid:zed"}]}))
+        await ws.send(json.dumps({**verb, "mentions": [{"name": "Zed", "mri": "8:orgid:zed", "at": 2}]}))
         assert json.loads(await asyncio.wait_for(ws.recv(), 2)) == {"sent": B, "error": "unknown mention"}
     [(_, body, kw)] = sent
     assert body == f'<ul><li><span itemtype="{MENTION}" itemscope="" itemid="0">Ann Lee</span></li></ul>'
@@ -371,7 +377,7 @@ async def test_emojis_expand_with_the_fetched_custom_set(board: W.Board, sent: l
 
 async def test_compose_errors_answer_the_page(board: W.Board, sent: list[Any]) -> None:
     """compose_html's ValueError becomes the answer, nothing sent."""
-    many = [{"name": "Ann Lee", "mri": ANN}] * 51
+    many = [{"name": "Ann Lee", "mri": ANN, "at": 0}] * 51
     assert await _send(board, B, "@Ann Lee", None, None, many) == "too many mentions (51 > 50)"
     assert sent == []
 
@@ -626,7 +632,7 @@ async def test_everyone_on_any_group_whatever_its_size(board: W.Board, sent: lis
         {"name": "everyone", "mri": TRIO, "everyone": True},
         {"name": "Ann Lee", "mri": ANN},
     ]
-    everyone = [{"name": "everyone", "mri": TRIO, "everyone": True}]
+    everyone = [{"name": "everyone", "mri": TRIO, "everyone": True, "at": 0}]
     assert await _send(board, TRIO, "@everyone hi", None, None, everyone) is None
     [(thread, body, kw)] = sent
     assert thread == TRIO and body.endswith('itemid="0">Everyone</span> hi')
@@ -634,16 +640,23 @@ async def test_everyone_on_any_group_whatever_its_size(board: W.Board, sent: lis
 
 
 async def test_mention_names_come_from_the_roster(board: W.Board, sent: list[Any]) -> None:
-    """The page's name only locates `@Name` and must be the member's own; the span shows the roster's.
-    032: `@ann leex`, which the pick does not cover, resolves on the roster as `@ann`."""
-    for wrong in ({"name": "Boss", "mri": ANN}, {"name": "Élodie Martin", "mri": ANN}):
-        assert await _send(board, B, f"@{wrong['name']} hi", None, None, [wrong]) == "unknown mention"
-    assert await _send(
-        board, B, "@everyone hi", None, None, [{"name": "all", "mri": B, "everyone": True}]
-    ) == ("unknown mention")
+    """The page's name is never trusted (spec 032): a pick is its MRI at its `@`, read there by the roster
+    forms of that member, and the span shows the roster's. A text that is none of them reads as unpicked:
+    `@Boss` is refused, `@Élodie Martin` is Élodie's, whoever was picked there. `@ann leex`, unpicked,
+    resolves on the roster as `@ann`."""
+    assert await _send(board, B, "@Boss hi", None, None, [{"name": "Boss", "mri": ANN, "at": 0}]) == (
+        "unknown mention @Boss (\\@ for a literal @)"
+    )
     assert sent == []
-    picked = [{"name": "ann lee", "mri": ANN}, {"name": "elodie martin", "mri": ELO}]
-    assert await _send(board, B, "@ann lee and @elodie martin, @ann leex", None, None, picked) is None
+    picked = [{"name": "Élodie Martin", "mri": ANN, "at": 0}]
+    assert await _send(board, B, "@Élodie Martin hi", None, None, picked) is None
+    assert _sent_mentions(sent.pop()[2]) == [(ELO, "Élodie Martin")]
+    everyone = [{"name": "all", "mri": B, "everyone": True, "at": 0}]
+    assert await _send(board, B, "@everyone hi", None, None, everyone) is None
+    assert _sent_mentions(sent.pop()[2]) == [(B, "Everyone")]
+    text = "@ann lee and @elodie martin, @ann leex"
+    picked = _anchor(text, {"name": "Ann Lee", "mri": ANN}, {"name": "Élodie Martin", "mri": ELO})
+    assert await _send(board, B, text, None, None, picked) is None
     [(_, body, kw)] = sent
     assert body == (
         f'<span itemtype="{MENTION}" itemscope="" itemid="0">Ann Lee</span> and '
@@ -655,8 +668,9 @@ async def test_mention_names_come_from_the_roster(board: W.Board, sent: list[Any
 
 
 async def test_shortened_mentions_keep_the_roster_identity(board: W.Board, sent: list[Any]) -> None:
-    picked = [{"name": "ann", "mri": ANN}, {"name": "elodie", "mri": ELO}]
-    assert await _send(board, B, "@ann and @elodie", None, None, picked) is None
+    text = "@ann and @elodie"
+    picked = _anchor(text, {"name": "Ann Lee", "mri": ANN}, {"name": "Élodie Martin", "mri": ELO})
+    assert await _send(board, B, text, None, None, picked) is None
     [(_, body, kw)] = sent
     assert body == (
         f'<span itemtype="{MENTION}" itemscope="" itemid="0">Ann</span> and '
@@ -666,17 +680,17 @@ async def test_shortened_mentions_keep_the_roster_identity(board: W.Board, sent:
         ("Ann", ANN),
         ("Élodie", ELO),
     ]
-    for name in ("An", "Boss"):  # 032: `Lee`, her last name, is hers
-        assert (
-            await _send(board, B, f"@{name}", None, None, [{"name": name, "mri": ANN}]) == "unknown mention"
-        )
+    for name in ("An", "Boss"):  # 032: `Lee`, her last name, is hers; these are no form of hers
+        reason = await _send(board, B, f"@{name}", None, None, [{"name": "Ann Lee", "mri": ANN, "at": 0}])
+        assert reason == f"unknown mention @{name} (\\@ for a literal @)"
     assert len(sent) == 1
 
 
 async def test_typed_names_elsewhere_in_the_text_stay_as_typed(board: W.Board, sent: list[Any]) -> None:
     """Only the mention takes the roster spelling: a URL, code and a link label/target keep `@ann lee`."""
     text = "https://x.com/@ann lee `@ann lee` [@ann lee](https://y/@ann) @ann lee"
-    assert await _send(board, B, text, None, None, [{"name": "ann lee", "mri": ANN}]) is None
+    picked = [{"name": "Ann Lee", "mri": ANN, "at": text.rindex("@")}]
+    assert await _send(board, B, text, None, None, picked) is None
     [(_, body, _)] = sent
     assert body == (
         '<a href="https://x.com/@ann">https://x.com/@ann</a> lee <code>@ann lee</code> '
@@ -940,6 +954,11 @@ BOB_LEE = "8:orgid:00000000-0000-0000-0000-0000000000b1"
 MOORE = "8:orgid:00000000-0000-0000-0000-0000000000b2"
 
 
+def _anchor(text: str, *picks: dict[str, Any]) -> list[dict[str, Any]]:
+    """The page's picks anchored at the first `@`s the server reads in `text`, in order (spec 032)."""
+    return [{**p, "at": at} for p, at in zip(picks, compose.mention_ats(text), strict=False)]
+
+
 def _sent_mentions(kw: dict[str, Any]) -> list[tuple[str, str]]:
     return [(e["mri"], e["displayName"]) for e in json.loads(kw["properties"]["mentions"])]
 
@@ -947,8 +966,9 @@ def _sent_mentions(kw: dict[str, Any]) -> list[tuple[str, str]]:
 async def test_last_name_and_free_label_picks_are_accepted(board: W.Board, sent: list[Any]) -> None:
     """032-AC1, AC3 (web): a pick spelling her last name, or a `{Who|label}` whose Who is one of her forms,
     is hers; the span shows the roster's form or the label."""
-    picked = [{"name": "lee", "mri": ANN}, {"name": "{Ann|the boss}", "mri": ANN}]
-    assert await _send(board, B, "@lee and @{Ann|the boss}", None, None, picked) is None
+    text = "@lee and @{Ann|the boss}"
+    picked = _anchor(text, {"name": "Ann Lee", "mri": ANN}, {"name": "Ann Lee", "mri": ANN})
+    assert await _send(board, B, text, None, None, picked) is None
     [(_, body, kw)] = sent
     assert body == (
         f'<span itemtype="{MENTION}" itemscope="" itemid="0">Lee</span> and '
@@ -958,13 +978,29 @@ async def test_last_name_and_free_label_picks_are_accepted(board: W.Board, sent:
 
 
 @pytest.mark.parametrize(
-    "name",
-    ["{Élodie Martin|x}", "{Ann|}", "{Ann|a}b}", "{Ann|x} ", "{Annie|x}", "{Ann|x"],
+    ("name", "outcome"),
+    [
+        ("{Élodie Martin|x}", [(ELO, "x")]),  # her Who: hers, whoever was picked at that `@`
+        ("{Ann|}", "empty mention label @{Ann|} (\\@ for a literal @)"),
+        ("{Ann|a}b}", [(ANN, "a")]),  # the label ends at the first `}`
+        ("{Ann|x} ", [(ANN, "x")]),
+        ("{Annie|x}", "unknown mention @{Annie|x} (\\@ for a literal @)"),
+        (
+            "{Ann|x",
+            "unclosed mention @{Ann|x: write @{Who|label}, " + compose._LABEL_RULE + " (\\@ for a literal @)",
+        ),
+    ],
 )
-async def test_a_forged_free_label_pick_is_refused(board: W.Board, sent: list[Any], name: str) -> None:
-    """032-AC3 (web): a free-label pick whose Who is no form of its member, or that is malformed."""
-    assert await _send(board, B, f"@{name}", None, None, [{"name": name, "mri": ANN}]) == "unknown mention"
-    assert sent == []
+async def test_a_free_label_at_a_pick_is_its_member_only_when_who_names_them(
+    board: W.Board, sent: list[Any], name: str, outcome: Any
+) -> None:
+    """032-AC3 (web): a `{Who|label}` at Ann's `@` is hers when Who is one of her forms; otherwise it reads as
+    unpicked (the member Who names, or the reader's refusal). Never Ann for another Who."""
+    answer = await _send(board, B, f"@{name}", None, None, [{"name": "Ann Lee", "mri": ANN, "at": 0}])
+    if isinstance(outcome, str):
+        assert answer == outcome and sent == []
+    else:
+        assert answer is None and _sent_mentions(sent[0][2]) == outcome
 
 
 @pytest.mark.parametrize(
@@ -1004,18 +1040,19 @@ async def test_an_unpicked_form_matching_none_or_several_refuses_the_send(
 async def test_namesake_picks_keep_their_own_recipient(
     board: W.Board, sent: list[Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """032-AC7 (server half): `@Ann` picked as Ann Lee and `@Moore` as Ann Moore, though `@Ann` alone would
-    be ambiguous on the roster; `@ann` is the `Ann` pick's too (case ignored), an unpicked `@Ann` with no
-    pick is ambiguous."""
+    """032-AC7 (server half): `@Ann` anchored to Ann Lee and `@Moore` to Ann Moore, though `@Ann` alone would
+    be ambiguous on the roster; an `@ann` no pick is anchored at is ambiguous, refused."""
     monkeypatch.setitem(_ROSTERS, B, [*_ROSTERS[B], {"mri": MOORE, "name": "Ann Moore"}])
-    picked = [{"name": "Ann", "mri": ANN}, {"name": "Moore", "mri": MOORE}]
-    assert await _send(board, B, "@Ann and @Moore", None, None, picked) is None
+    lee, moore = {"name": "Ann Lee", "mri": ANN}, {"name": "Ann Moore", "mri": MOORE}
+    assert (
+        await _send(board, B, "@Ann and @Moore", None, None, _anchor("@Ann and @Moore", lee, moore)) is None
+    )
     [(_, _, kw)] = sent
     assert _sent_mentions(kw) == [(ANN, "Ann"), (MOORE, "Moore")]
-    assert await _send(board, B, "@Ann and @ann", None, None, picked[:1]) is None
-    assert _sent_mentions(sent[1][2]) == [(ANN, "Ann"), (ANN, "Ann")]
-    reason = await _send(board, B, "@Ann and @ann")
-    assert reason == "ambiguous mention @Ann: Ann Lee, Ann Moore (\\@ for a literal @)" and len(sent) == 2
+    assert await _send(board, B, "@Ann and @ann", None, None, _anchor("@Ann and @ann", lee, moore)) is None
+    assert _sent_mentions(sent[1][2]) == [(ANN, "Ann"), (MOORE, "Ann")]
+    reason = await _send(board, B, "@Ann and @ann", None, None, [{**lee, "at": 0}])
+    assert reason == "ambiguous mention @ann: Ann Lee, Ann Moore (\\@ for a literal @)" and len(sent) == 2
 
 
 async def test_no_roster_call_without_a_mention_to_resolve(
@@ -1031,14 +1068,14 @@ async def test_no_roster_call_without_a_mention_to_resolve(
     assert len(sent) == 1
 
 
-@pytest.mark.parametrize("text", ["@Ann then @Ann Moore", "@Ann Moore then @ann"])
+@pytest.mark.parametrize(("text", "at"), [("@Ann then @Ann Moore", 0), ("@Ann Moore then @ann", 16)])
 async def test_a_longer_form_typed_after_a_shortened_pick_is_its_own_member(
-    board: W.Board, sent: list[Any], monkeypatch: pytest.MonkeyPatch, text: str
+    board: W.Board, sent: list[Any], monkeypatch: pytest.MonkeyPatch, text: str, at: int
 ) -> None:
     """032: Ann Lee picked and shortened to `@Ann`; `@Ann Moore` typed before or after it is Ann Moore's,
-    and `@Ann` (any case) stays Ann Lee's."""
+    and the anchored `@Ann` (any case) stays Ann Lee's."""
     monkeypatch.setitem(_ROSTERS, B, [*_ROSTERS[B], {"mri": MOORE, "name": "Ann Moore"}])
-    assert await _send(board, B, text, None, None, [{"name": "Ann", "mri": ANN}]) is None
+    assert await _send(board, B, text, None, None, [{"name": "Ann Lee", "mri": ANN, "at": at}]) is None
     [(_, _, kw)] = sent
     assert sorted(_sent_mentions(kw)) == sorted([(ANN, "Ann"), (MOORE, "Ann Moore")])
 
@@ -1048,7 +1085,7 @@ async def test_a_longer_form_typed_after_a_shortened_pick_is_its_own_member(
 def test_more_picks_than_max_mentions_are_refused_when_parsed(verb: str, same: bool) -> None:
     """032 review: picks are matched against the text, so their count is capped before any work."""
     names = ["Ann Lee" if same else f"Ann {n}" for n in range(compose.MAX_MENTIONS + 1)]
-    picks = [{"name": name, "mri": ANN} for name in names]
+    picks = [{"name": name, "mri": ANN, "at": 0} for name in names]
     if verb == "send":
         got = CV.parse_send({"send": B, "text": "@Ann Lee", "mentions": picks})
     else:
@@ -1081,10 +1118,14 @@ async def test_an_inline_send_resolves_what_inline_mode_reads(
 @pytest.mark.parametrize(
     "pick",
     [
-        {"name": "x" * (compose.MAX_FREE_NAME + 1), "mri": ANN},
-        {"name": "{" + "x" * compose.MAX_NAME + "|" + "y" * compose.MAX_NAME + "}" + "z", "mri": ANN},
-        {"name": "Ann", "mri": "8:orgid:" + "a" * 300},
-        {"name": "everyone", "mri": "19:" + "a" * 300 + "@thread.v2", "everyone": True},
+        {"name": "x" * (compose.MAX_FREE_NAME + 1), "mri": ANN, "at": 0},
+        {
+            "name": "{" + "x" * compose.MAX_NAME + "|" + "y" * compose.MAX_NAME + "}" + "z",
+            "mri": ANN,
+            "at": 0,
+        },
+        {"name": "Ann", "mri": "8:orgid:" + "a" * 300, "at": 0},
+        {"name": "everyone", "mri": "19:" + "a" * 300 + "@thread.v2", "everyone": True, "at": 0},
     ],
 )
 def test_a_pick_past_its_bounds_is_refused_when_parsed(pick: dict[str, str]) -> None:

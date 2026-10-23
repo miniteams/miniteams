@@ -242,14 +242,23 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   it, marks it read in Teams once the window is visible, focused and at the latest message, and the archive has caught
   up (no "loading latest messages…"); one `read` a second per chat, the last one sent only if all that still holds.
 - **Composer** (also the widget's quick reply): completes `:emoji` and `@member` (`@everyone` on group chats, not 1:1;
-  picked members are notified; a mention needs a non-word character before `@`, and two members with the same name map
-  in the order they were picked). An `@Ann`, `@Lee`, `@Ann Lee` or `@{Ann Lee|label}` no pick covers is resolved on
-  the chat's members as MCP does (spec 032, above): ambiguous or unknown, the send is refused with the reason; a
-  longer name typed where a pick's shorter one would match (`@Ann Moore` after picking Ann Lee as `@Ann`) is
-  the longer one's. Editing a message gives its plain `@word` back as `\@word`, so it stays text, and
+  picked members are notified; a mention needs a non-word character before `@`). A pick stays on the `@` it was
+  inserted at (spec 032): whatever the edit (selection deleted, Ctrl+Backspace, a word changed in the middle) that
+  `@` is the picked person while what follows it is one of their forms, `@Ann Lee`, `@Ann` or `@Lee`, case and
+  accents ignored, so namesakes shortened to `@Ann` and `@Moore` keep their own; another name there, or a longer
+  one of someone else (`@Ann Moore` typed over `@Ann Lee`), reads as unpicked. Bold, italic or a list around it
+  keep the pick; deleting, replacing or pasting over the `@` drops it, and so does an undo. An `@Ann`, `@Lee`,
+  `@Ann Lee` or `@{Ann Lee|label}` with no pick is resolved on the chat's members as MCP does (spec 032, above):
+  ambiguous or unknown, the send is refused, the text back in the empty composer and the reason on its line.
+  Editing a message gives its plain `@word` back as `\@word`, so it stays text, and
   each person mention braced: `@{Full Name|label}`, or `@{label|label}` when the full name is unknown (no
   roster, or they left), one spelling per person. A message whose mention label no `{…}` can hold, or
-  whose namesakes stay spelled alike, is not offered for editing.
+  whose namesakes stay spelled alike, is not offered for editing. In an edit, a brace with no pick (an undo,
+  or its Who edited) bearing a kept mention's label is that person's when its Who names them on the chat's
+  members and no one so labelled has left, or, naming no member, is the label or their name in the message
+  (one so labelled); else refused. Without the chat's members only `@{label|label}` is kept, any other Who is
+  `roster unavailable`. A brace with no kept label resolves on
+  the chat's members.
   Messages are limited to 28 KB and 50 mentions.
   - A backslash keeps markup literal: `\*` `\_` `\~` `` \` `` `\[` `\@`, and on the chat page a line starting `\- ` `\* `
     `\> ` `\1. ` (or a line that is only `\>`); `\\` is one backslash before another backslash or one of those, or
@@ -269,8 +278,8 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
     or edits it in place (Enter resends, Escape cancels). On the chat page a failed message Teams echoes counts as
     sent and the rest goes on (the widget sees no echo: ↻ checks and finds it); a `sent` bubble whose echo never
     comes leaves after 30 s.
-  - Backspace after a picked full-name mention shortens it to the first name while keeping its recipient (a
-    kept `@{…}` from an edit is never shortened).
+  - Backspace after a picked full-name mention shortens it to the first name, a shortcut for one of the edits
+    above (a kept `@{…}` from an edit is never shortened).
   - Paste images (PNG, JPEG, GIF, WebP; up to 8, 10 MiB each, 40 MiB in all): thumbnails per chat, click to preview,
     × to drop; Enter sends them after the text, or alone. They upload to Teams only on send and live in the page:
     a reload drops them, the text draft stays. A failed or unanswered send may have gone out: ↻, or the unchanged
@@ -283,7 +292,8 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
     streams them to the local server, which spools them to unnamed temp files under `~/.cache/miniteams/uploads/`.
   - Widget: inline formatting.
   - Chat page: bold, italic, strike, code, lists, quotes through a toolbar or Ctrl+B / Ctrl+I, plus a preview of the message as posted.
-- **Messages**: hover for actions: reply with a quote, react, edit and delete your own. The picker shows 8 favorites
+- **Messages**: hover for actions: reply with a quote, react, edit and delete your own. A mention shows its
+  person's full name on hover when known (spec 032). The picker shows 8 favorites
   (default: Teams' 6 reactions plus 🙏 and 🙃) and `…`, which reacts with any emoji found by `:name`, the org's custom ones
   included. Set the favorites in ⚙ **Reactions**: click a slot to replace it, ◀ ▶ move the chosen slot, `Reset`; kept
   in this browser's `localStorage`. An emoji goes as Teams' name for it (`praying`) when it has one, else as its hex key

@@ -173,12 +173,12 @@ def _verb(**over: Any) -> str:
 
 @pytest.mark.parametrize(
     "stored",
-    ["{", _verb(send="19:other@thread.v2"), _verb(text=1), _verb(html="<b>"), _verb(mentions=[{"name": 1}])],
-    ids=["json", "other-chat", "text-type", "extra-key", "mention"],
+    ["{", _verb(send="19:other@thread.v2"), _verb(text=1), _verb(html="<b>"), _verb(mentions={"name": 1})],
+    ids=["json", "other-chat", "text-type", "extra-key", "mentions-type"],
 )
 async def test_a_malformed_stored_queue_is_dropped(pages: Pages, stored: str) -> None:
     """017-AC12: what sessionStorage holds is checked like any input: a malformed entry sends nothing and
-    breaks nothing; the page still sends."""
+    breaks nothing; the page still sends. (A malformed pick alone leaves only itself out, spec 032.)"""
     fake = Widget()
     init = f"sessionStorage.setItem({json.dumps('queue:' + T)}, {json.dumps(stored)});"
     page = await open_fake_widget(pages, fake, init)
@@ -433,6 +433,38 @@ async def test_a_stored_paused_queue_says_enter_sends_it(pages: Pages) -> None:
     await pages.close()
 
 
+@pytest.mark.parametrize(
+    ("saved", "sent"),
+    [
+        ([{"name": "Ann Lee", "mri": "8:orgid:ann"}], []),  # saved before anchors
+        (
+            [{"name": "Ann Lee", "mri": "8:orgid:ann"}, {"name": "Bob Roe", "mri": "8:orgid:bob", "at": 8}],
+            [8],
+        ),
+        ([{"name": "Ann Lee", "mri": 5, "at": 0}], []),
+    ],
+)
+async def test_a_stored_message_keeps_its_text_when_a_pick_is_not_one(
+    pages: Pages, saved: Any, sent: Any
+) -> None:
+    """032 review L2: a queue stored before anchors (or tampered with) keeps its message: only the picks that
+    are not picks are left out, the rest go as stored, and its `@`s then resolve on the roster."""
+    record = {
+        "paused": True,
+        "items": [{"verb": {"send": T, "text": "@Ann Lee @Bob Roe", "mentions": saved, "format": "inline"}}],
+    }
+    fake = Widget()
+    page = await open_fake_widget(
+        pages, fake, f"sessionStorage.setItem('queue:{T}', {json.dumps(json.dumps(record))});"
+    )
+    await _error_is(page, "1 queued: Enter sends them")
+    await page.locator("#reply").press("Enter")
+    await wait(lambda: len(fake.of("send")) == 1)
+    assert fake.of("send")[0]["text"] == "@Ann Lee @Bob Roe"
+    assert [m["at"] for m in fake.of("send")[0]["mentions"]] == sent
+    await pages.close()
+
+
 # Image measuring held until `window.__release()`: a send whose images are still measured.
 HOLD = """(() => { const Real = window.Image, held = [];
   window.__release = () => held.splice(0).forEach((f) => f());
@@ -476,7 +508,7 @@ async def test_split_a_failure_for_a_chat_with_a_stored_draft_keeps_mentions_and
     """017-AC12, 017-AC3, 017-AC6: split, after a reload: another chat's queued message fails while its
     stored draft is not shown yet; switched to, its bubble says so, the draft untouched; ↻ retries it
     as it was: its mentions, its id, the check."""
-    verb = {"send": L, "text": "@Ann Lee hi", "mentions": [ANN], "format": "full"}
+    verb = {"send": L, "text": "@Ann Lee hi", "mentions": [{**ANN, "at": 0}], "format": "full"}
     init = _seed({"draft:" + L: STALE, "queue:" + L: {"items": [{"verb": verb}]}})
     fake = Chat(replies=[{"error": "boom"}])
     page = await open_chat(pages, fake, "?chatnav=split", init=init)
@@ -489,7 +521,9 @@ async def test_split_a_failure_for_a_chat_with_a_stored_draft_keeps_mentions_and
     await act(page, "retry")
     await wait(lambda: len(fake.of("send")) == 2)
     retry = fake.of("send")[1]
-    assert retry["mentions"] == [ANN] and retry["check"] is True and fake.cmids[0] == fake.cmids[1]
+    assert (
+        retry["mentions"] == [{**ANN, "at": 0}] and retry["check"] is True and fake.cmids[0] == fake.cmids[1]
+    )
     await page.context.close()
 
 
@@ -746,7 +780,7 @@ async def _acts(fake: Any, page: Page, action: str, widget: bool) -> None:
     fake.send({"sent": T, "error": "boom"})
     await queue_is(page, ("@Ann Lee one", "failed: boom"), ("two", "paused"))
     await _tab_order(page, widget)
-    first = ("@Ann Lee one", [ANN])
+    first = ("@Ann Lee one", [{**ANN, "at": 0}])
     if action == "retry":
         await act(page, "retry")
         expected = [(first, True)]
@@ -795,7 +829,7 @@ async def _acts(fake: Any, page: Page, action: str, widget: bool) -> None:
             await editor.press("End")
             await editor.press_sequentially(" fixed")
             await editor.press("Enter")
-            expected = [(("@Ann Lee one fixed", [ANN]), False)]
+            expected = [(("@Ann Lee one fixed", [{**ANN, "at": 0}]), False)]
     await wait(lambda: len(fake.of("send")) == 2)  # the retry, the edit, or "two" once "one" is dropped
     if expected:
         fake.send({"sent": T, "ok": True})

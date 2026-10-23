@@ -21,6 +21,7 @@ from .compose import (
     _literal,
     _word,
     compose_html,
+    mention_ats,
     plain_label,
     trim_url,
 )
@@ -705,10 +706,20 @@ def decompose(
                 except ValueError:
                     return "too long"
                 if _read(composed, composed_props or {}, emojis, names) == (blocks, []):
-                    return Editable(text, picks, quotes, images)
+                    return Editable(text, _anchor(text, picks), quotes, images)
     except _Refused as exc:
         return str(exc)
     return OTHER
+
+
+def _anchor(text: str, picks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Each pick anchored at its `@` in `text` (spec 032): the `@`s read, in order, each the next pick's
+    when it spells it (an `@` an escape leaves at a run's start, `x\\_@y`, is no mention's)."""
+    ats = iter(mention_ats(text))
+    try:
+        return [{**p, "at": next(at for at in ats if text.startswith("@" + p["name"], at))} for p in picks]
+    except StopIteration:
+        raise _Refused(OTHER) from None
 
 
 def _alike(picks: list[dict[str, Any]]) -> bool:

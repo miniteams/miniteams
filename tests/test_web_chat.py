@@ -34,6 +34,7 @@ from miniteams.messages import EMOJI, REACTION_KEY_MAX, _reaction_base, reaction
 from miniteams.teams_emojis import TEAMS_EMOJIS
 
 T = "19:aaaa@thread.v2"  # archived, not on the board
+MEETING = "19:meeting_fictional@thread.v2"
 B = "19:bbbb@thread.v2"  # on the board, not archived
 C = "19:cccc@thread.tacv2"  # archived channel: outside the board's scope
 NOPE = "19:zzzz@thread.v2"  # neither
@@ -637,6 +638,35 @@ def test_record_mentions_and_me() -> None:
     assert record["html"] == f'<p><span class="mention mention-me" data-mri="{ME}">Me</span> look</p>'
 
 
+@pytest.mark.parametrize(
+    ("thread", "mri", "known", "title"),
+    [
+        (T, ANN, {ANN: "Ann Lee"}, ' title="Ann Lee"'),
+        (T, ME, {ME: "Me Self"}, ' title="Me Self"'),
+        (T, ANN, {}, ""),  # unknown: no title, never the MRI's tail
+        (T, ANN, {ANN: ANN.rsplit(":", 1)[-1]}, ""),  # the directory's negative cache
+        (T, T, {T: "Everyone"}, ""),  # everyone: nothing extra
+        (MEETING, MEETING, {MEETING: "Weekly sync"}, ""),
+        (T, ANN, {ANN: 'A "<b>" & B'}, ' title="A &quot;&lt;b&gt;&quot; &amp; B"'),
+    ],
+)
+def test_a_mention_shows_its_persons_full_name_on_hover(
+    thread: str, mri: str, known: dict[str, str], title: str
+) -> None:
+    """032-AC9: a mention span carries its person's full name as `title`, from the directory (which holds the
+    chats' roster names); unknown, or everyone, no title."""
+    directory = Directory.__new__(Directory)
+    directory._names = dict(known)
+    kind = "everyone" if mri == thread else "person"
+    content = '<p><span itemtype="http://schema.skype.com/Mention" itemscope itemid="0">Ann</span> look</p>'
+    props = {"mentions": json.dumps([{"mentionType": kind, "itemid": 0, "mri": mri}])}
+    record = CV.chat_record(
+        _m("7", _at(7), content, properties=props), thread, ME, name_for=directory.name_for
+    )
+    cls = "mention mention-me" if mri == ME else "mention"
+    assert record["html"] == f'<p><span class="{cls}" data-mri="{mri}"{title}>Ann</span> look</p>'
+
+
 def test_record_resolves_reaction_people_without_losing_unknown_users() -> None:
     emotions = [{"key": "launch", "users": [{"mri": ANN}, {"mri": ME}, {"mri": "unknown"}]}]
     names = {ANN: "Ann Lee", ME: "Me Self"}
@@ -663,10 +693,13 @@ async def test_history_names_reaction_people(
     assert message["reactions"][0]["people"] == ["Ann Lee"]
 
 
-def test_resolved_refuses_a_blank_roster_name() -> None:
-    """A whitespace-only display name is no name: refused, not an IndexError."""
-    for label in ("  ", "", "x"):
-        assert CV._resolved(T, [{"mri": ANN, "name": "  "}], [{"name": label, "mri": ANN}]) is None
+def test_a_blank_roster_name_gives_its_pick_no_form() -> None:
+    """A whitespace-only display name is no name: its pick reads nothing at its `@`, which then resolves
+    as unpicked (refused here), not an IndexError."""
+    [anchored] = CV._anchored_picks(T, {ANN: "  "}, [{"name": "x", "mri": ANN, "at": 0}], [None])
+    assert anchored["forms"] == []
+    with pytest.raises(ValueError, match="unknown mention"):
+        compose.resolve_mentions("@x", [{"mri": ANN, "name": "  "}], T, ME, picks=[anchored])
 
 
 _FILE_CARD = (
@@ -2892,10 +2925,11 @@ def test_parse_send_types_a_valid_verb_and_names_the_first_refusal() -> None:
         "send": T,
         "text": "hi",
         "quote": ["1", "2"],
-        "mentions": [{"name": "A", "mri": ANN}],
+        "mentions": [{"name": "A", "mri": ANN, "at": 1}],
         "format": "full",
     }
-    assert CV.parse_send(verb) == CV.SendRequest(T, "hi", ("1", "2"), ({"name": "A", "mri": ANN},), True)
+    want = CV.SendRequest(T, "hi", ("1", "2"), ({"name": "A", "mri": ANN, "at": 1},), True)
+    assert CV.parse_send(verb) == want
     assert CV.parse_send({"send": T, "text": "hi"}) == CV.SendRequest(T, "hi")
     for extra, reason in (
         ({"text": " "}, "empty message"),
@@ -2905,11 +2939,56 @@ def test_parse_send_types_a_valid_verb_and_names_the_first_refusal() -> None:
         ({"quote": ["x"]}, "invalid quote"),
         ({"quote": [str(n) for n in range(11)]}, "too many quotes"),
         ({"mentions": {"name": "A"}}, "invalid mention"),
-        ({"mentions": [{"name": "A", "mri": ANN, "everyone": "yes"}]}, "invalid mention"),
+        ({"mentions": [{"name": "A", "mri": ANN, "everyone": "yes", "at": 0}]}, "invalid mention"),
         ({"format": "md"}, "invalid format"),
         ({"send": 3}, "unknown chat"),
     ):
         assert CV.parse_send({"send": T, "text": "hi", **extra}) == reason, extra
+
+
+@pytest.mark.parametrize(
+    ("text", "at"),
+    [("hi", None), ("hi", True), ("hi", 1.0), ("hi", "1"), ("hi", -1), ("hi", 2), ("😀@A", 1), ("😀@A", 4)],
+)
+def test_a_pick_anchor_must_be_an_offset_of_the_text(text: str, at: Any) -> None:
+    """032: every pick is anchored at an offset of the text, in UTF-16 code units: missing, not an int, past
+    the text or inside an emoji's surrogate pair, the verb is refused before any work."""
+    pick = {"name": "A", "mri": ANN} | ({} if at is None else {"at": at})
+    assert CV.parse_send({"send": T, "text": text, "mentions": [pick]}) == "invalid mention"
+    edit = {"edit": T, "msg": "1", "text": text, "mentions": [pick], "keep_quotes": [], "keep_images": []}
+    assert CV.parse_act("edit", edit) == "invalid mention"
+
+
+@pytest.mark.parametrize("verb", ["send", "edit"])
+def test_a_long_blank_text_beside_images_is_refused_before_its_picks_are_mapped(verb: str) -> None:
+    """032 review L3: whitespace beside images skips the text check; a megabyte of it with a pick is refused
+    as too long before any offset table is built over it."""
+    text, pick = " " * 1_000_000, {"name": "A", "mri": ANN, "at": 0}
+    start = time.process_time()
+    if verb == "send":
+        got = CV.parse_send(
+            {"send": T, "text": text, "images": [{"w": 1, "h": 1, "size": 1}], "mentions": [pick]}
+        )
+    else:
+        edit = {
+            "edit": T,
+            "msg": "1",
+            "text": text,
+            "mentions": [pick],
+            "keep_quotes": [],
+            "keep_images": ["0-weu-d1-a"],
+        }
+        got = CV.parse_act("edit", edit)
+    assert got == "message too long" and time.process_time() - start < 0.1
+
+
+@pytest.mark.parametrize(("text", "unit", "index"), [("😀@A", 2, 1), ("a😀𝐀 @A", 6, 4), ("@A", 0, 0)])
+def test_an_anchor_crosses_from_the_pages_unit_to_the_texts(text: str, unit: int, index: int) -> None:
+    """032: the page anchors a pick in UTF-16 code units (an emoji counts two), the server reads its text by
+    character: the `@` after astral characters is the one anchored."""
+    request = CV.parse_send({"send": T, "text": text, "mentions": [{"name": "A", "mri": ANN, "at": unit}]})
+    assert isinstance(request, CV.SendRequest) and request.mentions[0]["at"] == index
+    assert text[index] == "@" and compose.utf16_units(text)[index] == unit
 
 
 def test_react_accepts_the_three_key_shapes_and_sends_teams_keys() -> None:

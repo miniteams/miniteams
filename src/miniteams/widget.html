@@ -344,7 +344,7 @@
     note: (id, text) => errors.set(id, text),
     edit: (id, e) => {
       if (id !== replyTo || $reply.value || imgs.list(id).length || imgs.adding()) return false;
-      $reply.value = e.verb.text; drafts.set(id, e.verb.text); grow(); complete.restore(e.verb.mentions, id); $reply.focus();
+      $reply.value = e.verb.text; drafts.set(id, e.verb.text); grow(); complete.restore(e.verb.mentions, id, e.verb.text); $reply.focus();
       return true;
     },
   });
@@ -369,7 +369,7 @@
       sessionStorage.removeItem(k);
       if (typeof d?.text !== "string") continue;
       drafts.set(id, d.text);
-      if (Array.isArray(d.picked)) complete.restore(d.picked, id);
+      if (Array.isArray(d.picked)) complete.restore(d.picked, id, d.text);
       imgs.arm(id, d.sent);  // a failed message taken back with ✎: sent unchanged, it is a retry
     }
   } catch (e) {}

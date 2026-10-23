@@ -33,6 +33,7 @@ from browser_helpers import (  # skips without playwright
     queue_is,
     rendered,
     row,
+    server_reads,
     shows,
     wait,
 )
@@ -135,7 +136,12 @@ async def test_at_lists_members_everyone_first_and_send_carries_the_mentions(fak
     await box.press("Enter")
     await wait(lambda: len(fake.of("send")) == 1)
     assert fake.of("send") == [
-        {"send": T, "text": "@Ann Lee hi @everyone ", "mentions": [ANN, EVERYONE], "format": "inline"}
+        {
+            "send": T,
+            "text": "@Ann Lee hi @everyone ",
+            "mentions": [{**ANN, "at": 0}, {**EVERYONE, "at": 12}],
+            "format": "inline",
+        }
     ]
 
 
@@ -157,7 +163,8 @@ async def test_backspace_shortens_a_picked_mention_without_losing_the_recipient(
     assert await box.input_value() == "@Ann h"
     await box.press("Enter")
     await wait(lambda: len(fake.of("send")) == 1)
-    assert fake.of("send")[0]["mentions"] == [{**ANN, "name": "Ann"}]
+    assert fake.of("send")[0]["mentions"] == [{**ANN, "at": 0}]  # who was picked, at its `@` (spec 032)
+    assert server_reads(fake.of("send")[0], fake.members) == [ANN["mri"]]
 
 
 @pytest.mark.parametrize("member", [EVERYONE, {"name": "Cher", "mri": "8:orgid:cher"}])
@@ -173,7 +180,7 @@ async def test_backspace_leaves_everyone_and_single_word_mentions_as_normal_text
     assert await box.input_value() == "@" + member["name"]
     await box.press("Enter")
     await wait(lambda: len(fake.of("send")) == 1)
-    assert fake.of("send")[0]["mentions"] == [member]
+    assert fake.of("send")[0]["mentions"] == [{**member, "at": 0}]
 
 
 async def test_a_removed_mention_is_not_sent_and_picks_survive_a_failure_only(fake: Fake) -> None:
@@ -185,7 +192,10 @@ async def test_a_removed_mention_is_not_sent_and_picks_survive_a_failure_only(fa
         await shows(page, [{"ann": "Ann Lee", "bob": "Bob Roe"}[prefix]])
         await box.press("Enter")
     assert await box.input_value() == "@Ann Lee @Bob Roe "
-    await box.fill("@Ann Lee only")
+    await box.evaluate("b => b.setSelectionRange(9, 18)")
+    await box.press("Delete")
+    await box.press_sequentially("only")
+    assert await box.input_value() == "@Ann Lee only"
     fake.fail = True
     await box.press("Enter")
     await queue_is(page, ("@Ann Lee only", "failed: boom"))
@@ -195,7 +205,7 @@ async def test_a_removed_mention_is_not_sent_and_picks_survive_a_failure_only(fa
     await box.fill("@Ann Lee again")
     await box.press("Enter")
     await wait(lambda: len(fake.of("send")) == 3)
-    assert [v["mentions"] for v in fake.of("send")] == [[ANN], [ANN], []]
+    assert [v["mentions"] for v in fake.of("send")] == [[{**ANN, "at": 0}], [{**ANN, "at": 0}], []]
 
 
 async def test_escape_closes_the_list_keeps_the_text_then_enter_sends(fake: Fake) -> None:
@@ -477,11 +487,11 @@ async def test_two_people_with_one_name_are_both_mentioned(fake: Fake) -> None:
     await box.press("Enter")
     await box.press("Enter")
     await wait(lambda: len(fake.of("send")) == 1)
-    assert fake.of("send")[0]["mentions"] == [ANN, ANN2]
+    assert server_reads(fake.of("send")[0], fake.members) == [ANN["mri"], ANN2["mri"]]
 
 
 @pytest.mark.parametrize(
-    ("picks", "sent"), [([0, 1], [ANN2]), ([0, 1, 0], [ANN])], ids=["other", "re-picked"]
+    ("picks", "sent"), [([0, 1], [ANN2["mri"]]), ([0, 1, 0], [ANN["mri"]])], ids=["other", "re-picked"]
 )
 async def test_a_deleted_pick_does_not_mention_its_namesake(fake: Fake, picks: list[int], sent: Any) -> None:
     """M1: a namesake picked then deleted from the text is not mentioned; the one picked last is."""
@@ -490,13 +500,15 @@ async def test_a_deleted_pick_does_not_mention_its_namesake(fake: Fake, picks: l
 
 
 async def test_picks_out_of_text_order_mention_both(fake: Fake) -> None:
-    """M1: a mention inserted before an earlier pick still counts, and so does the earlier one."""
-    assert await pick_out_of_order(fake) == [BOB, ANN]
+    """M1: a mention inserted before an earlier pick still counts, and so does the earlier one; the picks
+    go in text order (spec 032)."""
+    assert await pick_out_of_order(fake) == [ANN["mri"], BOB["mri"]]
 
 
-async def test_a_longer_word_is_no_mention(fake: Fake) -> None:
-    """L4: `@Ann Leeds` is no mention of Ann Lee, as the server reads it (a raw substring would count it)."""
-    assert await pick_then_glue(fake) == []
+async def test_a_longer_word_leaves_the_first_name_mention(fake: Fake) -> None:
+    """L4, spec 032: `@Ann Leeds` is no `@Ann Lee`, but `@Ann` (her first name, a form of the pick) followed
+    by `Leeds`, as the server reads it."""
+    assert await pick_then_glue(fake) == [ANN["mri"]]
 
 
 async def test_row_names_and_snippets_take_their_own_direction(pages: Pages) -> None:

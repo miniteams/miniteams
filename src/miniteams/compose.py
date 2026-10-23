@@ -3,6 +3,7 @@
 Pure (spec 012). No backtracking regex: closers are found with `str.find`.
 """
 
+import contextlib
 import functools
 import html
 import itertools
@@ -54,8 +55,8 @@ _SCANS = 2 * MAX_MENTIONS  # `@` checked against picks or roster: the mentions p
 # An `@` starting a word, which compose_html expands when a name follows; URLs matched first to skip theirs.
 _CANDIDATE_RE = re.compile(rf"(?P<url>{_URL_RE.pattern})|(?<!\w)@")
 _OPENS_RE = re.compile(r"[\w{]")  # what follows an `@` a sender resolves: a name or a `{Who|label}`
-# What continues a word, so a name cannot end before it: `\w` and the marks (`re` has no \p{M}; ui.js's
-# `scan` reads the same `[\p{L}\p{N}_\p{M}]`). Planes 0, 1 and 14 hold every mark.
+# What continues a word, so a name cannot end before it: `\w` and the marks (`re` has no \p{M}).
+# Planes 0, 1 and 14 hold every mark.
 _MARKS = "".join(
     chr(c)
     for c in itertools.chain(range(0x20000), range(0xE0000, 0xE1000))
@@ -65,7 +66,7 @@ _JOINS = rf"[\w{_MARKS}]"
 _JOINS_RE = re.compile(_JOINS)
 _TRIM_RE = re.compile(rf"^[^\w{_MARKS}]+|[^\w{_MARKS}]+$")  # punctuation around a word
 
-type OnText = Callable[[str], str]
+type OnText = Callable[[str, int], str]  # a plain run and where it starts in the text
 
 
 def _word(ch: str) -> bool:
@@ -100,9 +101,10 @@ def _escaped(line: str, i: int) -> bool:
     return (i - back) % 2 == 1
 
 
-def _inline(line: str, on_text: OnText, lead: bool = False, after: str = "") -> str:
+def _inline(line: str, on_text: OnText, lead: bool = False, after: str = "", base: int = 0) -> str:
     """One line of inline markup; `on_text` renders the plain runs between spans. `lead`: a full-mode
-    text line, where `\\` before a block marker is one backslash; `after`: what follows a span's content.
+    text line, where `\\` before a block marker is one backslash; `after`: what follows a span's content;
+    `base`: where `line` starts in the text.
 
     Recursion stays shallow: a span's content cannot hold its own unescaped marker (the nearest one
     closes it).
@@ -147,9 +149,11 @@ def _inline(line: str, on_text: OnText, lead: bool = False, after: str = "") -> 
             # `@{Who|label}` starting a word is read raw up to its `}`, before any markup (spec 032): its own
             # run, so a mention's label or a URL inside it is never split by `*`, `_`, `[`…
             if (end := _token_end(line, i)) > 0:
-                out.append(on_text(line[flushed:i]))  # first: mentions are numbered in text order
+                out.append(
+                    on_text(line[flushed:i], base + flushed)
+                )  # first: mentions are numbered in text order
                 flushed = i
-                hit = on_text(line[i : end + 1]), end + 1
+                hit = on_text(line[i : end + 1], base + i), end + 1
             else:
                 i += 1
                 continue
@@ -182,9 +186,11 @@ def _inline(line: str, on_text: OnText, lead: bool = False, after: str = "") -> 
             for marker, tag in _SPANS:
                 if line.startswith(marker, i) and (end := closer(i, marker)) >= 0:
                     # Flushed before the span's content: mentions are numbered and paired in text order.
-                    out.append(on_text(line[flushed:i]))
+                    out.append(on_text(line[flushed:i], base + flushed))
                     flushed = i
-                    inner = _inline(line[i + len(marker) : end], on_text, after=marker[0])
+                    inner = _inline(
+                        line[i + len(marker) : end], on_text, after=marker[0], base=base + i + len(marker)
+                    )
                     hit = f"<{tag}>{inner}</{tag}>", end + len(marker)
                     break
             else:
@@ -194,9 +200,9 @@ def _inline(line: str, on_text: OnText, lead: bool = False, after: str = "") -> 
         if hit is None:
             i += 1
             continue
-        out += (on_text(line[flushed:i]), hit[0])
+        out += (on_text(line[flushed:i], base + flushed), hit[0])
         i = flushed = hit[1]
-    out.append(on_text(line[flushed:]))
+    out.append(on_text(line[flushed:], base + flushed))
     return "".join(out)
 
 
@@ -261,6 +267,7 @@ def _literal(line: str) -> str:
 def _blocks(text: str, on_text: OnText) -> str:
     """Full mode: fenced code, `> ` quotes, `- `/`* `/`1. ` lists; other lines inline, joined by <br>."""
     lines = text.split("\n")
+    starts = list(itertools.accumulate((len(line) + 1 for line in lines[:-1]), initial=0))
     fences = [n for n, line in enumerate(lines) if line.startswith("```")]
     fence_end = dict(zip(fences, fences[1:], strict=False))
     kinds: list[tuple[str, Callable[[str], int]]] = [
@@ -280,14 +287,14 @@ def _blocks(text: str, on_text: OnText) -> str:
             continue
         for tag, marker in kinds:
             if marker(line):
-                run: list[tuple[str, int]] = []
+                run: list[tuple[int, int]] = []
                 end = i
                 while end < len(lines) and (cut := marker(lines[end])):
-                    run.append((lines[end], cut))
+                    run.append((end, cut))
                     end += 1
-                if tag == "blockquote" and all(len(text) == cut for text, cut in run):
+                if tag == "blockquote" and all(len(lines[n]) == cut for n, cut in run):
                     continue  # `>` alone is what was typed, not an empty quote
-                items = [_inline(text[cut:], on_text) for text, cut in run]
+                items = [_inline(lines[n][cut:], on_text, base=starts[n] + cut) for n, cut in run]
                 i = end
                 if tag == "blockquote":
                     out.append(f"<blockquote>{'<br>'.join(items)}</blockquote>")
@@ -296,7 +303,11 @@ def _blocks(text: str, on_text: OnText) -> str:
                 after_text = False
                 break
         else:
-            out.append(("<br>" if after_text else "") + _inline(_literal(line), on_text, lead=True))
+            lit = _literal(line)
+            out.append(
+                ("<br>" if after_text else "")
+                + _inline(lit, on_text, lead=True, base=starts[i] + len(line) - len(lit))
+            )
             after_text = True
             i += 1
     return "".join(out)
@@ -307,7 +318,9 @@ def _render(text: str, full: bool, on_text: OnText) -> str:
         raise ValueError(f"message too long ({len(text)} > {MAX_TEXT} characters)")
     if full:
         return _blocks(text, on_text)
-    return "<br>".join(_inline(line, on_text) for line in text.split("\n"))
+    lines = text.split("\n")
+    starts = itertools.accumulate((len(line) + 1 for line in lines[:-1]), initial=0)
+    return "<br>".join(_inline(line, on_text, base=at) for line, at in zip(lines, starts, strict=True))
 
 
 def compose_html(
@@ -396,7 +409,7 @@ def compose_html(
             )
         return SHORTCODES.get(emoji)
 
-    def on_text(seg: str) -> str:
+    def on_text(seg: str, _at: int) -> str:
         out: list[str] = []
         pos = scan = 0
         while (m := token_re.search(seg, scan)) is not None:
@@ -422,12 +435,13 @@ def shown_label(name: str) -> str:
     return label if source == name else name
 
 
-def _segments(text: str, full: bool = True) -> list[str]:
-    """The plain runs compose_html's `on_text` gets for `text`: code, link labels and `\\@` never reach it."""
-    found: list[str] = []
+def _segments(text: str, full: bool = True) -> list[tuple[str, int]]:
+    """The plain runs compose_html's `on_text` gets for `text`, each with where it starts in `text`: code,
+    link labels and `\\@` never reach it."""
+    found: list[tuple[str, int]] = []
 
-    def on_text(seg: str) -> str:
-        found.append(seg)
+    def on_text(seg: str, at: int) -> str:
+        found.append((seg, at))
         return ""
 
     _render(text, full, on_text)
@@ -451,12 +465,7 @@ def _opens(rest: str) -> bool:
 def holds_mention(text: str, full: bool = True) -> bool:
     """Whether `text` holds an `@Name` to resolve, as compose_html reads it (spec 029): without any, nothing
     needs the roster."""
-    for seg in _segments(text, full):
-        at = 0
-        while (at := _next_at(seg, at)) >= 0:
-            if _opens(seg[at : at + 1]):
-                return True
-    return False
+    return bool(mention_ats(text, full))
 
 
 def _joins(ch: str) -> bool:
@@ -510,16 +519,15 @@ def free_label(rest: str) -> tuple[str, str, str]:
 
 
 def _typed_len(rest: str, form: str) -> int:
-    """Length of the longest start of `rest` that is `form`, case and accents ignored, and ends a word (a
-    `{Who|label}` form ends at its `}`, whatever follows, as compose_html reads it); 0 for none. Grown a
-    character at a time, folded per character: folding changes lengths (`ß` → `ss`, a combining accent →
-    "")."""
-    want, got, best, braced = _fold(form), 0, 0, form.startswith("{")
+    """Length of the longest start of `rest` that is `form`, case and accents ignored, and ends a word; 0
+    for none. Grown a character at a time, folded per character: folding changes lengths (`ß` → `ss`, a
+    combining accent → "")."""
+    want, got, best = _fold(form), 0, 0
     for k, ch in enumerate(rest, 1):
         if not want.startswith(part := _fold(ch), got):  # from `got` on: linear in what is read
             break
         got += len(part)
-        if got == len(want) and (braced or not _joins(rest[k : k + 1] or " ")):
+        if got == len(want) and not _joins(rest[k : k + 1] or " "):
             best = k
     return best
 
@@ -530,6 +538,59 @@ _fold_cached = functools.lru_cache(maxsize=4096)(fold)
 def _fold(text: str) -> str:
     # Bounded in count and size: characters and short names repeat; a long key would pin its memory.
     return _fold_cached(text) if len(text) <= 64 else fold(text)
+
+
+def _anchored(rest: str, pick: dict[str, Any]) -> tuple[str, str] | None:
+    """What an anchored pick reads at its `@` (spec 032): (the text read, its label) when `rest` starts with
+    one of its `forms` (the longest, as the roster spells it) or a `{Who|label}` whose Who is one of them
+    or of its `whos` (shown as typed); else None."""
+    if rest.startswith("{"):
+        try:
+            typed, who, label = free_label(rest)
+        except ValueError:
+            return None  # the roster's reading refuses it, with the reason
+        whos = pick.get("whos", pick["forms"])
+        return (typed, label) if who and any(_typed_len(who, w) == len(who) for w in whos) else None
+    size, form = max(((_typed_len(rest, f), f) for f in pick["forms"]), default=(0, ""))
+    return (rest[:size], form) if size else None
+
+
+type _ByWord = dict[str, list[tuple[str, dict[str, Any]]]]
+
+
+def _forms_by_word(
+    members: list[dict[str, Any]], thread_id: str, me: str, *, anyone: bool = False
+) -> _ByWord:
+    """Every member's forms (and everyone's, off 1:1s), by first word folded: a bucket per `@`. `anyone`
+    keeps me, bots and apps in, mentionable or not."""
+    named = {str(m["mri"]): str(m["name"] or "") for m in members} if anyone else humans(members)
+    people = [
+        (form, {"mri": mri, "label": form})
+        for mri, name in named.items()
+        if anyone or not is_me(mri, me)
+        for form in forms(name)
+    ]
+    everyone = [("everyone", {"mri": thread_id, "everyone": True})]
+    by_word: _ByWord = {}
+    for form, member in (everyone if chat_kind(thread_id) not in ("private", "system") else []) + people:
+        by_word.setdefault(_word_key(form), []).append((form, member))
+    return by_word
+
+
+def _named(by_word: _ByWord, who: str) -> dict[str, dict[str, Any]]:
+    """The members a `{Who|label}`'s Who names whole, never a start of it: `{Ann Leeds|x}` is not Ann Lee."""
+    return {
+        p["mri"]: p
+        for form, p in by_word.get(_word_key(who), ())
+        if who and "everyone" not in p and _typed_len(who, form) == len(who)
+    }
+
+
+def who_reader(members: list[dict[str, Any]], thread_id: str, me: str) -> Callable[[str], frozenset[str]]:
+    """The MRIs a `{Who|label}`'s Who names on `members`, read as resolve_mentions reads it but me, bots
+    and apps included: naming them is naming someone. The roster is indexed once, each Who read once."""
+    by_word = _forms_by_word(members, thread_id, me, anyone=True)
+    return functools.cache(lambda who: frozenset(_named(by_word, who)))
 
 
 def resolve_mentions(
@@ -546,25 +607,19 @@ def resolve_mentions(
     A member's full, first or last name matches, case and accents ignored, longest first; `name` is the
     spelling typed, `label` the roster's. `@{Who|label}` names the member Who matches whole, shown as
     `label`. Bots, apps and me are no candidates; `@everyone` is the chat's on groups, meetings and
-    channels. An `@` a caller's pick names (case and accents ignored) is that pick's, unless a longer
-    roster form is typed there; the n-th one of a spelling takes the n-th of the picks naming it (the last
-    past them). One pick per `@`, in text order, named as typed: compose_html's pairing, done once, on the
-    text walked as it walks it (resuming past each name read, URLs skipped whole). ValueError for a name
-    matching nobody or several members, a malformed label, more than MAX_MENTIONS, or more than _SCANS
-    `@` to check against the picks."""
-    picks = [p for p in picks or () if p.get("name")]
-    starts = {fold(str(p["name"]))[:1] for p in picks}  # an `@` no pick can start costs no pick scan
-    roster = humans(members)
-    people = [
-        (form, {"mri": mri, "label": form})
-        for mri, name in roster.items()
-        if not is_me(mri, me)
-        for form in forms(name)
-    ]
-    everyone = [("everyone", {"mri": thread_id, "everyone": True})]
-    by_word: dict[str, list[tuple[str, dict[str, Any]]]] = {}  # first word → its forms: a bucket per `@`
-    for form, pick in (everyone if chat_kind(thread_id) not in ("private", "system") else []) + people:
-        by_word.setdefault(_word_key(form), []).append((form, pick))
+    channels. `picks`: a page's, each `{at, mri, forms, whos?, kept?, everyone?}` anchored at the `@` at
+    `text[at]`: that `@` is its person when one of its `forms` (or a brace whose Who is one, or one of `whos`)
+    follows and no other member reads longer there (at a brace: Who names no other member whole, unless it
+    is `kept`, the edit's own spelling, unchanged); else it reads as if unpicked; a pick at no `@` read here,
+    or sharing its `@`, anchors nothing. One pick
+    per `@`, in text order, named as typed: compose_html's pairing, done once, on the text walked as it
+    walks it (resuming past each name read, URLs skipped whole). ValueError for a name matching nobody or
+    several members, a malformed label, more than MAX_MENTIONS, or more than _SCANS `@` to read."""
+    anchors: dict[int, dict[str, Any] | None] = {}
+    for page_pick in picks or ():
+        at = page_pick["at"]
+        anchors[at] = None if at in anchors else page_pick  # two picks on one `@`: neither stands
+    roster, by_word = humans(members), _forms_by_word(members, thread_id, me)
 
     def one(typed: str, found: dict[str, dict[str, Any]]) -> dict[str, Any]:
         shown = typed if typed.startswith("{") else typed[:MAX_NAME]
@@ -578,58 +633,84 @@ def resolve_mentions(
         return next(iter(found.values()))
 
     out: list[dict[str, Any]] = []
-    occurrences: dict[str, int] = {}  # folded spelling → `@` a pick covered so far
     scans = 0
-    for seg in _segments(text, full):
+    for seg, start in _segments(text, full):
         at = 0
         while (at := _next_at(seg, at)) >= 0:
             # A name past _FREE_LEN never matches: the rest of the text is not kept per `@`.
             rest = seg[at : at + _FREE_LEN + 1]
-            first = fold(rest[:1])[:1]
-            if not (_opens(rest) or first in starts):
+            pick = anchors.get(start + at - 1)
+            read = _anchored(rest, pick) if pick else None
+            if read is None and not _opens(rest):
                 continue
-            # Each `@` costs a scan of the picks or the roster: bounded whatever the text.
+            # Each `@` costs a scan of the roster: bounded whatever the text.
             if (scans := scans + 1) > _SCANS:
                 raise ValueError(f"too many @ to check (> {_SCANS}){_LITERAL}")
-            ties: list[dict[str, Any]] = []  # the picks covering the longest start of `rest`, in pick order
-            covered = 0
-            for pick in picks if not first or first in starts else ():
-                if (n := _typed_len(rest, str(pick["name"]))) and n >= covered:
-                    ties, covered = ([*ties, pick] if n == covered else [pick]), n
-            if not ties and not _opens(rest):
-                continue
             if len(out) == MAX_MENTIONS:
                 raise ValueError(f"too many mentions (> {MAX_MENTIONS})")
-            # Only the forms sharing the first word typed: a large roster costs a bucket, not every name. A
-            # `{` opens a free label, never a name, whatever a member calls themselves.
-            bucket = () if rest.startswith("{") else by_word.get(_word_key(rest), ())
-            hits = [(n, pick) for form, pick in bucket if (n := _typed_len(rest, form))]
-            size = max((n for n, _ in hits), default=0)
-            if ties and covered >= size:
-                typed = rest[:covered]
-                k = occurrences.get(key := fold(typed), 0)
-                occurrences[key] = k + 1
-                cover = ties[min(k, len(ties) - 1)]
-                # A free label shows as typed (`BOSS` for a pick `{Ann Lee|boss}`), a name as picked.
-                free = shown_label(cover["name"]) != cover["name"]
-                label = free_label(rest)[2] if free else cover.get("label") or cover["name"]
-                found = {**cover, "label": label}
-            elif rest.startswith("{"):
-                typed, who, label = free_label(rest)
-                # Whole, never a start of Who: `{Ann Leeds|x}` is not Ann Lee.
-                forms_of = by_word.get(_word_key(who), ())
-                whole = {
-                    p["mri"]: p
-                    for form, p in forms_of
-                    if who and "everyone" not in p and _typed_len(who, form) == len(who)
-                }
-                found = {**one(typed, whole), "label": label}
+            # The roster's reading of this `@` decides whether a pick there stands (spec 032): while no one
+            # else reads longer there (namesakes reading as far: the pick decides), or, at a brace, while its
+            # Who names no other member whole; a kept brace given back unchanged is the message's own.
+            if brace := rest.startswith("{"):
+                typed, who, label = free_label(rest)  # a malformed one is refused, picked or not
+                named = _named(by_word, who)
+                if pick and read and typed != pick.get("kept") and named and pick["mri"] not in named:
+                    read = None
+            else:
+                # Only the forms sharing the first word typed: a large roster costs a bucket, not every name.
+                hits = [
+                    (n, p) for form, p in by_word.get(_word_key(rest), ()) if (n := _typed_len(rest, form))
+                ]
+                size = max((n for n, _ in hits), default=0)
+                if (
+                    pick
+                    and read
+                    and size > len(read[0])
+                    and any(p["mri"] != pick["mri"] for n, p in hits if n == size)
+                ):
+                    read = None
+            if pick is not None and read is not None:
+                typed, label = read
+                found = {"mri": pick["mri"], "label": label} | (
+                    {"everyone": True} if pick.get("everyone") else {}
+                )
+            elif brace:
+                found = {**one(typed, named), "label": label}  # Whole, never a start of Who: `{Ann Leeds|x}`
             else:
                 typed = rest[: size or next((i for i, c in enumerate(rest) if not _joins(c)), len(rest))]
                 found = one(typed, {p["mri"]: p for n, p in hits if n == size})
             at += len(typed)  # compose_html resumes past the name: an `@` inside it is that name's
             out.append({**found, "name": typed})
     return out
+
+
+def mention_reads(text: str, full: bool = True) -> list[tuple[int, str]]:
+    """Each `@` resolve_mentions reads in `text` (`text[at] == "@"`), in text order, with the text after it
+    as it reads it: its segment's, at most _FREE_LEN + 1 characters. As it does, a valid `@{…}` is read
+    whole: an `@` inside is its Who's. Roster-free: an `@` inside a roster name holding " @" is listed."""
+    found: list[tuple[int, str]] = []
+    for seg, start in _segments(text, full):
+        at = 0
+        while (at := _next_at(seg, at)) >= 0:
+            if _opens(rest := seg[at : at + _FREE_LEN + 1]):
+                found.append((start + at - 1, rest))
+                if rest.startswith("{"):
+                    # A malformed one: resolve_mentions refuses it.
+                    with contextlib.suppress(ValueError):
+                        at += len(free_label(rest)[0])
+    return found
+
+
+def mention_ats(text: str, full: bool = True) -> list[int]:
+    """Where each `@` resolve_mentions reads in `text` is (roster-free, see mention_reads): the offsets an
+    edit's kept mentions are anchored at (spec 032)."""
+    return [at for at, _ in mention_reads(text, full)]
+
+
+def utf16_units(text: str) -> list[int]:
+    """Each index of `text`, and its end, as the page's offset in UTF-16 code units (an astral character
+    counts two): the unit mention anchors travel in (spec 032)."""
+    return list(itertools.accumulate((2 if ord(c) > 0xFFFF else 1 for c in text), initial=0))
 
 
 def render_outgoing(

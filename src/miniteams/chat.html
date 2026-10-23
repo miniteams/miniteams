@@ -883,7 +883,7 @@
     };
     const fill = (form, text = form.text, quotes = form.quotes, images = form.images, picks = form.picks) => {
       Object.assign(ed, { form, quotes, images });
-      complete.restore(picks);
+      complete.restore(picks, thread, text);
       Object.assign(box, { readOnly: false, placeholder: "", value: text, rows: Math.min(8, text.split("\n").length) });
       draw();
     };
@@ -1443,7 +1443,7 @@
   const draftOf = (id) => {
     const d = !drafts.has(id) && takeDraft(id);
     if (d) {
-      if (Array.isArray(d.picked)) complete.restore(d.picked, id);
+      if (Array.isArray(d.picked)) complete.restore(d.picked, id, d.text);
       imgs.arm(id, d.sent);
       delete d.picked; delete d.sent;
       drafts.set(id, d);
@@ -1522,7 +1522,7 @@
     nothing: (id) => { if (!(id === thread ? $err.textContent : draftOf(id)?.err)) noteFor(id, "nothing to send"); },  // a refused image keeps its reason
     edit: (id, e) => {
       if (id !== thread || $reply.value || quotes.length || imgs.list(id).length || imgs.adding()) return false;
-      $reply.value = e.verb.text; grow(); quotes = [...e.quotes]; renderQuotes(); complete.restore(e.verb.mentions, id); $reply.focus();
+      $reply.value = e.verb.text; grow(); quotes = [...e.quotes]; renderQuotes(); complete.restore(e.verb.mentions, id, e.verb.text); $reply.focus();
       return true;
     },
     // Its bubble stays until Teams' echo replaces it: no gap between the two.

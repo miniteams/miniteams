@@ -99,10 +99,11 @@ class _Sanitizer(HTMLParser):
         custom: frozenset[str] = frozenset(),
         names: dict[str, str] | None = None,
         named: set[str] | None = None,
+        titles: dict[str, str] | None = None,
     ) -> None:
         super().__init__(convert_charrefs=True)
         self.thread_id, self.media_dir, self.me, self.mentions = thread_id, media_dir, me, mentions
-        self.custom = custom
+        self.custom, self.titles = custom, titles or {}
         self.names, self.named = names or {}, named if named is not None else set()
         # (open-stack index, output length) of a link renamed after a file: its own content is cut at its end.
         self.renamed: tuple[int, int] | None = None
@@ -160,6 +161,7 @@ class _Sanitizer(HTMLParser):
                 mri = self.mentions.get(a.get("itemid", ""), "")
                 cls = "mention mention-me" if mri and mri == self.me else "mention"
                 extra = _attr("class", cls) + (_attr("data-mri", mri) if mri else "")
+                extra += _attr("title", self.titles[mri]) if mri in self.titles else ""
         elif tag == "blockquote" and itemtype.endswith("/Reply"):
             mid = a.get("itemid", "")
             # Digits only: the page reads the quoted message's time from its id (spec 021).
@@ -266,13 +268,15 @@ def sanitize(
     custom: frozenset[str] = frozenset(),
     names: dict[str, str] | None = None,
     named: set[str] | None = None,
+    titles: dict[str, str] | None = None,
 ) -> str:
     """Teams HTML → allowlisted HTML; `mentions` maps a Mention span's `itemid` to its MRI, `custom`
     holds the custom emoji object ids `/emoji/<id>` serves. A link whose `_link_key` is in `names` reads as
-    that file name instead of its content; its key is added to `named`.
+    that file name instead of its content; its key is added to `named`. `titles`: MRI → the full name a
+    mention of that person shows on hover (spec 032).
 
     Input past `_HTML_MAX` chars is cut off: the parser's cost must stay bounded per message."""
-    parser = _Sanitizer(thread_id, media_dir, me, mentions or {}, custom, names, named)
+    parser = _Sanitizer(thread_id, media_dir, me, mentions or {}, custom, names, named, titles)
     parser.feed(content[:_HTML_MAX])
     return parser.result()
 

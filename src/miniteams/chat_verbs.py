@@ -43,11 +43,14 @@ from .compose import (
     forms,
     free_label,
     holds_mention,
+    mention_reads,
     reply_quote,
     resolve_mentions,
     shown_label,
+    utf16_units,
+    who_reader,
 )
-from .decompose import Editable, brace_name, decompose
+from .decompose import MISREAD, Editable, brace_name, decompose
 from .directory import Directory, is_app
 from .directory import humans as _humans
 from .dump import epoch_seconds, fetch_history
@@ -402,7 +405,12 @@ def chat_record(
                 if isinstance(m, dict)
             }
             names = file_links(props.get("files"))
-            body = sanitize(content, thread_id, media_dir, me, mentions, custom, names, named)
+            # A known name only: name_for gives an unknown MRI's tail. Everyone (the thread) shows none.
+            known = {
+                mri: name_for(mri) for mri in set(mentions.values()) if mri and mri != thread_id and name_for
+            }
+            titles = {mri: name for mri, name in known.items() if name != mri.rsplit(":", 1)[-1]}
+            body = sanitize(content, thread_id, media_dir, me, mentions, custom, names, named, titles)
         elif msgtype == "Text":
             body = html.escape(content)
         if msgtype == "RichText/Media_Card" or props.get("cards"):
@@ -546,7 +554,27 @@ def _mention_shape(mention: Any) -> bool:
         and isinstance(mri := mention.get("mri"), str)
         and len(mri) <= _MAX_MRI
         and isinstance(mention.get("everyone", False), bool)
+        and type(mention.get("at")) is int  # the `@` it was picked at (spec 032), never a bool
     )
+
+
+def _picks(verb: dict[str, Any], text: Any) -> list[dict[str, Any]] | str:
+    """The page's picks, each anchored at an index of `text` (the page's UTF-16 offset converted), or the
+    refusal: a malformed one, one past the text or inside a character, more than MAX_MENTIONS."""
+    mentions = [] if verb.get("mentions") is None else verb["mentions"]
+    if not isinstance(mentions, list) or not all(_mention_shape(m) for m in mentions):
+        return "invalid mention"
+    if len(mentions) > MAX_MENTIONS:  # each pick is matched against the text: bounded before any work
+        return f"too many mentions ({len(mentions)} > {MAX_MENTIONS})"
+    if not mentions:
+        return []
+    if isinstance(text, str) and too_long(text):  # whitespace beside images skips _text_error: bound it here
+        return "message too long"
+    units = utf16_units(text if isinstance(text, str) else "")
+    index = {unit: i for i, unit in enumerate(units[:-1])}
+    if any(m["at"] not in index for m in mentions):
+        return "invalid mention"
+    return [{**m, "at": index[m["at"]]} for m in mentions]
 
 
 def _format(value: Any) -> bool | None:
@@ -621,11 +649,8 @@ def parse_send(verb: dict[str, Any]) -> SendRequest | str:
         return "too many quotes"
     if not all(isinstance(q, str) and MSG_ID_RE.fullmatch(q) for q in quote) or len(set(quote)) < len(quote):
         return "invalid quote"
-    mentions = [] if verb.get("mentions") is None else verb["mentions"]
-    if not isinstance(mentions, list) or not all(_mention_shape(m) for m in mentions):
-        return "invalid mention"
-    if len(mentions) > MAX_MENTIONS:  # each pick is matched against the text: bounded before any work
-        return f"too many mentions ({len(mentions)} > {MAX_MENTIONS})"
+    if isinstance(mentions := _picks(verb, text), str):
+        return mentions
     if (full := _format(verb.get("format"))) is None:
         return "invalid format"
     return SendRequest(thread, str(text), tuple(quote), tuple(mentions), full, images, cmid, check, files)
@@ -655,11 +680,8 @@ def parse_act(action: Action, verb: dict[str, Any]) -> ActRequest | str:
         # Kept images alone are a message, as in a send.
         if not (images and isinstance(text, str) and not text.strip()) and (error := _text_error(text)):
             return error
-        mentions = [] if verb.get("mentions") is None else verb["mentions"]
-        if not isinstance(mentions, list) or not all(_mention_shape(m) for m in mentions):
-            return "invalid mention"
-        if len(mentions) > MAX_MENTIONS:
-            return f"too many mentions ({len(mentions)} > {MAX_MENTIONS})"
+        if isinstance(mentions := _picks(verb, text), str):
+            return mentions
         return ActRequest(
             action,
             thread,
@@ -819,32 +841,29 @@ async def answer(ws: ServerConnection, head: dict[str, Any], work: Awaitable[dic
     await reply(ws, frame)
 
 
-def _resolved(
-    thread_id: str, members: list[dict[str, Any]], mentions: list[dict[str, Any]]
-) -> list[dict[str, Any]] | None:
-    """Each pick labelled from the roster: the form of its member's name it spells (full, first or last),
-    or the label of its `{Who|label}`, Who one of those forms (spec 032); None for a nonmember or a name
-    that is none of them."""
-    humans = _humans(members)
+def _anchored_picks(
+    thread_id: str, humans: dict[str, str], picks: list[dict[str, Any]], kept: list[dict[str, Any] | None]
+) -> list[dict[str, Any]] | str:
+    """The page's picks as resolve_mentions anchors them (spec 032): each read at its `@` by the forms of
+    its person's roster name, a kept one (`kept[i]`, the edit's copy's own) by its braced Who and label
+    too, everyone by `everyone`. "unknown mention" for a new pick of no member, or an everyone pick not
+    this chat's."""
     out: list[dict[str, Any]] = []
-    for m in mentions:
-        typed = m["name"]
-        if m.get("everyone"):
-            ok = m["mri"] == thread_id and chat_kind(thread_id) != "private" and fold(typed) == "everyone"
-            label: str | None = typed if ok else None
-        else:
-            spelled = {fold(form): form for form in reversed(forms(humans.get(m["mri"], "")))}
-            label = spelled.get(fold(typed))
-            if typed.startswith("{"):
-                try:
-                    source, who, label = free_label(typed)
-                except ValueError:
-                    return None
-                if source != typed or fold(who) not in spelled:
-                    return None
-        if label is None:
-            return None
-        out.append({**m, "label": label})
+    for pick, own in zip(picks, kept, strict=True):
+        if pick.get("everyone") or (own or {}).get("everyone"):
+            if pick["mri"] != thread_id or chat_kind(thread_id) == "private":
+                return "unknown mention"
+            out.append(
+                {"at": pick["at"], "mri": thread_id, "everyone": True, "forms": ["everyone"], "whos": []}
+            )
+            continue
+        if own is None and pick["mri"] not in humans:
+            return "unknown mention"
+        names = forms(humans.get(pick["mri"], ""))
+        whos = [*names, *free_label(own["name"])[1:]] if own else names  # a kept `{Who|label}`: Who, label
+        out.append({"at": pick["at"], "mri": pick["mri"], "forms": names, "whos": whos})
+        if own:
+            out[-1]["kept"] = pick["name"]  # as given back: unchanged, the message's own whoever Who names
     return out
 
 
@@ -857,6 +876,66 @@ def _spellings(kept: dict[str, Any], names: dict[str, str]) -> set[str]:
     label = shown_label(str(kept["name"]))
     full = brace_name(names.get(str(kept["mri"]), ""))  # as decompose braces it
     return {str(kept["name"]), f"{{{label}|{label}}}", *([f"{{{full}|{label}}}"] if full else [])}
+
+
+def _kept_unpicked(
+    text: str,
+    mentions: tuple[dict[str, Any], ...],
+    picks: list[dict[str, Any]],
+    members: list[dict[str, Any]] | None,
+    thread_id: str,
+    me: str,
+) -> list[dict[str, Any]] | str:
+    """The copy's own picks at the `@{Who|label}`s the page sent none for (its anchors lost: an undo), spec
+    032: a brace whose label is a kept mention's is about the kept people so labelled. Its Who, read on the
+    whole roster (me and apps too), naming one of them is that one, unless another so labelled is absent
+    from the roster (it could be them); naming nobody on it, it is the one so labelled, if only one and Who
+    is the label or a form of the copy's name for them; else it refuses. Without a roster only
+    `{label|label}` names nobody; any other Who is `roster unavailable`. A brace with no kept label is left
+    to the roster rule."""
+    by_label: dict[str, list[dict[str, Any]]] = {}
+    for pick in picks:
+        if not pick.get("everyone"):
+            by_label.setdefault(shown_label(pick["name"]), []).append(pick)
+    covered, braces = {m["at"] for m in mentions}, []
+    for at, rest in mention_reads(text):
+        if at not in covered and rest.startswith("{"):
+            # A malformed one: the roster rule refuses it, with its reason.
+            with contextlib.suppress(ValueError):
+                brace, who, label = free_label(rest)
+                if label in by_label:
+                    braces.append((at, brace, who, label))
+    if len(braces) > MAX_MENTIONS:  # before any roster work
+        return f"too many mentions (> {MAX_MENTIONS})"
+    if not braces:
+        return []
+    reads = who_reader(members or [], thread_id, me)
+    present = set(_humans(members or []))
+    out = []
+    for at, brace, who, label in braces:
+        kept = {p["mri"]: p for p in by_label[label]}
+        if members is None and who != label:  # only `{label|label}` names nobody without a roster
+            return "roster unavailable"
+        named = reads(who) if members is not None else frozenset()
+        if not named:
+            # Nobody on the roster: only the label or the copy's own name for the one so labelled.
+            own = next(iter(kept.values())) if len(kept) == 1 else None
+            if own is not None and fold(who) not in {fold(label), *map(fold, forms(_copy_who(own)))}:
+                own = None
+        elif len(named) == 1 and (mri := next(iter(named))) in kept and set(kept) <= present:
+            own = kept[mri]
+        else:
+            own = None
+        if own is None:
+            return MISREAD
+        out.append({**own, "name": brace, "at": at})
+    return out
+
+
+def _copy_who(pick: dict[str, Any]) -> str:
+    """The name a copy's pick is braced under (`{Ann Lee|Lee}` → Ann Lee); "" for a plain one."""
+    name = str(pick["name"])
+    return free_label(name)[1] if name.startswith("{") else ""
 
 
 def _kept(
@@ -1412,10 +1491,17 @@ class ChatVerbs:
         if not quoted.issuperset(request.keep_quotes) or not pictured.issuperset(request.keep_images):
             return CHANGED
         # The copy's own pick, never the page's: a kept mention brings no label or person of its choosing.
-        names = _humans(await self._members(request.thread) or []) if form.picks else {}
+        members = await self._members(request.thread) if form.picks else None
+        names = _humans(members or [])
         # Braced, each kept mention names one person and reads as itself on save (spec 032).
         mine = _kept(request.mentions, form.picks, names)
-        mentions = await self._mentions(request.thread, request.text, True, list(request.mentions), mine)
+        unpicked = _kept_unpicked(
+            request.text, request.mentions, form.picks, members, request.thread, self.me
+        )
+        if isinstance(unpicked, str):
+            return unpicked
+        picks, mine = [*request.mentions, *unpicked], [*mine, *unpicked]
+        mentions = await self._mentions(request.thread, request.text, True, picks, mine)
         if isinstance(mentions, str):
             return mentions
         settings = self.directory.settings
@@ -1458,10 +1544,11 @@ class ChatVerbs:
                 srcs = await io("media", self._image_srcs, thread_id, form)
         props = copy.get("properties")
         props = props if isinstance(props, dict) else {}
+        units = utf16_units(form.text)
         return {
             "ok": True,
             "text": form.text,
-            "picks": form.picks,
+            "picks": [{**p, "at": units[p["at"]]} for p in form.picks],  # anchored in the page's unit
             "quotes": [{"key": q.key, "name": q.name, "line": q.line} for q in form.quotes],
             "images": [
                 {"key": image.key, "src": src, "alt": image.alt}
@@ -1770,23 +1857,22 @@ class ChatVerbs:
         picks: list[dict[str, Any]],
         kept: list[dict[str, Any] | None] | None = None,
     ) -> list[dict[str, Any]] | str:
-        """The picks compose_html gets for `text`, or the refusal (spec 032). `picks`: the page's, in order;
-        `kept[i]`: an edit's copy's own pick standing for `picks[i]`, else None for a new one, checked on the
-        roster. resolve_mentions then pairs each `@` once, from the picks or the roster. No roster is asked
-        without a pick or an `@`; without one, kept picks alone still cover their own `@`."""
+        """The picks compose_html gets for `text`, or the refusal (spec 032). `picks`: the page's, each
+        anchored at its `@`; `kept[i]`: an edit's copy's own pick standing for `picks[i]`, else None for a new
+        one, checked on the roster. resolve_mentions then reads each `@` once, as its pick's person or from
+        the roster. No roster is asked without a pick or an `@`; without one, kept picks alone still read
+        their own `@`."""
         if not picks and not holds_mention(text, full):
             return []
         kept = kept or [None] * len(picks)
-        new = [p for p, k in zip(picks, kept, strict=True) if k is None]
         members = await self._members(thread_id)
-        if members is None and new:
+        if members is None and None in kept:
             return "roster unavailable"
-        if (checked := _resolved(thread_id, members or [], new)) is None:
-            return "unknown mention"
-        fresh = iter(checked)
-        ordered = [k or next(fresh) for k in kept]
+        anchored = _anchored_picks(thread_id, _humans(members or []), picks, kept)
+        if isinstance(anchored, str):
+            return anchored
         try:
-            return resolve_mentions(text, members or [], thread_id, self.me, full=full, picks=ordered)
+            return resolve_mentions(text, members or [], thread_id, self.me, full=full, picks=anchored)
         except ValueError as exc:
             # Without the roster, an `@` no pick covers is unresolved rather than unknown.
             unresolved = members is None and str(exc).startswith("unknown mention")

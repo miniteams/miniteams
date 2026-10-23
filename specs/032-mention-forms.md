@@ -17,9 +17,10 @@ In the chat page a mention reads in bold, with no way to tell who it names.
 ## Solution
 
 Every sender (composer, MCP, CLI) accepts three forms of a member's name: `@First`, `@Last` and
-`@First Last`. `@{First Last|label}` mentions that member under any label. In the composer a picked
-mention stays a mention whatever the edit, as long as what follows the `@` is still one of the picked
-person's forms. Hovering a mention in the chat page shows the full name of the person it names.
+`@First Last`. `@{First Last|label}` mentions that member under any label. In the composer a pick stays
+on the `@` it was inserted at: whatever the edit, that `@` names the picked person while what follows it
+is still one of their forms. Hovering a mention in the chat page shows the full name of the person it
+names.
 
 ## Scope
 
@@ -34,11 +35,13 @@ person's forms. Hovering a mention in the chat page shows the full name of the p
   text, `@` too. `label` is one line of text, not empty, at most MAX_NAME characters: no `|` or `}`, no tab or other blank but the space, no control, format, private-use or unassigned character
   (refused with that rule). Who may hold anything but `}` and a line break, and must name one member
   whole. `\@` keeps the text literal. In the composer, `@{` does not open the member list.
-- **Composer.** Picks stay the source of who a mention names. When a `@form` matches a form of one
-  picked person, it is that pick, whatever the edits that produced it, so the Backspace shortening is no
-  longer the only way. An `@form` that matches no pick resolves on the roster like MCP; when it is
-  ambiguous or unknown, the send is refused with the reason and the text stays in the composer. Namesake
-  picks keep their own recipient.
+- **Composer.** Each pick is anchored at the `@` it was inserted at and travels with that offset. The
+  `@` is the picked person while what follows it is one of their forms (full, first, last, or a
+  `{Who|label}` whose Who is one), whatever the edits that produced it, so the Backspace shortening is no
+  longer the only way; otherwise the pick is dropped and the `@` reads as unpicked. An edit that removes
+  or replaces the `@` drops its pick, never moves it to another `@`. An `@form` with no pick resolves on
+  the roster like MCP; when it is ambiguous or unknown, the send is refused with the reason and the text
+  stays in the composer. Namesake picks keep their own recipient.
 - **Edit round trip.** Editing a sent message gives back every person mention braced (user decision,
   2026-10-23): `@{Full Name|label}` with the name from the chat's roster, `@{label|label}` when it is
   unknown (no roster, or they left); `@everyone` stays `@everyone` (spec 019 decompose). Each kept
@@ -50,12 +53,18 @@ person's forms. Hovering a mention in the chat page shows the full name of the p
   On save, a kept mention given back as spelled, as `{label|label}` or as `{Full Name|label}` (whichever
   roster the editor opened with) stays the message's own; any other spelling is a new pick, checked on
   the roster: `unknown mention`, or `roster unavailable` without one. So a kept `{Full Name|label}`
-  opened with the roster and saved without it is refused `roster unavailable`. Regression-tested
+  opened with the roster and saved without it is refused `roster unavailable`. A brace with no pick (an
+  undo, or its Who edited) whose label is a kept mention's is about the kept people so labelled: its Who
+  naming one of them on the roster is that one, unless another so labelled has left (it could be them);
+  naming nobody (me and apps are somebody), the one so labelled if only one and Who is the label or a form
+  of the name the message knows them by; else refused. Without a
+  roster, only `{label|label}` names nobody; any other Who is `roster unavailable`. A brace with no kept label
+  takes the roster rule. Regression-tested
   shapes (spec 032 review): a longer roster name after a kept label (`, ` `/` ` (` NBSP `-`), a longer
   member picked beside it, namesakes deleted, re-picked or preceded by a new pick, a namesake or a member
   bearing a departed person's name picked then deleted, text typed after a kept mention, the roster down
-  at opening or at saving, with the page's own reading (ui.js `scan`, `mentions`, Backspace) simulated:
-  none sends a kept mention to another person.
+  at opening or at saving, the page's picks anchored as ui.js keeps them: none sends a kept mention to
+  another person.
 - **Hover.** In the chat page a mention shows the full name of its person on hover (`title`), from the
   chat's roster or the directory. When the name is unknown, nothing is shown. `@everyone` shows nothing
   extra.
@@ -103,8 +112,8 @@ person's forms. Hovering a mention in the chat page shows the full name of the p
   green; pre-commit green.
 
 ### Phase 2 — Composer and hover
-- Work: `ui.js` matches picks by form, not by a single shortening gesture; refusal shown in the composer;
-  hover title on mentions.
+- Work: `ui.js` anchors each pick at its `@` and keeps the anchors current through every edit; the server
+  reads each anchored `@` as its pick's person; refusal shown in the composer; hover title on mentions.
 - **Covers**: AC5, AC6, AC7, AC9, AC10
 - **Data model impact**: none
 - **DoD**: browser tests green; one composer send to the test chat checked in the Teams client.
@@ -134,3 +143,30 @@ None.
   so the heuristics that guessed which ones needed a brace, and the save-time checks behind them, went.
 - Namesakes with no full name known cannot be told apart, so the message is not offered for editing.
 - First and last names lose the punctuation around them (`Doe, John` → `Doe`, `(Sales)` → `Sales`).
+- Phase 2 (user decision, review C1): a pick is anchored at its `@`, not read back from names. The page
+  sends `{name, mri, at}`, `at` the `@`'s offset in UTF-16 code units (JavaScript's), converted by the
+  server; an offset not in the text, inside a character or not an integer refuses the send. The page
+  never reads names: it reads no markdown, so it cannot disagree with the server about where a mention is.
+- The server reads an anchored `@` only as its pick's person, by the forms of that member's roster name
+  (a kept mention also by its own Who and label); the page's name is never trusted. The pick stands down,
+  the `@` then reading as unpicked, where another member reads longer there (`@Ann Moore` typed over a
+  picked `@Ann Lee`, `@Ann Lee Smith`), or at a brace whose Who names another member whole; namesakes
+  reading as far leave it to the pick, and a kept brace given back unchanged stays the message's own,
+  whoever its Who names (review H1). A pick at an `@` the
+  server does not read as a mention (in code, escaped, a link label) or sharing its `@` with another is
+  dropped, never moved: the worst case is a refusal or plain text, never another recipient.
+- Anchors follow each change of the text: the old span `[a, b)` became the new `[a, caret)`, so anchors
+  before stay, after shift, inside go (review round 2: no text matching). The caret places the change, so
+  deleting the first of two identical mentions keeps the second's pick; a paste or typing over the `@`
+  always drops it, even an `@` over itself. An input method's composition is placed once, when it commits,
+  over the selection it started on (wherever the caret sat in its preedit), the caret at the end of what it
+  committed; committed anywhere else, it drops them all. Only a change `beforeinput` announced is placed so; the page's own writes need none, and
+  its toolbar wraps and line prefixes (bold, italic, strike, code, list, quote) say what they add and where,
+  each anchor shifting by the markers added at or before its `@`, in one undo step. An undo or redo, a change
+  nothing announced (a script's `input`, even after a `beforeinput`), or a write no input event reported drops them all; a failed
+  message edited in its bubble keeps the picks before its first change. A draft, a failed message taken
+  back and an opened edit restore their picks with their anchors.
+- A refusal ending with the `\@` hint (the resolver's) goes back into the empty composer, its reason on the
+  chat's line; with text already in the composer it stays a failed bubble (spec 017's ✎ brings it back).
+- Hover: the full name comes from the directory's names (each chat roster fetched is noted there), as
+  `title` on the mention span; an unknown name (the directory's MRI-tail placeholder) or everyone shows none.

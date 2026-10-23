@@ -196,7 +196,7 @@ async def test_enter_with_the_list_open_picks_and_does_not_send(widget: Any) -> 
     assert widget.of("send") == []
     await box.press("Enter")
     await wait(lambda: len(widget.frames) == 1)
-    assert widget.of("send")[0]["mentions"] == [{"name": "Ann Lee", "mri": "8:orgid:ann"}]
+    assert widget.of("send")[0]["mentions"] == [{"name": "Ann Lee", "mri": "8:orgid:ann", "at": 0}]
 
 
 async def test_text_paste_is_left_to_the_textarea(widget: Any) -> None:

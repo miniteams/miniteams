@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -13,7 +14,7 @@ from test_web_chat import ANN, ME, _archive, _at, _chat_socket, _m, _Recorder, _
 from miniteams import chat_verbs as CV
 from miniteams import web as W
 from miniteams.archive_store import find_chat_dir
-from miniteams.compose import compose_html, reply_quote
+from miniteams.compose import compose_html, mention_ats, reply_quote
 from miniteams.config import Settings
 from miniteams.directory import Directory
 from miniteams.images import Image, images_html
@@ -200,6 +201,11 @@ async def _edit(board: W.Board, msg: str, text: Any, **extra: Any) -> dict[str, 
     return await board.chat.act_answer(None, "edit", {"edit": G, "msg": msg, "text": text, **extra})
 
 
+def _anchor(text: str, *picks: dict[str, Any]) -> list[dict[str, Any]]:
+    """The page's picks anchored at the `@`s the server reads in `text`, in order (spec 032)."""
+    return [{**p, "at": at} for p, at in zip(picks, mention_ats(text), strict=True)]
+
+
 def _composed(text: str, picks: list[dict[str, Any]], board: W.Board) -> tuple[str, dict[str, Any] | None]:
     host = board.chat.directory.settings.asyncgw_host  # type: ignore[union-attr]
     return compose_html(text, picks, EMOJIS, full=True, asyncgw_host=host)
@@ -217,7 +223,7 @@ async def test_editable_answers_the_messages_editable_form(edit_board: W.Board, 
         "msg": "10",
         "ok": True,
         "text": "**hi** @{Gone Person|Gone Person} :fiesta:",
-        "picks": [GONE_KEPT],
+        "picks": [{**GONE_KEPT, "at": TEXT_10.index("@")}],
         "quotes": [{"key": "1", "name": "Ann Lee", "line": "q1"}, {"key": "3", "name": "Bo", "line": "q3"}],
         "images": [
             {"key": IMG_A, "src": f"/media/{quote(G, safe='')}/{IMG_A}.png", "alt": "image"},
@@ -270,7 +276,9 @@ async def test_edit_rebuilds_from_the_copy_kept_quotes_text_kept_images(
     """019-AC3 + 019-AC6 + 019-AC7 + 019-AC8: kept Reply block and image verbatim from the copy, the text
     composed as a send, the mention of someone who left kept without the roster."""
     text = "**hi** @{Gone Person|Gone Person} :fiesta: again"
-    answer = await _edit(edit_board, "10", text, mentions=[GONE_KEPT], keep_quotes=["3"], keep_images=[IMG_A])
+    answer = await _edit(
+        edit_board, "10", text, mentions=_anchor(text, GONE_KEPT), keep_quotes=["3"], keep_images=[IMG_A]
+    )
     assert answer == {"edit": G, "msg": "10", "ok": True}
     body, props = _composed(text, [GONE_KEPT], edit_board)
     assert writes == [
@@ -286,8 +294,10 @@ async def test_edit_rebuilds_from_the_copy_kept_quotes_text_kept_images(
 async def test_edit_posts_what_a_send_of_the_same_text_posts(edit_board: W.Board, writes: list[Any]) -> None:
     """019-AC3: markdown rendered, shortcodes expanded, mentions as mentions: byte for byte a send's."""
     text = "**b** _i_ `c` :fiesta: @Ann Lee\n- x\n> q"
-    assert (await _edit(edit_board, "12", text, mentions=[ANN_PICK], keep_quotes=[], keep_images=[]))["ok"]
-    assert await _send(edit_board, G, text, None, None, [ANN_PICK], "full") is None
+    assert (
+        await _edit(edit_board, "12", text, mentions=_anchor(text, ANN_PICK), keep_quotes=[], keep_images=[])
+    )["ok"]
+    assert await _send(edit_board, G, text, None, None, _anchor(text, ANN_PICK), "full") is None
     [(_, _, edited, edit_kw), (_, sent, send_kw)] = writes
     assert edited == sent and edit_kw["properties"] == send_kw["properties"]
     assert "<b>b</b>" in edited and 'itemtype="http://schema.skype.com/Mention"' in edited
@@ -334,10 +344,12 @@ async def test_mentions_new_ones_go_through_the_roster(edit_board: W.Board, writ
         {"name": "everyone", "mri": GONE, "everyone": True},
     ):
         text = f"hi @{forged['name']}"
-        assert (await _edit(edit_board, "10", text, mentions=[forged], **keep))["error"] == "unknown mention"
+        assert (await _edit(edit_board, "10", text, mentions=_anchor(text, forged), **keep))[
+            "error"
+        ] == "unknown mention"
     assert writes == []
     text = "@{Gone Person|Gone Person} @Ann Lee"
-    answer = await _edit(edit_board, "10", text, mentions=[GONE_KEPT, ANN_PICK], **keep)
+    answer = await _edit(edit_board, "10", text, mentions=_anchor(text, GONE_KEPT, ANN_PICK), **keep)
     assert answer["ok"]
     entries = json.loads(writes[0][3]["properties"]["mentions"])
     assert [(e["mri"], e["displayName"]) for e in entries] == [(GONE, "Gone Person"), (ANN, "Ann Lee")]
@@ -347,7 +359,9 @@ async def test_a_kept_mention_shows_the_copys_label(edit_board: W.Board, writes:
     """019-AC8: a kept mention cannot bring a label of the page's choosing."""
     pick = {**GONE_KEPT, "label": "Someone Else"}
     text = "@{Gone Person|Gone Person}"
-    assert (await _edit(edit_board, "10", text, mentions=[pick], keep_quotes=[], keep_images=[]))["ok"]
+    assert (
+        await _edit(edit_board, "10", text, mentions=_anchor(text, pick), keep_quotes=[], keep_images=[])
+    )["ok"]
     assert ">Gone Person</span>" in writes[0][2] and "Someone Else" not in json.dumps(writes)
 
 
@@ -443,7 +457,7 @@ async def test_edit_failure_paths(
     """019-AC3 + 019-AC8: no roster for a new mention, a compose refusal, a message too long once its
     kept quotes and images are added back: each refused, nothing posted."""
     keep = {"keep_quotes": [], "keep_images": []}
-    assert (await _edit(edit_board, "10", "x", mentions=[GONE_PICK] * 51, **keep))["error"] == (
+    assert (await _edit(edit_board, "10", "x", mentions=[{**GONE_PICK, "at": 0}] * 51, **keep))["error"] == (
         "too many mentions (51 > 50)"
     )
     long = "y" * 28_500
@@ -456,9 +470,9 @@ async def test_edit_failure_paths(
         return None
 
     monkeypatch.setattr(Directory, "thread", no_roster)
-    assert (await _edit(edit_board, "10", "@Ann Lee", mentions=[ANN_PICK], **keep))["error"] == (
-        "roster unavailable"
-    )
+    assert (await _edit(edit_board, "10", "@Ann Lee", mentions=_anchor("@Ann Lee", ANN_PICK), **keep))[
+        "error"
+    ] == ("roster unavailable")
     assert [w[0] for w in writes] == ["edit"]  # the long one alone
 
 
@@ -491,10 +505,9 @@ async def test_editable_braces_every_person_mention(edit_board: W.Board, writes:
     well as `the boss`: `@{Ann Lee|Lee}`, `@{Ann Lee|the boss}`."""
     answer = await _editable(edit_board, "16")
     assert answer["text"] == "hi @{Ann Lee|Lee} and @{Ann Lee|the boss}"
-    assert answer["picks"] == [
-        {"name": "{Ann Lee|Lee}", "mri": ANN},
-        {"name": "{Ann Lee|the boss}", "mri": ANN},
-    ]
+    assert answer["picks"] == _anchor(
+        answer["text"], {"name": "{Ann Lee|Lee}", "mri": ANN}, {"name": "{Ann Lee|the boss}", "mri": ANN}
+    )
 
 
 async def test_resending_an_opened_edit_unchanged_keeps_its_mentions(
@@ -523,7 +536,9 @@ async def test_editable_without_a_roster_braces_each_label_on_itself(
     monkeypatch.setattr(Directory, "thread", _no_roster)
     answer = await _editable(edit_board, "16")
     assert answer["text"] == "hi @{Lee|Lee} and @{the boss|the boss}"
-    assert answer["picks"] == [{"name": "{Lee|Lee}", "mri": ANN}, {"name": "{the boss|the boss}", "mri": ANN}]
+    assert answer["picks"] == _anchor(
+        answer["text"], {"name": "{Lee|Lee}", "mri": ANN}, {"name": "{the boss|the boss}", "mri": ANN}
+    )
 
 
 async def test_an_edit_resolves_an_unpicked_form(edit_board: W.Board, writes: list[Any]) -> None:
@@ -567,7 +582,8 @@ async def test_plain_at_text_stays_text_across_an_edit(edit_board: W.Board, writ
 
 
 @pytest.mark.parametrize(
-    ("msg", "text", "picks"), [("10", "@{Gone Person|Gone Person} ok", [GONE_KEPT]), ("16", None, None)]
+    ("msg", "text", "picks"),
+    [("10", "@{Gone Person|Gone Person} ok", [{**GONE_KEPT, "at": 0}]), ("16", None, None)],
 )
 async def test_kept_mentions_alone_need_no_roster(
     edit_board: W.Board, writes: list[Any], monkeypatch: pytest.MonkeyPatch, msg: str, text: Any, picks: Any
@@ -609,12 +625,13 @@ async def test_a_kept_label_holding_an_at_re_saves_unchanged(
 async def test_a_kept_pick_takes_no_malformed_name_from_the_page(
     edit_board: W.Board, writes: list[Any], name: str
 ) -> None:
-    """032 review: a page name showing the kept label but no well-formed `{Who|label}` is a new pick, so
-    the roster judges it."""
+    """032 review: a page name showing the kept label but no well-formed `{Who|label}` is a new pick; the
+    text at its `@` is no `{Who|label}` either, so the save is refused with the reader's reason."""
     keep = {"keep_quotes": [], "keep_images": []}
-    picks = [{"name": "Lee", "mri": ANN}, {"name": name, "mri": ANN}]
-    answer = await _edit(edit_board, "16", f"hi @Lee and @{name}", mentions=picks, **keep)
-    assert answer["error"] == "unknown mention" and writes == []
+    text = f"hi @Lee and @{name}"
+    picks = [{"name": "Lee", "mri": ANN, "at": 3}, {"name": name, "mri": ANN, "at": 12}]
+    answer = await _edit(edit_board, "16", text, mentions=picks, **keep)
+    assert answer["error"].startswith("mention @{") and writes == []
 
 
 async def test_an_unchanged_edit_keeps_the_recipient_a_longer_name_would_take(
@@ -650,11 +667,13 @@ async def test_a_kept_pick_renamed_is_checked_as_new(
     edit_board: W.Board, writes: list[Any], name: str
 ) -> None:
     """032 review: the copy's `{Ann Lee|the boss}` renamed by the page, even to a well-formed `{Who|label}`,
-    is a new pick: Who must name the pick's own member."""
+    is a new pick, read at its `@` by its own member's forms: a Who naming nobody else in the chat is
+    refused, nothing written."""
     keep = {"keep_quotes": [], "keep_images": []}
-    picks = [{"name": "Lee", "mri": ANN}, {"name": name, "mri": ANN}]
-    answer = await _edit(edit_board, "16", f"hi @Lee and @{name}", mentions=picks, **keep)
-    assert answer["error"] == "unknown mention" and writes == []
+    text = f"hi @Lee and @{name}"
+    picks = [{"name": "Lee", "mri": ANN, "at": 3}, {"name": name, "mri": ANN, "at": 12}]
+    answer = await _edit(edit_board, "16", text, mentions=picks, **keep)
+    assert answer["error"].startswith("unknown mention @{") and writes == []
 
 
 @pytest.mark.parametrize(
@@ -716,9 +735,9 @@ async def test_a_kept_mention_given_another_mri_is_new(
 ) -> None:
     """032 review: the copy's spelling sent under another person's MRI is a new pick, checked on the roster
     (Who names Ann, not Ann Moore): refused, nothing written."""
-    picks = [{"name": "{Ann Lee|Lee}", "mri": ANN}, {"name": "{Ann Lee|the boss}", "mri": ANN}]
-    picks[which] = {**picks[which], "mri": MOORE}
     text = "hi @{Ann Lee|Lee} and @{Ann Lee|the boss}"
+    picks = _anchor(text, {"name": "{Ann Lee|Lee}", "mri": ANN}, {"name": "{Ann Lee|the boss}", "mri": ANN})
+    picks[which] = {**picks[which], "mri": MOORE}
     answer = await _edit(edit_board, "16", text, mentions=picks, keep_quotes=[], keep_images=[])
     assert answer["error"] == "unknown mention" and writes == []
 
@@ -769,7 +788,7 @@ async def test_a_longer_pick_or_name_never_takes_a_kept_mention(
     cases = (
         (
             opened["text"] + " cc @Doe, John",
-            [*opened["picks"], {"name": "Doe, John", "mri": OTHER}],
+            [*opened["picks"], {"name": "Doe, John", "mri": OTHER, "at": len(opened["text"]) + 4}],
             [XAV, OTHER],
         ),
         (opened["text"], opened["picks"], [XAV]),
@@ -890,13 +909,14 @@ async def test_namesakes_sharing_a_label_come_back_braced(
         ("someone and @{Ann Moore|Ann}", [second], [MOORE]),  # the first deleted
         (
             "@Ann hi @{Ann Lee|Ann} and @{Ann Moore|Ann}",
-            [{"name": "Ann", "mri": MOORE}, first, second],
+            [{"name": "Ann Moore", "mri": MOORE}, first, second],
             [MOORE, ANN, MOORE],
         ),
     )
     for text, picks, mris in shapes:
         writes.clear()
-        answer = await _edit(edit_board, "27", text, mentions=picks, **keep)
+        # Anchored where the page moved them as the text changed.
+        answer = await _edit(edit_board, "27", text, mentions=_anchor(text, *picks), **keep)
         assert answer.get("ok"), (text, answer)
         assert [e["mri"] for e in json.loads(writes[0][3]["properties"]["mentions"])] == mris, text
 
@@ -922,94 +942,55 @@ def test_a_kept_mention_given_back_as_spelled_wins_over_a_new_namesake_pick(
     assert CV._kept(page, [copy], {ANN: "Ann Lee", MOORE: "Ann Moore"}) == [None, copy]
 
 
-# --- the chat page's composer, as ui.js reads mentions (scan, mentions, Backspace), ported line by line ---
+# --- the chat page's composer: picks anchored at their `@`, as ui.js keeps them (spec 032) ---
 
 
 class _Page:
-    """The composer's text and its picks, changed as ui.js changes them; `sent()` is what an edit sends."""
+    """The composer's text and its picks as ui.js keeps them (spec 032): each pick anchored at the `@` it was
+    inserted at; an edit drops the anchors inside the span it changes and shifts those after it.
+    `mentions()` is what an edit sends."""
 
     def __init__(self, text: str, picks: list[dict[str, Any]]) -> None:
         self.text, self.picked = text, [dict(p) for p in picks]
 
-    @staticmethod
-    def scan(text: str, names: list[str]) -> list[str]:
-        """ui.js `scan`: `@` starting a word, not escaped, then the longest name ending a word."""
-        from miniteams.compose import _joins
-
-        alts = sorted({n for n in names if n}, key=len, reverse=True)
-        found, i = [], 0
-        while (i := text.find("@", i)) >= 0:
-            back = len(text[:i]) - len(text[:i].rstrip("\\"))
-            if (i and (text[i - 1].isalnum() or text[i - 1] == "_")) or back % 2:
-                i += 1
-                continue
-            name = next(
-                (
-                    n
-                    for n in alts
-                    if text.startswith(n, i + 1) and not _joins(text[i + 1 + len(n) : i + 2 + len(n)] or " ")
-                ),
-                None,
-            )
-            if name is None:
-                i += 1
-                continue
-            found.append(name)
-            i += 1 + len(name)
-        return found
-
     def mentions(self) -> list[dict[str, Any]]:
-        """ui.js `mentions`: of the picks under one name the last `count` stand."""
-        count: dict[str, int] = {}
-        for name in self.scan(self.text, [m["name"] for m in self.picked]):
-            count[name] = count.get(name, 0) + 1
-        return [
-            m
-            for i, m in enumerate(self.picked)
-            if sum(1 for n in self.picked[i + 1 :] if n["name"] == m["name"]) < count.get(m["name"], 0)
+        return sorted(
+            (p for p in self.picked if self.text[p["at"] : p["at"] + 1] == "@"), key=lambda p: p["at"]
+        )
+
+    def change(self, a: int, b: int, new: str) -> None:
+        """`text[a:b]` becomes `new`: anchors inside it go, those after it shift."""
+        d = len(new) - (b - a)
+        self.picked = [
+            p if p["at"] < a else {**p, "at": p["at"] + d} for p in self.picked if not a <= p["at"] < b
         ]
+        self.text = self.text[:a] + new + self.text[b:]
 
     def pick(self, name: str, mri: str) -> None:
-        """A member picked from the list at the end of the text: `@Name ` inserted."""
-        self.text += f" @{name} "
-        self.picked.append({"name": name, "mri": mri})
-        self.picked = self.mentions()
+        """A member picked from the list at the end of the text: `@Name ` inserted, anchored at its `@`."""
+        at = len(self.text) + 1
+        self.change(len(self.text), len(self.text), f" @{name} ")
+        self.picked.append({"name": name, "mri": mri, "at": at})
 
     def backspace(self) -> None:
-        """Backspace at the end right after a picked full name: shortened to its first word (ui.js `key`)."""
-        at, before = len(self.text), self.text
-        for m in reversed(list(self.picked)):
-            first = m["name"].split()[0]
-            if m.get("everyone") or first == m["name"] or m["name"].startswith("{"):
-                continue
-            space = " " if before.endswith(f"@{m['name']} ") else ""
-            start = at - len(m["name"]) - 1 - len(space)
-            if not before.endswith(f"@{m['name']}{space}") or (
-                start and (before[start - 1].isalnum() or before[start - 1] == "_")
-            ):
-                continue
-            active = self.mentions()
-            names, seen, ordered = [p["name"] for p in active], {}, []
-            for name in self.scan(self.text, names):
-                matches = [p for p in active if p["name"] == name]
-                nth = seen.get(name, 0)
-                seen[name] = nth + 1
-                ordered.append(matches[min(nth, len(matches) - 1)])
-            if self.scan(self.text[start:], names)[:1] != [m["name"]]:
-                continue
-            pos = len(self.scan(self.text[:start], names))
-            ordered[pos] = {**ordered[pos], "name": first}
-            self.picked = ordered
-            self.text = self.text[:start] + f"@{first}{space}"
-            return
-        self.text = self.text[:-1]  # nothing to shorten: an ordinary Backspace
+        """Backspace at the end: right after a picked full name (and its space) its first name is left,
+        else one character goes."""
+        end = len(self.text) - self.text.endswith(" ")
+        for p in self.picked:
+            first = p["name"].split()[0] if p["name"].split() else ""
+            if not p.get("everyone") and not p["name"].startswith("{") and first != p["name"]:
+                if p["at"] + 1 + len(p["name"]) == end and self.text.startswith("@" + p["name"], p["at"]):
+                    self.change(p["at"] + 1 + len(first), end, "")
+                    return
+        self.change(len(self.text) - 1, len(self.text), "")
 
     def delete_last(self, piece: str) -> None:
         cut = self.text.rindex(piece)
-        self.text = self.text[:cut] + self.text[cut + len(piece) :]
+        self.change(cut, cut + len(piece), "")
 
     def delete_first(self, piece: str) -> None:
-        self.text = self.text.replace(piece, "", 1)
+        cut = self.text.index(piece)
+        self.change(cut, cut + len(piece), "")
 
 
 async def _save(board: W.Board, msg: str, page: _Page) -> dict[str, Any]:
@@ -1117,3 +1098,279 @@ def test_a_full_name_no_brace_can_hold_gives_only_the_label_brace(name: str) -> 
     """032 review: decompose and the save share one rule (brace_name): a roster name holding `}` or a line
     break is no Who, so the kept mention is known as `{label|label}` only."""
     assert CV._spellings({"name": "{Ann|Ann}", "mri": ANN}, {ANN: name}) == {"{Ann|Ann}"}
+
+
+BOB_LEE = "8:orgid:00000000-0000-0000-0000-0000000000c3"
+
+
+MISREAD_ = "a mention the edit would read as someone else"
+
+
+@pytest.mark.parametrize(
+    ("people", "text", "outcome"),
+    [
+        # Ann left, nobody answers to `Lee`: her `{Lee|Lee}` saved as shown, the page's picks lost, stays hers
+        ((("Me Self", ME), ("Bob Roe", BOB_LEE)), None, [ANN, ANN]),
+        # opened with her full name, saved as shown with the picks lost
+        ((("Me Self", ME), ("Ann Lee", ANN), ("Bob Lee", BOB_LEE)), None, [ANN, ANN]),
+        # the round-4 repro: Bob Lee answers to `Lee` now: whose it is cannot be told, refused
+        ((("Me Self", ME), ("Bob Lee", BOB_LEE)), None, MISREAD_),
+        # a member whose name is the kept label `the boss`: refused the same way
+        ((("Me Self", ME), ("the boss", BOB_LEE)), None, MISREAD_),
+        # `Lee` names two others (Bob Lee, Lee Smith): ambiguous, refused
+        ((("Me Self", ME), ("Bob Lee", BOB_LEE), ("Lee Smith", OTHER)), None, MISREAD_),
+        # the label edited: not the shown spelling, a new brace, the roster's (Who `Lee` is Bob Lee now)
+        ((("Me Self", ME), ("Bob Lee", BOB_LEE)), "hi @{Lee|Leo} and @{the boss|the boss}", [BOB_LEE, ANN]),
+    ],
+)
+async def test_a_kept_brace_whose_page_pick_was_lost(
+    edit_board: W.Board,
+    writes: list[Any],
+    monkeypatch: pytest.MonkeyPatch,
+    people: tuple[tuple[str, str], ...],
+    text: str | None,
+    outcome: Any,
+) -> None:
+    """032 review r4/r5: the page lost its anchors (an undo) and sends no pick: a brace spelled exactly as the
+    editor shows a kept mention stays the message's own while its Who names nobody else on the roster; naming
+    someone else, it is refused; any other brace is read by the roster rule."""
+    monkeypatch.setattr(Directory, "thread", _people(*people))
+    opened = await _editable(edit_board, "16")
+    answer = await _edit(
+        edit_board, "16", text or opened["text"], mentions=[], keep_quotes=[], keep_images=[]
+    )
+    if isinstance(outcome, str):
+        assert answer["error"] == outcome and writes == []
+    else:
+        assert answer.get("ok"), answer
+        assert _sent(writes) == outcome
+
+
+@pytest.mark.parametrize(
+    ("msg", "people", "add", "outcome"),
+    [
+        # Xavier kept as `Ann`; a new `{Ann|Ann}`: labelled as he is, but its Who reads Ann Lee: refused
+        ("22", (("Me Self", ME), ("Xavier Doe", XAV), ("Ann Lee", ANN)), " cc @{Ann|Ann}", MISREAD_),
+        # someone gone kept as `{Ann Lee|Ann Lee}`; member Ann Lee's own brace typed: refused, not the gone
+        ("29", (("Me Self", ME), ("Ann Lee", ANN)), " cc @{Ann Lee|Ann Lee}", MISREAD_),
+        # Ann Lee kept as `Ann`; a new `{Ann|Ann}` with Ann Moore in the chat: Who ambiguous, refused
+        ("28", (("Me Self", ME), ("Ann Lee", ANN), ("Ann Moore", MOORE)), " cc @{Ann|Ann}", MISREAD_),
+        # a label no kept mention bears: the roster rule
+        ("22", (("Me Self", ME), ("Xavier Doe", XAV), ("Ann Lee", ANN)), " cc @{Ann|boss}", [XAV, ANN]),
+    ],
+)
+async def test_a_new_brace_typed_beside_kept_mentions_is_never_taken_by_them(
+    edit_board: W.Board,
+    writes: list[Any],
+    monkeypatch: pytest.MonkeyPatch,
+    msg: str,
+    people: Any,
+    add: str,
+    outcome: Any,
+) -> None:
+    """032 review r5/r6: an edit opened, a brace typed (no page pick, `@{` opens no list) and saved with the
+    opened picks: labelled as a kept mention, it refuses unless its Who names that kept person (or nobody, one
+    so labelled); with another label it is the roster's; it never silently becomes a kept person's."""
+    monkeypatch.setattr(Directory, "thread", _people(*people))
+    opened = await _editable(edit_board, msg)
+    keep = {"keep_quotes": [], "keep_images": []}
+    answer = await _edit(edit_board, msg, opened["text"] + add, mentions=opened["picks"], **keep)
+    if isinstance(outcome, str):
+        assert answer["error"] == outcome and writes == []
+    else:
+        assert answer.get("ok"), answer
+        assert _sent(writes) == outcome
+
+
+@pytest.mark.parametrize("saving_with", [(("Ann Lee", ANN), ("Ann Moore", MOORE)), (("Ann Lee", ANN),)])
+async def test_a_lost_pick_on_a_spelling_two_people_could_be_is_refused(
+    edit_board: W.Board, writes: list[Any], monkeypatch: pytest.MonkeyPatch, saving_with: Any
+) -> None:
+    """032 review r4/r5: namesakes Ann Lee and Ann Moore both kept as `Ann`; a lost pick on `@{Ann|Ann}`:
+    ambiguous on the full roster, and, with only Ann Lee left (Ann Moore's shown spelling now `{Ann|Ann}`),
+    naming Ann Lee rather than Ann Moore: refused either way, nothing written; their own spellings save."""
+    monkeypatch.setattr(Directory, "thread", _people(("Me Self", ME), ("Ann Lee", ANN), ("Ann Moore", MOORE)))
+    opened = await _editable(edit_board, "27")
+    monkeypatch.setattr(Directory, "thread", _people(("Me Self", ME), *saving_with))
+    keep = {"keep_quotes": [], "keep_images": []}
+    answer = await _edit(edit_board, "27", "@{Ann|Ann} hi", mentions=[], **keep)
+    assert "error" in answer and writes == []
+    monkeypatch.setattr(Directory, "thread", _people(("Me Self", ME), ("Ann Lee", ANN), ("Ann Moore", MOORE)))
+    assert (await _edit(edit_board, "27", opened["text"], mentions=[], **keep)).get("ok")
+    assert _sent(writes) == [ANN, MOORE]
+
+
+async def test_a_lost_pick_whose_shown_who_two_members_answer_to_is_refused(
+    edit_board: W.Board, writes: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """032 review r5: someone gone kept as `{Ann Lee|Ann Lee}`, two members now called Ann Lee: a lost pick
+    there cannot be told from them, refused."""
+    monkeypatch.setattr(Directory, "thread", _people(("Me Self", ME), ("Ann Lee", ANN), ("Ann Lee", OTHER)))
+    opened = await _editable(edit_board, "29")
+    answer = await _edit(edit_board, "29", opened["text"], mentions=[], keep_quotes=[], keep_images=[])
+    assert answer["error"] == MISREAD_ and writes == []
+
+
+NEWB = "8:orgid:00000000-0000-0000-0000-0000000000c4"
+
+
+@pytest.mark.parametrize(
+    ("msg", "opening", "saving", "outcome"),
+    [
+        # opened with Ann Lee (`{Ann Lee|Lee}`); she left and another Ann Lee joined: whose, cannot be told
+        ("16", (("Ann Lee", ANN),), (("Ann Lee", NEWB),), MISREAD_),
+        # namesakes kept as `Ann`, both still here: each brace's Who names its own
+        (
+            "27",
+            (("Ann Lee", ANN), ("Ann Moore", MOORE)),
+            (("Ann Lee", ANN), ("Ann Moore", MOORE)),
+            [ANN, MOORE],
+        ),
+        # the same, Ann Moore gone: Ann Lee's brace could be the absent `Ann` too, so it refuses
+        ("27", (("Ann Lee", ANN), ("Ann Moore", MOORE)), (("Ann Lee", ANN),), MISREAD_),
+        # Ann Moore already gone at opening (`{Ann|Ann}`): its Who reads Ann Lee, yet it is the gone one's
+        ("27", (("Ann Lee", ANN),), (("Ann Lee", ANN),), MISREAD_),
+    ],
+)
+async def test_lost_picks_saved_unchanged_after_the_roster_moved(
+    edit_board: W.Board,
+    writes: list[Any],
+    monkeypatch: pytest.MonkeyPatch,
+    msg: str,
+    opening: Any,
+    saving: Any,
+    outcome: Any,
+) -> None:
+    """032 review r6: an edit opened on one roster, its picks lost (an undo), saved unchanged on another: a
+    brace bearing a kept label is that kept person's only when its Who names them and no other so labelled
+    is gone; else refused, never sent to whoever answers to the name now."""
+    monkeypatch.setattr(Directory, "thread", _people(("Me Self", ME), *opening))
+    opened = await _editable(edit_board, msg)
+    monkeypatch.setattr(Directory, "thread", _people(("Me Self", ME), *saving))
+    answer = await _edit(edit_board, msg, opened["text"], mentions=[], keep_quotes=[], keep_images=[])
+    if isinstance(outcome, str):
+        assert answer["error"] == outcome and writes == []
+    else:
+        assert answer.get("ok"), answer
+        assert _sent(writes) == outcome
+
+
+@pytest.mark.parametrize(
+    "braces", [["@{Lee|Lee}"] * 25 + ["@{the boss|the boss}"] * 25, ["@{the boss|the boss}"] * 50]
+)
+async def test_lost_kept_braces_read_the_roster_once(
+    edit_board: W.Board, writes: list[Any], monkeypatch: pytest.MonkeyPatch, braces: list[str]
+) -> None:
+    """032 review r6 M1: 1000 members; 1800 braces bearing a kept label are refused before any roster work,
+    and 50 are read with the roster indexed once and each distinct Who once."""
+    from miniteams import compose
+
+    people = [("Me Self", ME), ("Bob Roe", BOB_LEE)] + [(f"P{n} N{n}", f"8:orgid:x-{n}") for n in range(1000)]
+    monkeypatch.setattr(Directory, "thread", _people(*people))
+    keep = {"keep_quotes": [], "keep_images": []}
+    start = time.perf_counter()
+    answer = await _edit(edit_board, "16", " ".join(["@{Lee|Lee}"] * 1800), mentions=[], **keep)
+    assert answer["error"] == "too many mentions (> 50)" and time.perf_counter() - start < 0.5
+    indexed: list[int] = []
+    real_index = compose._forms_by_word
+    monkeypatch.setattr(compose, "_forms_by_word", lambda *a, **k: indexed.append(1) or real_index(*a, **k))
+    text = " ".join(braces)
+    start = time.perf_counter()
+    answer = await _edit(edit_board, "16", text, mentions=[], **keep)
+    assert answer.get("ok"), answer
+    assert len(indexed) == 2 and time.perf_counter() - start < 0.5  # the save's reader, then the resolver
+    indexed.clear()
+    answer = await _edit(edit_board, "16", "hi @Bob", mentions=[], **keep)
+    assert answer.get("ok"), answer
+    assert len(indexed) == 1  # no lost brace: the resolver only
+
+
+@pytest.mark.parametrize("brace", ["@{Zed|Ann}", "@{Nobody Here|Ann}"])
+async def test_a_lost_brace_naming_nobody_with_a_label_two_kept_share_is_refused(
+    edit_board: W.Board, writes: list[Any], monkeypatch: pytest.MonkeyPatch, brace: str
+) -> None:
+    """032 review r6: namesakes kept as `Ann`; a brace labelled `Ann` whose Who names nobody could be either:
+    refused."""
+    monkeypatch.setattr(Directory, "thread", _people(("Me Self", ME), ("Ann Lee", ANN), ("Ann Moore", MOORE)))
+    await _editable(edit_board, "27")
+    answer = await _edit(edit_board, "27", f"{brace} hi", mentions=[], keep_quotes=[], keep_images=[])
+    assert answer["error"] == MISREAD_ and writes == []
+
+
+APP = "28:00000000-0000-0000-0000-0000000000d1"
+
+
+@pytest.mark.parametrize(
+    ("who", "roster", "outcome"),
+    [
+        ("Me Self", True, MISREAD_),  # Who naming me, or an app, names someone: never the kept Ann Lee
+        ("Me", True, MISREAD_),
+        ("Jira Cloud", True, MISREAD_),
+        ("Jira", True, MISREAD_),
+        ("Bob Smith", False, "roster unavailable"),  # without a roster, only `{label|label}` names nobody
+        ("Ann Lee", False, "roster unavailable"),
+        ("Lee", False, [ANN]),
+        ("the boss", False, [ANN]),
+    ],
+)
+async def test_a_lost_brace_whose_who_no_reader_saw_is_refused(
+    edit_board: W.Board,
+    writes: list[Any],
+    monkeypatch: pytest.MonkeyPatch,
+    who: str,
+    roster: bool,
+    outcome: Any,
+) -> None:
+    """032 review r7: a brace bearing the kept label `Lee`, its pick lost (Who edited, or an undo), is Ann
+    Lee's only when its Who names her or nobody: me and apps are somebody, and without a roster nobody can
+    be told from somebody but by `{Lee|Lee}`."""
+    people = (("Me Self", ME), ("Ann Lee", ANN), ("Bob Smith", OTHER), ("Jira Cloud", APP))
+    monkeypatch.setattr(Directory, "thread", _people(*people))
+    await _editable(edit_board, "16")
+    if not roster:
+        monkeypatch.setattr(Directory, "thread", _no_roster)
+    label = "the boss" if who == "the boss" else "Lee"
+    text = f"hi @{{{who}|{label}}}"
+    answer = await _edit(edit_board, "16", text, mentions=[], keep_quotes=[], keep_images=[])
+    if isinstance(outcome, str):
+        assert answer["error"] == outcome and writes == []
+    else:
+        assert answer.get("ok"), answer
+        assert _sent(writes) == outcome
+
+
+@pytest.mark.parametrize("who", ["Gone Person", "zzz"])
+async def test_a_lost_brace_whose_who_is_off_the_roster_is_refused(
+    edit_board: W.Board, writes: list[Any], monkeypatch: pytest.MonkeyPatch, who: str
+) -> None:
+    """032 review r8: a brace bearing the kept label `Lee` whose Who names nobody on the roster, yet is
+    neither the label nor a form of Ann Lee's name, could be anyone: refused, never sent to Ann."""
+    monkeypatch.setattr(Directory, "thread", _people(("Me Self", ME), ("Ann Lee", ANN)))
+    await _editable(edit_board, "16")
+    answer = await _edit(edit_board, "16", f"hi @{{{who}|Lee}}", mentions=[], keep_quotes=[], keep_images=[])
+    assert answer["error"] == MISREAD_ and writes == []
+
+
+@pytest.mark.parametrize(
+    ("text", "outcome"),
+    [
+        ("@{Gone Person|Gone Person} ok", [GONE]),  # Who is the label: the one gone so labelled
+        ("@{Gone|Gone Person} ok", [GONE]),  # a form of the copy's name for them
+        ("@{Person|Gone Person} ok", [GONE]),
+        ("@{gone|Gone Person} ok", [GONE]),  # folded, as the resolver reads names
+        ("@{GÖNE|Gone Person} ok", [GONE]),
+        ("@{zzz|Gone Person} ok", MISREAD_),
+    ],
+)
+async def test_a_lost_brace_for_someone_gone_keeps_only_their_own_names(
+    edit_board: W.Board, writes: list[Any], monkeypatch: pytest.MonkeyPatch, text: str, outcome: Any
+) -> None:
+    """032 review r8: Gone Person left; a lost brace labelled as them is theirs only under their names."""
+    monkeypatch.setattr(Directory, "thread", _people(("Me Self", ME), ("Ann Lee", ANN)))
+    await _editable(edit_board, "10")
+    answer = await _edit(edit_board, "10", text, mentions=[], keep_quotes=[], keep_images=[])
+    if isinstance(outcome, str):
+        assert answer["error"] == outcome and writes == []
+    else:
+        assert answer.get("ok"), answer
+        assert _sent(writes) == outcome

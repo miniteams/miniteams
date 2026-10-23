@@ -9,10 +9,12 @@ from typing import Any
 import pytest
 from test_compose import _best_ms
 
+from miniteams import chat_verbs as CV
 from miniteams import compose as compose_mod
 from miniteams import decompose as D
 from miniteams.compose import compose_html, reply_quote
 from miniteams.decompose import Editable, decompose
+from miniteams.directory import humans
 from miniteams.images import Image, images_html
 from miniteams.send import MAX_HTML_BYTES
 
@@ -125,7 +127,9 @@ def test_mentions_come_back_as_picks_in_text_order() -> None:
     form = _round_trip("@Ann Lee and @everyone, again @Ann Lee", [ANN, EVERYONE])
     assert form.text == "@{Ann Lee|Ann Lee} and @everyone, again @{Ann Lee|Ann Lee}"
     braced = {"name": "{Ann Lee|Ann Lee}", "mri": ANN["mri"]}
-    assert form.picks == [braced, EVERYONE, braced]
+    # Each anchored at its own `@` (spec 032).
+    ats = [form.text.index("@{"), form.text.index("@every"), form.text.rindex("@{")]
+    assert form.picks == [{**braced, "at": ats[0]}, {**EVERYONE, "at": ats[1]}, {**braced, "at": ats[2]}]
 
 
 def test_custom_emoji_round_trips_as_its_shortcode() -> None:
@@ -155,8 +159,8 @@ def test_teams_client_markup_reads_as_its_composer_equivalent() -> None:
     form = _form(content, mentions=_mentions(("8:orgid:ann", "person"), ("8:orgid:ann", "person")))
     assert form.text == "hi **you** _x_ ~~y~~ 🙂\nhttps://x.test [why](https://y.test)\n@{Ann|Ann} @{Lee|Lee}"
     assert form.picks == [
-        {"name": "{Ann|Ann}", "mri": "8:orgid:ann"},
-        {"name": "{Lee|Lee}", "mri": "8:orgid:ann"},
+        {"name": "{Ann|Ann}", "mri": "8:orgid:ann", "at": 60},
+        {"name": "{Lee|Lee}", "mri": "8:orgid:ann", "at": 71},
     ]
     assert _form("<pre><code>a\nb</code></pre>").text == "```\na\nb\n```"
     assert _form("<p>&nbsp;</p><div><div>x</div></div>").text == "\xa0\nx"
@@ -603,10 +607,19 @@ ROSTER_032 = [
 NAMES_032 = {m["mri"]: m["name"] for m in ROSTER_032}
 
 
+def _saved(text: str, picks: list[dict[str, Any]], roster: list[dict[str, Any]] = ROSTER_032) -> list[Any]:
+    """What a save resolves for `text` with the editor's picks given back unchanged, as chat_verbs does:
+    each the copy's own (kept), anchored at its `@`, read on `roster`."""
+    names = humans(roster)
+    kept = CV._kept(tuple(picks), picks, names)
+    anchored = CV._anchored_picks("19:grp@thread.v2", names, picks, kept)
+    assert not isinstance(anchored, str), anchored
+    return compose_mod.resolve_mentions(text, roster, "19:grp@thread.v2", "8:orgid:me", picks=anchored)
+
+
 def _save(text: str, picks: list[dict[str, Any]]) -> list[tuple[str, str]]:
     """The (MRI, label) a save sends for `text` and its picks, on the roster above."""
-    sent = compose_mod.resolve_mentions(text, ROSTER_032, "19:grp@thread.v2", "8:orgid:me", picks=picks)
-    return [(p["mri"], p["label"]) for p in sent]
+    return [(p["mri"], p["label"]) for p in _saved(text, picks)]
 
 
 def _labelled(*spans: tuple[str, str, str]) -> dict[str, Any]:
@@ -634,7 +647,7 @@ def test_a_person_always_comes_back_braced_with_the_full_name(label: str, typed:
     save can extend; the text and picks compose back to the same span and entry."""
     form = decompose(_labelled(("8:orgid:ann", label, " hi")), {}, NAMES_032)
     assert isinstance(form, Editable), form
-    assert (form.text, form.picks) == (f"@{typed} hi", [{"name": typed, "mri": "8:orgid:ann"}])
+    assert (form.text, form.picks) == (f"@{typed} hi", [{"name": typed, "mri": "8:orgid:ann", "at": 0}])
     assert _save(form.text, form.picks) == [("8:orgid:ann", label)]
 
 
@@ -646,7 +659,7 @@ def test_with_the_name_unknown_the_label_braces_itself(names: dict[str, str]) ->
     assert isinstance(form, Editable), form
     assert (form.text, form.picks) == (
         "@{the boss|the boss} hi",
-        [{"name": "{the boss|the boss}", "mri": "8:orgid:ann"}],
+        [{"name": "{the boss|the boss}", "mri": "8:orgid:ann", "at": 0}],
     )
 
 
@@ -693,10 +706,7 @@ def test_a_plain_at_comes_back_escaped(plain: str) -> None:
     form = decompose(_msg(composed[0], **(composed[1] or {})), {}, NAMES_032)
     assert isinstance(form, Editable), form
     assert form.text == plain.replace("@", "\\@") + " and @{Ann Lee|Lee}"
-    sent = compose_mod.resolve_mentions(
-        form.text, ROSTER_032, "19:grp@thread.v2", "8:orgid:me", picks=form.picks
-    )
-    assert compose_html(form.text, sent, {}, full=True) == composed
+    assert compose_html(form.text, _saved(form.text, form.picks), {}, full=True) == composed
 
 
 @pytest.mark.parametrize(
@@ -739,8 +749,9 @@ def test_with_no_roster_a_label_and_a_surname_stay_the_same_person(roster: list[
     saved with or without the roster, still Ann Moore."""
     form = decompose(_labelled(("8:orgid:moore", "Ann", " Lee")), {}, {})
     assert isinstance(form, Editable) and form.text == "@{Ann|Ann} Lee"
-    sent = compose_mod.resolve_mentions(form.text, roster, "19:grp@thread.v2", "8:orgid:me", picks=form.picks)
-    assert [(p["mri"], p["label"]) for p in sent] == [("8:orgid:moore", "Ann")]
+    assert [(p["mri"], p["label"]) for p in _saved(form.text, form.picks, roster)] == [
+        ("8:orgid:moore", "Ann")
+    ]
 
 
 @pytest.mark.parametrize(
