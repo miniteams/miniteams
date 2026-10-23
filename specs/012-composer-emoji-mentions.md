@@ -23,6 +23,8 @@ the person (or everyone) is notified and the name shows highlighted in Teams, as
 
 - **Emoji table.** `emoji_table.py`: a built-in `shortcode → character` dict (the common set,
   ~450 entries, GitHub/Slack names: `smile`, `thumbsup`, `fire`, `eyes`, `tada`, `+1` alias…).
+  Teams' own names it lacks (`salute`, hex-keyed ids by their name part) come after the custom
+  emojis: an organisation emoji by such a name wins.
   Custom emojis come from `emojis.rows()` (spec: `emojis.py`), fetched once at `web` start and
   refreshed every 6 h; failure to fetch leaves only the built-in set and logs a warning.
 - **Lookup verb.** `{"complete": "emoji"|"member", "q": "<prefix>", "thread": "<id>"}` answers

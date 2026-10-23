@@ -40,7 +40,7 @@ from .decompose import Editable, decompose
 from .directory import Directory, is_app
 from .directory import humans as _humans
 from .dump import epoch_seconds, fetch_history
-from .emoji_table import SHORTCODES
+from .emoji_table import SHORTCODES, TEAMS_NAMES
 from .emojis import EmojiCache
 from .files import check_files, my_onedrive, post_files, upload_files
 from .http import Downloads, failure
@@ -1760,5 +1760,10 @@ class ChatVerbs:
             }
             for name, oid in self.emojis.names.items()
             if name.casefold().startswith(prefix) and name not in SHORTCODES
+        ]
+        found += [
+            {"name": name, "char": char}
+            for name, char in TEAMS_NAMES.items()
+            if name.startswith(prefix) and name not in self.emojis.names
         ]
         return sorted(found, key=lambda it: str(it["name"]).casefold())[:_COMPLETE_ITEMS]
