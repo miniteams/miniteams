@@ -430,6 +430,10 @@ class Index:
             for r in rows
         ]
 
+    def chat_ids(self, after: str = "") -> list[str]:
+        """Ids sorting after `after`, in order: a resumable walk over every indexed chat."""
+        return [r[0] for r in self._db.execute("SELECT id FROM chats WHERE id > ? ORDER BY id", (after,))]
+
     def backfill_done(self, thread_id: str) -> bool:
         row = self._db.execute("SELECT backfill_done FROM chats WHERE id = ?", (thread_id,)).fetchone()
         return bool(row and row[0])
@@ -623,11 +627,23 @@ class ChatStore:
                 "UPDATE messages SET pending = 0 WHERE pending = 1 AND composetime <= ?", (upto,)
             )
 
-    def iter_messages(self) -> Iterator[dict[str, Any]]:
-        """Yield every stored message (raw JSON), oldest first."""
-        cursor = self._db.execute("SELECT raw FROM messages ORDER BY composetime")
-        for (raw,) in cursor:
-            yield json.loads(raw)
+    def iter_messages(self, page: int = 500) -> Iterator[dict[str, Any]]:
+        """Yield every stored message (raw JSON), oldest first.
+
+        Keyset pages, each read whole: an open statement pins a WAL read snapshot, and once another
+        connection commits, every write on this one fails `database is locked` (BUSY_SNAPSHOT)."""
+        after = ("", "")
+        while True:
+            rows = self._db.execute(
+                "SELECT composetime, id, raw FROM messages WHERE (composetime, id) > (?, ?)"
+                " ORDER BY composetime, id LIMIT ?",
+                (*after, page),
+            ).fetchall()
+            for _, _, raw in rows:
+                yield json.loads(raw)
+            if len(rows) < page:
+                return
+            after = (rows[-1][0], rows[-1][1])
 
     def count(self) -> int:
         return int(self._db.execute("SELECT COUNT(*) FROM messages").fetchone()[0])

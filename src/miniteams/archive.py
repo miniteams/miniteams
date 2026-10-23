@@ -287,13 +287,14 @@ async def _download_media(
     sp_token: Callable[[str], str | None] | None = None,
     ignore_denied: bool = False,
     media: frozenset[str] = attachments.DEFAULT_MEDIA,
+    sem: asyncio.Semaphore | None = None,
 ) -> int:
     """Best-effort pass: download every stored message's attachments at original quality.
 
     Runs after messages are committed, iterating stored data — so it is resumable (a crash mid-pass
     re-runs cheaply, skipping files already on disk) and never blocks message capture. Downloads run
     over a bounded async pool sharing one connection pool; `_MEDIA_CONCURRENCY` caps in-flight
-    requests to stay polite (429-friendly).
+    requests to stay polite (429-friendly); `sem` replaces it with a limit shared with other downloads.
 
     Assets the archive gave up on are remembered in `denied_assets`, or the loop mode hammers them
     every cycle. A 403 (deleted object, lost share permission) and a 413 (transcript over the size
@@ -302,19 +303,7 @@ async def _download_media(
     content type or encoding) backs off the same way. `ignore_denied` (--retry-assets) forces them all; fresh
     failures are recorded either way.
     """
-    targets: list[dict[str, Any]] = []
-    recordings: list[dict[str, Any]] = []
-    for m in store.iter_messages():
-        content, msgtype = m.get("content") or "", str(m.get("messagetype") or "")
-        if msgtype == "RichText/Media_CallRecording":
-            recordings.append(m)
-        if attachments.extract(content, msgtype, media, message_files(m)):
-            targets.append(m)
-    if not targets:
-        # Still derive the recordings manifest: a chat can hold recording messages whose only
-        # copies aren't downloadable under current flags, and the pairing info is message-derived.
-        _write_recordings_manifest(store, recordings)
-        return 0
+    recordings: list[dict[str, Any]] = []  # a handful per chat; the manifest needs them all
     denied = set() if ignore_denied else store.denied_urls(_now_iso())
     skipped = 0
 
@@ -327,7 +316,22 @@ async def _download_media(
 
     fetched = done = 0
     start = time.monotonic()
-    sem = asyncio.Semaphore(_MEDIA_CONCURRENCY)
+    sem = sem or asyncio.Semaphore(_MEDIA_CONCURRENCY)
+    # Lazy scan into a bounded queue: memory stays flat on a big chat. Only the workers wait on `sem`,
+    # so a live download sharing it waits behind at most `_MEDIA_CONCURRENCY`, served FIFO.
+    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(_MEDIA_CONCURRENCY)
+
+    async def _scan() -> None:
+        for i, m in enumerate(store.iter_messages(), 1):
+            if i % 500 == 0:  # the live sweep scans on the stream's loop: a big chat must not stall it
+                await asyncio.sleep(0)
+            content, msgtype = m.get("content") or "", str(m.get("messagetype") or "")
+            if msgtype == "RichText/Media_CallRecording":
+                recordings.append(m)
+            if attachments.extract(content, msgtype, media, message_files(m)):
+                await queue.put(m)
+        for _ in range(_MEDIA_CONCURRENCY):
+            await queue.put(None)
 
     async def _one(message: dict[str, Any], client: httpx.AsyncClient) -> int:
         async with sem:  # cap concurrent downloads
@@ -351,10 +355,13 @@ async def _download_media(
                 return 0
             return sum(1 for n in notes if "→" in n)
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        tasks = [asyncio.create_task(_one(m, client)) for m in targets]
-        for task in asyncio.as_completed(tasks):
-            fetched += await task
+    client: httpx.AsyncClient | None = None  # built on the first target: most chats a sweep visits have none
+
+    async def _worker() -> None:
+        nonlocal fetched, done, client
+        while (message := await queue.get()) is not None:
+            client = client or httpx.AsyncClient(timeout=60.0)
+            fetched += await _one(message, client)
             done += 1
             if done % 50 == 0:
                 log.info(
@@ -362,10 +369,21 @@ async def _download_media(
                     chat=label,
                     thread=store.thread_id,
                     done=done,
-                    of=len(targets),
                     files=fetched,
                     files_per_s=_rate(fetched, start),
                 )
+
+    tasks = [asyncio.create_task(_scan())]
+    tasks += [asyncio.create_task(_worker()) for _ in range(_MEDIA_CONCURRENCY)]
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        # Cancelled (a live pass takes the chat): no download may outlive the caller's store.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if client is not None:
+            await client.aclose()
     if skipped:
         log.info("media_denied_skipped", chat=label, thread=store.thread_id, skipped=skipped)
     _write_recordings_manifest(store, recordings)
@@ -423,6 +441,7 @@ async def archive_chat(
     sp_token: Callable[[str], str | None] | None = None,
     force: bool = False,
     floor: str | None = None,
+    media_sem: asyncio.Semaphore | None = None,
 ) -> dict[str, int]:
     """Returns per-chat counts (`new`, `media`, `avatars`) for the run recap."""
     directory.set_token(skype_token, bearer)
@@ -441,6 +460,7 @@ async def archive_chat(
                     sp_token,
                     ignore_denied=retry_assets,
                     media=media_types,
+                    sem=media_sem,
                 )
                 index.touch(thread_id, _now_iso())
                 log.info("chat_assets", thread=thread_id, total=store.count(), media=media)
@@ -563,6 +583,7 @@ async def run_archive(
     retry_assets: bool = False,
     force: frozenset[str] = frozenset(),
     recheck_since: str | None = None,
+    live_pass: bool = False,
 ) -> bool:
     """Returns True when the run stopped on AuthExpired (re-login needed), False otherwise.
     `recheck_since` re-walks every chat active since that UTC time down to it."""
@@ -576,6 +597,8 @@ async def run_archive(
     failed = denied = 0
     auth_expired = False
     note_meta(index, archiver_state="syncing", sync_started_at=_now_iso())
+    if not live_pass:  # a killed `--live --verify-media` left it set; a live pass leaves its sweep's alone
+        note_meta(index, media_sweep="")
     try:
         if thread:
             targets: list[dict[str, Any]] = [{"id": thread}]

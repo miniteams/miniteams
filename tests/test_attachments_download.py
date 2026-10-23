@@ -482,6 +482,52 @@ async def test_process_sp_transcript_write_failure_leaves_no_part(settings: Sett
     assert notes == [f"[transcript(sp): {SP}]"]
 
 
+async def test_process_sp_transcript_cancelled_mid_write_leaves_no_part(
+    settings: Settings, monkeypatch
+) -> None:
+    """A live pass cancels a sweep download mid-stream: the cut .part must go too."""
+    import asyncio
+
+    class _C(_StreamFromGet):
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aclose(self):
+            return None
+
+        async def get(self, url, headers=None, cookies=None, **kw):
+            ctype = "application/json" if (kw.get("params") or {}).get("format") else "text/vtt"
+            return _HangResp(content=b'{"entries":[]}', headers={"content-type": ctype})
+
+    started = asyncio.Event()
+
+    class _HangResp(_Resp):
+        async def aiter_bytes(self, size: int = 65536):
+            yield self.content[:4]
+            started.set()
+            await asyncio.Event().wait()
+            yield b""
+
+    monkeypatch.setattr(A.httpx, "AsyncClient", lambda *a, **k: _C())
+    task = asyncio.create_task(
+        A.process(
+            REC_SP,
+            "RichText/Media_CallRecording",
+            "sk",
+            settings.media_dir,
+            download=True,
+            sp_token=lambda h: "T",
+        )
+    )
+    await asyncio.wait_for(started.wait(), 5)
+    task.cancel()
+    await asyncio.wait({task})
+    assert task.cancelled() and not list(settings.media_dir.glob("*.part"))
+
+
 class _NoBodyResp(_Resp):
     async def aiter_bytes(self, size: int = 65536):
         raise AssertionError("body read before the content-type check")

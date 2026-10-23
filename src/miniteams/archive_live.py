@@ -3,6 +3,9 @@
 Live writes are pending (`ChatStore.newest` ignores them), so the next top-up still crosses any
 message Trouter dropped without a gap signal; a reconcile pass on a timer bounds how long that
 takes. Events are buffered, not written, while a pass runs: a single writer, never both.
+
+`--verify-media` adds a media sweep (spec 032): `--assets-only` chat by chat on the stream's loop,
+paused while a pass runs and cancelled mid-chat when one starts, so it never writes beside a pass.
 """
 
 import asyncio
@@ -17,11 +20,20 @@ from typing import Any
 import structlog
 
 from . import attachments
-from .archive import _MEDIA_CONCURRENCY, TokenProvider, _now_iso, note_meta, record_asset_failure, run_archive
+from .archive import (
+    _MEDIA_CONCURRENCY,
+    TokenProvider,
+    _now_iso,
+    archive_chat,
+    note_meta,
+    record_asset_failure,
+    run_archive,
+)
 from .archive_store import ChatStore, Index, merge_dicts, message_version
 from .auth import AuthExpired
 from .chats import in_archive_scope
 from .config import Settings
+from .directory import Directory
 from .messages import message_files, thread_of
 from .stream import run_forever
 
@@ -79,6 +91,7 @@ class LiveArchive:
         self._again = False  # a gap arrived after the running pass started
         self._recent: OrderedDict[str, float] = OrderedDict()  # thread → last live write
         self._catchup: asyncio.Task[None] | None = None
+        self._sweep_chat: asyncio.Task[int] | None = None
         self._dropped = 0
         self._media_sem = asyncio.Semaphore(_MEDIA_CONCURRENCY)
         self._media_tasks: set[asyncio.Task[None]] = set()  # strong refs until each download ends
@@ -238,10 +251,15 @@ class LiveArchive:
                 download_avatars=self.download_avatars,
                 media_types=self.media_types,
                 force=force,
+                live_pass=True,
             )
         )
 
     async def _catch_up(self) -> None:
+        sweeping = self._sweep_chat
+        if sweeping is not None and not sweeping.done():
+            sweeping.cancel()  # the sweep redoes the chat after the pass (skip-exists)
+            await asyncio.wait({sweeping})
         failures = write_failures = 0
         while True:
             self._again = False
@@ -297,6 +315,81 @@ class LiveArchive:
             if self._catchup is None or self._catchup.done():
                 await self.on_gap("reconcile")
 
+    # --- media sweep ---
+
+    async def sweep(self) -> None:
+        """One `--assets-only` walk over every archived chat, resumed after the last chat done."""
+        await self._until_idle()  # the first pass may add chats: read the list after it
+        try:
+            after = self.index.get_meta("media_sweep_after")
+            ids = self.index.chat_ids(after)
+            directory = Directory(self.settings)
+            files = failed = 0
+            start = time.monotonic()
+            log.info("media_sweep_start", chats=len(ids), resumed_after=after)
+            note_meta(self.index, media_sweep="running")
+            for thread_id in ids:
+                # Progress stops at the first failure, so a resumed sweep retries that chat.
+                task = await self._sweep_one(thread_id, directory, advance=not failed)
+                error = task.exception()
+                if isinstance(error, AuthExpired):
+                    log.error("media_sweep_auth_expired", error=str(error))
+                    self.stopped.set()
+                    return
+                if error is not None:
+                    failed += 1
+                    log.warning("media_sweep_chat_failed", thread=thread_id, error=str(error))
+                else:
+                    files += task.result()
+                await asyncio.sleep(self.settings.sweep_pause)
+            if not failed:
+                note_meta(self.index, media_sweep_after="")
+            duration = round(time.monotonic() - start, 1)
+            log.info("media_sweep_done", chats=len(ids), files=files, failures=failed, duration_s=duration)
+        except Exception as exc:  # noqa: BLE001 — the live archive goes on without its sweep
+            log.error("media_sweep_failed", error=str(exc))
+        finally:
+            note_meta(self.index, media_sweep="")
+
+    async def _sweep_one(self, thread_id: str, directory: Directory, advance: bool) -> asyncio.Task[int]:
+        """The chat's finished task; one a starting pass cancelled is run again once it ends."""
+        while True:
+            await self._until_idle()
+            task = self._sweep_chat = asyncio.create_task(self._sweep_assets(thread_id, directory, advance))
+            try:
+                await asyncio.wait({task})
+            except asyncio.CancelledError:
+                task.cancel()
+                await asyncio.wait({task})  # its downloads end before the caller closes the index
+                raise
+            if not task.cancelled():
+                return task
+
+    async def _until_idle(self) -> None:
+        """Returns once a catch-up ran and none runs. Read from `_catchup` itself: a done-callback
+        may land after the next pass started."""
+        while (catchup := self._catchup) is None or not catchup.done():
+            await (asyncio.wait({catchup}) if catchup else asyncio.sleep(1.0))
+
+    async def _sweep_assets(self, thread_id: str, directory: Directory, advance: bool) -> int:
+        token = await asyncio.to_thread(self.provider.token)
+        counts = await archive_chat(
+            self.settings,
+            token,
+            "",  # assets only: no avatar, no profile lookup
+            thread_id,
+            self.data_dir,
+            directory,
+            self.index,
+            media_types=self.media_types,
+            assets_only=True,
+            sp_token=self.provider.sharepoint_token,
+            media_sem=self._media_sem,
+        )
+        if advance:  # inside the task: a pass cancelling it after this point cannot redo the chat
+            note_meta(self.index, media_sweep_after=thread_id)
+        return counts["media"]
+
     def close(self) -> None:
         self.index.close()
 
@@ -311,8 +404,10 @@ async def run_live(
     download_avatars: bool = True,
     media_types: frozenset[str] = attachments.DEFAULT_MEDIA,
     reconcile: float = 1800.0,
+    verify_media: bool = False,
 ) -> bool:
-    """Returns True when it stopped on a dead refresh token (re-login needed)."""
+    """Returns True when it stopped on a dead refresh token (re-login needed). `verify_media` runs
+    (or resumes) one media sweep; without it, the progress of an unfinished one is dropped."""
     live = LiveArchive(
         settings,
         data_dir.resolve(),
@@ -333,12 +428,17 @@ async def run_live(
     )
     stop = asyncio.create_task(live.stopped.wait())
     timer = asyncio.create_task(live.reconcile(reconcile))
+    # A killed process never cleared its heartbeat; progress survives only for a resume.
+    note_meta(live.index, media_sweep="", **({} if verify_media else {"media_sweep_after": ""}))
+    sweep = asyncio.create_task(live.sweep()) if verify_media else None
     try:
         await asyncio.wait({stream, stop}, return_when=asyncio.FIRST_COMPLETED)
     finally:
-        for task in (stream, stop, timer, live._catchup):
+        for task in (stream, stop, timer, sweep, live._catchup):
             if task is not None:
                 task.cancel()
+        if sweep is not None:
+            await asyncio.wait({sweep})  # its `finally` clears the heartbeat before the index closes
         live.close()
     # run_forever only returns on a dead refresh token (or a closed stdout, not a case here).
     return True
