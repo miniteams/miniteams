@@ -576,7 +576,8 @@
         const at = input.selectionStart, before = input.value.slice(0, at);
         for (const m of [...(picked.get(chat()) || [])].reverse()) {
           const first = m.name.split(/\s+/)[0];
-          if (m.everyone || first === m.name) continue;
+          // A kept `{Full Name|label}` (an edit, spec 032) is one token: never shortened to `{Ann`.
+          if (m.everyone || first === m.name || m.name.startsWith("{")) continue;
           const space = before.endsWith(`@${m.name} `) ? " " : "", start = at - m.name.length - 1 - space.length;
           // Both ends on a word boundary, as `scan` reads a mention: `@Ann Leex` is no `@Ann Lee`.
           if (!before.endsWith(`@${m.name}${space}`) || /[\p{L}\p{N}_]$/u.test(before.slice(0, start))

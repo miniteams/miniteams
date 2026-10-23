@@ -634,7 +634,8 @@ async def test_everyone_on_any_group_whatever_its_size(board: W.Board, sent: lis
 
 
 async def test_mention_names_come_from_the_roster(board: W.Board, sent: list[Any]) -> None:
-    """The page's name only locates `@Name` and must be the member's own; the span shows the roster's."""
+    """The page's name only locates `@Name` and must be the member's own; the span shows the roster's.
+    032: `@ann leex`, which the pick does not cover, resolves on the roster as `@ann`."""
     for wrong in ({"name": "Boss", "mri": ANN}, {"name": "Élodie Martin", "mri": ANN}):
         assert await _send(board, B, f"@{wrong['name']} hi", None, None, [wrong]) == "unknown mention"
     assert await _send(
@@ -646,10 +647,11 @@ async def test_mention_names_come_from_the_roster(board: W.Board, sent: list[Any
     [(_, body, kw)] = sent
     assert body == (
         f'<span itemtype="{MENTION}" itemscope="" itemid="0">Ann Lee</span> and '
-        f'<span itemtype="{MENTION}" itemscope="" itemid="1">Élodie Martin</span>, @ann leex'
+        f'<span itemtype="{MENTION}" itemscope="" itemid="1">Élodie Martin</span>, '
+        f'<span itemtype="{MENTION}" itemscope="" itemid="2">Ann</span> leex'
     )
     names = [e["displayName"] for e in json.loads(kw["properties"]["mentions"])]
-    assert names == ["Ann Lee", "Élodie Martin"]
+    assert names == ["Ann Lee", "Élodie Martin", "Ann"]
 
 
 async def test_shortened_mentions_keep_the_roster_identity(board: W.Board, sent: list[Any]) -> None:
@@ -664,7 +666,7 @@ async def test_shortened_mentions_keep_the_roster_identity(board: W.Board, sent:
         ("Ann", ANN),
         ("Élodie", ELO),
     ]
-    for name in ("Lee", "An", "Boss"):
+    for name in ("An", "Boss"):  # 032: `Lee`, her last name, is hers
         assert (
             await _send(board, B, f"@{name}", None, None, [{"name": name, "mri": ANN}]) == "unknown mention"
         )
@@ -930,3 +932,166 @@ async def test_a_cached_404_is_answered_inline_as_no_roster(
     assert (await board.follow(ws, B))["people"] is None  # type: ignore[arg-type]
     await asyncio.sleep(0.05)
     assert ws.frames == []
+
+
+# --- name forms, free labels and unpicked mentions (spec 032) ---
+
+BOB_LEE = "8:orgid:00000000-0000-0000-0000-0000000000b1"
+MOORE = "8:orgid:00000000-0000-0000-0000-0000000000b2"
+
+
+def _sent_mentions(kw: dict[str, Any]) -> list[tuple[str, str]]:
+    return [(e["mri"], e["displayName"]) for e in json.loads(kw["properties"]["mentions"])]
+
+
+async def test_last_name_and_free_label_picks_are_accepted(board: W.Board, sent: list[Any]) -> None:
+    """032-AC1, AC3 (web): a pick spelling her last name, or a `{Who|label}` whose Who is one of her forms,
+    is hers; the span shows the roster's form or the label."""
+    picked = [{"name": "lee", "mri": ANN}, {"name": "{Ann|the boss}", "mri": ANN}]
+    assert await _send(board, B, "@lee and @{Ann|the boss}", None, None, picked) is None
+    [(_, body, kw)] = sent
+    assert body == (
+        f'<span itemtype="{MENTION}" itemscope="" itemid="0">Lee</span> and '
+        f'<span itemtype="{MENTION}" itemscope="" itemid="1">the boss</span>'
+    )
+    assert _sent_mentions(kw) == [(ANN, "Lee"), (ANN, "the boss")]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["{Élodie Martin|x}", "{Ann|}", "{Ann|a}b}", "{Ann|x} ", "{Annie|x}", "{Ann|x"],
+)
+async def test_a_forged_free_label_pick_is_refused(board: W.Board, sent: list[Any], name: str) -> None:
+    """032-AC3 (web): a free-label pick whose Who is no form of its member, or that is malformed."""
+    assert await _send(board, B, f"@{name}", None, None, [{"name": name, "mri": ANN}]) == "unknown mention"
+    assert sent == []
+
+
+@pytest.mark.parametrize(
+    ("text", "mentions"),
+    [
+        ("@Lee hi", [(ANN, "Lee")]),
+        ("@elodie and @{Ann Lee|the boss}", [(ELO, "Élodie"), (ANN, "the boss")]),
+        ("- @martin\n- @ann", [(ELO, "Martin"), (ANN, "Ann")]),
+    ],
+)
+async def test_an_unpicked_form_resolves_on_the_roster(
+    board: W.Board, sent: list[Any], rosters: list[str], text: str, mentions: list[tuple[str, str]]
+) -> None:
+    """032-AC6 (server half): with no pick, an `@form` or `@{Who|label}` is resolved as MCP does."""
+    assert await _send(board, B, text, None, None, None, "full") is None
+    [(_, _, kw)] = sent
+    assert _sent_mentions(kw) == mentions and rosters == [B]
+
+
+@pytest.mark.parametrize(
+    ("text", "error"),
+    [
+        ("@Lee hi", "ambiguous mention @Lee: Ann Lee, Bob Lee (\\@ for a literal @)"),
+        ("@Nobody hi", "unknown mention @Nobody (\\@ for a literal @)"),
+        ("@{Ann Lee|} hi", "empty mention label @{Ann Lee|} (\\@ for a literal @)"),
+    ],
+)
+async def test_an_unpicked_form_matching_none_or_several_refuses_the_send(
+    board: W.Board, sent: list[Any], monkeypatch: pytest.MonkeyPatch, text: str, error: str
+) -> None:
+    """032-AC6 (server half): the reason goes back to the page, nothing is sent."""
+    monkeypatch.setitem(_ROSTERS, B, [*_ROSTERS[B], {"mri": BOB_LEE, "name": "Bob Lee"}])
+    assert await _send(board, B, text) == error
+    assert sent == []
+
+
+async def test_namesake_picks_keep_their_own_recipient(
+    board: W.Board, sent: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """032-AC7 (server half): `@Ann` picked as Ann Lee and `@Moore` as Ann Moore, though `@Ann` alone would
+    be ambiguous on the roster; `@ann` is the `Ann` pick's too (case ignored), an unpicked `@Ann` with no
+    pick is ambiguous."""
+    monkeypatch.setitem(_ROSTERS, B, [*_ROSTERS[B], {"mri": MOORE, "name": "Ann Moore"}])
+    picked = [{"name": "Ann", "mri": ANN}, {"name": "Moore", "mri": MOORE}]
+    assert await _send(board, B, "@Ann and @Moore", None, None, picked) is None
+    [(_, _, kw)] = sent
+    assert _sent_mentions(kw) == [(ANN, "Ann"), (MOORE, "Moore")]
+    assert await _send(board, B, "@Ann and @ann", None, None, picked[:1]) is None
+    assert _sent_mentions(sent[1][2]) == [(ANN, "Ann"), (ANN, "Ann")]
+    reason = await _send(board, B, "@Ann and @ann")
+    assert reason == "ambiguous mention @Ann: Ann Lee, Ann Moore (\\@ for a literal @)" and len(sent) == 2
+
+
+async def test_no_roster_call_without_a_mention_to_resolve(
+    board: W.Board, sent: list[Any], rosters: list[str]
+) -> None:
+    """032: an email, code or `\\@` needs no roster; without one, an unpicked `@form` is refused as a pick
+    is."""
+    assert await _send(board, B, r"a@b.com `@Lee` \@Lee \@{Ann|x}") is None
+    assert rosters == [] and len(sent) == 1
+    ws = object()
+    assert (await board.follow(ws, T))["ok"]  # type: ignore[arg-type]
+    assert await _send(board, T, "@Lee", ws) == "roster unavailable"
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize("text", ["@Ann then @Ann Moore", "@Ann Moore then @ann"])
+async def test_a_longer_form_typed_after_a_shortened_pick_is_its_own_member(
+    board: W.Board, sent: list[Any], monkeypatch: pytest.MonkeyPatch, text: str
+) -> None:
+    """032: Ann Lee picked and shortened to `@Ann`; `@Ann Moore` typed before or after it is Ann Moore's,
+    and `@Ann` (any case) stays Ann Lee's."""
+    monkeypatch.setitem(_ROSTERS, B, [*_ROSTERS[B], {"mri": MOORE, "name": "Ann Moore"}])
+    assert await _send(board, B, text, None, None, [{"name": "Ann", "mri": ANN}]) is None
+    [(_, _, kw)] = sent
+    assert sorted(_sent_mentions(kw)) == sorted([(ANN, "Ann"), (MOORE, "Ann Moore")])
+
+
+@pytest.mark.parametrize("same", [True, False])
+@pytest.mark.parametrize("verb", ["send", "edit"])
+def test_more_picks_than_max_mentions_are_refused_when_parsed(verb: str, same: bool) -> None:
+    """032 review: picks are matched against the text, so their count is capped before any work."""
+    names = ["Ann Lee" if same else f"Ann {n}" for n in range(compose.MAX_MENTIONS + 1)]
+    picks = [{"name": name, "mri": ANN} for name in names]
+    if verb == "send":
+        got = CV.parse_send({"send": B, "text": "@Ann Lee", "mentions": picks})
+    else:
+        edit = {
+            "edit": B,
+            "msg": "1",
+            "text": "@Ann Lee",
+            "mentions": picks,
+            "keep_quotes": [],
+            "keep_images": [],
+        }
+        got = CV.parse_act("edit", edit)
+    assert got == "too many mentions (51 > 50)"
+    ok = CV.parse_send({"send": B, "text": "x", "mentions": picks[:-1]})
+    assert isinstance(ok, CV.SendRequest)
+
+
+@pytest.mark.parametrize(("text", "label"), [("```\n@Ann\n```", "Ann"), ("hi\n```\n@lee x\n```", "Lee")])
+async def test_an_inline_send_resolves_what_inline_mode_reads(
+    board: W.Board, sent: list[Any], text: str, label: str
+) -> None:
+    """032 review: format "inline" (the widget's quick reply) has no code fences: `@Ann` between ``` lines is
+    Ann's mention, as compose_html renders it inline; in full mode it stays code."""
+    assert await _send(board, B, text, None, None, None, "inline") is None
+    assert _sent_mentions(sent[0][2]) == [(ANN, label)]
+    assert await _send(board, B, text, None, None, None, "full") is None
+    assert "properties" not in sent[1][2] or not sent[1][2]["properties"]
+
+
+@pytest.mark.parametrize(
+    "pick",
+    [
+        {"name": "x" * (compose.MAX_FREE_NAME + 1), "mri": ANN},
+        {"name": "{" + "x" * compose.MAX_NAME + "|" + "y" * compose.MAX_NAME + "}" + "z", "mri": ANN},
+        {"name": "Ann", "mri": "8:orgid:" + "a" * 300},
+        {"name": "everyone", "mri": "19:" + "a" * 300 + "@thread.v2", "everyone": True},
+    ],
+)
+def test_a_pick_past_its_bounds_is_refused_when_parsed(pick: dict[str, str]) -> None:
+    """032 review: a pick's name is matched and folded, its MRI kept: past a free label's length or an MRI's,
+    the verb is refused before any work."""
+    assert CV.parse_send({"send": B, "text": "@Ann", "mentions": [pick]}) == "invalid mention"
+    edit = {"edit": B, "msg": "1", "text": "@Ann", "mentions": [pick], "keep_quotes": [], "keep_images": []}
+    assert CV.parse_act("edit", edit) == "invalid mention"
+    ok = {**pick, "name": "x" * compose.MAX_FREE_NAME, "mri": ANN}
+    assert isinstance(CV.parse_send({"send": B, "text": "@Ann", "mentions": [ok]}), CV.SendRequest)

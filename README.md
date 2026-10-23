@@ -36,7 +36,8 @@ uv run miniteams chats --since 2026-07-01 --until 2026-07-10   # activity window
 uv run miniteams send "hello"     # send to your Notes (write-safe default)
 uv run miniteams send --thread 19:xxx@thread.v2 "hi"   # send to a conversation
 uv run miniteams send --thread 19:xxx@thread.v2 "@Ann Lee **ready** :fire:"   # rendered as the chat
-                                  # page's composer: markdown, :shortcode:, bare URLs, @mentions (below)
+                                  # page's composer: markdown, :shortcode:, bare URLs, @mentions by full,
+                                  # first or last name and @{Who|label} (below)
 uv run miniteams send --file msg.txt              # body from a file (rendered the same way)
 uv run miniteams send --file test.html --html     # raw RichText/Html, verbatim (no markdown, no @mentions)
 uv run miniteams send "look" --thread 19:xxx@thread.v2 --image a.png --image b.jpg  # inline images after the text
@@ -91,11 +92,13 @@ write to Teams as you; with `send_at` (ISO 8601 with an offset, 5 seconds to 125
 `send_message` schedules instead, and `list_scheduled`, `update_scheduled` and `cancel_scheduled`
 manage what Teams is holding (`docs/scheduled-send-wire.md`). Their text, like `miniteams send`'s
 without `--html`, is rendered as the chat page's composer does (spec 029): markdown, built-in
-`:shortcode:` emojis, bare URLs as links. `@Ann Lee` or `@ann` (a member's full or first name, case and
-accents ignored) mentions that member, shown as typed (`Ann Lee`, `Ann`); `@everyone` mentions a group
-chat; `\@` is a literal `@`, and an email or code is never a mention. A name matching nobody or
-several members, a roster that cannot be fetched, `@everyone` on a 1:1, more than 50 mentions or
-28 KB of HTML refuse the send (an MCP error, exit 2 for the CLI), nothing written. `--read-only` keeps every writing tool
+`:shortcode:` emojis, bare URLs as links. `@Ann Lee`, `@ann` or `@lee` (a member's full, first or last
+name, case and accents ignored, longest first) mentions that member, shown as the roster spells that form
+(`Ann Lee`, `Ann`, `Lee`); `@{Who|label}` mentions the member Who names (any of those forms, so the full
+name settles a shared one) shown as `label`, the whole `@{Who|label}` read raw, markup and all, up to its
+`}` (the last `|` splits; the label: one line, 1 to 200 characters, no `|` or `}`, no tab or other blank but the space, no control, format, private-use or unassigned character) (spec 032); `@everyone` mentions a group chat; `\@` is a literal `@`, and an email or code is never a mention. A name matching nobody or several members (`ambiguous
+mention @Lee: Ann Lee, Bob Lee (\@ for a literal @)`), a malformed label, a roster that cannot be fetched, `@everyone` on a 1:1,
+more than 50 mentions or 28 KB of HTML refuse the send (an MCP error, exit 2 for the CLI), nothing written. `--read-only` keeps every writing tool
 out of the list. Nothing needs a token until the
 API is called; a dead credential makes that call return a device-login URL and code, and `login` reports the
 same flow. The server needs the project's `.env` and `data/`, so register it as
@@ -240,7 +243,14 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   up (no "loading latest messages…"); one `read` a second per chat, the last one sent only if all that still holds.
 - **Composer** (also the widget's quick reply): completes `:emoji` and `@member` (`@everyone` on group chats, not 1:1;
   picked members are notified; a mention needs a non-word character before `@`, and two members with the same name map
-  in the order they were picked). Messages are limited to 28 KB and 50 mentions.
+  in the order they were picked). An `@Ann`, `@Lee`, `@Ann Lee` or `@{Ann Lee|label}` no pick covers is resolved on
+  the chat's members as MCP does (spec 032, above): ambiguous or unknown, the send is refused with the reason; a
+  longer name typed where a pick's shorter one would match (`@Ann Moore` after picking Ann Lee as `@Ann`) is
+  the longer one's. Editing a message gives its plain `@word` back as `\@word`, so it stays text, and
+  each person mention braced: `@{Full Name|label}`, or `@{label|label}` when the full name is unknown (no
+  roster, or they left), one spelling per person. A message whose mention label no `{…}` can hold, or
+  whose namesakes stay spelled alike, is not offered for editing.
+  Messages are limited to 28 KB and 50 mentions.
   - A backslash keeps markup literal: `\*` `\_` `\~` `` \` `` `\[` `\@`, and on the chat page a line starting `\- ` `\* `
     `\> ` `\1. ` (or a line that is only `\>`); `\\` is one backslash before another backslash or one of those, or
     (chat page) before a line-start marker; any other backslash stays as typed (`\\srv\share`), and backslashes
@@ -259,7 +269,8 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
     or edits it in place (Enter resends, Escape cancels). On the chat page a failed message Teams echoes counts as
     sent and the rest goes on (the widget sees no echo: ↻ checks and finds it); a `sent` bubble whose echo never
     comes leaves after 30 s.
-  - Backspace after a picked full-name mention shortens it to the first name while keeping its recipient.
+  - Backspace after a picked full-name mention shortens it to the first name while keeping its recipient (a
+    kept `@{…}` from an edit is never shortened).
   - Paste images (PNG, JPEG, GIF, WebP; up to 8, 10 MiB each, 40 MiB in all): thumbnails per chat, click to preview,
     × to drop; Enter sends them after the text, or alone. They upload to Teams only on send and live in the page:
     a reload drops them, the text draft stays. A failed or unanswered send may have gone out: ↻, or the unchanged

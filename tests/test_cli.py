@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 import structlog.testing
 
-from miniteams import cli
+from miniteams import cli, compose
 from miniteams.config import Settings
 
 
@@ -695,16 +695,16 @@ def test_send_html_is_verbatim_with_no_roster_call(
 @pytest.mark.parametrize(
     ("text", "thread", "members", "reason"),
     [
-        ("@Nobody hi", GROUP, ROSTER, "unknown mention @Nobody"),
+        ("@Nobody hi", GROUP, ROSTER, "unknown mention @Nobody (\\@ for a literal @)"),
         (
             "@Ann hi",
             GROUP,
             [*ROSTER, {"mri": "8:orgid:moore", "name": "Ann Moore"}],
-            "ambiguous mention @Ann: Ann Lee, Ann Moore",
+            "ambiguous mention @Ann: Ann Lee, Ann Moore (\\@ for a literal @)",
         ),
         ("@Ann hi", GROUP, None, "chat members unavailable"),
         ("@everyone hi", "19:a_b@unq.gbl.spaces", ROSTER, "@everyone is not available in this chat"),
-        ("@Ann hi", "48:notes", ROSTER, "unknown mention @Ann"),
+        ("@Ann hi", "48:notes", ROSTER, "unknown mention @Ann (\\@ for a literal @)"),
     ],
 )
 @pytest.mark.parametrize("extra", ["none", "image", "attach"])
@@ -765,3 +765,77 @@ def test_the_roster_lookup_gets_the_bearer_every_directory_gets(
     wire["aad"] = aad
     assert cli.cmd_send(settings, _send_ns("@Ann Lee hi")) == 0
     assert wire["bearers"] == [bearer] and wire["roster"] == [GROUP]
+
+
+# --- send: name forms and free labels (spec 032) ---
+
+
+@pytest.mark.parametrize(
+    ("text", "members", "html", "entries"),
+    [
+        ("@lee hi", ROSTER, f"{_span(0, 'Lee')} hi", [(0, ANN, "Lee")]),
+        ("@Roe hi", ROSTER, f"{_span(0, 'Roe')} hi", [(0, BOB, "Roe")]),
+        (
+            "@{Ann Lee|Lee} hi",
+            [*ROSTER, {"mri": "8:orgid:boblee", "name": "Bob Lee"}],
+            f"{_span(0, 'Lee')} hi",
+            [(0, ANN, "Lee")],
+        ),
+        ("@{ann|the boss} hi", ROSTER, f"{_span(0, 'the boss')} hi", [(0, ANN, "the boss")]),
+        (
+            "@{John Doe | Sales|boss} hi",
+            [*ROSTER, {"mri": "8:orgid:john", "name": "John Doe | Sales"}],
+            f"{_span(0, 'boss')} hi",
+            [(0, "8:orgid:john", "boss")],
+        ),
+    ],
+)
+def test_send_takes_every_name_form_and_free_labels(
+    settings: Settings,
+    wire: dict[str, Any],
+    text: str,
+    members: list[dict[str, str]],
+    html: str,
+    entries: list[tuple[Any, ...]],
+) -> None:
+    """032-AC4 (AC1–AC3): a last name, or `@{Who|label}`, mentions its member as MCP does."""
+    wire["members"] = members
+    assert cli.cmd_send(settings, _send_ns(text)) == 0
+    ((_, body, _, props),) = wire["posts"]
+    assert body == html and _entries(props) == entries
+
+
+@pytest.mark.parametrize(
+    ("text", "reason"),
+    [
+        ("@Lee hi", "ambiguous mention @Lee: Ann Lee, Bob Lee (\\@ for a literal @)"),
+        ("@{Ann Lee|} hi", "empty mention label @{Ann Lee|} (\\@ for a literal @)"),
+        (
+            "@{Ann Lee|a\tb} hi",
+            f"mention label refused @{{Ann Lee|a\tb}}: {compose._LABEL_RULE} (\\@ for a literal @)",
+        ),
+        ("@{Nobody|x} hi", "unknown mention @{Nobody|x} (\\@ for a literal @)"),
+    ],
+)
+@pytest.mark.parametrize("extra", ["none", "image"])
+def test_a_refused_form_exits_2_before_any_write(
+    settings: Settings, wire: dict[str, Any], tmp_path, text: str, reason: str, extra: str
+) -> None:
+    """032-AC4: an ambiguous form or a malformed free label is logged and exits 2; nothing uploaded or
+    posted."""
+    from test_images import png
+
+    wire["members"] = [*ROSTER, {"mri": "8:orgid:boblee", "name": "Bob Lee"}]
+    path = tmp_path / "a.png"
+    path.write_bytes(png())
+    kw = {} if extra == "none" else {extra: [str(path)]}
+    with structlog.testing.capture_logs() as logs:
+        assert cli.cmd_send(settings, _send_ns(text, **kw)) == 2
+    assert [(e["event"], e.get("reason")) for e in logs] == [("send_refused", reason)]
+    assert wire["posts"] == [] and wire["uploads"] == []
+
+
+def test_an_escaped_free_label_is_sent_as_typed(settings: Settings, wire: dict[str, Any]) -> None:
+    """032-AC4 (AC3): `\\@{Ann Lee|x}` is literal: no roster call, no properties."""
+    assert cli.cmd_send(settings, _send_ns(r"\@{Ann Lee|x}")) == 0
+    assert wire["posts"] == [(GROUP, "@{Ann Lee|x}", True, None)] and wire["roster"] == []

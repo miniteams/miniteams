@@ -12,6 +12,7 @@ import httpx
 import pytest
 
 from miniteams import archive as AR
+from miniteams import compose
 from miniteams import drafts as D
 from miniteams import mcp as M
 from miniteams import mcp_api as API
@@ -1261,10 +1262,10 @@ def test_everyone_mentions_the_group(settings: Settings, data: Path, monkeypatch
             GROUP,
             "@Ann hi",
             [*ROSTER, _member("8:orgid:moore", "Ann Moore")],
-            "ambiguous mention @Ann: Ann Lee, Ann Moore",
+            "ambiguous mention @Ann: Ann Lee, Ann Moore (\\@ for a literal @)",
         ),
-        (GROUP, "@Nobody hi", ROSTER, "unknown mention @Nobody"),
-        (GROUP, "@Me hi", ROSTER, "unknown mention @Me"),
+        (GROUP, "@Nobody hi", ROSTER, "unknown mention @Nobody (\\@ for a literal @)"),
+        (GROUP, "@Me hi", ROSTER, "unknown mention @Me (\\@ for a literal @)"),
         (PRIVATE, "@everyone hi", ROSTER, "@everyone is not available in this chat"),
         (GROUP, "@Ann hi", None, "chat members unavailable"),
         (GROUP, "<" * 7200, ROSTER, "message too long: over Teams' limit of 28 KB once rendered"),
@@ -1376,7 +1377,10 @@ def test_more_than_max_mentions_send_nothing(settings: Settings, data: Path, mon
 
 @pytest.mark.parametrize(
     ("text", "error"),
-    [("@x hi", "unknown mention @x"), ("@everyone hi", "@everyone is not available in this chat")],
+    [
+        ("@x hi", "unknown mention @x (\\@ for a literal @)"),
+        ("@everyone hi", "@everyone is not available in this chat"),
+    ],
 )
 @pytest.mark.parametrize("send_at", [False, True])
 def test_notes_has_nobody_to_mention_and_asks_no_roster(
@@ -1413,4 +1417,114 @@ def test_a_refused_long_mention_answers_a_bounded_error(settings: Settings, data
     server, _, calls = _scheduling(settings, data, monkeypatch)
     _roster(monkeypatch)
     out = _call(server, "send_message", thread_id=GROUP, text="@" + "z" * 20_000)
-    assert out == {"error": True, "text": "unknown mention @" + "z" * 200} and calls == []
+    assert (
+        out == {"error": True, "text": "unknown mention @" + "z" * 200 + " (\\@ for a literal @)"}
+        and calls == []
+    )
+
+
+# --- name forms and free labels (spec 032) ---
+
+LEE2 = "8:orgid:boblee"
+
+
+@pytest.mark.parametrize(
+    ("text", "label"), [("@Lee", "Lee"), ("@ann", "Ann"), ("@Ann Lee", "Ann Lee"), ("@lee", "Lee")]
+)
+def test_send_mentions_by_first_last_or_full_name(
+    settings: Settings, data: Path, monkeypatch, text: str, label: str
+) -> None:
+    """032-AC1: one Lee in the chat: each form mentions Ann Lee with the roster spelling of that form."""
+    server, _, calls = _scheduling(settings, data, monkeypatch)
+    _roster(monkeypatch)
+    assert not _call(server, "send_message", thread_id=GROUP, text=f"{text} hi")["error"]
+    assert calls[0][2] == f"{_span(0, label)} hi"
+    assert _entries(calls[0][5]) == [(0, ANN, "person", label)]
+
+
+@pytest.mark.parametrize("tool", ["send_message", "send_at", "update_message", "update_scheduled"])
+def test_a_shared_last_name_is_refused_on_every_write_tool(
+    settings: Settings, data: Path, monkeypatch, tool: str
+) -> None:
+    """032-AC2: two Lees: `@Lee` refuses with both full names, nothing written."""
+    server, drafts, calls = _scheduling(settings, data, monkeypatch)
+    _roster(monkeypatch, [*ROSTER, _member(LEE2, "Bob Lee")])
+    drafts.add("p1", GROUP, int(time.time() * 1000) + 3_600_000)
+    args: dict[str, Any] = {"thread_id": GROUP, "text": "@Lee hi"}
+    if tool == "send_at":
+        tool, args["send_at"] = "send_message", _in(days=1)
+    elif tool != "send_message":
+        args["message_id"] = "p1"
+    assert _call(server, tool, **args) == {
+        "error": True,
+        "text": "ambiguous mention @Lee: Ann Lee, Bob Lee (\\@ for a literal @)",
+    }
+    assert calls == [] and [r for r in drafts.requests if r[0] != "GET"] == []
+
+
+@pytest.mark.parametrize(
+    ("text", "members", "entry"),
+    [
+        ("@{Ann Lee|Lee} hi", [_member(LEE2, "Bob Lee")], (0, ANN, "person", "Lee")),
+        ("@{Ann Lee|the boss} hi", [], (0, ANN, "person", "the boss")),
+        (
+            "@{John Doe | Sales|boss} hi",
+            [_member("8:orgid:john", "John Doe | Sales")],
+            (0, "8:orgid:john", "person", "boss"),
+        ),
+    ],
+)
+def test_a_free_label_sends_the_label_with_the_members_mri(
+    settings: Settings,
+    data: Path,
+    monkeypatch,
+    text: str,
+    members: list[dict[str, str]],
+    entry: tuple[Any, ...],
+) -> None:
+    """032-AC2, AC3: `@{Who|label}` → a span showing the label, the entry with Who's MRI and the label as
+    displayName; the last `|` splits."""
+    server, _, calls = _scheduling(settings, data, monkeypatch)
+    _roster(monkeypatch, [*ROSTER, *members])
+    assert not _call(server, "send_message", thread_id=GROUP, text=text)["error"]
+    assert calls[0][2] == f"{_span(0, entry[3])} hi"
+    assert _entries(calls[0][5]) == [entry]
+
+
+@pytest.mark.parametrize(
+    ("text", "error"),
+    [
+        ("@{Ann Lee|} hi", "empty mention label @{Ann Lee|} (\\@ for a literal @)"),
+        ("@{Ann Lee} hi", "mention @{Ann Lee} has no label: write @{Who|label} (\\@ for a literal @)"),
+        ("@{Ann Lee|\t } hi", "empty mention label @{Ann Lee|\t } (\\@ for a literal @)"),
+        ("@{Ann Lee|a|b} hi", "unknown mention @{Ann Lee|a|b} (\\@ for a literal @)"),
+        (
+            "@{Ann Lee|a\tb} hi",
+            f"mention label refused @{{Ann Lee|a\tb}}: {compose._LABEL_RULE} (\\@ for a literal @)",
+        ),
+        (
+            "@{Ann Lee|a\nb}",
+            f"unclosed mention @{{Ann Lee|a: write @{{Who|label}}, {compose._LABEL_RULE}"
+            " (\\@ for a literal @)",
+        ),
+        ("@{Ann Lee|" + "x" * 201 + "}", "mention label too long (> 200 characters) (\\@ for a literal @)"),
+    ],
+)
+def test_a_malformed_free_label_writes_nothing(
+    settings: Settings, data: Path, monkeypatch, text: str, error: str
+) -> None:
+    """032-AC3: an empty label, one with `|`, `}` or a line break, or over MAX_NAME: refused, no write."""
+    server, _, calls = _scheduling(settings, data, monkeypatch)
+    _roster(monkeypatch)
+    assert _call(server, "send_message", thread_id=GROUP, text=text) == {"error": True, "text": error}
+    assert calls == []
+
+
+def test_an_escaped_free_label_stays_literal_and_asks_no_roster(
+    settings: Settings, data: Path, monkeypatch
+) -> None:
+    """032-AC3: `\\@{Ann Lee|x}` is sent as typed, no `\\`, no roster call, no properties."""
+    server, _, calls = _scheduling(settings, data, monkeypatch)
+    asked = _roster(monkeypatch)
+    assert not _call(server, "send_message", thread_id=GROUP, text=r"\@{Ann Lee|x}")["error"]
+    assert asked == [] and calls == [("send", GROUP, "@{Ann Lee|x}", "", True, None)]

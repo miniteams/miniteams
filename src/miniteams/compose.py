@@ -3,6 +3,7 @@
 Pure (spec 012). No backtracking regex: closers are found with `str.find`.
 """
 
+import functools
 import html
 import itertools
 import json
@@ -25,7 +26,7 @@ EMOJI_NAME_RE = re.compile(r"[A-Za-z0-9_+-]{1,64}")  # what `:name:` expands
 
 _MENTION = "http://schema.skype.com/Mention"
 _CUSTOM_EMOJI = "http://schema.skype.com/CustomEmoji"
-_SPECIAL_RE = re.compile(r"[\\`\[*_~]|https?://")
+_SPECIAL_RE = re.compile(r"[\\`\[*_~]|https?://|@\{")
 ESCAPABLE = frozenset("\\*_~`[@")  # `\x` gives a literal x; `\\` only where a lone `\` would escape
 _RUN_RE = re.compile(r"\*+|_+|~+")
 # `'` only before a word character: `Hitchhiker's_Guide`, not `'https://a.com/x'|jq`.
@@ -42,8 +43,17 @@ _PREVIEW_LEN = 100  # characters of the quoted message a Reply block carries
 _SPANS = (("**", "b"), ("~~", "s"), ("*", "i"), ("_", "i"))
 MAX_MENTIONS = 50
 MAX_NAME = 200
-# An `@` compose_html could expand: starting a word, followed by one; URLs matched first to skip theirs.
-_CANDIDATE_RE = re.compile(rf"(?P<url>{_URL_RE.pattern})|(?<!\w)@(?=\w)")
+_FREE_LEN = MAX_FREE_NAME = 2 * MAX_NAME + 3  # `{Who|label}`, each part at most MAX_NAME
+# What `plain_label` refuses (spec 032): a `{Who|label}` is read raw, markup and all, up to its `}`.
+_LABEL_RULE = (
+    "the label is one line of text: no | or }, no tab or other blank but the space, no control, format, "
+    "private-use or unassigned character"
+)
+_LITERAL = " (\\@ for a literal @)"
+_SCANS = 2 * MAX_MENTIONS  # `@` checked against picks or roster: the mentions plus as many that are not
+# An `@` starting a word, which compose_html expands when a name follows; URLs matched first to skip theirs.
+_CANDIDATE_RE = re.compile(rf"(?P<url>{_URL_RE.pattern})|(?<!\w)@")
+_OPENS_RE = re.compile(r"[\w{]")  # what follows an `@` a sender resolves: a name or a `{Who|label}`
 # What continues a word, so a name cannot end before it: `\w` and the marks (`re` has no \p{M}; ui.js's
 # `scan` reads the same `[\p{L}\p{N}_\p{M}]`). Planes 0, 1 and 14 hold every mark.
 _MARKS = "".join(
@@ -53,6 +63,7 @@ _MARKS = "".join(
 )
 _JOINS = rf"[\w{_MARKS}]"
 _JOINS_RE = re.compile(_JOINS)
+_TRIM_RE = re.compile(rf"^[^\w{_MARKS}]+|[^\w{_MARKS}]+$")  # punctuation around a word
 
 type OnText = Callable[[str], str]
 
@@ -106,9 +117,16 @@ def _inline(line: str, on_text: OnText, lead: bool = False, after: str = "") -> 
         if (i and _word(line[i - 1])) or start >= len(line) or line[start].isspace():
             return -1
         end = find(marker, start)
-        # An escaped closer is text: look past it (`*a\*b*`). Linear: an unescaped candidate ends the
-        # search, so each escaped one costs only its own backslash run.
-        while end > start and _escaped(line, end):
+        # An escaped closer is text, and so is one inside a `@{Who|label}` the content's own reading will
+        # take (`*see @{Ann|a* b}*`, `_@{Ann|a_ b}_`): look past it. Linear: tokens are walked lazily, only
+        # as far as the candidate, and an unescaped candidate outside one ends the search.
+        walked, token = start, (-1, -1)
+        while end > start:
+            while walked <= end:
+                walked, *found = _atom(line, walked, end + 1, start, marker[0])
+                token = (found[0], found[1]) if found[0] >= 0 else token
+            if not (_escaped(line, end) or token[0] <= end <= token[1]):
+                break
             end = find(marker, end + 1)
         after = end + len(marker)
         if end <= start or line[end - 1].isspace() or (after < len(line) and _word(line[after])):
@@ -125,20 +143,23 @@ def _inline(line: str, on_text: OnText, lead: bool = False, after: str = "") -> 
         if ch == "h":  # a bare URL is no markup, markers and all: on_text links it
             i = url_m.end() if (url_m := _URL_RE.match(line, i)) else i + 1
             continue
+        if ch == "@":
+            # `@{Who|label}` starting a word is read raw up to its `}`, before any markup (spec 032): its own
+            # run, so a mention's label or a URL inside it is never split by `*`, `_`, `[`…
+            if (end := _token_end(line, i)) > 0:
+                out.append(on_text(line[flushed:i]))  # first: mentions are numbered in text order
+                flushed = i
+                hit = on_text(line[i : end + 1]), end + 1
+            else:
+                i += 1
+                continue
         if ch == "`":
             end = find("`", i + 1)
             if end > i + 1:
                 hit = f"<code>{html.escape(line[i + 1 : end])}</code>", end + 1
         elif ch == "\\":
-            nxt = line[i + 1 : i + 2]
-            # `\\srv\share` stays as typed: a backslash pair collapses only before what it would escape.
-            if nxt == "\\":
-                if (line[i + 2 : i + 3] or after) in ESCAPABLE or (
-                    lead and not i and _literal(line[1:]) != line[1:]
-                ):
-                    hit = nxt, i + 2
-            elif nxt in ESCAPABLE:  # none of them needs HTML escaping
-                hit = nxt, i + 2
+            if _escape_len(line, i, after, lead):  # none of the escaped characters needs HTML escaping
+                hit = line[i + 1], i + 2
         elif ch == "[":
             close = find("]", i + 1) if i < last_close else -1
             if (
@@ -177,6 +198,54 @@ def _inline(line: str, on_text: OnText, lead: bool = False, after: str = "") -> 
         i = flushed = hit[1]
     out.append(on_text(line[flushed:]))
     return "".join(out)
+
+
+_ATOM_RE = re.compile(r"https?://|[\\`]|@\{")  # what `_inline` reads whole before markup: URL, escape, code
+
+
+def _token_end(line: str, i: int, lo: int = 0, opened: bool = False) -> int:
+    """The `}` ending the `@{Who|label}` token `_inline` reads at `i`, else -1: `@{` at a word start (the
+    run's start `lo` or after a non-word character) or, with `opened`, right after a `_` that opens a span
+    there (`a _@{…}_`), closed on the line (spec 032)."""
+
+    def starts(k: int) -> bool:
+        return k <= lo or not _word(line[k - 1])
+
+    if not line.startswith("@{", i) or not (starts(i) or opened and line[i - 1] == "_" and starts(i - 1)):
+        return -1
+    return line.find("}", i + 2)
+
+
+def _escape_len(line: str, i: int, after: str, lead: bool) -> int:
+    """2 when `_inline` reads the backslash at `i` as escaping the next character, else 0 (kept as typed).
+    `\\srv\\share` stays: a backslash pair collapses only before what it would escape."""
+    nxt = line[i + 1 : i + 2]
+    if nxt == "\\":
+        escapes = (line[i + 2 : i + 3] or after) in ESCAPABLE or (
+            lead and not i and _literal(line[1:]) != line[1:]
+        )
+        return 2 if escapes else 0
+    return 2 if nxt in ESCAPABLE else 0
+
+
+def _atom(line: str, i: int, hi: int, lo: int, after: str) -> tuple[int, int, int]:
+    """One step of reading a span's content `line[lo:]` as `_inline` reads it, from `i`, looking no further
+    than `hi`: (where the next step starts, and the `@`/`}` of a `@{…}` token read on the way or -1, -1).
+    URLs, escapes and code spans are taken whole, so nothing inside them is a token; a `_` right before a
+    `@{` there opens the span, not a word."""
+    if (m := _ATOM_RE.search(line, i, hi)) is None:
+        return hi, -1, -1
+    i, ch = m.start(), line[m.start()]
+    if ch == "h":
+        return (url.end() if (url := _URL_RE.match(line, i)) else i + 1), -1, -1
+    if ch == "\\":
+        return i + (_escape_len(line, i, after, False) or 1), -1, -1
+    if ch == "`":
+        end = line.find("`", i + 1)
+        return (end + 1 if end > i + 1 else i + 1), -1, -1
+    if (end := _token_end(line, i, lo, True)) > 0:
+        return end + 1, i, end
+    return i + 1, -1, -1
 
 
 def _literal(line: str) -> str:
@@ -252,26 +321,38 @@ def compose_html(
     """Composer text → (content HTML, message `properties` or None).
 
     `mentions`: picked `{name, mri, label?, everyone?}`, `name` as typed and `label` as shown (default
-    `name`), in the order picked: the n-th `@Name` goes to the n-th pick of that name, any further one
-    to its last; `emojis`: custom name → AMS object id. `@Name` matches when `@` starts a word and
-    the name is followed by the end or neither a word character nor a mark; names are tried longest first,
-    case-sensitive, so `@Ann Lee` wins over `@Ann`. Code, link labels and URLs are never expanded.
-    A backslash makes ESCAPABLE characters literal, and in full mode a leading block marker (spec 019).
+    `name`, or the label of a `{Who|label}` name, spec 032), in the order picked: the n-th `@Name` goes to
+    the n-th pick of that name, any further one to its last; `emojis`: custom name → AMS object id.
+    `@Name` matches when `@` starts a word and the name is followed by the end or neither a word character
+    nor a mark (a `{Who|label}` name ends at its `}`, whatever follows); names are tried longest first,
+    case-sensitive, so `@Ann Lee` wins over `@Ann`. Code, link labels and URLs are never expanded. A
+    backslash makes ESCAPABLE characters literal, and in full mode a leading block marker (spec 019).
 
     Trusts every `mri` as given: the caller checks each against the thread roster (the thread id
-    for everyone). More than MAX_MENTIONS entries or a name past MAX_NAME raises ValueError.
+    for everyone). More than MAX_MENTIONS entries, a label or a name past MAX_NAME (a `{Who|label}` name:
+    2 * MAX_NAME + 3) raises ValueError.
     """
-    if len(mentions) > MAX_MENTIONS:
-        raise ValueError(f"too many mentions ({len(mentions)} > {MAX_MENTIONS})")
+    # Distinct ones: a resolver's pick spelled another way (`@ann` for `Ann`) is still that one mention.
+    distinct = {
+        (str(m.get("mri")), shown_label(str(m.get("label") or m.get("name"))), bool(m.get("everyone")))
+        for m in mentions
+    }
+    if len(distinct) > MAX_MENTIONS:
+        raise ValueError(f"too many mentions ({len(distinct)} > {MAX_MENTIONS})")
     by_name: dict[str, list[dict[str, Any]]] = {}
     for mention in mentions:
         if name := str(mention.get("name") or ""):
-            if max(len(name), len(str(mention.get("label") or ""))) > MAX_NAME:
-                raise ValueError(f"mention name too long (> {MAX_NAME} characters)")
+            limit = _FREE_LEN if name.startswith("{") else MAX_NAME
+            if len(name) > limit or len(str(mention.get("label") or "")) > MAX_NAME:
+                raise ValueError(f"mention name too long (> {limit} characters)")
             by_name.setdefault(name, []).append(mention)
     seen: dict[str, int] = {}  # name → occurrences so far
-    alternatives = "|".join(re.escape(n) for n in sorted(by_name, key=len, reverse=True))
-    mention_re = rf"(?<!\w)@(?P<name>{alternatives})(?!{_JOINS})|" if alternatives else ""
+    names = sorted(by_name, key=len, reverse=True)
+    braced = "|".join(re.escape(n) for n in names if n.startswith("{"))
+    plain = "|".join(re.escape(n) for n in names if not n.startswith("{"))
+    # A `{Who|label}` ends at its `}`, whatever follows, as free_label reads it (`_a_@{Ann|x}y`).
+    alternatives = "|".join(filter(None, [braced, plain and f"(?:{plain})(?!{_JOINS})"]))
+    mention_re = rf"(?<!\w)@(?P<name>{alternatives})|" if alternatives else ""
     # Bare URLs go first: no emoji or mention inside a URL.
     token_re = re.compile(rf"(?P<url>{_URL_RE.pattern})|" + mention_re + _EMOJI)
     entries: list[dict[str, Any]] = []
@@ -289,7 +370,7 @@ def compose_html(
             picked = picks[min(seen.get(name, 0), len(picks) - 1)]
             seen[name] = seen.get(name, 0) + 1
             everyone = bool(picked.get("everyone"))
-            label = "Everyone" if everyone else str(picked.get("label") or name)
+            label = "Everyone" if everyone else str(picked.get("label") or shown_label(name))
             entries.append(
                 {
                     "@type": _MENTION,
@@ -331,27 +412,51 @@ def compose_html(
     return content, ({"mentions": json.dumps(entries, ensure_ascii=False)} if entries else None)
 
 
-def _candidates(text: str) -> list[str]:
-    """The text after each `@` compose_html (full mode) could expand: code, link labels, URLs and `\\@`
-    never reach `on_text`, or are skipped."""
+def shown_label(name: str) -> str:
+    """What a pick named `name` displays without a `label`: a well-formed `{Who|label}`'s label, else the
+    name (`{x`, `{a*b}`: a label Teams wrote)."""
+    try:
+        source, _, label = free_label(name)
+    except ValueError:
+        return name
+    return label if source == name else name
+
+
+def _segments(text: str, full: bool = True) -> list[str]:
+    """The plain runs compose_html's `on_text` gets for `text`: code, link labels and `\\@` never reach it."""
     found: list[str] = []
 
     def on_text(seg: str) -> str:
-        # A name past MAX_NAME never matches: the rest of the text is not kept per `@`.
-        found.extend(
-            seg[m.end() : m.end() + MAX_NAME + 1]
-            for m in _CANDIDATE_RE.finditer(seg)
-            if m.group("url") is None
-        )
+        found.append(seg)
         return ""
 
-    _render(text, True, on_text)
+    _render(text, full, on_text)
     return found
 
 
-def holds_mention(text: str) -> bool:
-    """Whether `text` holds an `@Name` to resolve: only then is the roster needed (spec 029)."""
-    return bool(_candidates(text))
+def _next_at(seg: str, pos: int) -> int:
+    """Where the text after the next `@` starting a word begins, from `pos`, a URL met on the way skipped
+    whole as compose_html's `on_text` skips it; -1 for none."""
+    while (m := _CANDIDATE_RE.search(seg, pos)) is not None:
+        if m.group("url") is None:
+            return m.end()
+        pos = m.end()
+    return -1
+
+
+def _opens(rest: str) -> bool:
+    return _OPENS_RE.match(rest) is not None
+
+
+def holds_mention(text: str, full: bool = True) -> bool:
+    """Whether `text` holds an `@Name` to resolve, as compose_html reads it (spec 029): without any, nothing
+    needs the roster."""
+    for seg in _segments(text, full):
+        at = 0
+        while (at := _next_at(seg, at)) >= 0:
+            if _opens(seg[at : at + 1]):
+                return True
+    return False
 
 
 def _joins(ch: str) -> bool:
@@ -359,54 +464,172 @@ def _joins(ch: str) -> bool:
     return _JOINS_RE.fullmatch(ch) is not None
 
 
+def forms(name: str) -> list[str]:
+    """The forms a member is mentioned by (spec 032): full name, first word, last word, the last two
+    without the punctuation around them (`Doe, John` → `Doe`; `(Sales)` → `Sales`)."""
+    words = name.split()
+    if not words:
+        return []
+    return list(
+        dict.fromkeys((name, *(word for w in (words[0], words[-1]) if (word := _TRIM_RE.sub("", w)))))
+    )
+
+
+def _word_key(text: str) -> str:
+    """`text`'s first word, folded: the forms an `@` can be followed by share it with the text after it."""
+    return _fold(text[: next((i for i, c in enumerate(text) if not _joins(c)), len(text))])
+
+
+def plain_label(label: str) -> bool:
+    """Whether a `{Who|label}` can hold `label` (spec 032, _LABEL_RULE): no `|` or `}`, and nothing in
+    Unicode's C or Z categories (line break, tab, blanks, control, format, private-use, unassigned) but the
+    space."""
+    return not any(c in "|}" or c != " " and unicodedata.category(c)[0] in "CZ" for c in label)
+
+
+def free_label(rest: str) -> tuple[str, str, str]:
+    """`rest` opening a `{Who|label}` → (that source, Who, label): up to the first `}`, the last `|`
+    splitting (spec 032). Who may hold anything but `}` and a line break. ValueError for an unclosed one,
+    or a missing, empty, too long or refused label."""
+    end = rest.find("}")
+    if end < 0:
+        raise ValueError(
+            f"unclosed mention @{rest[:MAX_NAME]}: write @{{Who|label}}, {_LABEL_RULE}{_LITERAL}"
+        )
+    source = rest[: end + 1]
+    who, bar, label = source[1:-1].rpartition("|")
+    if not bar:
+        raise ValueError(f"mention @{source} has no label: write @{{Who|label}}{_LITERAL}")
+    if not label.strip():
+        raise ValueError(f"empty mention label @{source}{_LITERAL}")
+    if not plain_label(label):
+        raise ValueError(f"mention label refused @{source}: {_LABEL_RULE}{_LITERAL}")
+    if len(label) > MAX_NAME:
+        raise ValueError(f"mention label too long (> {MAX_NAME} characters){_LITERAL}")
+    return source, who.strip(), label
+
+
 def _typed_len(rest: str, form: str) -> int:
-    """Length of the longest start of `rest` that is `form`, case and accents ignored, and ends a word; 0
-    for none. Grown a character at a time, folded per character: folding changes lengths (`ß` → `ss`,
-    a combining accent → "")."""
-    want, got, best = fold(form), "", 0
+    """Length of the longest start of `rest` that is `form`, case and accents ignored, and ends a word (a
+    `{Who|label}` form ends at its `}`, whatever follows, as compose_html reads it); 0 for none. Grown a
+    character at a time, folded per character: folding changes lengths (`ß` → `ss`, a combining accent →
+    "")."""
+    want, got, best, braced = _fold(form), 0, 0, form.startswith("{")
     for k, ch in enumerate(rest, 1):
-        got += fold(ch)
-        if not want.startswith(got):
+        if not want.startswith(part := _fold(ch), got):  # from `got` on: linear in what is read
             break
-        if got == want and not _joins(rest[k : k + 1] or " "):
+        got += len(part)
+        if got == len(want) and (braced or not _joins(rest[k : k + 1] or " ")):
             best = k
     return best
 
 
-def resolve_mentions(
-    text: str, members: list[dict[str, Any]], thread_id: str, me: str
-) -> list[dict[str, Any]]:
-    """Each `@Name` of `text` (full mode) → a compose_html pick `{name, mri, label?, everyone?}` (spec 029).
+_fold_cached = functools.lru_cache(maxsize=4096)(fold)
 
-    A member's full or first name matches, case and accents ignored, longest first; `name` is the
-    spelling typed, `label` the roster's. Bots, apps and me are no candidates; `@everyone` is the
-    chat's on groups, meetings and channels. ValueError for a name matching nobody or several members,
-    or more than MAX_MENTIONS."""
-    candidates = _candidates(text)
-    if len(candidates) > MAX_MENTIONS:
-        raise ValueError(f"too many mentions (> {MAX_MENTIONS})")
+
+def _fold(text: str) -> str:
+    # Bounded in count and size: characters and short names repeat; a long key would pin its memory.
+    return _fold_cached(text) if len(text) <= 64 else fold(text)
+
+
+def resolve_mentions(
+    text: str,
+    members: list[dict[str, Any]],
+    thread_id: str,
+    me: str,
+    *,
+    full: bool = True,
+    picks: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Each `@Name` of `text` → a compose_html pick `{name, mri, label?, everyone?}` (specs 029, 032).
+
+    A member's full, first or last name matches, case and accents ignored, longest first; `name` is the
+    spelling typed, `label` the roster's. `@{Who|label}` names the member Who matches whole, shown as
+    `label`. Bots, apps and me are no candidates; `@everyone` is the chat's on groups, meetings and
+    channels. An `@` a caller's pick names (case and accents ignored) is that pick's, unless a longer
+    roster form is typed there; the n-th one of a spelling takes the n-th of the picks naming it (the last
+    past them). One pick per `@`, in text order, named as typed: compose_html's pairing, done once, on the
+    text walked as it walks it (resuming past each name read, URLs skipped whole). ValueError for a name
+    matching nobody or several members, a malformed label, more than MAX_MENTIONS, or more than _SCANS
+    `@` to check against the picks."""
+    picks = [p for p in picks or () if p.get("name")]
+    starts = {fold(str(p["name"]))[:1] for p in picks}  # an `@` no pick can start costs no pick scan
     roster = humans(members)
-    forms: list[tuple[str, dict[str, Any]]] = []  # (roster spelling, pick)
-    if chat_kind(thread_id) not in ("private", "system"):
-        forms.append(("everyone", {"mri": thread_id, "everyone": True}))
-    for mri, name in roster.items():
-        if name.strip() and not is_me(mri, me):
-            forms += ((form, {"mri": mri, "label": form}) for form in dict.fromkeys((name, name.split()[0])))
-    picks: dict[str, dict[str, Any]] = {}  # typed spelling → pick
-    for rest in candidates:
-        hits = [(n, pick) for form, pick in forms if (n := _typed_len(rest, form))]
-        size = max((n for n, _ in hits), default=0)
-        found = {pick["mri"]: pick for n, pick in hits if n == size}
-        typed = rest[: size or next((i for i, c in enumerate(rest) if not _joins(c)), len(rest))]
+    people = [
+        (form, {"mri": mri, "label": form})
+        for mri, name in roster.items()
+        if not is_me(mri, me)
+        for form in forms(name)
+    ]
+    everyone = [("everyone", {"mri": thread_id, "everyone": True})]
+    by_word: dict[str, list[tuple[str, dict[str, Any]]]] = {}  # first word → its forms: a bucket per `@`
+    for form, pick in (everyone if chat_kind(thread_id) not in ("private", "system") else []) + people:
+        by_word.setdefault(_word_key(form), []).append((form, pick))
+
+    def one(typed: str, found: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        shown = typed if typed.startswith("{") else typed[:MAX_NAME]
         if not found:
             if fold(typed) == "everyone":
                 raise ValueError("@everyone is not available in this chat")
-            raise ValueError(f"unknown mention @{typed[:MAX_NAME]}")
+            raise ValueError(f"unknown mention @{shown}{_LITERAL}")
         if len(found) > 1:
             names = sorted((roster.get(mri, "Everyone") for mri in found), key=fold)
-            raise ValueError(f"ambiguous mention @{typed[:MAX_NAME]}: {', '.join(names)}")
-        picks.setdefault(typed, {"name": typed, **next(iter(found.values()))})
-    return list(picks.values())
+            raise ValueError(f"ambiguous mention @{shown}: {', '.join(names)}{_LITERAL}")
+        return next(iter(found.values()))
+
+    out: list[dict[str, Any]] = []
+    occurrences: dict[str, int] = {}  # folded spelling → `@` a pick covered so far
+    scans = 0
+    for seg in _segments(text, full):
+        at = 0
+        while (at := _next_at(seg, at)) >= 0:
+            # A name past _FREE_LEN never matches: the rest of the text is not kept per `@`.
+            rest = seg[at : at + _FREE_LEN + 1]
+            first = fold(rest[:1])[:1]
+            if not (_opens(rest) or first in starts):
+                continue
+            # Each `@` costs a scan of the picks or the roster: bounded whatever the text.
+            if (scans := scans + 1) > _SCANS:
+                raise ValueError(f"too many @ to check (> {_SCANS}){_LITERAL}")
+            ties: list[dict[str, Any]] = []  # the picks covering the longest start of `rest`, in pick order
+            covered = 0
+            for pick in picks if not first or first in starts else ():
+                if (n := _typed_len(rest, str(pick["name"]))) and n >= covered:
+                    ties, covered = ([*ties, pick] if n == covered else [pick]), n
+            if not ties and not _opens(rest):
+                continue
+            if len(out) == MAX_MENTIONS:
+                raise ValueError(f"too many mentions (> {MAX_MENTIONS})")
+            # Only the forms sharing the first word typed: a large roster costs a bucket, not every name. A
+            # `{` opens a free label, never a name, whatever a member calls themselves.
+            bucket = () if rest.startswith("{") else by_word.get(_word_key(rest), ())
+            hits = [(n, pick) for form, pick in bucket if (n := _typed_len(rest, form))]
+            size = max((n for n, _ in hits), default=0)
+            if ties and covered >= size:
+                typed = rest[:covered]
+                k = occurrences.get(key := fold(typed), 0)
+                occurrences[key] = k + 1
+                cover = ties[min(k, len(ties) - 1)]
+                # A free label shows as typed (`BOSS` for a pick `{Ann Lee|boss}`), a name as picked.
+                free = shown_label(cover["name"]) != cover["name"]
+                label = free_label(rest)[2] if free else cover.get("label") or cover["name"]
+                found = {**cover, "label": label}
+            elif rest.startswith("{"):
+                typed, who, label = free_label(rest)
+                # Whole, never a start of Who: `{Ann Leeds|x}` is not Ann Lee.
+                forms_of = by_word.get(_word_key(who), ())
+                whole = {
+                    p["mri"]: p
+                    for form, p in forms_of
+                    if who and "everyone" not in p and _typed_len(who, form) == len(who)
+                }
+                found = {**one(typed, whole), "label": label}
+            else:
+                typed = rest[: size or next((i for i, c in enumerate(rest) if not _joins(c)), len(rest))]
+                found = one(typed, {p["mri"]: p for n, p in hits if n == size})
+            at += len(typed)  # compose_html resumes past the name: an `@` inside it is that name's
+            out.append({**found, "name": typed})
+    return out
 
 
 def render_outgoing(

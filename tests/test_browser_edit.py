@@ -502,3 +502,21 @@ async def test_the_message_is_text_in_the_editor(fake: Fake) -> None:
     assert await page.locator(".editor").count() == 0
     await fake.settled()
     assert fake.of("edit") == []
+
+
+@BOTH
+async def test_backspace_after_a_kept_brace_is_an_ordinary_backspace(fake: Fake) -> None:
+    """032 review: an edit opens with a kept `@{Ann Lee|Ann} `; Backspace at its end deletes the space, never
+    shortens the brace to `@{Ann`, and the save carries the kept mention."""
+    page = fake.page
+    assert page is not None
+    kept = {"name": "{Ann Lee|Ann}", "mri": ANN["mri"]}
+    fake.forms["1"] = _form("hi @{Ann Lee|Ann} ", picks=[kept])
+    box = await _edit(fake)
+    await box.press("End")
+    await box.press("Backspace")
+    assert await box.input_value() == "hi @{Ann Lee|Ann}"
+    await box.press("Enter")
+    await wait(lambda: len(fake.of("edit")) == 1)
+    [sent] = fake.of("edit")
+    assert (sent["text"], sent["mentions"]) == ("hi @{Ann Lee|Ann}", [kept])
