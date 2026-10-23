@@ -21,10 +21,12 @@ from .compose import (
     _literal,
     _word,
     compose_html,
+    mention_ats,
+    plain_label,
     trim_url,
 )
 from .images import OBJECT_ID_RE
-from .messages import TEXT_TYPES, json_list
+from .messages import TEXT_TYPES, fold, json_list
 from .send import MAX_HTML_BYTES
 
 _DEPTH = 32  # open elements: compose nests a few spans, never more
@@ -40,6 +42,8 @@ _EMOJI_TAG = frozenset(("id", "alt", "title"))
 _EMOJI_SPAN = frozenset(("itemscope", "itemtype", "itemid", "title"))
 _ANIMATED = frozenset(("class", "itemscope", "title", "type"))  # Teams' animated emoji around its <img>
 _MENTION_SPAN = frozenset(("itemscope", "itemtype", "itemid"))
+# After an `@` starting a word, what compose reads as a mention (spec 033).
+_NAMES_START = re.compile(r"[\w{]")
 _LINK = frozenset(("href", "rel", "target", "title", "itemtype", "itemid"))
 _HYPERLINK = "http://schema.skype.com/HyperLink"  # a Teams link (its preview lives in properties)
 _BLOCKED = {
@@ -50,10 +54,11 @@ _BLOCKED = {
     "font": "coloured or styled text",
 }
 OTHER = "formatting miniteams cannot write"
+MISREAD = "a mention the edit would read as someone else"
 IMAGE_IN_TEXT = "an image inside the text"
 
 # ("text", s) | ("b" | "i" | "s", tokens) | ("code", s) | ("a", href, label) | ("url", href)
-# | ("mention", everyone, mri, label) | ("emoji", name, object id)
+# | ("mention", everyone, mri, typed) | ("emoji", name, object id); typed: what follows the `@`
 type Token = tuple[Any, ...]
 type Block = tuple[str, Any]  # ("line", tokens) | ("blockquote" | "ul" | "ol", lines) | ("pre", code)
 
@@ -108,9 +113,11 @@ def _add(tokens: list[Token], token: Token) -> None:
 class _Reader(HTMLParser):
     """Teams HTML → blocks in compose's own model; `_Refused` on anything compose cannot write."""
 
-    def __init__(self, mentions: dict[str, dict[str, Any]], emojis: dict[str, str]) -> None:
+    def __init__(
+        self, mentions: dict[str, dict[str, Any]], emojis: dict[str, str], names: dict[str, str]
+    ) -> None:
         super().__init__(convert_charrefs=True)
-        self.mentions, self.emojis = mentions, emojis
+        self.mentions, self.emojis, self.names = mentions, emojis, names
         self.stack = [_Frame("", "lines")]
         self.images: list[KeptImage] = []
 
@@ -338,7 +345,15 @@ class _Reader(HTMLParser):
         kind = str(entry.get("mentionType") or "") if entry else ""
         if entry is None or kind not in ("person", "everyone"):
             raise _Refused("a tag or team mention" if entry else OTHER)
-        self._inline(("mention", kind == "everyone", str(entry.get("mri") or ""), label))
+        mri = str(entry.get("mri") or "")
+        # Spec 033: a person always comes back braced, `{Full Name|label}`, or `{label|label}` with the name
+        # unknown (or one a `{…}` cannot hold): one spelling for one person, which no name read on save can
+        # extend. A label no `{…}` can hold would come back bare, readable as someone else: not offered.
+        if kind == "person" and not plain_label(label):
+            raise _Refused(MISREAD)
+        name = brace_name(self.names.get(mri, ""))
+        typed = f"{{{name or label}|{label}}}" if kind == "person" else label
+        self._inline(("mention", kind == "everyone", mri, typed))
 
     def handle_data(self, data: str) -> None:
         top = self.stack[-1]
@@ -391,10 +406,12 @@ def _urls(tokens: tuple[Token, ...]) -> tuple[Token, ...]:
     return tuple(out)
 
 
-def _read(content: str, props: dict[str, Any], emojis: dict[str, str]) -> tuple[list[Block], list[KeptImage]]:
+def _read(
+    content: str, props: dict[str, Any], emojis: dict[str, str], names: dict[str, str] | None = None
+) -> tuple[list[Block], list[KeptImage]]:
     entries = json_list(props.get("mentions"))
     mentions = {str(e.get("itemid")): e for e in entries if isinstance(e, dict)}
-    reader = _Reader(mentions, emojis)
+    reader = _Reader(mentions, emojis, names or {})
     reader.feed(content)
     return reader.blocks(), reader.images
 
@@ -429,7 +446,12 @@ def _escape(seg: str, wide: bool, line_start: bool, following: str, after_url: b
             out.append(seg[i:j] if inert and not wide else "".join("\\" + c for c in seg[i:j]))
             i = j
             continue
-        at = ch == "@" and wide and not _word(seg[i - 1 : i] or " ")  # a literal `@Name` next to its mention
+        # A literal `@Name`: since spec 033 every sender resolves an unpicked one, so it must not read as one.
+        at = (
+            ch == "@"
+            and not _word(seg[i - 1 : i] or " ")
+            and (wide or _NAMES_START.match(seg[i + 1 : i + 2] or following[:1] or " ") is not None)
+        )
         if ch == "`" or (ch == "[" and (wide or i < link_end)) or at:
             out.append("\\" + ch)
         elif ch == "\\":
@@ -549,17 +571,23 @@ def _markdown(blocks: list[Block], wide: bool, italic: str) -> str:
     return "\n".join(out)
 
 
+def brace_name(name: str) -> str:
+    """`name` as the Who of a kept `{Who|label}` (spec 033), or "" when it cannot be one: blank, or holding
+    a `}` (which closes the token) or a line break. Then the label braces itself."""
+    return name if name.strip() and "}" not in name and "\n" not in name else ""
+
+
 def _picks(blocks: list[Block]) -> list[dict[str, Any]]:
     picks: list[dict[str, Any]] = []
 
     def walk(tokens: tuple[Token, ...]) -> None:
         for token in tokens:
             if token[0] == "mention":
-                everyone, mri, label = token[1:]
+                everyone, mri, typed = token[1:]
                 picks.append(
                     {"name": "everyone", "mri": mri, "everyone": True}
                     if everyone
-                    else {"name": label, "mri": mri}
+                    else {"name": typed, "mri": mri}
                 )
             elif token[0] in _MARKERS:
                 walk(token[1])
@@ -638,10 +666,14 @@ class _QuoteText(HTMLParser):
         return parser.key or "", name, line
 
 
-def decompose(message: dict[str, Any], emojis: dict[str, str]) -> Editable | str:
+def decompose(
+    message: dict[str, Any], emojis: dict[str, str], names: dict[str, str] | None = None
+) -> Editable | str:
     """One of my messages as the editor opens it, or what keeps it from being edited here.
 
-    `emojis`: custom name → AMS object id, as `compose_html` takes it."""
+    `emojis`: custom name → AMS object id, as `compose_html` takes it; `names`: MRI → full name, from the
+    chat's roster: each person mention comes back as `@{Full Name|label}`, or `@{label|label}` with the
+    name unknown (spec 033). Two people still spelled alike (namesakes, no name known) refuse the edit."""
     props = message.get("properties")
     props = props if isinstance(props, dict) else {}
     msgtype, content = str(message.get("messagetype") or ""), str(message.get("content") or "")
@@ -657,13 +689,15 @@ def decompose(message: dict[str, Any], emojis: dict[str, str]) -> Editable | str
         return "too long"
     try:
         quotes, start = _quotes(content)
-        blocks, images = _read(content[start:], props, emojis)
+        blocks, images = _read(content[start:], props, emojis, names)
         # The page keeps quotes and images by key: two under one key could not be removed one at a time.
         if len({q.key for q in quotes}) < len(quotes):
             return "the same quote twice"
         if len({image.key for image in images}) < len(images):
             return "the same image twice"
         picks = _picks(blocks)
+        if _alike(picks):
+            return MISREAD
         for wide in (False, True):
             for italic in _ITALICS:
                 text = _markdown(blocks, wide, italic)
@@ -671,8 +705,27 @@ def decompose(message: dict[str, Any], emojis: dict[str, str]) -> Editable | str
                     composed, composed_props = compose_html(text, picks, emojis, full=True)
                 except ValueError:
                     return "too long"
-                if _read(composed, composed_props or {}, emojis) == (blocks, []):
-                    return Editable(text, picks, quotes, images)
+                if _read(composed, composed_props or {}, emojis, names) == (blocks, []):
+                    return Editable(text, _anchor(text, picks), quotes, images)
     except _Refused as exc:
         return str(exc)
     return OTHER
+
+
+def _anchor(text: str, picks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Each pick anchored at its `@` in `text` (spec 033): the `@`s read, in order, each the next pick's
+    when it spells it (an `@` an escape leaves at a run's start, `x\\_@y`, is no mention's)."""
+    ats = iter(mention_ats(text))
+    try:
+        return [{**p, "at": next(at for at in ats if text.startswith("@" + p["name"], at))} for p in picks]
+    except StopIteration:
+        raise _Refused(OTHER) from None
+
+
+def _alike(picks: list[dict[str, Any]]) -> bool:
+    """Whether two people's mentions are spelled alike (`{Ann|Ann}` twice, no full name known)."""
+    people: dict[str, set[str]] = {}
+    for pick in picks:
+        if not pick.get("everyone"):
+            people.setdefault(fold(str(pick["name"])), set()).add(str(pick["mri"]))
+    return any(len(mris) > 1 for mris in people.values())

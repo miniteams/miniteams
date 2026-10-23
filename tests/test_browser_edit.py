@@ -14,6 +14,7 @@ from browser_helpers import ANN, Page, Pages, T, closed, shows, until, wait
 from test_browser_chat_compose import MINE, Fake, _open
 
 from miniteams import chat_verbs as CV
+from miniteams.compose import resolve_mentions
 
 pytestmark = pytest.mark.browser
 pages = browser_helpers.pages
@@ -31,7 +32,7 @@ def _form(text: str = "mine", edittime: str = E1, **over: Any) -> dict[str, Any]
 
 RICH = _form(
     "**hi** @Ann Lee",
-    picks=[ANN],
+    picks=[{**ANN, "at": 7}],
     quotes=[
         {"key": Q1, "name": "Ann Lee", "line": "first"},
         {"key": Q2, "name": "Bob Roe", "line": "second"},
@@ -104,7 +105,7 @@ async def test_the_editor_completes_like_the_composer_and_posts_the_mention(fake
             "edit": T,
             "msg": "1",
             "text": "mine 🔥 @Ann Lee ",
-            "mentions": [ANN],
+            "mentions": [{**ANN, "at": 8}],  # UTF-16: the emoji counts two (spec 033)
             "keep_quotes": [],
             "keep_images": [],
         }
@@ -186,7 +187,7 @@ async def test_quotes_and_images_show_and_only_the_kept_ones_are_posted(fake: Fa
             "edit": T,
             "msg": "1",
             "text": RICH["text"],
-            "mentions": [ANN],
+            "mentions": [{**ANN, "at": RICH["text"].index("@")}],
             "keep_quotes": [Q2],
             "keep_images": [I1],
         }
@@ -301,7 +302,7 @@ async def test_a_changed_message_keeps_the_editor_and_the_typed_text_on_reopen(f
         "edit": T,
         "msg": "1",
         "text": "mine @Ann Lee ",
-        "mentions": [ANN],
+        "mentions": [{**ANN, "at": 5}],
         "keep_quotes": [Q2],
         "keep_images": [],
     }
@@ -502,3 +503,62 @@ async def test_the_message_is_text_in_the_editor(fake: Fake) -> None:
     assert await page.locator(".editor").count() == 0
     await fake.settled()
     assert fake.of("edit") == []
+
+
+@BOTH
+async def test_backspace_after_a_kept_brace_is_an_ordinary_backspace(fake: Fake) -> None:
+    """033 review: an edit opens with a kept `@{Ann Lee|Ann} `; Backspace at its end deletes the space, never
+    shortens the brace to `@{Ann`, and the save carries the kept mention."""
+    page = fake.page
+    assert page is not None
+    kept = {"name": "{Ann Lee|Ann}", "mri": ANN["mri"], "at": 3}
+    fake.forms["1"] = _form("hi @{Ann Lee|Ann} ", picks=[kept])
+    box = await _edit(fake)
+    await box.press("End")
+    await box.press("Backspace")
+    assert await box.input_value() == "hi @{Ann Lee|Ann}"
+    await box.press("Enter")
+    await wait(lambda: len(fake.of("edit")) == 1)
+    [sent] = fake.of("edit")
+    assert (sent["text"], sent["mentions"]) == ("hi @{Ann Lee|Ann}", [kept])
+
+
+@BOTH
+@pytest.mark.parametrize("keys", [["Control+z"], ["Control+z", "Control+Shift+z"]])
+@pytest.mark.parametrize(
+    ("other", "outcome"),
+    [("Bob Roe", [ANN["mri"]]), ("Bob Lee", "a mention the edit would read as someone else")],
+)
+async def test_an_undo_in_an_edit_keeps_the_kept_mention_its_own(
+    fake: Fake, keys: list[str], other: str, outcome: Any
+) -> None:
+    """033 review r4/r5: a departed Ann's kept `@{Lee|Lee}`; text typed then undone (or undone and redone),
+    then more typed: the page dropped its anchors; the save, read by the server, still mentions Ann while
+    nobody else answers to `Lee`, and is refused when Bob Lee does, never sent to him."""
+    page = fake.page
+    assert page is not None
+    kept = {"name": "{Lee|Lee}", "mri": ANN["mri"]}
+    fake.forms["1"] = _form("hi @{Lee|Lee}", picks=[{**kept, "at": 3}])
+    box = await _edit(fake)
+    await box.press("End")
+    await box.press_sequentially(" ok")
+    for key in keys:
+        await box.press(key)
+    await box.press("End")
+    await box.press_sequentially("!")  # unchanged, the editor would send nothing
+    await box.press("Enter")
+    await wait(lambda: len(fake.of("edit")) == 1)
+    [verb] = fake.of("edit")
+    assert verb["mentions"] == []  # the page lost them
+    request = CV.parse_act("edit", verb)
+    assert isinstance(request, CV.ActRequest) and request.text is not None
+    roster = [{"mri": "8:orgid:me", "name": "Me Self"}, {"mri": "8:orgid:other", "name": other}]
+    lost = CV._kept_unpicked(request.text, request.mentions, [{**kept, "at": 3}], roster, T, "8:orgid:me")
+    if isinstance(outcome, str):
+        assert lost == outcome
+        return
+    assert not isinstance(lost, str)
+    anchored = CV._anchored_picks(T, CV._humans(roster), lost, lost)
+    assert not isinstance(anchored, str)
+    got = resolve_mentions(request.text, roster, T, "8:orgid:me", picks=anchored)
+    assert [p["mri"] for p in got] == outcome

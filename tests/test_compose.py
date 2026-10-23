@@ -1,5 +1,6 @@
 """Composer text → Teams HTML: markdown subset, emojis, mentions (spec 012)."""
 
+import contextlib
 import gc
 import html
 import json
@@ -664,17 +665,17 @@ def test_two_mentions_are_numbered_in_text_order() -> None:
 @pytest.mark.parametrize(
     ("text", "roster", "error"),
     [
-        ("@Ann hi", [*ROSTER, MOORE], "ambiguous mention @Ann: Ann Lee, Ann Moore"),
-        ("hi @ann", [*ROSTER, MOORE], "ambiguous mention @ann: Ann Lee, Ann Moore"),
+        ("@Ann hi", [*ROSTER, MOORE], "ambiguous mention @Ann: Ann Lee, Ann Moore (\\@ for a literal @)"),
+        ("hi @ann", [*ROSTER, MOORE], "ambiguous mention @ann: Ann Lee, Ann Moore (\\@ for a literal @)"),
         (
             "@Ann Lee",
             [*ROSTER, {"mri": "8:orgid:lee2", "name": "Ann Lee"}],
-            "ambiguous mention @Ann Lee: Ann Lee, Ann Lee",
+            "ambiguous mention @Ann Lee: Ann Lee, Ann Lee (\\@ for a literal @)",
         ),
-        ("@Nobody here", ROSTER, "unknown mention @Nobody"),
-        ("@Me Self", ROSTER, "unknown mention @Me"),
-        ("@Bot", ROSTER, "unknown mention @Bot"),
-        ("@Annabel", ROSTER, "unknown mention @Annabel"),
+        ("@Nobody here", ROSTER, "unknown mention @Nobody (\\@ for a literal @)"),
+        ("@Me Self", ROSTER, "unknown mention @Me (\\@ for a literal @)"),
+        ("@Bot", ROSTER, "unknown mention @Bot (\\@ for a literal @)"),
+        ("@Annabel", ROSTER, "unknown mention @Annabel (\\@ for a literal @)"),
     ],
 )
 def test_a_name_matching_none_or_several_is_refused(
@@ -749,7 +750,11 @@ def test_the_resolver_refuses_more_than_max_mentions(text: str) -> None:
         compose.resolve_mentions(text, ROSTER, GROUP, ME)
 
 
-@pytest.mark.parametrize("blank", ["", "   "])
+@pytest.mark.parametrize(
+    "blank",
+    ["\t", "\u2028", "\u2029", "\u00a0", "\x00", "\u200b", "\u3000", "\ue000", "\u0378"],
+    ids=lambda c: f"U+{ord(c):04X}",
+)
 def test_a_member_without_a_name_is_skipped(blank: str) -> None:
     """029-AC1: a nameless roster entry neither breaks the match nor matches."""
     roster = [{"mri": "8:orgid:anon", "name": blank}, *ROSTER]
@@ -786,7 +791,7 @@ def test_folding_that_changes_length_still_matches(text: str, name: str, label: 
 def test_an_unknown_decomposed_name_is_named_whole(word: str) -> None:
     """029-AC4: the refusal names the word typed, combining accent included; a mark after `Ann` does not end
     the word, so `@Anńa` is not Ann."""
-    with pytest.raises(ValueError, match=f"^unknown mention @{word}$"):
+    with pytest.raises(ValueError, match=f"^{re.escape(f'unknown mention @{word} (\\@ for a literal @)')}$"):
         compose.resolve_mentions(f"@{word} hi", ROSTER, GROUP, ME)
 
 
@@ -828,7 +833,10 @@ def test_candidates_keep_bounded_text(unit: str) -> None:
 @pytest.mark.parametrize("word", ["a" * 1000, "Ann" + "x" * 5000])
 def test_a_refusal_names_at_most_max_name_characters(word: str) -> None:
     """029-AC4: the refusal echoes the word typed, cut at MAX_NAME."""
-    with pytest.raises(ValueError, match=f"^unknown mention @{word[: compose.MAX_NAME]}$"):
+    with pytest.raises(
+        ValueError,
+        match=f"^{re.escape(f'unknown mention @{word[: compose.MAX_NAME]} (\\@ for a literal @)')}$",
+    ):
         compose.resolve_mentions(f"@{word} hi", ROSTER, GROUP, ME)
 
 
@@ -875,3 +883,750 @@ def test_custom_emojis_win_their_name() -> None:
     assert 'alt="party"' in compose_html(":party:", [], {"party": "x"})[0]
     assert 'alt="fire"' in compose_html(":fire:", [], {"fire": "x"})[0]
     assert compose_html(":party: :salute: :smile:", [], {})[0] == "🥳 🫡 🙂"
+
+
+# --- name forms and free labels (spec 033) --------------------------------------------------------
+
+BOB_LEE = {"mri": "8:orgid:boblee", "name": "Bob Lee"}
+SALES = {"mri": "8:orgid:john", "name": "John Doe | Sales"}
+
+
+@pytest.mark.parametrize(
+    ("text", "label"), [("@Lee", "Lee"), ("@lee", "Lee"), ("@ann", "Ann"), ("@Ann Lee", "Ann Lee")]
+)
+def test_a_first_last_or_full_name_mentions_with_the_roster_spelling(text: str, label: str) -> None:
+    """033-AC1: full name, first word or last word, any case, shows as the roster spells that form."""
+    html_, props = _resolved(f"{text} hi")
+    assert html_ == f"{_span(0, label)} hi"
+    assert [(e["mri"], e["displayName"]) for e in _mentions(props)] == [("8:orgid:ann", label)]
+
+
+@pytest.mark.parametrize(
+    ("text", "error"),
+    [
+        ("@Lee hi", "ambiguous mention @Lee: Ann Lee, Bob Lee (\\@ for a literal @)"),
+        ("hi @lee", "ambiguous mention @lee: Ann Lee, Bob Lee (\\@ for a literal @)"),
+        ("@{Lee|x}", "ambiguous mention @{Lee|x}: Ann Lee, Bob Lee (\\@ for a literal @)"),
+        ("@Leeds", "unknown mention @Leeds (\\@ for a literal @)"),
+    ],
+)
+def test_a_shared_last_name_is_refused_with_every_full_name(text: str, error: str) -> None:
+    """033-AC2: two members named Lee: `@Lee`, in any case or as a free label's Who, names both."""
+    with pytest.raises(ValueError, match=f"^{re.escape(error)}$"):
+        compose.resolve_mentions(text, [*ROSTER, BOB_LEE], GROUP, ME)
+
+
+def test_a_free_label_disambiguates_with_the_full_name() -> None:
+    """033-AC2: `@{Ann Lee|Lee}` mentions Ann Lee labelled `Lee`, Bob Lee in the chat."""
+    html_, props = _resolved("@{Ann Lee|Lee} hi", [*ROSTER, BOB_LEE])
+    assert html_ == f"{_span(0, 'Lee')} hi"
+    assert [(e["mri"], e["displayName"]) for e in _mentions(props)] == [("8:orgid:ann", "Lee")]
+
+
+@pytest.mark.parametrize(
+    ("text", "mri", "label"),
+    [
+        ("@{Ann Lee|the boss}, hi", "8:orgid:ann", "the boss"),
+        ("@{ann|the boss}, hi", "8:orgid:ann", "the boss"),
+        ("@{LEE|the boss}, hi", "8:orgid:ann", "the boss"),
+        ("@{John Doe | Sales|the boss}, hi", "8:orgid:john", "the boss"),
+        ("@{Sales|the boss}, hi", "8:orgid:john", "the boss"),
+        ("@{ann|}, hi", "8:orgid:ann", "Ann Lee"),  # no label: the full name
+        ("@{Sales|   }, hi", "8:orgid:john", "John Doe | Sales"),
+    ],
+)
+def test_a_free_label_mentions_its_member_under_the_label(text: str, mri: str, label: str) -> None:
+    """033-AC3: the span shows the label, the entry carries the member's MRI and the label as displayName;
+    Who is any form of the name, and the last `|` splits, so Who may hold one."""
+    html_, props = _resolved(text, [*ROSTER, SALES])
+    assert html_ == f"{_span(0, label)}, hi"
+    assert [(e["mri"], e["mentionType"], e["displayName"]) for e in _mentions(props)] == [
+        (mri, "person", label)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "error"),
+    [
+        ("@{Ann Lee|a|b} hi", "unknown mention @{Ann Lee|a|b} (\\@ for a literal @)"),
+        (
+            "@{Ann Lee|the\nboss}",
+            "unclosed mention @{Ann Lee|the: write @{Who|label}, "
+            f"{compose._LABEL_RULE} (\\@ for a literal @)",
+        ),
+        (
+            "@{Ann Lee|the boss hi",
+            "unclosed mention @{Ann Lee|the boss hi: write @{Who|label}, "
+            f"{compose._LABEL_RULE} (\\@ for a literal @)",
+        ),
+        ("@{Ann Lee} hi", "mention @{Ann Lee} has no label: write @{Who|label} (\\@ for a literal @)"),
+        ("@{Ann Lee|" + "x" * 201 + "}", "mention label too long (> 200 characters) (\\@ for a literal @)"),
+        ("@{Ann Leeds|x}", "unknown mention @{Ann Leeds|x} (\\@ for a literal @)"),
+        ("@{An|x}", "unknown mention @{An|x} (\\@ for a literal @)"),
+        ("@{|x}", "unknown mention @{|x} (\\@ for a literal @)"),
+        ("@{everyone|x}", "unknown mention @{everyone|x} (\\@ for a literal @)"),
+        ("@{Me Self|x}", "unknown mention @{Me Self|x} (\\@ for a literal @)"),
+    ],
+)
+def test_a_malformed_free_label_is_refused(text: str, error: str) -> None:
+    """033-AC3: an empty label, one holding `|` (Who then names nobody) or a line break (unclosed), one past
+    MAX_NAME, or a Who that is not one member's form whole (a start of it, everyone, me) is refused."""
+    with pytest.raises(ValueError, match=f"^{re.escape(error)}$"):
+        compose.resolve_mentions(text, ROSTER, GROUP, ME)
+
+
+def test_a_label_of_max_name_characters_is_taken() -> None:
+    """033-AC3: MAX_NAME is the label's cap, not one under it; Who and label each have their own."""
+    label = "x" * compose.MAX_NAME
+    html_, props = _resolved(f"@{{John Doe | Sales|{label}}}", [*ROSTER, SALES])
+    assert html_ == _span(0, label) and _mentions(props)[0]["displayName"] == label
+
+
+@pytest.mark.parametrize("text", [r"\@{Ann Lee|x}", "`@{Ann Lee|x}`", "a@{Ann Lee|x}"])
+def test_an_escaped_free_label_stays_literal(text: str) -> None:
+    """033-AC3: `\\@`, code or an `@` inside a word keep the brace text as typed: no candidate."""
+    assert not compose.holds_mention(text)
+    html_, props = _resolved(text)
+    assert "<span" not in html_ and "{Ann Lee|x}" in html_ and props is None
+
+
+@pytest.mark.parametrize("text", ["{a|b} c", "x | y {z}", "- {a|b}\n> |c|"])
+def test_braces_and_bars_are_no_markup(text: str) -> None:
+    """033-AC3: `{` and `|` mean nothing to compose outside a mention."""
+    assert html.unescape(re.sub(r"<[^>]+>", "", compose_html(text, [], {})[0])) == text.replace("\n", "")
+
+
+def test_a_one_word_name_has_one_form() -> None:
+    """033: `Cher` is full, first and last name at once: one form, never ambiguous with itself."""
+    assert compose.forms("Cher") == ["Cher"]
+    assert compose.forms("Ann Lee") == ["Ann Lee", "Ann", "Lee"]
+    assert compose.forms("  ") == []
+    html_, props = _resolved("@cher", [*ROSTER, {"mri": "8:orgid:cher", "name": "Cher"}])
+    assert html_ == _span(0, "Cher") and len(_mentions(props)) == 1
+
+
+def test_a_free_label_pick_shows_its_label_without_one() -> None:
+    """033-AC8: compose_html shows a `{Who|label}` pick's label when the pick carries none (a kept pick)."""
+    picks = [{"name": "{John Doe | Sales|the boss}", "mri": "8:orgid:john"}]
+    html_, props = compose_html("@{John Doe | Sales|the boss} hi", picks, {})
+    assert html_ == f"{_span(0, 'the boss')} hi" and _mentions(props)[0]["displayName"] == "the boss"
+
+
+def test_an_at_a_pick_names_is_left_to_it() -> None:
+    """033-AC7: an `@` a pick is anchored at is that pick's, so namesakes keep their own recipients; the
+    others still resolve on the roster: one pick per `@`, in text order."""
+    text = "@Ann, @Moore and @Bob"
+    picks = _anchored(text, ("8:orgid:ann", "Ann Lee"), ("8:orgid:moore", "Ann Moore"))
+    assert compose.resolve_mentions(text, [*ROSTER, MOORE], GROUP, ME, picks=picks) == [
+        {"name": "Ann", "mri": "8:orgid:ann", "label": "Ann"},
+        {"name": "Moore", "mri": "8:orgid:moore", "label": "Moore"},
+        {"name": "Bob", "mri": "8:orgid:bob", "label": "Bob"},
+    ]
+
+
+@pytest.mark.parametrize(("text", "picked"), [("@Ann then @Ann Moore", 0), ("@Ann Moore then @Ann", 1)])
+def test_an_unpicked_longer_name_beside_a_pick_is_the_rosters(text: str, picked: int) -> None:
+    """033: Ann Lee picked and shortened to `@Ann`, then `@Ann Moore` typed, in either order: the anchored
+    `@Ann` stays Ann Lee's, the typed `@Ann Moore` is Ann Moore's."""
+    people = [("8:orgid:ann", "Ann Lee") if n == picked else None for n in range(2)]
+    resolved = compose.resolve_mentions(text, [*ROSTER, MOORE], GROUP, ME, picks=_anchored(text, *people))
+    _, props = compose_html(text, resolved, {}, full=True)
+    got = {e["displayName"]: e["mri"] for e in _mentions(props)}
+    assert got == {"Ann": "8:orgid:ann", "Ann Moore": "8:orgid:moore"}
+
+
+@pytest.mark.parametrize(("typed", "shown"), [("ann", "Ann"), ("ANN", "Ann"), ("{ann lee|x}", "x")])
+def test_a_pick_names_its_at_whatever_the_case(typed: str, shown: str) -> None:
+    """033: `@ann` where Ann Lee was picked (or a free label in another case) is the pick's, not ambiguous
+    between the namesakes: compose_html, case-sensitive, gets a pick spelled as typed."""
+    text = f"@{typed} hi"
+    picks = _anchored(text, ("8:orgid:ann", "Ann Lee"))
+    resolved = compose.resolve_mentions(text, [*ROSTER, MOORE], GROUP, ME, picks=picks)
+    assert resolved == [{"name": typed, "mri": "8:orgid:ann", "label": shown}]
+    html_, _ = compose_html(text, resolved, {}, full=True)
+    assert html_ == f"{_span(0, shown)} hi"
+
+
+@pytest.mark.parametrize("text", ["@{Ann Lee|@boss} hi", "@{Ann Lee|ask @Bob} hi", "@{Ann Lee|@Nobody} hi"])
+def test_an_at_inside_a_free_label_is_the_labels(text: str) -> None:
+    """033-AC3: the label is plain text: an `@` in it is neither another mention nor a refusal."""
+    html_, props = _resolved(text)
+    label = text[text.index("|") + 1 : text.index("}")]
+    assert html_ == f"{_span(0, label)} hi"
+    assert [(e["mri"], e["displayName"]) for e in _mentions(props)] == [("8:orgid:ann", label)]
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["the *boss*", "a * b", "snake_case", "~~x~~", "a~b", "`x`", "a`b", "[x](https://y.test)", "[x]", "a\\b"],
+)
+def test_a_free_label_is_read_raw_markup_and_all(label: str) -> None:
+    """033 user decision: `@{Who|label}` is read before markdown, so `* _ ~ ` [ \\` in a label stay as typed:
+    the span shows them, escaped, and the entry carries them."""
+    html_, props = _resolved(f"say @{{Ann Lee|{label}}} hi")
+    assert html_ == f"say {_span(0, html.escape(label))} hi"
+    assert _mentions(props)[0]["displayName"] == label
+
+
+@pytest.mark.parametrize(("text", "after"), [("@{Ann Lee|a}b} hi", "b} hi"), ("@{Ann Lee|a}x", "x")])
+def test_a_free_label_ends_at_its_first_closing_brace(text: str, after: str) -> None:
+    """033 user decision: `}` closes the token; what follows is text, glued or not."""
+    html_, props = _resolved(text)
+    assert html_ == f"{_span(0, 'a')}{html.escape(after)}" and _mentions(props)[0]["displayName"] == "a"
+
+
+@pytest.mark.parametrize(
+    ("who", "mri"), [("Ann *Lee*", None), ("John Doe | Sales", "8:orgid:john"), ("Sales", "8:orgid:john")]
+)
+def test_who_is_read_raw_too(who: str, mri: str | None) -> None:
+    """033 user decision: Who is part of the opaque token: markup in it is not markup (`*Lee*` names no
+    one), a `|` in it is kept (the last one splits)."""
+    roster = [*ROSTER, {"mri": "8:orgid:john", "name": "John Doe | Sales"}]
+    text = f"@{{{who}|boss}} hi"
+    if mri is None:
+        with pytest.raises(ValueError, match=re.escape(f"unknown mention @{{{who}|boss}}")):
+            compose.resolve_mentions(text, roster, GROUP, ME)
+    else:
+        assert [p["mri"] for p in compose.resolve_mentions(text, roster, GROUP, ME)] == [mri]
+
+
+@pytest.mark.parametrize(
+    ("name", "limit"),
+    [("x" * 201, 200), ("{" + "x" * 201 + "|" + "y" * 200 + "}", 403), ("{Ann|" + "y" * 400 + "}", 403)],
+)
+def test_a_pick_name_past_its_limit_is_refused_with_that_limit(name: str, limit: int) -> None:
+    """033 review: a `{Who|label}` name may reach 2 * MAX_NAME + 3, a plain one MAX_NAME; the refusal says
+    which."""
+    with pytest.raises(ValueError, match=re.escape(f"mention name too long (> {limit} characters)")):
+        compose_html(f"@{name}", [{"name": name, "mri": "8:orgid:ann"}], {})
+
+
+@pytest.mark.parametrize("label", ["@boss", "x @team", "hi @Bob"])
+def test_an_at_inside_a_picked_label_is_that_picks(label: str) -> None:
+    """033 review: a kept pick whose label holds an `@word` covers it: no new candidate, no refusal, no
+    spurious mention, and no roster needed."""
+    text = f"hi @{{Gone|{label}}} there"
+    picks = _anchored(text, ("8:orgid:gone", f"{{Gone|{label}}}"))
+    resolved = compose.resolve_mentions(text, ROSTER, GROUP, ME, picks=picks)
+    assert resolved == [{"name": f"{{Gone|{label}}}", "mri": "8:orgid:gone", "label": label}]
+    _, props = compose_html(text, resolved, {}, full=True)
+    assert [(e["mri"], e["displayName"]) for e in _mentions(props)] == [("8:orgid:gone", label)]
+
+
+@pytest.mark.parametrize("typed", ["BOSS", "bôss"])
+def test_a_free_label_typed_in_another_case_shows_as_typed(typed: str) -> None:
+    """033 review: a kept `{Ann Lee|boss}` covers `@{Ann Lee|BOSS}`, but the label shows as typed."""
+    text = f"@{{Ann Lee|{typed}}} hi"
+    picks = _anchored(text, ("8:orgid:ann", "{Ann Lee|boss}"))
+    resolved = compose.resolve_mentions(text, ROSTER, GROUP, ME, picks=picks)
+    assert resolved == [{"name": f"{{Ann Lee|{typed}}}", "mri": "8:orgid:ann", "label": typed}]
+    html_, props = compose_html(text, resolved, {}, full=True)
+    assert html_ == f"{_span(0, typed)} hi" and _mentions(props)[0]["displayName"] == typed
+
+
+@pytest.mark.parametrize("alias", [{"name": "p0", "label": "P0"}, {"name": "P0"}])
+def test_the_mention_cap_counts_distinct_mentions(alias: dict[str, str]) -> None:
+    """033 review: a pick spelled another way for the same mention does not count twice; 51 distinct do."""
+    picks = [{"name": f"P{n}", "mri": f"8:orgid:{n}", "label": f"P{n}"} for n in range(compose.MAX_MENTIONS)]
+    compose_html("@P0 @p0", [*picks, {**alias, "mri": "8:orgid:0"}], {})
+    with pytest.raises(ValueError, match=re.escape("too many mentions (51 > 50)")):
+        compose_html("@P0", [*picks, {"name": "P50", "mri": "8:orgid:50"}], {})
+    with pytest.raises(ValueError, match=re.escape("too many mentions (51 > 50)")):
+        compose_html("@P0", [*picks, {"name": "P0", "mri": "8:orgid:other"}], {})
+
+
+@pytest.mark.parametrize("blank", ["\t", " ", " ", " ", "\x00", "​", "　"], ids=lambda c: f"U+{ord(c):04X}")
+def test_a_free_label_holding_a_blank_but_the_space_or_a_control_is_refused(blank: str) -> None:
+    """033 review: the label rule (plain_label): tab, line/paragraph separators, other blanks, control,
+    format, private-use (U+E000) and unassigned (U+0378) characters are refused."""
+    with pytest.raises(ValueError, match=re.escape(f"{compose._LABEL_RULE} (\\@ for a literal @)")):
+        compose.resolve_mentions(f"@{{Ann Lee|a{blank}b}} hi", ROSTER, GROUP, ME)
+
+
+CROWD = [*ROSTER, *({"mri": f"8:orgid:{n:04x}", "name": f"Person{n} Name{n}"} for n in range(250))]
+
+
+@pytest.mark.parametrize("unit", ["@", "@ ", "@!", "@@Ann "])
+def test_a_flood_of_at_signs_stays_linear(unit: str) -> None:
+    """033 review: an `@` no pick and no name can start costs no roster scan, and names read stop at
+    MAX_MENTIONS: a 28 KB flood resolves (or refuses) in time linear in its size."""
+    # The composer's cap of picks, anchored at the first `@`s, none of whose names follows them.
+    people = [(f"8:orgid:p{n}", f"Pick{n} Name") for n in range(50)]
+
+    def run(n: int) -> object:
+        text = unit * (n // len(unit))
+        try:
+            return compose.resolve_mentions(text, CROWD, GROUP, ME, picks=_anchored(text, *people))
+        except ValueError as exc:
+            return exc
+
+    start = time.process_time()  # one bounded run first: a quadratic one would take seconds
+    run(28_000)
+    assert time.process_time() - start < 0.25  # ~25 ms here; a scan per `@` costs 0.5 s to 15 s
+    assert _best_ms(lambda: run(28_000)) / max(_best_ms(lambda: run(7_000)), 0.05) < 8
+
+
+@pytest.mark.parametrize(
+    ("text", "mris"),
+    [
+        ("@ann @ann", ["8:orgid:ann", "8:orgid:moore"]),
+        ("@ANN @ann", ["8:orgid:ann", "8:orgid:moore"]),
+        ("@ann @Ann", ["8:orgid:moore", "8:orgid:ann"]),
+        ("@Ann @Ann @Ann", ["8:orgid:ann", "8:orgid:moore", "8:orgid:moore"]),
+    ],
+)
+def test_re_cased_namesake_picks_stay_at_their_own_at(text: str, mris: list[str]) -> None:
+    """033: namesakes Ann Lee and Ann Moore, each anchored at its own `@`, whatever its case: each `@ann`
+    is the pick's anchored there, never paired by spelling."""
+    people = {"8:orgid:ann": "Ann Lee", "8:orgid:moore": "Ann Moore"}
+    picks = _anchored(text, *((mri, people[mri]) for mri in mris))
+    resolved = compose.resolve_mentions(text, [*ROSTER, MOORE], GROUP, ME, picks=picks)
+    _, props = compose_html(text, resolved, {}, full=True)
+    assert [e["mri"] for e in _mentions(props)] == mris
+
+
+@pytest.mark.parametrize("kept", [False, True])
+def test_sixty_ats_inside_one_label_are_one_mention(kept: bool) -> None:
+    """033 review: the cap counts names read, not every `@`: sixty `@x` in a free label, or in a kept pick's
+    label as Teams wrote it, are that one mention's."""
+    label = ("@x " * 60).strip()
+    if kept:
+        text = f"hi @{{Gone|{label}}}"
+        picks = _anchored(text, ("8:orgid:gone", f"{{Gone|{label}}}"))
+        resolved = compose.resolve_mentions(text, ROSTER, GROUP, ME, picks=picks)
+        assert resolved == [{"name": f"{{Gone|{label}}}", "mri": "8:orgid:gone", "label": label}]
+    else:
+        html_, props = _resolved(f"@{{Ann Lee|{label}}} hi")
+        assert len(_mentions(props)) == 1 and html_.count("<span") == 1
+
+
+@pytest.mark.parametrize("text", ["@Ann " * 51, "@Ann " * 50 + "@Bob"])
+def test_fifty_one_mentions_read_are_refused(text: str) -> None:
+    """033 review: picked or resolved, the 51st name read refuses."""
+    with pytest.raises(ValueError, match=re.escape("too many mentions (> 50)")):
+        compose.resolve_mentions(text, ROSTER, GROUP, ME, picks=_anchored(text, ("8:orgid:ann", "Ann Lee")))
+
+
+# --- the resolver reads the text as compose_html does (033 review) ---
+
+BL, BM = "8:orgid:bl", "8:orgid:bm"
+NAMESAKES = [
+    {"mri": ME, "name": "Me Self"},
+    {"mri": "8:orgid:ann", "name": "Ann Lee"},
+    {"mri": "8:orgid:moore", "name": "Ann Moore"},
+    {"mri": BL, "name": "Bob Lee"},
+    {"mri": BM, "name": "Bob Moore"},
+]
+
+
+def _pick_at(at: int, mri: str, name: str) -> dict[str, Any]:
+    """A page's pick anchored at `text[at]` (spec 033), as chat_verbs hands it over: read by the forms of
+    `name`, or, a braced `{Who|label}` (an edit's kept mention, `kept` as given back), by Who and label."""
+    if name.startswith("{"):
+        _, who, label = compose.free_label(name)
+        return {"at": at, "mri": mri, "forms": [], "whos": [who, label], "kept": name}
+    return {"at": at, "mri": mri, "forms": compose.forms(name)}
+
+
+def _anchored(text: str, *people: tuple[str, str] | None) -> list[dict[str, Any]]:
+    """Picks anchored at the `@`s of `text` in order, one (mri, name) each; None leaves an `@` unpicked."""
+    ats = [i for i, c in enumerate(text) if c == "@"]
+    return [_pick_at(at, *person) for at, person in zip(ats, people, strict=False) if person]
+
+
+def _entries(
+    text: str, picks: list[dict[str, Any]], full: bool = True, roster: list[dict[str, Any]] = NAMESAKES
+) -> tuple[list[Any], list[Any]]:
+    """(the resolver's mentions, compose_html's from them), as (mri, label) in text order."""
+    resolved = compose.resolve_mentions(text, roster, GROUP, ME, picks=picks, full=full)
+    want = [(p["mri"], "Everyone" if p.get("everyone") else p.get("label") or p["name"]) for p in resolved]
+    _, props = compose_html(text, resolved, {}, full=full)
+    return want, [(e["mri"], e["displayName"]) for e in _mentions(props)] if props else []
+
+
+@pytest.mark.parametrize(
+    "text", ["@{Ann Lee|http://a.b}@Bob @Bob @Bob", "@{Ann Lee|a http://x.y/}@Bob Lee", "@{Ann Lee|x}@Bob"]
+)
+def test_a_url_inside_a_read_label_does_not_hide_what_follows(text: str) -> None:
+    """033 review: past a name read, the resolver resumes where compose_html does: a URL starting inside the
+    label cannot swallow the `@` after it, for one and not the other."""
+    picks = _anchored(text, None, (BL, "Bob Lee"), (BM, "Bob Moore"), (BM, "Bob Moore"))
+    want, got = _entries(text, picks)
+    assert want == got and len(got) == text.count("@")
+
+
+# Markup that splits or hides text, escapes, emojis, URLs, braces, namesakes and re-cased names.
+_PIECES = ["@", "@", "{", "}", "|", "http://a.b", " ", " ", "Ann", "ann", "ANN", "Lee", "Moore", "Bob", "x"]
+_PIECES += ["`", "```", "\n", "\n- ", "\n> ", "- ", "> ", "\\@", ":x:"]
+_PIECES += [
+    "*",
+    "_",
+    "~~",
+    "[x](http://a.b)",
+    "{Ann Lee|a*b}",
+    "{Ann Lee|_x_}",
+    "{Ann *Lee*|y}",
+]  # markup in labels
+# Runs `_inline` refuses to read as a token (`_a_@{…}y`, `\_@{…}é`): the `@{…}` still ends at its `}`.
+_PIECES += ["\\_", "_a_", "}y", "\\\\", "a_", "__", "é", "https://x.io/@{Ann Lee|x}"]
+# Whole names read longer than a pick anchored there (spec 033): the pick stands down, in both readers.
+_PIECES += ["@Ann Moore", "@Ann Lee", "@Bob Moore", "@{Ann Moore|m}", "@Ann Lee Smith", "@Lee Smith"]
+
+
+# Members whose names read longer than a pick of Ann Lee at the same `@`: by a third word, a last-name join.
+LONGER = [
+    *NAMESAKES,
+    {"mri": "8:orgid:als", "name": "Ann Lee Smith"},
+    {"mri": "8:orgid:ls", "name": "Lee Smith"},
+]
+
+
+def test_resolver_and_compose_agree_on_random_texts() -> None:
+    """033 review: on random texts, in full and inline mode (the widget's quick reply), with picks anchored
+    at random `@`s (namesakes, kept braces, one `@` twice), compose_html sends exactly the mentions the
+    resolver read, in order, whenever the resolver does not refuse."""
+    import random
+
+    rng = random.Random(32)
+    pool = [
+        ("8:orgid:ann", "Ann Lee"),
+        ("8:orgid:moore", "Ann Moore"),
+        (BL, "Bob Lee"),
+        (BM, "Bob Moore"),
+        ("8:orgid:ann", "{Ann Lee|x}"),
+        ("8:orgid:ann", "{Ann Lee|a*b}"),
+    ]
+    checked = 0
+    start = time.process_time()
+    for _ in range(20000):
+        text = "".join(rng.choice(_PIECES) for _ in range(rng.randint(1, 14)))
+        ats = [i for i, c in enumerate(text) if c == "@"]
+        picks = [_pick_at(at, *rng.choice(pool)) for at in ats if rng.random() < 0.6]
+        if picks and rng.random() < 0.1:
+            picks.append({**picks[0], "mri": BM})  # two picks on one `@`: neither stands
+        full = rng.random() < 0.5
+        try:
+            want, got = _entries(text, picks, full, LONGER)
+        except ValueError:
+            continue
+        assert want == got, (text, picks, full)
+        checked += 1
+    assert checked > 5000 and time.process_time() - start < 20
+
+
+_ANN_X = [("8:orgid:ann", "x")]
+_GONE = ("8:orgid:gone", "{Gone|q}")  # an edit's kept mention of someone who left
+
+
+@pytest.mark.parametrize(
+    ("text", "picks", "roster", "want"),
+    [
+        ("_a_@{Ann Lee|x}y", [], NAMESAKES, _ANN_X),
+        ("\\_@{Ann Lee|x}y", [], NAMESAKES, _ANN_X),
+        ("\\_@{Ann Lee|x}é", [], NAMESAKES, _ANN_X),
+        ("x @{Ann Lee|x}_y", [], NAMESAKES, _ANN_X),
+        # A kept pick of someone gone, read off the picks alone, whether the roster is up or not.
+        ("hi _a_@{Gone|q}y", [_GONE], NAMESAKES, [("8:orgid:gone", "q")]),
+        ("hi _a_@{Gone|q}y", [_GONE], [], [("8:orgid:gone", "q")]),
+        ("hi \\_@{Gone|q}é", [_GONE], NAMESAKES, [("8:orgid:gone", "q")]),
+    ],
+)
+@pytest.mark.parametrize("full", [True, False])
+def test_a_braced_mention_ends_at_its_brace_whatever_follows(
+    text: str, picks: list[tuple[str, str]], roster: list[dict[str, Any]], want: list[Any], full: bool
+) -> None:
+    """033 review: a `@{…}` run `_inline` does not take as a token still ends at its `}`, in the resolver
+    (a free label or a kept pick) and in compose: the mention picked is sent, not left as raw text."""
+    assert _entries(text, _anchored(text, *picks), full, roster) == (want, want)
+
+
+_MARKERS_033 = ["*", "_", "~~", "**"]
+
+
+def test_a_label_holding_the_marker_of_the_span_around_it_never_refuses() -> None:
+    """033 review: random spans around a `@{Ann Lee|label}` whose label holds that span's own marker (and
+    others): never refused, and compose sends exactly the mention the resolver read. Counted, so a refusal
+    cannot hide among the skipped cases."""
+    import random
+
+    rng = random.Random(23)
+    # What sits between the opening marker and the `@` (nothing: `_@{`, `*@{`), and after the `}`. No blank
+    # against a marker: a space-padded marker opens or closes no span.
+    left, right = ["", "a ", "x y ", "\\@{x} ", "\\@Ann "], ["", " b", " z w", "."]
+    refused: list[str] = []
+    for _ in range(3000):
+        mark, other = rng.choice(_MARKERS_033), rng.choice(_MARKERS_033)
+        label = (
+            "".join(rng.choice(["a", "b", " ", mark, other]) for _ in range(rng.randint(1, 6))).strip() or "a"
+        )
+        inner = f"{rng.choice(left)}@{{Ann Lee|{label}}}{rng.choice(right)}"
+        text = f"{rng.choice(['', 'go ', 'x: '])}{mark}{inner}{mark}{rng.choice(['', ' ok', '.'])}"
+        try:
+            want, got = _entries(text, [], rng.random() < 0.5)
+        except ValueError as exc:
+            refused.append(f"{text!r}: {exc}")
+            continue
+        assert want == got == [("8:orgid:ann", label)], text
+    assert refused == []
+
+
+@pytest.mark.parametrize("unit", ["-@", ".@", "@x"])
+def test_a_flood_against_long_pick_names_stays_bounded(unit: str) -> None:
+    """033 review: 50 picks of 200-character names anchored in a 28 KB `@` flood: each anchored `@` reads
+    only its own pick's forms, the rest never meet them, so the text resolves (or refuses) fast."""
+    text = "@" + unit * 14_000
+    names = [unit * 99 + f"{unit[0]}{n}" for n in range(50)]
+    picks = _anchored(text, *((f"8:orgid:{n}", name) for n, name in enumerate(names)))
+    start = time.process_time()
+    with contextlib.suppress(ValueError):
+        compose.resolve_mentions(text, ROSTER, GROUP, ME, picks=picks)
+    assert time.process_time() - start < 0.5
+
+
+@pytest.mark.parametrize("letters", ["abcdefghijklmnopqrstuvwxyz", "ÀÉÎÕÜàéîõüŁłŻżÇç", "A"])
+def test_a_large_roster_is_scanned_by_first_letter(letters: str) -> None:
+    """033 review: 5000 members and 50 mentions resolve in well under a second: an `@` only tries the forms
+    sharing its first word (folded: `É` and `e` are one), so 5000 names all starting with `A` cost no more."""
+    roster = [{"mri": ME, "name": "Me Self"}]
+    roster += [
+        {
+            "mri": f"8:orgid:{n}",
+            "name": f"{letters[n % len(letters)]}{n} {letters[n // 7 % len(letters)]}x{n}",
+        }
+        for n in range(5000)
+    ]
+    text = " ".join(f"@{m['name']}" for m in roster[1:51])
+    start = time.process_time()
+    resolved = compose.resolve_mentions(text, roster, GROUP, ME)
+    took = time.process_time() - start
+    assert len(resolved) == 50 and took < 0.4, took
+
+
+@pytest.mark.parametrize(
+    ("name", "found"),
+    [
+        ("Doe, John", ["Doe, John", "Doe", "John"]),
+        ("Ann Lee (Sales)", ["Ann Lee (Sales)", "Ann", "Sales"]),
+        ("“Ann” Lee!", ["“Ann” Lee!", "Ann", "Lee"]),
+        ("(x)", ["(x)", "x"]),
+        ("--", ["--"]),
+    ],
+)
+def test_first_and_last_names_drop_the_punctuation_around_them(name: str, found: list[str]) -> None:
+    """033 review: `Doe, John` is `@Doe`, `Ann Lee (Sales)` is `@Sales`; nothing left is no form."""
+    assert compose.forms(name) == found
+
+
+@pytest.mark.parametrize(
+    ("text", "label", "mri"),
+    [
+        ("@Doe thanks", "Doe", "8:orgid:doe"),
+        ("@Doe, thanks", "Doe", "8:orgid:doe"),
+        ("@sales hi", "Sales", "8:orgid:sales"),
+    ],
+)
+def test_a_name_with_punctuation_is_reached_by_its_words(text: str, label: str, mri: str) -> None:
+    """033 review: the roster's punctuation is no part of a first or last name."""
+    roster = [
+        *ROSTER,
+        {"mri": "8:orgid:doe", "name": "Doe, John"},
+        {"mri": "8:orgid:sales", "name": "Bo Roy (Sales)"},
+    ]
+    assert compose.resolve_mentions(text, roster, GROUP, ME) == [
+        {"name": text[1 : 1 + len(label)], "mri": mri, "label": label}
+    ]
+
+
+@pytest.mark.parametrize("kept", ["{Ann Lee|Ann Lee}", "{Gone|boss}"])
+def test_no_member_name_can_take_a_kept_brace(kept: str) -> None:
+    """033 review: a member whose display name starts like a kept brace (`{Ann Lee|Ann Lee} and`) is never
+    read at a `{`: a free label is not a name, so the departed person's kept mention stays theirs."""
+    hostile = [*ROSTER, {"mri": "8:orgid:hostile", "name": f"{kept} and"}]
+    text = f"hi @{kept} and more"
+    sent = compose.resolve_mentions(text, hostile, GROUP, ME, picks=_anchored(text, ("8:orgid:gone", kept)))
+    assert [(p["mri"], p["name"]) for p in sent] == [("8:orgid:gone", kept)]
+
+
+@pytest.mark.parametrize("size", [65, 10_000])
+def test_long_keys_are_folded_without_being_cached(size: int) -> None:
+    """033 review: the fold cache keeps short keys only: a long name a page sends must not pin its memory."""
+    compose._fold_cached.cache_clear()
+    key = "x" * size
+    assert compose._fold(key) == key
+    assert compose._fold_cached.cache_info().currsize == 0
+    compose._fold("short")
+    assert compose._fold_cached.cache_info().currsize == 1
+
+
+@pytest.mark.parametrize("token", ["{Ann Lee|Ann Lee}", "{Ann Lee|boss}"])
+def test_a_member_named_like_a_free_label_never_takes_it(token: str) -> None:
+    """033 review: unpicked `@{Ann Lee|boss}` with a member whose display name is exactly `{Ann Lee|boss}`:
+    a `{` opens a free label, never a roster name, so Who (Ann Lee) is who it names."""
+    hostile = [*ROSTER, {"mri": "8:orgid:hostile", "name": token}]
+    sent = compose.resolve_mentions(f"hi @{token} there", hostile, GROUP, ME)
+    assert [p["mri"] for p in sent] == ["8:orgid:ann"]
+
+
+@pytest.mark.parametrize(
+    ("text", "html_"),
+    [
+        ("*see @{Ann Lee|a* b}*", "<i>see {m}</i>"),
+        ("_a @{Ann Lee|b_} c_", "<i>a {m} c</i>"),
+        ("~~@{Ann Lee|x~~}~~", "<s>{m}</s>"),
+        ("**@{Ann Lee|b**}**", "<b>{m}</b>"),
+        ("*a @{Ann Lee|b*}*", "<i>a {m}</i>"),
+        ("~~x @{Ann Lee|~~} y~~", "<s>x {m} y</s>"),
+        ("*@{Ann Lee|*}*", "<i>{m}</i>"),
+        ("**go @{Ann Lee|a * b**}** now", "<b>go {m}</b> now"),
+        ("_@{Ann Lee|a_ b}_", "<i>{m}</i>"),
+        ("*@{Ann Lee|a* b} c*", "<i>{m} c</i>"),
+        ("*a _@{Ann Lee|b*}_ c*", "<i>a <i>{m}</i> c</i>"),
+        ("~~x _@{Ann Lee|y~~ z}_~~", "<s>x <i>{m}</i></s>"),
+        ("**go _@{Ann Lee|a**}_ now**", "<b>go <i>{m}</i> now</b>"),
+    ],
+)
+def test_a_span_closes_past_a_marker_inside_a_free_label(text: str, html_: str) -> None:
+    """033 review: an emphasis or strike opened before `@{…}` does not close on the same marker inside the
+    label: the span closes after it and the label keeps its marker."""
+    label = text[text.index("|") + 1 : text.index("}")]
+    got, props = _resolved(text)
+    assert got == html_.format(m=_span(0, html.escape(label)))
+    assert _mentions(props)[0]["displayName"] == label
+
+
+@pytest.mark.parametrize(
+    ("text", "html_"),
+    [
+        ("*a `@{` b* c}", "<i>a <code>@{</code> b</i> c}"),
+        ("_a `@{x` b_ y}", "<i>a <code>@{x</code> b</i> y}"),
+        ("*a_@{p* b} c*", "<i>a_@{p</i> b} c*"),
+        ("*x a_@{p* b} c*", "<i>x a_@{p</i> b} c*"),
+        ("*a https://x.io/@{p* b} c", '<i>a <a href="https://x.io/@{p">https://x.io/@{p</a></i> b} c'),
+    ],
+)
+def test_a_brace_the_content_reads_as_text_is_no_token_for_the_span_around_it(text: str, html_: str) -> None:
+    """033 review: a `@{` inside code, a URL or a word (an intra-word `_` opens nothing) is no token, so
+    the span closes where it did before 033."""
+    assert _resolved(text) == (html_, None)
+
+
+@pytest.mark.parametrize(
+    ("text", "at"),
+    [
+        ("`@Ann` and @Ann", 1),  # in code
+        ("\\@Ann and @Ann", 1),  # escaped
+        ("[@Ann](https://x.io) and @Ann", 1),  # a link label
+        ("https://x.io/@Ann and @Ann", 12),  # inside a URL
+        ("x@Ann and @Ann", 1),  # no word start
+        ("@Ann and @Ann", 2),  # not an `@` at all
+        ("@{Ann Lee|@Ann} and @Ann", 10),  # inside a label read whole
+    ],
+)
+def test_a_pick_at_no_mention_start_anchors_nothing(text: str, at: int) -> None:
+    """033 (C1): a pick whose `@` the reader never reads is dropped, never moved to the next `@`: Ann Moore
+    anchored there leaves the real `@Ann` to the roster (ambiguous here: refused, not hers)."""
+    picks = [{"at": at, "mri": "8:orgid:moore", "forms": compose.forms("Ann Moore")}]
+    with pytest.raises(ValueError, match="ambiguous mention @Ann:"):
+        compose.resolve_mentions(text, [*ROSTER, MOORE], GROUP, ME, picks=picks)
+
+
+@pytest.mark.parametrize("second", ["8:orgid:moore", "8:orgid:ann"])
+def test_two_picks_on_one_at_anchor_nothing(second: str) -> None:
+    """033: two picks sent for one `@` (a forged or stale page): neither stands, the roster decides."""
+    picks = [
+        {"at": 0, "mri": "8:orgid:ann", "forms": compose.forms("Ann Lee")},
+        {"at": 0, "mri": second, "forms": compose.forms("Ann Moore" if "moore" in second else "Ann Lee")},
+    ]
+    with pytest.raises(ValueError, match="ambiguous mention @Ann"):
+        compose.resolve_mentions("@Ann hi", [*ROSTER, MOORE], GROUP, ME, picks=picks)
+    assert (
+        compose.resolve_mentions("@Ann Lee", [*ROSTER, MOORE], GROUP, ME, picks=picks)[0]["mri"]
+        == "8:orgid:ann"
+    )
+
+
+@pytest.mark.parametrize("text", ["@\u0301Ann and @Ann", "@Ann and @\u0301Ann", "@\u0301Ann and @\u0301Ann"])
+def test_a_mark_after_an_anchored_at_reads_as_compose_html_does(text: str) -> None:
+    """033 (C1 repro): a combining mark right after an `@`: the anchored pick reads there or not as the
+    resolver and compose_html agree, and the other `@Ann` keeps its own pick."""
+    ats = [i for i, c in enumerate(text) if c == "@"]
+    picks = [
+        {"at": ats[0], "mri": "8:orgid:ann", "forms": compose.forms("Ann Lee")},
+        {"at": ats[1], "mri": "8:orgid:moore", "forms": compose.forms("Ann Moore")},
+    ]
+    resolved = compose.resolve_mentions(text, [*ROSTER, MOORE], GROUP, ME, picks=picks)
+    _, props = compose_html(text, resolved, {}, full=True)
+    assert (
+        [p["mri"] for p in resolved]
+        == [e["mri"] for e in _mentions(props)]
+        == ["8:orgid:ann", "8:orgid:moore"]
+    )
+
+
+_ROÉ = {"mri": "8:orgid:roe", "name": "Bob Roé"}
+_H1 = [*LONGER, _ROÉ, {"mri": "8:orgid:twin", "name": "Ann Lee"}]  # Ann Lee's twin: same full name
+
+
+@pytest.mark.parametrize(
+    ("text", "pick", "want"),
+    [
+        ("@Ann Moore hi", ("8:orgid:ann", "Ann Lee"), "8:orgid:moore"),  # `Lee` retyped `Moore`
+        ("@Ann Lee Smith hi", ("8:orgid:ann", "Ann Lee"), "8:orgid:als"),  # a third word
+        ("@Lee Smith hi", ("8:orgid:ann", "Ann Lee"), "8:orgid:ls"),  # her last name, joined
+        ("@Ann Mooré hi", ("8:orgid:ann", "Ann Lee"), "8:orgid:moore"),  # with a combining mark
+        ("@{Ann Moore|x} hi", ("8:orgid:ann", "Ann Lee"), "8:orgid:moore"),  # a brace Who naming another
+        (
+            "@{Bob Roé|Bob} hi",
+            ("8:orgid:ann", "{Ann Lee|Bob Roé}"),
+            "8:orgid:roe",
+        ),  # a kept brace's Who edited
+        ("@Ann hi", ("8:orgid:ann", "Ann Lee"), "8:orgid:ann"),  # namesakes reading as far: the pick decides
+        ("@Ann hi", ("8:orgid:moore", "Ann Moore"), "8:orgid:moore"),
+        ("@Ann Lee hi", ("8:orgid:ann", "Ann Lee"), "8:orgid:ann"),
+        ("@{Ann|x} hi", ("8:orgid:moore", "Ann Moore"), "8:orgid:moore"),  # Who names both: the pick decides
+        (
+            "@{Ann Lee|x} hi",
+            ("8:orgid:twin", "Ann Lee"),
+            "8:orgid:twin",
+        ),  # twins' full name: the pick decides
+    ],
+)
+def test_a_pick_stands_down_where_another_member_reads_longer(
+    text: str, pick: tuple[str, str], want: str
+) -> None:
+    """033 review H1: an anchored `@` is its pick's while what follows is one of the pick's forms and no other
+    member reads longer there (at a brace: Who names no other member whole); else it reads as unpicked."""
+    picks = _anchored(text, pick)
+    if pick[1].startswith("{"):
+        picks[0]["forms"] = compose.forms("Ann Lee")
+    resolved = compose.resolve_mentions(text, _H1, GROUP, ME, picks=picks)
+    _, props = compose_html(text, resolved, {}, full=True)
+    assert [p["mri"] for p in resolved] == [e["mri"] for e in _mentions(props)] == [want]
+
+
+@pytest.mark.parametrize(
+    ("text", "kept"), [("@{Bob Roé|Bob Roé} hi", "{Bob Roé|Bob Roé}"), ("@{Ann Moore|x} hi", "{Ann Moore|x}")]
+)
+def test_a_kept_brace_given_back_unchanged_stays_the_messages_own(text: str, kept: str) -> None:
+    """033 review H1: a departed person's kept `{label|label}` whose label is a member's full name, or a kept
+    brace naming another member, saved unchanged: the message's own person, not the member it names."""
+    picks = [_pick_at(0, "8:orgid:gone", kept)]
+    assert [p["mri"] for p in compose.resolve_mentions(text, _H1, GROUP, ME, picks=picks)] == ["8:orgid:gone"]
+    edited = text.replace("|", "| ", 1)  # the same Who, the brace edited: no longer the copy's own
+    assert [p["mri"] for p in compose.resolve_mentions(edited, _H1, GROUP, ME, picks=picks)] != [
+        "8:orgid:gone"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "ats"),
+    [
+        ("hi @{x @{Bob Smith|Lee}", [3]),  # a valid brace is read whole: the `@` inside is its Who's
+        ("@{a @b|c} @d", [0, 10]),
+        ("@{x @y and @z", [0, 4, 11]),  # unclosed: no brace to skip, resolve_mentions refuses it
+    ],
+)
+def test_mention_ats_reads_a_brace_whole_as_resolve_mentions(text: str, ats: list[int]) -> None:
+    """033 review r7 L1: the `@`s anchors may sit on are those resolve_mentions reads, an `@` inside a
+    `{Who|label}` not among them."""
+    assert compose.mention_ats(text) == ats

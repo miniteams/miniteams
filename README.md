@@ -36,7 +36,8 @@ uv run miniteams chats --since 2026-07-01 --until 2026-07-10   # activity window
 uv run miniteams send "hello"     # send to your Notes (write-safe default)
 uv run miniteams send --thread 19:xxx@thread.v2 "hi"   # send to a conversation
 uv run miniteams send --thread 19:xxx@thread.v2 "@Ann Lee **ready** :fire:"   # rendered as the chat
-                                  # page's composer: markdown, :shortcode:, bare URLs, @mentions (below)
+                                  # page's composer: markdown, :shortcode:, bare URLs, @mentions by full,
+                                  # first or last name and @{Who|label} (below)
 uv run miniteams send --file msg.txt              # body from a file (rendered the same way)
 uv run miniteams send --file test.html --html     # raw RichText/Html, verbatim (no markdown, no @mentions)
 uv run miniteams send "look" --thread 19:xxx@thread.v2 --image a.png --image b.jpg  # inline images after the text
@@ -91,11 +92,13 @@ write to Teams as you; with `send_at` (ISO 8601 with an offset, 5 seconds to 125
 `send_message` schedules instead, and `list_scheduled`, `update_scheduled` and `cancel_scheduled`
 manage what Teams is holding (`docs/scheduled-send-wire.md`). Their text, like `miniteams send`'s
 without `--html`, is rendered as the chat page's composer does (spec 029): markdown, built-in
-`:shortcode:` emojis, bare URLs as links. `@Ann Lee` or `@ann` (a member's full or first name, case and
-accents ignored) mentions that member, shown as typed (`Ann Lee`, `Ann`); `@everyone` mentions a group
-chat; `\@` is a literal `@`, and an email or code is never a mention. A name matching nobody or
-several members, a roster that cannot be fetched, `@everyone` on a 1:1, more than 50 mentions or
-28 KB of HTML refuse the send (an MCP error, exit 2 for the CLI), nothing written. `--read-only` keeps every writing tool
+`:shortcode:` emojis, bare URLs as links. `@Ann Lee`, `@ann` or `@lee` (a member's full, first or last
+name, case and accents ignored, longest first) mentions that member, shown as the roster spells that form
+(`Ann Lee`, `Ann`, `Lee`); `@{Who|label}` mentions the member Who names (any of those forms, so the full
+name settles a shared one) shown as `label`, the whole `@{Who|label}` read raw, markup and all, up to its
+`}` (the last `|` splits; an empty label shows the full name; the label: one line, up to 200 characters, no `|` or `}`, no tab or other blank but the space, no control, format, private-use or unassigned character) (spec 033); `@everyone` mentions a group chat; `\@` is a literal `@`, and an email or code is never a mention. A name matching nobody or several members (`ambiguous
+mention @Lee: Ann Lee, Bob Lee (\@ for a literal @)`), a malformed label, a roster that cannot be fetched, `@everyone` on a 1:1,
+more than 50 mentions or 28 KB of HTML refuse the send (an MCP error, exit 2 for the CLI), nothing written. `--read-only` keeps every writing tool
 out of the list. Nothing needs a token until the
 API is called; a dead credential makes that call return a device-login URL and code, and `login` reports the
 same flow. The server needs the project's `.env` and `data/`, so register it as
@@ -239,8 +242,26 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   it, marks it read in Teams once the window is visible, focused and at the latest message, and the archive has caught
   up (no "loading latest messages…"); one `read` a second per chat, the last one sent only if all that still holds.
 - **Composer** (also the widget's quick reply): completes `:emoji` and `@member` (`@everyone` on group chats, not 1:1;
-  picked members are notified; a mention needs a non-word character before `@`, and two members with the same name map
-  in the order they were picked). Messages are limited to 28 KB and 50 mentions.
+  picked members are notified; a mention needs a non-word character before `@`; `@{` completes the Who of a free
+  label, the pick inserting `@{Ann Lee|Ann Lee}` with the label selected, or a plain `@Name` when no label can hold
+  the name). A pick stays on the `@` it was inserted at (spec 033): whatever the edit (selection deleted,
+  Ctrl+Backspace, a word changed in the middle) that
+  `@` is the picked person while what follows it is one of their forms, `@Ann Lee`, `@Ann` or `@Lee`, case and
+  accents ignored, so namesakes shortened to `@Ann` and `@Moore` keep their own; another name there, or a longer
+  one of someone else (`@Ann Moore` typed over `@Ann Lee`), reads as unpicked. Bold, italic or a list around it
+  keep the pick; deleting, replacing or pasting over the `@` drops it, and so does an undo. An `@Ann`, `@Lee`,
+  `@Ann Lee` or `@{Ann Lee|label}` with no pick is resolved on the chat's members as MCP does (spec 033, above):
+  ambiguous or unknown, the send is refused, the text back in the empty composer and the reason on its line.
+  Editing a message gives its plain `@word` back as `\@word`, so it stays text, and
+  each person mention braced: `@{Full Name|label}`, or `@{label|label}` when the full name is unknown (no
+  roster, or they left), one spelling per person. A message whose mention label no `{…}` can hold, or
+  whose namesakes stay spelled alike, is not offered for editing. In an edit, a brace with no pick (an undo,
+  or its Who edited) bearing a kept mention's label is that person's when its Who names them on the chat's
+  members and no one so labelled has left, or, naming no member, is the label or their name in the message
+  (one so labelled); else refused. Without the chat's members only `@{label|label}` is kept, any other Who is
+  `roster unavailable`. A brace with no kept label resolves on
+  the chat's members.
+  Messages are limited to 28 KB and 50 mentions.
   - A backslash keeps markup literal: `\*` `\_` `\~` `` \` `` `\[` `\@`, and on the chat page a line starting `\- ` `\* `
     `\> ` `\1. ` (or a line that is only `\>`); `\\` is one backslash before another backslash or one of those, or
     (chat page) before a line-start marker; any other backslash stays as typed (`\\srv\share`), and backslashes
@@ -259,7 +280,8 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
     or edits it in place (Enter resends, Escape cancels). On the chat page a failed message Teams echoes counts as
     sent and the rest goes on (the widget sees no echo: ↻ checks and finds it); a `sent` bubble whose echo never
     comes leaves after 30 s.
-  - Backspace after a picked full-name mention shortens it to the first name while keeping its recipient.
+  - Backspace after a picked full-name mention shortens it to the first name, a shortcut for one of the edits
+    above (a kept `@{…}` from an edit is never shortened).
   - Paste images (PNG, JPEG, GIF, WebP; up to 8, 10 MiB each, 40 MiB in all): thumbnails per chat, click to preview,
     × to drop; Enter sends them after the text, or alone. They upload to Teams only on send and live in the page:
     a reload drops them, the text draft stays. A failed or unanswered send may have gone out: ↻, or the unchanged
@@ -272,7 +294,8 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
     streams them to the local server, which spools them to unnamed temp files under `~/.cache/miniteams/uploads/`.
   - Widget: inline formatting.
   - Chat page: bold, italic, strike, code, lists, quotes through a toolbar or Ctrl+B / Ctrl+I, plus a preview of the message as posted.
-- **Messages**: hover for actions: reply with a quote, react, edit and delete your own. The picker shows 8 favorites
+- **Messages**: hover for actions: reply with a quote, react, edit and delete your own. A mention shows its
+  person's full name on hover when known (spec 033). The picker shows 8 favorites
   (default: Teams' 6 reactions plus 🙏 and 🙃) and `…`, which reacts with any emoji found by `:name`, the org's custom ones
   included. Set the favorites in ⚙ **Reactions**: click a slot to replace it, ◀ ▶ move the chosen slot, `Reset`; kept
   in this browser's `localStorage`. An emoji goes as Teams' name for it (`praying`) when it has one, else as its hex key

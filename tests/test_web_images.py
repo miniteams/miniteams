@@ -454,7 +454,7 @@ def _gated(board: W.Board, monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
 
 
 MENTION = {"name": "Ann Lee", "mri": "8:orgid:ann"}
-FIRST = {"send": B, "text": "@Ann Lee hi", "mentions": [MENTION], "cmid": "42"}
+FIRST = {"send": B, "text": "@Ann Lee hi", "mentions": [{**MENTION, "at": 0}], "cmid": "42"}
 RETRY = {**FIRST, "check": True}
 
 

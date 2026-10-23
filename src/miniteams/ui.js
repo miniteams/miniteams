@@ -492,7 +492,10 @@
     pop.setAttribute("role", "listbox");
     pop.onmousedown = (e) => e.preventDefault();  // its scrollbar too: a press there must not blur the input
     let comp = null, want = null, timer = 0, dismissed = -1;
-    const picked = new Map();  // chat id → ordered picks: repeated first names can have different recipients
+    // Spec 033: each pick anchored at the `@` it was inserted at, in the text it was last kept current with.
+    // The server reads that `@` as that person while one of their forms follows it, else as unpicked: an
+    // edit never moves a pick to another `@`, it can only drop it.
+    const picked = new Map();  // chat id → { text, picks: [{ name, mri, everyone?, at }] }
     const token = () => {
       const at = input.selectionStart;
       if (at !== input.selectionEnd) return null;
@@ -501,7 +504,11 @@
       // Emoji first: the member pattern's inner space would let `@ann :fi` read as one name.
       const before = input.value.slice(0, at), e = /(?:^|\s):([a-z0-9_+-]{2,})$/i.exec(before);
       const m = e || /(?:^|\s)@([^\s@]*(?: [^\s@]*)?)$/.exec(before);
-      return m && { kind: e ? "emoji" : "member", q: m[1], start: at - m[1].length - 1 };
+      if (!m) return null;
+      // `@{` asks for the Who of a free label until its `|` (spec 033).
+      const brace = !e && m[1].startsWith("{");
+      if (brace && /[|}]/.test(m[1])) return null;
+      return { kind: e ? "emoji" : "member", q: brace ? m[1].slice(1) : m[1], start: at - m[1].length - 1, brace };
     };
     const render = () => {
       pop.hidden = !comp;
@@ -549,52 +556,54 @@
     // The word the open list answers, or null once the caret left it.
     const word = () => { const t = token(); return t && t.start === comp.start && t.kind === comp.kind ? t : null; };
     const pick = (m) => ({ name: m.name, mri: m.mri, ...(m.everyone === true ? { everyone: true } : {}) });
-    // The server's mention rule (compose.py): `@` starts a word, not escaped by an odd run of `\`, the name
-    // ends one (Python's Unicode \w, or a mark), longest names first. The `@Name`s it would read, in order.
-    const scan = (text, names) => {
-      const alt = [...new Set(names.filter(Boolean))].sort((a, b) => [...b].length - [...a].length)
-        .map((n) => n.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")).join("|");
-      return alt ? [...text.matchAll(new RegExp(`(?<![\\p{L}\\p{N}_])(?<=(?:^|[^\\\\])(?:\\\\\\\\)*)@(${alt})(?![\\p{L}\\p{N}_\\p{M}])`, "gu"))].map((m) => m[1]) : [];
+    // A change of the text, the old `[a, b)` become the new `[a, caret)` (typed, pasted, deleted, Backspace
+    // before it): anchors before stay, after it shift, inside it go. The caret places the change, so `@a @a`
+    // losing its first `@a ` keeps the second's anchor. Only a change `beforeinput` announced, or one the page
+    // made itself (`own`, its markers shifting anchors as they say), is placed; an undo or any other drops them.
+    let from = null;  // where the selection began before the change under way, when `beforeinput` said
+    const track = (type, own = input.own) => {
+      const s = picked.get(chat()), now = input.value;
+      // An announced change whose text comes out the same (`@` typed over itself) still drops what it covers;
+      // an unannounced one (Chrome repeats an execCommand's input event) changes nothing.
+      if (!s || (s.text === now && from === null)) return;
+      const was = s.text, c = input.selectionEnd, d = now.length - was.length, b = c - d;
+      let a = 0;
+      for (const end = Math.min(c, b, from ?? Infinity); a < end && was[a] === now[a];) a++;
+      const ok = (own || from !== null) && !type.startsWith("history") && b >= 0 && b <= was.length && was.slice(b) === now.slice(c);
+      s.picks = !ok ? [] : own?.shift ? s.picks.map((p) => ({ ...p, at: own.shift(p.at) }))
+        : s.picks.flatMap((p) => (p.at < a ? [p] : p.at >= b ? [{ ...p, at: p.at + d }] : []));
+      s.text = now;
     };
     const insert = (t) => {
-      const it = comp.items[comp.active], member = comp.kind === "member", text = member ? `@${it.name} ` : it.custom ? `:${it.name}:` : it.char;
-      if (member) {
-        const id = chat();
-        picked.set(id, [...(picked.get(id) || []), pick(it)]);
-      }
+      const it = comp.items[comp.active], member = comp.kind === "member";
+      // The label starts as the name: one the label rule refuses (compose.plain_label, MAX_NAME), and @everyone, go in plain.
+      const brace = member && t.brace && !it.everyone && [...it.name].length <= 200 && !/[|}]|(?! )[\p{C}\p{Z}]/u.test(it.name);
+      const text = brace ? `@{${it.name}|${it.name}}` : member ? `@${it.name} ` : it.custom ? `:${it.name}:` : it.char;
+      const id = chat(), s = picked.get(id) || { text: input.value, picks: [] };
+      picked.set(id, s);
       close();
       if (member) dismissed = t.start;  // `@everyone ` + the next word must not ask `everyone t`…
       put(text, t.start, input.selectionStart, it);
-      if (member) picked.set(chat(), mentions(input.value));
+      track("insertReplacementText", true);  // a `put` no input event reported (setRangeText)
+      if (member) s.picks = [...s.picks.filter((p) => p.at !== t.start), { ...pick(it), at: t.start }];
+      if (brace) input.setSelectionRange(t.start + it.name.length + 3, t.start + text.length - 1);  // the label, to type over
       edited();
     };
     // Enter with the list open picks, never sends; true when the key was the list's. While a longer
     // prefix is still being asked, the list on screen answers a shorter one: Enter/Tab wait for it.
     const key = (e) => {
       if (e.isComposing || e.keyCode === 229) return false;
+      // Backspace right after a picked full name (and maybe a space) leaves its first name (spec 012): a
+      // shortcut, the pick stays anchored at its `@`. Not inside a longer word: `@Ann Leex` is no `@Ann Lee`.
       if (e.key === "Backspace" && !e.ctrlKey && !e.altKey && !e.metaKey && input.selectionStart === input.selectionEnd) {
-        const at = input.selectionStart, before = input.value.slice(0, at);
-        for (const m of [...(picked.get(chat()) || [])].reverse()) {
-          const first = m.name.split(/\s+/)[0];
-          if (m.everyone || first === m.name) continue;
-          const space = before.endsWith(`@${m.name} `) ? " " : "", start = at - m.name.length - 1 - space.length;
-          // Both ends on a word boundary, as `scan` reads a mention: `@Ann Leex` is no `@Ann Lee`.
-          if (!before.endsWith(`@${m.name}${space}`) || /[\p{L}\p{N}_]$/u.test(before.slice(0, start))
-            || !space && /^[\p{L}\p{N}_]/u.test(input.value.slice(at))) continue;
-          // Resolve occurrences before changing the label: namesakes must keep their own recipient.
-          const active = mentions(input.value), names = active.map((p) => p.name), seen = new Map();
-          const ordered = scan(input.value, names).map((name) => {
-            const matches = active.filter((p) => p.name === name), nth = seen.get(name) || 0;
-            seen.set(name, nth + 1);
-            return matches[Math.min(nth, matches.length - 1)];
-          });
-          // Inside a longer picked name (`@Ann Lee` of `@Ann Lee Smith`) the server reads that one.
-          if (scan(input.value.slice(start), names)[0] !== m.name) continue;
-          const pos = scan(input.value.slice(0, start), names).length;
-          ordered[pos] = pick({ ...ordered[pos], name: first });
-          picked.set(chat(), ordered);
-          close(); dismissed = start;
-          put(`@${first}${space}`, start, at); edited();
+        const at = input.selectionStart, text = input.value, space = text[at - 1] === " " ? 1 : 0;
+        const p = (picked.get(chat())?.text === text ? picked.get(chat()).picks : []).find((p) => !p.everyone && !p.name.startsWith("{")
+          && p.at + 1 + p.name.length === at - space && text.startsWith("@" + p.name, p.at));
+        const first = p?.name.split(/\s+/)[0].replace(/^[^\p{L}\p{N}_\p{M}]+|[^\p{L}\p{N}_\p{M}]+$/gu, "");
+        if (first && first !== p.name && (space || !/^[\p{L}\p{N}_\p{M}]/u.test(text.slice(at)))) {
+          close(); dismissed = p.at;
+          put(`@${first}${space ? " " : ""}`, p.at, at);
+          track("deleteContentBackward", true); edited();
           return true;
         }
       }
@@ -612,32 +621,78 @@
     };
     // Another chat or a reopened composer: a word dismissed before may be asked again.
     const reset = () => { dismissed = -1; close(); };
-    // Names, not offsets: of the picks under one name the last `count` stand, `count` its `@Name`s in the
-    // text; a pick deleted from the text then re-picked as a namesake must not take the n-th `@Name`.
+    // The picks to send with `text`, each with the offset of its `@` (UTF-16, JavaScript's own): none
+    // for a text the anchors were not kept current with, rather than anchors on the wrong `@`.
     const mentions = (text, id = chat()) => {
-      const all = picked.get(id) || [], count = new Map();
-      for (const name of scan(text, all.map((m) => m.name))) count.set(name, (count.get(name) || 0) + 1);
-      return all.filter((m, i) => all.slice(i + 1).filter((n) => n.name === m.name).length < (count.get(m.name) || 0));
+      const s = picked.get(id);
+      return s?.text !== text ? [] : s.picks.filter((p) => text[p.at] === "@").sort((x, y) => x.at - y.at).map((p) => ({ ...pick(p), at: p.at }));
     };
-    // Picks saved across a reload: data from sessionStorage, checked like any input.
-    const restore = (list, id = chat()) => {
-      const ok = list.filter((m) => m && typeof m.name === "string" && typeof m.mri === "string" && [undefined, true].includes(m.everyone));
-      picked.set(id, ok.map(pick));
+    // Picks back with the text they were sent or saved with (a draft, a failed message, an editor), each
+    // with its full identity and anchor; data from sessionStorage or the server, checked like any input.
+    const restore = (list, id = chat(), text = input.value) => {
+      const ok = list.filter((m) => m && typeof m.name === "string" && typeof m.mri === "string" && [undefined, true].includes(m.everyone)
+        && Number.isInteger(m.at));
+      picked.set(id, { text, picks: ok.map((m) => ({ ...pick(m), at: m.at })) });
     };
     // A sent text empties the composer without an input event: its dismissed word must not outlive it.
     const forget = (id) => { picked.delete(id); if (id === chat()) dismissed = -1; };
-    input.addEventListener("input", (e) => { if (!e.isComposing) lookup(); });
-    input.addEventListener("compositionend", lookup);
+    // An input method's composition is placed once, when it commits: the selection it started over, `[a, b)`,
+    // became `[a, b + delta)`, the text around unchanged and the caret at its end, or the anchors go.
+    let composing = null;
+    const settle = () => {
+      const s = picked.get(chat()), [a, b] = composing, now = input.value;
+      composing = null;
+      if (!s) return;
+      const was = s.text, d = now.length - was.length;
+      // The commit ends the span: a composition the browser placed elsewhere (its caret not there) is not placed.
+      const ok = b + d >= a && input.selectionEnd === b + d && was.slice(0, a) === now.slice(0, a) && was.slice(b) === now.slice(b + d);
+      s.picks = !ok ? [] : s.picks.flatMap((p) => (p.at < a ? [p] : p.at >= b ? [{ ...p, at: p.at + d }] : []));
+      s.text = now;
+    };
+    input.addEventListener("compositionstart", () => {
+      const s = picked.get(chat());
+      if (s && s.text !== input.value) { s.picks = []; s.text = input.value; }  // a write nobody tracked
+      composing = [input.selectionStart, input.selectionEnd];
+    });
+    input.addEventListener("beforeinput", () => {
+      if (composing) return;
+      const s = picked.get(chat());
+      if (s && s.text !== input.value) { s.picks = []; s.text = input.value; }  // a write nobody tracked
+      from = input.selectionStart;
+      setTimeout(() => { from = null; });  // its input comes in this task; a cancelled one's never does
+    });
+    input.addEventListener("input", (e) => {
+      if (composing && e.isComposing) return;  // placed at its compositionend
+      if (composing) {  // a composition that never said it ended: nothing places it
+        composing = null;
+        const s = picked.get(chat());
+        if (s) { s.picks = []; s.text = input.value; }
+      } else {
+        if (!e.isTrusted) from = null;  // a script's event announces nothing, whatever `beforeinput` came before
+        track(e.inputType || "");
+      }
+      from = null;
+      if (!e.isComposing) lookup();
+    });
+    input.addEventListener("compositionend", () => { if (composing) settle(); lookup(); });
     input.addEventListener("blur", close);
     return { mentions, restore, forget, answered, key, close, reset };
   };
 
   // execCommand keeps the edit in the textarea's undo history (Ctrl+Z); setRangeText would not.
   // Its `input` event runs the completion's lookup: an insert settles what it dismisses before calling.
-  const insertText = (input, text, a, b, selA, selB) => {
+  // `adds`: the [offset, length] spans `text` adds to `[a, b)` without changing it (markers, prefixes), which
+  // move a mention's anchor with its `@` (spec 033). The input event it causes is marked as the page's own.
+  const insertText = (input, text, a, b, selA, selB, adds = null) => {
     input.focus();
     input.setSelectionRange(a, b);
-    if (!document.execCommand("insertText", false, text)) input.setRangeText(text, a, b);
+    input.own = { shift: adds && ((at) => at + adds.reduce((n, [pos, len]) => n + (pos <= at ? len : 0), 0)) };
+    try {
+      if (!document.execCommand("insertText", false, text)) {
+        input.setRangeText(text, a, b);
+        input.dispatchEvent(new InputEvent("input", { inputType: "insertText" }));
+      }
+    } finally { input.own = null; }
     input.setSelectionRange(selA, selB);
   };
 
@@ -657,30 +712,33 @@
         // Whole lines: from the start of the first one to the end of the last (a trailing newline ends it).
         const from = v.lastIndexOf("\n", a - 1) + 1, end = b > a && v[b - 1] === "\n" ? b - 1 : b;
         const nl = v.indexOf("\n", end), to = nl < 0 ? v.length : nl;
-        const lines = v.slice(from, to).split("\n").map((l) => (fmt === "list" ? "- " : "> ") + l).join("\n");
-        put(lines, from, to, from, from + lines.length);
+        const old = v.slice(from, to).split("\n"), lines = old.map((l) => (fmt === "list" ? "- " : "> ") + l).join("\n");
+        const adds = old.map((l, i) => [from + old.slice(0, i).reduce((n, x) => n + x.length + 1, 0), 2]);
+        put(lines, from, to, from, from + lines.length, adds);
       } else if (fmt === "code" && sel.includes("\n")) {
         // A fence only opens and closes on a line of its own.
         const pre = a && v[a - 1] !== "\n" ? "\n" : "", post = b < v.length && v[b] !== "\n" ? "\n" : "";
         const text = pre + "```\n" + sel + "\n```" + post;
-        put(text, a, b, a, a + text.length);
+        put(text, a, b, a, a + text.length, [[a, pre.length + 4], [b, post.length + 4]]);
       } else if (!sel) {
         const m = MARK[fmt];
-        put(m + m, a, b, a + m.length, a + m.length);
+        put(m + m, a, b, a + m.length, a + m.length, [[a, 2 * m.length]]);
       } else {
         // The server never closes a marker across lines, nor one with a space inside it: each line gets
         // its own pair, inside its list or quote prefix, around its text without the surrounding spaces.
-        const m = MARK[fmt], atLineStart = !a || v[a - 1] === "\n";
-        let inner = null;
+        const m = MARK[fmt], atLineStart = !a || v[a - 1] === "\n", adds = [];
+        let inner = null, at = a;  // `at`: where the line being wrapped starts in the text
         const text = sel.split("\n").map((l, i) => {
           const p = i || atLineStart ? /^\s*(?:(?:[-*]|\d+\.|>) +)*/.exec(l)[0] : "";
-          const [, lead, body, tail] = /^(\s*)(.*?)(\s*)$/.exec(l.slice(p.length));
+          const [, lead, body, tail] = /^(\s*)(.*?)(\s*)$/.exec(l.slice(p.length)), open = at + p.length + lead.length;
+          at += l.length + 1;
           if (!body) return l;
+          adds.push([open, m.length], [open + body.length, m.length]);
           inner ??= [p.length + lead.length + m.length, body.length];
           return p + lead + m + body + m + tail;
         }).join("\n");
         const one = inner && !sel.includes("\n");  // one line: its text stays selected, inside the markers
-        put(text, a, b, one ? a + inner[0] : a, one ? a + inner[0] + inner[1] : a + text.length);
+        put(text, a, b, one ? a + inner[0] : a, one ? a + inner[0] + inner[1] : a + text.length, adds);
       }
       close();
       edited();
@@ -973,6 +1031,8 @@
     };
     // The send in flight, its attempt and images, back on its item: sent again, it goes with its id and the check.
     const hold = (id, e) => { const f = imgs.recall(id); if (f) Object.assign(e, { sent: { cmid: f.cmid, json: f.json }, images: Promise.resolve(f.items) }); };
+    // A mention the server refused (spec 033: ambiguous, unknown…, said with compose.py's `\@` hint) is
+    // the text's to fix: it goes back into the empty composer, its reason on the chat's line.
     const fail = (id, text) => {
       if (!busy(id)) return;
       const q = of(id), e = q.list[0];
@@ -981,6 +1041,7 @@
       q.paused = true;
       for (const x of q.list.slice(1)) x.state = "paused";
       changed(id);
+      if (text.endsWith(" (\\@ for a literal @)") && back(id, e)) note(id, "not sent: " + text);
     };
     // No answer will come once the socket drops, and the message may have gone out: it waits at the head,
     // queued, and goes again with its id and the check once the socket is back (`wake`).
@@ -1003,16 +1064,25 @@
     const wake = () => { for (const id of [...queues.keys()]) pump(id); };
     // Into the page's empty composer, its images too: the queue stays paused until the composer sends it
     // (back at its place) or Enter on the emptied box drops it. Else an editor in the item.
-    const edit = (id, e) => {
+    const back = (id, e) => {
+      if (!took(id, e)) return false;
       const q = of(id);
-      if (!took(id, e)) { e.editing = e.verb.text; changed(id); return; }
       q.list = q.list.filter((x) => x !== e);
       e.images.then((items) => imgs.back(id, items, e.sent));
       changed(id);
+      return true;
     };
+    const edit = (id, e) => { if (!back(id, e)) { e.editing = e.verb.text; changed(id); } };
     // An edit sent from the item: a changed text is a new message (its old id's echo is not its own), an
-    // unchanged one a retry.
-    const resend = (id, e, text) => { if (text !== e.verb.text) { e.verb = { ...e.verb, text }; e.cmid = undefined; } retry(id, e); };
+    // unchanged one a retry. That editor tracks no anchors (spec 033): picks before the first change stay.
+    const resend = (id, e, text) => {
+      if (text !== e.verb.text) {
+        let a = 0;
+        while (text[a] !== undefined && text[a] === e.verb.text[a]) a++;
+        e.verb = { ...e.verb, text, mentions: e.verb.mentions.filter((m) => m.at < a) }; e.cmid = undefined;
+      }
+      retry(id, e);
+    };
     const LABEL = { queued: "queued", sending: "sending…", paused: "paused", sent: "sent" };
     const button = (label, title, act) => {
       const b = el("button", null, label);
@@ -1073,9 +1143,10 @@
     // Data from sessionStorage, checked like any input: a malformed entry is dropped, never thrown on.
     // The verb is kept as parsed, so an unchanged message serialises to its attempt's `json` again.
     const str = (v) => typeof v === "string", keys = (o, ok) => !!o && typeof o === "object" && !Array.isArray(o) && Object.keys(o).every((k) => ok.includes(k));
-    const pick = (m) => keys(m, ["name", "mri", "everyone"]) && str(m.name) && str(m.mri) && [undefined, true].includes(m.everyone);
+    const pick = (m) => keys(m, ["name", "mri", "everyone", "at"]) && str(m.name) && str(m.mri) && [undefined, true].includes(m.everyone)
+      && Number.isInteger(m.at) && m.at >= 0;
     const verbOk = (v, id) => keys(v, ["send", "text", "mentions", "format", "quote"]) && v.send === id && str(v.text) && str(v.format)
-      && Array.isArray(v.mentions) && v.mentions.every(pick) && (v.quote === undefined || Array.isArray(v.quote) && v.quote.every(str));
+      && Array.isArray(v.mentions) && (v.quote === undefined || Array.isArray(v.quote) && v.quote.every(str));
     const LOST = "attachments not kept across the reload: add them again";
     // `only`: the chats to take (null: all), the others' queues stay stored.
     const load = (only = null) => {
@@ -1093,11 +1164,14 @@
           if (!verbOk(it?.verb, id)) continue;
           pics ||= it.pics === true;
           if (!it.verb.text.trim()) continue;
-          const sent = /^\d+$/.test(it.sent?.cmid) && str(it.sent.json) ? { cmid: it.sent.cmid, json: it.sent.json } : undefined;
+          // A pick that is not one (saved before anchors, spec 033) is left out, never its message: that
+          // `@` then resolves on the roster, or the send is refused. Its attempt stays its own, check and all.
+          const verb = { ...it.verb, mentions: it.verb.mentions.filter(pick) }, same = verb.mentions.length === it.verb.mentions.length;
+          const sent = /^\d+$/.test(it.sent?.cmid) && str(it.sent.json) ? { cmid: it.sent.cmid, json: same ? it.sent.json : JSON.stringify(verb) } : undefined;
           const quotes = (Array.isArray(it.quotes) ? it.quotes : []).filter((qt) => str(qt?.id)).map((qt) => ({ id: qt.id, name: String(qt.name ?? ""), line: String(qt.line ?? "") }));
           // A failed head waits for its ↻ ✎ ✕ again. `cmid`: its echo may land before the resend.
           const why = q.paused && !q.list.length && str(it.why) ? it.why : undefined;
-          q.list.push({ verb: it.verb, quotes, sent, cmid: sent?.cmid, pics: false, images: Promise.resolve([]),
+          q.list.push({ verb, quotes, sent, cmid: sent?.cmid, pics: false, images: Promise.resolve([]),
             ...(why !== undefined ? { state: "failed", why } : { state: q.paused ? "paused" : "queued" }) });
         }
         if (!q.list.length) q.paused = false;

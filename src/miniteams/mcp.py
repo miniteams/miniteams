@@ -807,8 +807,11 @@ TOOLS: tuple[Tool, ...] = (
         "send_message",
         "Post a message to a chat as you, now or at `send_at` (Teams holds it until then). Get "
         "the chat id from find_chats; `48:notes` is your own Notes. Markdown and :shortcode: render as in "
-        "the chat page; `@Full Name` or `@First` mentions a member (`@everyone` the chat), `\\@` is a "
-        "literal @. A name matching no member, or several (listed), is refused: nothing is sent.",
+        "the chat page; `@Full Name`, `@First` or `@Last` mentions a member (`@everyone` the chat), "
+        "`@{Who|label}` mentions the member Who names (any of those forms) shown as `label`, read raw up "
+        "to its `}` (the label: one line, no `|` or `}`, no tab or other blank but the space, no control, "
+        "format, private-use or unassigned character; empty: the full name), `\\@` is a literal @. "
+        "A name matching no member, or several (listed), is refused: nothing is sent.",
         {
             "thread_id": {"type": "string"},
             "text": {"type": "string"},

@@ -1112,8 +1112,9 @@ _RICH = "**b** _i_ ~~s~~ `c` [l](https://example.invalid/) @Ann Lee 😀\n- one\
 async def test_edit_round_trips_the_message_less_a_dropped_quote(
     board: W.Board, chat: Pages, data_dir: Path, calls: list[tuple[Any, ...]]
 ) -> None:
-    """019-AC4 + 019-AC6: the editor opens on the composer's markdown of the message, its mention picked,
-    its reply quote as a chip; ✕ drops the quote and the saved message is the same one without it."""
+    """019-AC4 + 019-AC6: the editor opens on the composer's markdown of the message, its mention picked
+    (braced, spec 033), its reply quote as a chip; ✕ drops the quote and the saved message is the same one
+    without it."""
     content, props = compose.compose_html(_RICH, [{"name": "Ann Lee", "mri": ANN}], {}, full=True)
     assert props is not None
     quote_html = compose.reply_quote(_m("1", _at(1), "<p>hello there</p>"), "Ann Lee")
@@ -1121,7 +1122,7 @@ async def test_edit_round_trips_the_message_less_a_dropped_quote(
     page = await chat.open(_chat(T))
     await _handled(page, "history")
     box = await _edit(page, "9")
-    assert await box.input_value() == _RICH
+    assert await box.input_value() == _RICH.replace("@Ann Lee", "@{Ann Lee|Ann Lee}")
     chip = page.locator('[data-id="9"] .editbox .quote')
     assert await chip.all_inner_texts() == ["Ann Lee\nhello there\n✕"]
     await chip.locator("button").click()

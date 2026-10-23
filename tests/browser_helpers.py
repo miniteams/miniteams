@@ -32,6 +32,9 @@ from playwright.async_api import (  # noqa: E402
     async_playwright,
 )
 
+from miniteams import chat_verbs as CV  # noqa: E402
+from miniteams.compose import compose_html, resolve_mentions  # noqa: E402
+
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
     "1f15c4890000000d49444154789c63000100000500010d0a2db40000000049454e44ae426082"  # pragma: allowlist secret
@@ -396,6 +399,27 @@ async def open_fake(
     return page
 
 
+def server_reads(verb: dict[str, Any], members: list[dict[str, Any]]) -> list[str] | str:
+    """The MRIs the server mentions, in text order, for a page's `send` verb with `members` in the chat (spec
+    033): parsed, anchored and resolved as a send does it; the refusal when it refuses."""
+    request = CV.parse_send(verb)
+    if isinstance(request, str):
+        return request
+    people = [m for m in members if not m.get("everyone")]
+    picks = list(request.mentions)
+    anchored = CV._anchored_picks(request.thread, CV._humans(people), picks, [None] * len(picks))
+    if isinstance(anchored, str):
+        return anchored
+    try:
+        got = resolve_mentions(
+            request.text, people, request.thread, "8:orgid:me", full=request.full, picks=anchored
+        )
+    except ValueError as exc:
+        return str(exc)
+    _, props = compose_html(request.text, got, {}, full=request.full)
+    return [m["mri"] for m in json.loads(props["mentions"])] if props else []
+
+
 async def pick_namesakes(fake: Fake, picks: list[int]) -> Any:
     """`@ann` picks the n-th of two namesakes for each n in `picks`, the text cleared before every pick
     but the first; Enter sends. The mentions sent."""
@@ -413,7 +437,7 @@ async def pick_namesakes(fake: Fake, picks: list[int]) -> Any:
         await box.press("Enter")
     await box.press("Enter")
     await wait(lambda: len(fake.of("send")) == 1)
-    return fake.of("send")[0]["mentions"]
+    return server_reads(fake.of("send")[0], fake.members)
 
 
 async def pick_out_of_order(fake: Fake) -> Any:
@@ -431,7 +455,7 @@ async def pick_out_of_order(fake: Fake) -> Any:
     assert await box.input_value() == "hi @Ann Lee @Bob Roe "
     await box.press("Enter")
     await wait(lambda: len(fake.of("send")) == 1)
-    return fake.of("send")[0]["mentions"]
+    return server_reads(fake.of("send")[0], fake.members)
 
 
 async def pick_then_glue(fake: Fake) -> Any:
@@ -448,4 +472,4 @@ async def pick_then_glue(fake: Fake) -> Any:
     assert await box.input_value() == "@Ann Leeds"
     await box.press("Enter")
     await wait(lambda: len(fake.of("send")) == 1)
-    return fake.of("send")[0]["mentions"]
+    return server_reads(fake.of("send")[0], fake.members)
