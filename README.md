@@ -235,8 +235,8 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
 - **Images**: served from the archive's `media/` folder, else fetched from Teams by `web` (memory only, never written
   to the archive; archives run with `--no-media` or without `images` in `--media` show theirs this way). One the page cannot load yet is retried
   for about 30 s, then reads `[image not archived]`. A Giphy GIF (spec 031) shows inline too: the archived copy
-  (`giphy-<id>.<ext>`), else fetched from Giphy by `web` (no token), else loaded by the page from Giphy itself (no
-  referrer), else the link below. Any other external image is a link to it, `[image: <alt>]` (`[image not archived]`
+  (`giphy-<id>.<ext>`), else fetched from Giphy by `web` (no token), else loaded by the page from Giphy itself at once
+  (no referrer), else the link below. Any other external image is a link to it, `[image: <alt>]` (`[image not archived]`
   without alt; the text alone inside a link): the page loads no other external image.
 - **Mark read in Teams when shown** (⚙, on by default): a chat opened, and each message from someone else landing in
   it, marks it read in Teams once the window is visible, focused and at the latest message, and the archive has caught

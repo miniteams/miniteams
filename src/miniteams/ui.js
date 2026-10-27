@@ -6,7 +6,8 @@
   const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
   // A /media image not served yet (archiver a moment behind, Teams slow) is asked again for about 30 s,
   // then said. Delegated, in capture: `error` does not bubble, and the CSP forbids inline handlers.
-  // A Giphy GIF (spec 031) then tries Giphy itself, then reads as the link to it.
+  // A Giphy GIF (spec 031) then tries Giphy itself, then reads as the link to it; one the web fetched
+  // live (`?giphy=`) goes there at once: the web's failure memo outlives the retries.
   const MEDIA_RETRY_MS = [1000, 3000, 7000, 19000];
   const giphyLink = (img) => {
     const alt = img.alt.trim(), text = alt ? `[image: ${alt}]` : "[image not archived]";
@@ -22,7 +23,7 @@
     if (giphy && src === giphy) { img.replaceWith(giphyLink(img)); return; }
     if (!src.startsWith("/media/")) return;
     const n = Number(img.dataset.retry || 0);
-    if (n >= MEDIA_RETRY_MS.length) {
+    if (n >= MEDIA_RETRY_MS.length || (giphy && src.includes("?giphy="))) {
       if (!giphy) { img.replaceWith("[image not archived]"); return; }
       img.src = giphy;
       return;
