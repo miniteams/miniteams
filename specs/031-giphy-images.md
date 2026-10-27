@@ -33,8 +33,10 @@ The `[image: <alt>]` link stays as the last fallback when none loads.
   fetches `https://<giphy host>/<path>` server-side: host rebuilt from an allowlist, never a page URL
   passed through; image types only (gif, webp, png, jpeg), size cap, the #69 concurrency, deadline
   and failure memo. No cookies or token on the request. Nothing written to the archive.
-- **Browser (A).** CSP `img-src` gains `https://*.giphy.com`; when `/media` fails after the #69
-  retries, the image switches to the Giphy URL with no referrer (page-wide `Referrer-Policy: no-referrer`), then to the link.
+- **Browser (A).** CSP `img-src` gains `https://*.giphy.com`; when `/media` fails (the live
+  fetch at once, as its failure memo would answer the #69 retries; the archived copy after them), the
+  image switches to the Giphy URL with no referrer (page-wide `Referrer-Policy: no-referrer`), then
+  to the link.
 - **Render.** A Giphy `<img>` renders as an `<img>` (width/height/alt kept), not as the link.
 - **Animated Teams GIFs.** When several archived files share an object id (`.gif` and `.full.png`),
   `/media` serves the animated one first (`.gif`, then other originals, `.full.*` last), whatever the

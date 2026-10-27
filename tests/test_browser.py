@@ -466,11 +466,44 @@ async def test_giphy_images_show_inline_from_the_archive_and_the_web(
     assert asked == [_giphy(live)]
 
 
+async def test_archived_giphy_retries_the_archive_before_giphy(
+    board: W.Board, chat: Pages, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """031-AC2: an archived Giphy copy the archive fails to serve once is asked again, Giphy never is."""
+    chat_dir = find_chat_dir(data_dir, T)
+    assert chat_dir is not None
+    (chat_dir / "media" / f"giphy-{GIPHY_ID}.gif").write_bytes(GIF)
+    served, calls = CV.ChatVerbs.media_file, []
+
+    def flaky(self: CV.ChatVerbs, path: str) -> tuple[bytes, str] | None:
+        calls.append(path)
+        return served(self, path) if len(calls) > 1 else None  # the archive drops the first read
+
+    asked: list[str] = []
+
+    async def giphy(route: Route) -> None:
+        asked.append(route.request.url)
+        await route.abort()
+
+    async def prepare(context: BrowserContext) -> None:
+        await context.route("https://media2.giphy.com/**", giphy)
+
+    page = await chat.open(_chat(T), csp=True, prepare=prepare)
+    await _handled(page, "follow")
+    await page.clock.install()
+    monkeypatch.setattr(CV.ChatVerbs, "media_file", flaky)
+    await board.on_event(_event("NewMessage", T, **_m("4", _at(4), f'<p><img src="{_giphy(GIPHY_ID)}"></p>')))
+    await until(page, "document.querySelector(`[data-id='4'] img[data-retry='1']`)")
+    await page.clock.run_for(1000)
+    await until(page, _SHOWN.format(4))
+    assert asked == []
+
+
 @pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
 async def test_giphy_falls_back_to_giphy_then_to_the_link(
     board: W.Board, chat: Pages, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """031-AC4: /media failing past its retries, the page loads Giphy's own copy without a referrer (its zoom
+    """031-AC4: /media failing, the page loads Giphy's own copy at once, without a referrer (its zoom
     too); when Giphy fails too, the `[image: <alt>]` link (new tab, noopener) shows."""
     monkeypatch.setattr(CV, "giphy_image", lambda client, url: asyncio.sleep(0))  # the web cannot fetch it
     asked: list[tuple[str, str | None]] = []
@@ -493,10 +526,8 @@ async def test_giphy_falls_back_to_giphy_then_to_the_link(
     imgs = f'<img src="{_giphy(ok)}" alt="yes">' + f'<img src="{_giphy(bad)}" alt="no &lt;b&gt;">'
     await board.on_event(_event("NewMessage", T, **_m("4", _at(4), f"<p>{imgs}</p>")))
     shown = page.locator('[data-id="4"] .html')
-    for n in (1, 2, 3, 4):
-        await until(page, f"document.querySelectorAll(`[data-id='4'] img[data-retry='{n}']`).length === 2")
-        await page.clock.run_for(20000)
-    await until(page, _SHOWN.format(4))
+    await until(page, _SHOWN.format(4))  # the installed clock never runs: no retry timer stands between
+    assert await page.locator("[data-retry]").count() == 0
     await shown.locator("a").wait_for()
     img = shown.locator("img")
     assert await img.count() == 1 and await img.get_attribute("src") == _giphy(ok)
