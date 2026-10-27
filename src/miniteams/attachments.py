@@ -42,7 +42,7 @@ LIVE_HOST_RE = re.compile(r"[a-z0-9-]{1,63}\.asyncgw\.teams\.microsoft\.com")
 # The view a page may name: a pasted GIF's `imgo` is a still, its message references the animated view.
 LIVE_VIEW_RE = re.compile(r"[a-z0-9_]{1,40}")
 _LIVE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
-_LIVE_MAX = 10 * 1024 * 1024
+_LIVE_MAX = 25 * 1024 * 1024
 # Giphy GIFs (spec 031): fetched with no token, so any of its media hosts; whole netloc, no port or userinfo.
 _GIPHY_HOST_RE = re.compile(r"media[0-9]*\.giphy\.com|i\.giphy\.com")
 # `/media/[v1.<blob>/]<id>/<rendition>.<ext>`, or i.giphy.com's `/<id>.<ext>`: no `..`, no other file type.
