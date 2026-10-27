@@ -294,7 +294,9 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
     streams them to the local server, which spools them to unnamed temp files under `~/.cache/miniteams/uploads/`.
   - Widget: inline formatting.
   - Chat page: bold, italic, strike, code, lists, quotes through a toolbar or Ctrl+B / Ctrl+I, plus a preview of the message as posted.
-- **Messages**: hover for actions: reply with a quote, react, edit and delete your own. A mention shows its
+- **Messages**: hover for actions: reply with a quote, react, edit and delete your own. Right-click a message (or
+  the Menu key / Shift+F10 on a focused one) for the same actions in a menu, plus Copy text when it has text (without
+  reply quotes, secure context only like 🔗); a link, an image or selected text keeps the browser's own menu (spec 034). A mention shows its
   person's full name on hover when known (spec 033). The picker shows 8 favorites
   (default: Teams' 6 reactions plus 🙏 and 🙃) and `…`, which reacts with any emoji found by `:name`, the org's custom ones
   included. Set the favorites in ⚙ **Reactions**: click a slot to replace it, ◀ ▶ move the chosen slot, `Reset`; kept
