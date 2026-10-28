@@ -90,7 +90,7 @@ from .receipts import EVENT as RECEIPT_EVENT
 from .receipts import Receipts
 from .sections import Sections
 from .send import mark_read, set_alerts
-from .stream import run_forever
+from .stream import LinkState, run_forever
 
 log = structlog.get_logger()
 
@@ -672,6 +672,8 @@ class Board:
         self.token = secrets.token_urlsafe(24)  # single use: `/auth` trades it for the cookie
         self.publish: Callable[[str], bool] | None = None  # a new token into web.json, set by serve_board
         self.clients: set[ServerConnection] = set()
+        self.pages: set[ServerConnection] = set()  # every socket, board or chat: all show the Teams link
+        self.link: LinkState = "down"  # the stream's Teams session (spec 036)
         self.busy = busy  # the page shows a spinner until the background fill says otherwise
         self.seed = seed or {}
         self.data_dir = data_dir
@@ -1425,6 +1427,13 @@ class Board:
         """Every page, board or chat: the same person's dots change everywhere at once."""
         broadcast(self.clients | self._authors.keys(), self.presence_frame())
 
+    def set_link(self, state: LinkState) -> None:
+        if state == self.link:
+            return  # every keepalive reports "up"
+        log.info("teams_link", state=state)
+        self.link = state
+        broadcast(self.pages, json.dumps({"link": state}))
+
     async def handle(self, ws: ServerConnection) -> None:
         # A chat page (`/ws?chat`) only needs its own chat: the board's rows reach it only once it
         # asks (`board`, split layout).
@@ -1432,7 +1441,9 @@ class Board:
         board_page = "chat" not in query
         if board_page:
             self.clients.add(ws)
+        self.pages.add(ws)
         try:
+            await ws.send(json.dumps({"link": self.link}))
             if board_page:
                 await ws.send(self.payload())
                 if self.presence is not None:
@@ -1452,6 +1463,7 @@ class Board:
                 await self._dispatch(ws, key, verb)
         finally:
             self.clients.discard(ws)
+            self.pages.discard(ws)
             self._follows.pop(ws, None)
             if self.receipts is not None:
                 self.receipts.retain({tid for tid, _ in self._follows.values()})
@@ -1953,6 +1965,7 @@ async def run(
                 on_gap=board.on_gap,
                 on_session=presence.on_session,
                 on_presence=presence.on_presence,
+                on_link=board.set_link,
             )
         )
         emojis = asyncio.create_task(board.emojis.refresh())

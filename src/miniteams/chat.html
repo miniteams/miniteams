@@ -132,8 +132,6 @@
   #mpop li { display: flex; align-items: center; gap: 8px; padding: 3px 6px; }
   #mpop .mav { flex: none; width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; font-size: 10px; font-weight: 650; color: #fff; }
   #mpop .none { color: var(--dim); padding: 3px 6px; }
-  #status { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); flex: none; }
-  #status.off { background: var(--hot); box-shadow: 0 0 0 3px color-mix(in srgb, var(--hot) 25%, transparent); }
   .btn { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 3px 10px; cursor: pointer; color: var(--dim); font-size: 12.5px; white-space: nowrap; }
   a.btn { text-decoration: none; }
   .btn:disabled, a.btn:not([href]) { opacity: .5; cursor: default; }
@@ -342,12 +340,12 @@
   <h1 id="label" class="truncate">…</h1>
   <span id="members" role="button" aria-expanded="false" aria-controls="mpop" tabindex="0" hidden></span>
   <div id="mpop" role="region" aria-label="chat members" tabindex="0" hidden></div>
-  <span id="status" class="off" title="connecting…"></span>
   <input id="find" type="search" placeholder="search · Enter" aria-label="search this chat">
   <a id="teams" class="btn" role="link" target="_blank" rel="noopener" title="open this chat in Teams" aria-label="Open in Teams" aria-disabled="true"><span class="full">Open in Teams</span><span class="icon" aria-hidden="true">↗</span></a>
   <div class="cog" id="cog"><button id="gear" title="settings" aria-label="settings" aria-controls="settings" aria-expanded="false">⚙</button></div>
   <div id="hits" hidden></div>
 </header>
+<div id="banner" role="status"></div>
 <div id="pane">
   <!-- tabindex -1: Firefox would make the scroller a Tab stop of its own, next to the thread's. -->
   <div id="list" tabindex="-1"><div id="note">loading…</div><div id="msgs" role="feed" aria-label="messages"></div><div id="outq" hidden></div></div>
@@ -379,13 +377,13 @@
 </div>
 <script>
 (() => {
-  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn itemKey itemOf rowActions sectionList caret firstLine completion insertText formatBar imageQueue sendQueue
+  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn itemKey itemOf rowActions sectionList linkBanner caret firstLine completion insertText formatBar imageQueue sendQueue
   /* ui.js */
   let thread = null;
   try { thread = decodeURIComponent(location.pathname.slice("/chat/".length)); } catch (e) {}
   const $list = document.getElementById("list"), $msgs = document.getElementById("msgs"), $note = document.getElementById("note"),
         $label = document.getElementById("label"), $members = document.getElementById("members"),
-        $status = document.getElementById("status"), $teams = document.getElementById("teams"),
+        $teams = document.getElementById("teams"), banner = linkBanner(document.getElementById("banner")),
         $typing = document.getElementById("typing"), $reply = document.getElementById("reply"), $err = document.getElementById("err"),
         $quotes = document.getElementById("quotes"), $latest = document.getElementById("latest"), $lag = document.getElementById("lag"),
         $find = document.getElementById("find"), $hits = document.getElementById("hits"), $outq = document.getElementById("outq");
@@ -2009,7 +2007,7 @@
   const connect = () => {
     ws = dial("/ws?chat");
     ws.onopen = () => {
-      $status.title = "live"; $status.classList.remove("off");
+      banner.opened();
       send({ follow: thread });
       if (split) send({ board: true });
       authorsSent = ""; authorsSoon();  // a new socket starts with no authors on the server
@@ -2019,6 +2017,7 @@
       const m = JSON.parse(e.data);
       if (m.rows) { onBoard(m); return; }
       if (m.presence) { paintPresence(m.presence); return; }
+      if ("link" in m) { banner.link(m.link); return; }
       // Relayed frames name their chat: those of a chat left since (split) are dropped.
       if ("thread" in m && m.thread !== thread) return;
       if ("receipts" in m) {
@@ -2045,7 +2044,7 @@
       else if ("sent" in m) onSent(m);
     };
     ws.onclose = () => {
-      $status.title = "disconnected"; $status.classList.add("off");
+      banner.closed();
       typing.clear(); renderTyping();
       for (const b of asks.splice(0)) b.lost();
       sends.lost();

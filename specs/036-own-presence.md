@@ -27,8 +27,8 @@ Reset status).
   - page ↔ `web` socket closed: "Disconnected from miniteams, reconnecting…";
   - `web` ↔ Teams (Trouter) down, reconnecting: "Teams connection lost, reconnecting…";
   - sign-in expired (`web` waits for a login): "Teams sign-in expired: run `miniteams login`".
-  The page-socket state shows after a 2 s grace (a reload or a quick server restart does not flash
-  it); the Teams states show as `web` reports them. The banner clears itself on recovery.
+  Any of them shows once it has lasted 2 s (a reload, a quick server restart or `web`'s own Teams
+  reconnect after a restart does not flash it); recovery hides the banner at once.
 - **Teams link state.** `web` tracks its Trouter session (connected / reconnecting / login needed)
   and sends it to every page on connect and on change.
 - **Own presence read.** My MRI joins the followed people of the presence collector (spec 015):
@@ -68,7 +68,8 @@ Reset status).
       3 s; restarting `web` clears it without a manual reload. A page reload while `web` runs does
       not show it.
 - [ ] **AC4** When `web`'s Trouter session drops, every connected page shows "Teams connection lost,
-      reconnecting…" until the next session is connected; a page opened meanwhile shows it at once.
+      reconnecting…" until the next session is connected; a page opened meanwhile shows it after the
+      same 2 s grace.
 - [ ] **AC5** When `web` waits for a login (refresh token dead), pages show the sign-in banner;
       a `miniteams login` clears it once the session reconnects.
 - [ ] **AC6** My own dot shows my current availability with the spec 015 colours and label; it
@@ -134,5 +135,6 @@ None.
 - Live spike and tests may flip the real status briefly, restored after each run (babs, 2026-10-28).
 - Both pages get the banner and the selector, the dot's place in each header — because the dot
   lives in both today.
-- 2 s grace before the page-socket banner — so reloads and quick restarts do not flash it.
+- 2 s grace before any banner — so reloads, quick restarts and `web`'s first Teams connect do not
+  flash it.
 - No MCP/CLI command — not asked; a later spec if wanted.

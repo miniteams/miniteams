@@ -1152,11 +1152,11 @@ async def test_a_longer_word_leaves_the_first_name_mention(fake: Fake) -> None:
     assert await pick_then_glue(fake) == [ANN["mri"]]
 
 
-# Delays of 1 s and more (the reconnect backoff) are recorded and run at once: the test reads the
-# backoff without waiting it out.
+# Redial delays (`setTimeout(connect, …)`) are recorded and run at once: the test reads the backoff
+# without waiting it out.
 DELAYS = """(() => { const real = window.setTimeout; window.__delays = [];
   window.setTimeout = (f, ms, ...a) => {
-    if (ms >= 1000) { window.__delays.push(ms); ms = 0; }
+    if (f.name === "connect") { window.__delays.push(ms); ms = 0; }  // redials only, not the banner's grace
     return real(f, ms, ...a);
   };
 })();"""

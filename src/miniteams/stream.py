@@ -15,7 +15,7 @@ import json
 import os
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import structlog
@@ -47,6 +47,9 @@ GapHook = Callable[[str], Awaitable[None]]  # events may have been missed; arg =
 AliveHook = Callable[[], Awaitable[None]]  # the socket is up: at connect and on every keepalive
 SessionHook = Callable[[str, str], Awaitable[None]]  # (endpoint id, surl) of a registered socket
 PresenceHook = Callable[[dict[str, Any]], Awaitable[None]]  # a decoded presence delivery body
+# The Teams session: up, down (reconnecting) or login (waiting for a `miniteams login`).
+LinkState = Literal["up", "down", "login"]
+LinkHook = Callable[[LinkState], None]
 
 
 def _correlation_vector() -> str:
@@ -377,6 +380,7 @@ async def run_forever(
     wait_for_login: bool = False,
     on_session: SessionHook | None = None,
     on_presence: PresenceHook | None = None,
+    on_link: LinkHook | None = None,
 ) -> None:
     """Re-establish a full session on every disconnect.
 
@@ -394,6 +398,20 @@ async def run_forever(
         tokens.acquire()
     else:
         tokens.refresh()  # silent only: a watch owns stdout and cannot show a device code
+
+    def link(state: LinkState) -> None:
+        if on_link is None:
+            return
+        try:
+            on_link(state)
+        except Exception as exc:  # noqa: BLE001 — a page note must not stop the session loop
+            log.warning("link_hook_failed", error=str(exc), error_type=type(exc).__name__)
+
+    async def alive() -> None:
+        link("up")  # called once registered, then on every keepalive
+        if on_alive is not None:
+            await on_alive()
+
     backoff = 1.0
     while True:
         connected_at: float | None = None
@@ -423,7 +441,7 @@ async def run_forever(
                     typing,
                     on_event,
                     on_gap,
-                    on_alive,
+                    on_alive=alive,
                     on_session=on_session,
                     on_presence=on_presence,
                 ).run()
@@ -441,6 +459,7 @@ async def run_forever(
             log.error("auth_expired", error=str(exc), waiting_for_login=wait_for_login)
             if not wait_for_login:
                 return
+            link("login")
             await _wait_for_login(settings)  # the next refresh rereads the rewritten cache (_sync_cache)
             log.info("login_detected")
             backoff = 1.0
@@ -450,6 +469,7 @@ async def run_forever(
 
         if connected_at is not None and time.monotonic() - connected_at > _STABLE_AFTER:
             backoff = 1.0
+        link("down")
         log.info("reconnecting", in_seconds=round(backoff, 1))
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, _BACKOFF_MAX)

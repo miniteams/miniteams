@@ -95,6 +95,38 @@
     let ms = 1000;
     return { next: () => { const d = ms; ms = Math.min(ms * 2, 30000); return d; }, reset: () => { ms = 1000; } };
   };
+  // Spec 036: the worst connection problem, under the header. Any new problem shows once it has lasted 2 s,
+  // so a reload or a quick server restart does not flash it; recovery hides it at once.
+  const BANNER_GRACE_MS = 2000;
+  const BANNER = {
+    page: () => ["Disconnected from miniteams, reconnecting…"],
+    login: () => ["Teams sign-in expired: run ", el("code", null, "miniteams login")],
+    down: () => ["Teams connection lost, reconnecting…"],
+  };
+  // Hidden by emptying, never `hidden`: a live region must stay in the tree for its new text to be announced.
+  const linkBanner = (box) => {
+    let open = false, link = null, timer = null, shown = null;  // link: the server's last word on this socket
+    // "unknown": reopened, the server's link frame not in yet; it keeps whatever shows.
+    const problem = () => !open ? "page" : link === null ? "unknown"
+      : link === "login" || link === "down" ? link : null;
+    const show = (p) => { if (p !== shown) { shown = p; box.replaceChildren(...(p ? BANNER[p]() : [])); } };
+    const update = () => {
+      const p = problem();
+      if (p === "unknown") return;
+      if (!p || p === shown) { clearTimeout(timer); timer = null; show(p); return; }
+      timer ??= setTimeout(() => {
+        timer = null;
+        const q = problem();
+        if (q && q !== "unknown") show(q);
+      }, BANNER_GRACE_MS);
+    };
+    update();
+    return {
+      opened: () => { open = true; update(); },
+      closed: () => { open = false; link = null; update(); },  // while away the Teams link is unknown
+      link: (state) => { link = state; update(); },
+    };
+  };
 
   // Board rows, the widget's list and the chat page's split list alike.
   // Parse, don't compare strings: Teams stamps 7 fraction digits, the server's mention time 3.

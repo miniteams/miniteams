@@ -321,3 +321,90 @@ async def test_run_forever_waits_for_a_login_when_asked(
     with pytest.raises(asyncio.CancelledError):
         await S.run_forever(settings, directory=directory, wait_for_login=True)
     assert len(calls) == 2 and next(stamps) == (2, 2, 2)  # one refresh before the wait, one after it
+
+
+def _link_loop(monkeypatch, *refreshes: Any, exchanges: list[Any]) -> list[int]:
+    """run_forever on scripted tokens and exchanges, sessions that report alive twice, no backoff wait."""
+    tokens = _Tokens(*refreshes)
+    monkeypatch.setattr(
+        S,
+        "token_source",
+        lambda _s: type("T", (), {"acquire": lambda self: None, "refresh": lambda self: tokens.refresh()})(),
+    )
+
+    def exchange(*_a: Any) -> Any:
+        out = exchanges.pop(0)
+        if isinstance(out, BaseException):
+            raise out
+        return out
+
+    monkeypatch.setattr(S, "exchange_skype_token", exchange)
+    monkeypatch.setattr(S, "force_blocking_stdout", lambda: None)
+    monkeypatch.setattr(S, "get_or_create_epid", lambda *_a: "epid")
+    monkeypatch.setattr(S, "trouter_info", lambda *_a: {})
+    monkeypatch.setattr(S, "handshake", lambda *_a: "sid")
+    stamps = iter([(1,), (2,), (2,), (2,)])
+    monkeypatch.setattr(S, "cache_stamp", lambda _s: next(stamps))
+    monkeypatch.setattr(S, "_LOGIN_POLL", 0.0)
+    real_sleep = asyncio.sleep
+
+    async def no_backoff(_delay: float) -> None:
+        await real_sleep(0)
+
+    monkeypatch.setattr(S.asyncio, "sleep", no_backoff)
+    sessions: list[int] = []
+
+    class _Client:
+        def __init__(self, *_a: Any, on_alive: Any, **_kw: Any) -> None:
+            self.alive = on_alive
+
+        async def run(self) -> None:
+            sessions.append(1)
+            await self.alive()  # registered
+            await self.alive()  # a keepalive
+
+    monkeypatch.setattr(S, "TrouterClient", _Client)
+    return sessions
+
+
+async def test_run_forever_reports_the_teams_link(
+    settings: Settings, directory: Directory, monkeypatch
+) -> None:
+    """036-AC4/AC5: up once registered, down when the session ends or a connect fails, login while it
+    waits for one."""
+    from miniteams.auth import AuthExpired
+
+    aad = {"access_token": "A", "id_token": "I"}
+    st = {"skype_token": "ST", "expires_in": 3600}
+    _link_loop(
+        monkeypatch,
+        aad,
+        aad,
+        AuthExpired("dead"),
+        aad,
+        exchanges=[st, RuntimeError("authz down"), st, asyncio.CancelledError()],
+    )
+    states: list[str] = []
+    with pytest.raises(asyncio.CancelledError):
+        await S.run_forever(settings, directory=directory, wait_for_login=True, on_link=states.append)
+    assert states == ["up", "up", "down", "down", "login", "up", "up", "down"]
+
+
+async def test_a_failing_link_hook_does_not_stop_the_loop(
+    settings: Settings, directory: Directory, monkeypatch
+) -> None:
+    """036-AC4: the hook raising is logged; the sessions go on."""
+    import structlog
+
+    aad = {"access_token": "A", "id_token": "I"}
+    st = {"skype_token": "ST", "expires_in": 3600}
+    sessions = _link_loop(monkeypatch, aad, exchanges=[st, st, asyncio.CancelledError()])
+
+    def broken(_state: str) -> None:
+        raise ValueError("page gone")
+
+    with structlog.testing.capture_logs() as logs, pytest.raises(asyncio.CancelledError):
+        await S.run_forever(settings, directory=directory, on_link=broken)
+    assert len(sessions) == 2
+    failed = [e for e in logs if e["event"] == "link_hook_failed"]
+    assert len(failed) == 6 and failed[0]["error_type"] == "ValueError"  # 2 × (up, up, down)

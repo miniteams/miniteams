@@ -12,7 +12,7 @@
   button { font: inherit; color: inherit; }
   .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 
-  header { position: sticky; top: 0; z-index: 2; background: color-mix(in srgb, var(--bg) 85%, transparent); backdrop-filter: blur(10px);
+  header { position: sticky; top: 0; z-index: 3; background: color-mix(in srgb, var(--bg) 85%, transparent); backdrop-filter: blur(10px);
     padding: 10px 16px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid var(--line); }
   h1 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -.01em; white-space: nowrap; }
   .seg { display: inline-flex; background: var(--panel-2); border-radius: 10px; padding: 3px; gap: 2px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
@@ -26,7 +26,7 @@
     border: 0; border-radius: 10px; padding: 4px 8px; }
   #q::placeholder { color: var(--faint); }
   #q:focus { outline: 2px solid var(--accent-soft); }
-  /* Narrow widget window: title, filter, dot and ⚙ on one line, the tabs on a full-width second one. */
+  /* Narrow widget window: title, filter and ⚙ on one line, the tabs on a full-width second one. */
   @media (max-width: 640px) {
     header { flex-wrap: wrap; gap: 6px 8px; padding: 8px 10px; }
     header > .seg { order: 1; flex-basis: 100%; }
@@ -35,9 +35,8 @@
   .name mark { background: var(--accent-soft); color: var(--accent); border-radius: 4px; padding: 0 2px; }
   li.sel { outline: 2px solid var(--accent); outline-offset: -2px; }
   /* Arrowing up scrolls the row to the viewport top, which the sticky header covers. */
-  li { scroll-margin-top: var(--hdr, 90px); }
-  #status { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); flex: none; }
-  #status.off { background: var(--hot); box-shadow: 0 0 0 3px color-mix(in srgb, var(--hot) 25%, transparent); }
+  li { scroll-margin-top: var(--hdr, 90px); }  /* --hdr: header and banner, --head: the header alone */
+  #banner { position: sticky; top: var(--head, 0); z-index: 2; }  /* stays in sight with the header */
 
   ul { list-style: none; margin: 8px; padding: 0; display: grid; gap: 2px; }
   li { display: grid; grid-template-columns: 40px minmax(0,1fr) auto; gap: 2px 10px; padding: 9px 10px; border-radius: 12px; align-items: center; position: relative; }
@@ -115,19 +114,19 @@
   <div class="seg" id="tabs"></div>
   <input id="q" type="search" placeholder="filter" autocomplete="off" spellcheck="false" aria-label="filter chats by name">
   <div class="seg" id="mode" role="group" aria-label="arrange chats" hidden></div>
-  <span id="status" title="connecting…"></span>
   <div class="cog" id="cog"><button id="gear" title="options">⚙</button></div>
 </header>
+<div id="banner" role="status"></div>
 <ul id="rows"></ul>
 <span id="say" class="sr" aria-live="polite"></span>
 <div id="empty" hidden>nothing yet</div>
 <div id="spin" class="spin" hidden title="loading the live list…"></div>
 <script>
 (() => {
-  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn itemKey itemOf rowActions sectionList caret firstLine completion insertText formatBar imageQueue sendQueue
+  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn itemKey itemOf rowActions sectionList linkBanner caret firstLine completion insertText formatBar imageQueue sendQueue
   /* ui.js */
   const $rows = document.getElementById("rows"), $empty = document.getElementById("empty"),
-        $status = document.getElementById("status"), $tabs = document.getElementById("tabs"),
+        $tabs = document.getElementById("tabs"), $banner = document.getElementById("banner"),
         $cog = document.getElementById("cog"), $gear = document.getElementById("gear"),
         $q = document.getElementById("q"), $say = document.getElementById("say"),
         $spin = document.getElementById("spin"), $mode = document.getElementById("mode"),
@@ -189,6 +188,15 @@
     }
   };
 
+  // The header wraps with the width and the banner comes and goes: rows scroll in under both.
+  const measure = new ResizeObserver(() => {
+    const root = document.documentElement.style, h = $header.getBoundingClientRect().height;  // fractional: no seam
+    root.setProperty("--head", h + "px");
+    root.setProperty("--hdr", h + $banner.getBoundingClientRect().height + "px");
+  });
+  measure.observe($header, { box: "border-box" });
+  measure.observe($banner, { box: "border-box" });
+  const banner = linkBanner($banner);
   const renderHeader = () => {
     const c = counts();
     $tabs.replaceChildren(...Object.entries(TABS).map(([k, lbl]) => {
@@ -196,7 +204,6 @@
       b.append(el("b", null, c[k])); b.onclick = () => { tab = k; keep("tab", k); render(); }; return b;
     }));
     secs.paint($mode);
-    document.documentElement.style.setProperty("--hdr", $header.offsetHeight + "px");
     $cog.classList.toggle("open", menuOpen);
     $cog.querySelector(".menu")?.remove();
     if (!menuOpen) return;
@@ -451,7 +458,7 @@
   const retry = backoff();
   const connect = () => {
     ws = dial("/ws");
-    ws.onopen = () => { retry.reset(); $status.title = "live"; $status.classList.remove("off"); };
+    ws.onopen = () => { retry.reset(); banner.opened(); };
     ws.onmessage = (e) => {
       const msg = JSON.parse(e.data);
       // A newer widget.html on the server (restart, edit): this page is stale, reload it.
@@ -463,11 +470,12 @@
       if ("busy" in msg) { busy = !!msg.busy; $spin.hidden = !busy; }
       if (msg.rows) { rows = msg.rows; live = !busy; secs.set(msg.sections); render(); publish(); news(); }
       if (msg.presence) paintPresence(msg.presence);
+      if ("link" in msg) banner.link(msg.link);
       if (msg.complete) complete.answered(msg);
       if (msg.sent) { if (msg.ok) sends.done(msg.sent); else sends.fail(msg.sent, msg.unsure ? UNSURE : msg.error || "not sent"); }
     };
     ws.onclose = () => {
-      $status.title = "disconnected"; $status.classList.add("off");
+      banner.closed();
       live = false; before = null; publish();
       sends.lost();
       setTimeout(connect, retry.next());  // server restarts → page recovers alone

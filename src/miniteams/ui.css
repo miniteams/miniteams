@@ -22,6 +22,12 @@
       --shadow: 0 1px 2px #00000066, 0 6px 20px #00000055;
     }
   }
+  /* The connection banner (spec 036): in the flow under the header, wrapping in the narrow widget. */
+  #banner { flex: none; padding: 4px 12px; font-size: 12.5px; color: var(--text); overflow-wrap: anywhere;
+    background: color-mix(in srgb, var(--hot) 14%, var(--bg)); border-bottom: 1px solid var(--hot); }
+  #banner code { font: 12px ui-monospace, monospace; }
+  #banner:empty { padding: 0; border: 0; }
+  body:has(> #signin) #banner { display: none; }  /* signed out: the sign-in alert says more */
   #signin { position: fixed; inset: 0 0 auto 0; z-index: 10; padding: 8px 12px; background: var(--hot); color: #fff; font-size: 13px; }
   .switch { appearance: none; width: 32px; height: 18px; border-radius: 99px; background: var(--line); position: relative; cursor: pointer; transition: background .15s; margin: 0; }
   .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: left .15s; box-shadow: 0 1px 2px #0003; }
