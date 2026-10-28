@@ -217,11 +217,20 @@ watches the token cache file).
 - A dot on the avatar of 1:1 rows (widget and split list) and of message authors: green available, red busy or
   do-not-disturb, amber away, grey ring offline. Hover: `Availability · Activity` (e.g. `Busy · In a meeting`).
 - Unknown presence (no answer, `PresenceUnknown`, refused subscription) shows no dot, never Offline.
-- Followed: the peers of the 50 newest 1:1 rows plus the authors an open chat page shows (50 per page, 100 people in all).
+- Followed: you, the peers of the 50 newest 1:1 rows, and the authors an open chat page shows (50 per page, 100 people in all).
 - Native presence service + `web`'s own Trouter socket, no Graph; re-subscribed on every reconnect and every 10 min.
-  Two periods (20 min) without a confirmation and the dots go. The collector publishes nothing of your own presence.
+  Two periods (20 min) without a confirmation and the dots go. The collector never publishes your own presence
+  by itself: only a pick in the status menu sets it.
 - Latest states are cached in `~/.cache/miniteams/presence.sqlite3` (local disk, `0600`): after a restart they show
   at once, faded and `(unconfirmed)`, until the service confirms them. Delete the file anytime; it is regenerated.
+
+**My status** (spec 036)
+- Your own dot sits in the header of the widget and the chat page; unknown is a dashed empty ring. Click it (or
+  Enter, Space, ↓) for the Teams status menu: Available, Busy, Do not disturb, Be right back, Appear away, Appear
+  offline, then Reset status, which lifts a forced status. The forced one is checked.
+- `web` sets it on the native presence service (`PUT /v1/me/forceavailability/`), once, no retry; the dot changes
+  when Teams confirms it. A failure shows "status not changed: <reason>" under the dot. Teams' own expiry applies
+  (Busy and Do not disturb 1 day, Available, Be right back and Away 7 days, Appear offline never).
 
 ### Chat page
 

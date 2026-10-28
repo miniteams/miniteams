@@ -3747,6 +3747,7 @@ def test_the_board_takes_every_chat_verb_from_chat_verbs(board: W.Board) -> None
         "dm",  # spec 023: my 1:1 with a sender
         "open",
         "authors",  # spec 015: a chat page's authors, for their presence
+        "setpresence",  # spec 036: my own status, picked in a page's header
     ]
 
 

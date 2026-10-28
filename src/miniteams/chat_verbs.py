@@ -1012,7 +1012,8 @@ class ChatVerbs:
             **acts,
         }
 
-    def _background(self, work: Coroutine[Any, Any, None]) -> None:
+    def background(self, work: Coroutine[Any, Any, None]) -> None:
+        """Run `work` off the socket loop, kept referenced until done; the board uses it too (spec 036)."""
         task = asyncio.create_task(work)
         self._replies.add(task)
         task.add_done_callback(self._replies.discard)
@@ -1042,35 +1043,35 @@ class ChatVerbs:
             if isinstance(request, SendRequest) and (request.images or request.files)
             else None
         )
-        self._background(answer(ws, _head_send(verb), self.send_answer(ws, verb, frames)))
+        self.background(answer(ws, _head_send(verb), self.send_answer(ws, verb, frames)))
 
     async def _on_act(self, action: Action, ws: ServerConnection, verb: dict[str, Any]) -> None:
         # An HTTP round trip, like send: the page's other verbs must not queue behind it.
         acted = functools.partial(self.act_answer, ws, action, verb)
         head = _head_act(action, verb)
-        self._background(answer(ws, head, self._one_at_a_time(ws, head, acted, self._action_busy)))
+        self.background(answer(ws, head, self._one_at_a_time(ws, head, acted, self._action_busy)))
 
     async def _on_editable(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
         # Reads the server's copy (maybe an API round trip); its own slot: a pending save never blocks it.
         opened = functools.partial(self.editable_answer, ws, verb)
         head = _head_editable(verb)
-        self._background(answer(ws, head, self._one_at_a_time(ws, head, opened, self._editable_busy)))
+        self.background(answer(ws, head, self._one_at_a_time(ws, head, opened, self._editable_busy)))
 
     async def _on_history(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
         # The API fallback is a network round trip: the page's other verbs must not wait.
         paged = functools.partial(self.history_answer, verb)
         head = _head_history(verb)
-        self._background(answer(ws, head, self._one_at_a_time(ws, head, paged, self._history_busy)))
+        self.background(answer(ws, head, self._one_at_a_time(ws, head, paged, self._history_busy)))
 
     async def _on_search(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
         # Reads the whole chat in a worker thread: one search per socket.
         found = functools.partial(self.search_answer, verb)
         head = _head_search(verb)
-        self._background(answer(ws, head, self._one_at_a_time(ws, head, found, self._search_busy)))
+        self.background(answer(ws, head, self._one_at_a_time(ws, head, found, self._search_busy)))
 
     async def _on_complete(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
         # A roster fetch is a network round trip: the page's typing must not wait on it.
-        self._background(answer(ws, _head_complete(verb), self.complete_answer(ws, verb)))
+        self.background(answer(ws, _head_complete(verb), self.complete_answer(ws, verb)))
 
     async def _on_preview(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
         await reply(ws, self.preview_answer(verb))
@@ -1916,7 +1917,7 @@ class ChatVerbs:
             if following():  # the page moved on: its next follow asks again
                 await reply(ws, {"members": thread_id, **frame})
 
-        self._background(push())
+        self.background(push())
 
     def _emoji_items(self, prefix: str) -> list[dict[str, Any]]:
         keys = self.emojis.keys

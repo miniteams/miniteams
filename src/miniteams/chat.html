@@ -35,8 +35,9 @@
   #back:hover { background: var(--panel-2); color: var(--text); }
   #menu, #teams .icon { display: none; }
   /* Narrow chat column: the header keeps one line, the label keeps room to be read. Breakpoints measured:
-     the full header needs ~596px with a long label, the compact one ~387px (~350 tightened). */
+     the full header needs ~636px with a long label, the compact one ~425px (~385 tightened). */
   @container (max-width: 639px) {
+    header { gap: 10px; }  /* room for my status button (spec 036) at 400px */
     #teams .full, #members { display: none; }
     #teams .icon { display: inline; }
     #find { width: 8em; }
@@ -340,6 +341,7 @@
   <h1 id="label" class="truncate">…</h1>
   <span id="members" role="button" aria-expanded="false" aria-controls="mpop" tabindex="0" hidden></span>
   <div id="mpop" role="region" aria-label="chat members" tabindex="0" hidden></div>
+  <div id="own"></div>
   <input id="find" type="search" placeholder="search · Enter" aria-label="search this chat">
   <a id="teams" class="btn" role="link" target="_blank" rel="noopener" title="open this chat in Teams" aria-label="Open in Teams" aria-disabled="true"><span class="full">Open in Teams</span><span class="icon" aria-hidden="true">↗</span></a>
   <div class="cog" id="cog"><button id="gear" title="settings" aria-label="settings" aria-controls="settings" aria-expanded="false">⚙</button></div>
@@ -377,7 +379,7 @@
 </div>
 <script>
 (() => {
-  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn itemKey itemOf rowActions sectionList linkBanner caret firstLine completion insertText formatBar imageQueue sendQueue
+  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn itemKey itemOf rowActions sectionList linkBanner ownStatus caret firstLine completion insertText formatBar imageQueue sendQueue
   /* ui.js */
   let thread = null;
   try { thread = decodeURIComponent(location.pathname.slice("/chat/".length)); } catch (e) {}
@@ -488,6 +490,7 @@
   addEventListener("storage", () => { applyPrefs(); renderRows(); });  // the widget tab changed theme or avatars
 
   const send = (obj) => { if (!(ws && ws.readyState === 1)) return false; ws.send(JSON.stringify(obj)); return true; };
+  const own = ownStatus(document.getElementById("own"), send);
   // Same shape as web.deep_link's https form.
   const CTX = encodeURIComponent('{"contextType":"chat"}');
   const teamsLink = (msgId) => msgId
@@ -2007,7 +2010,7 @@
   const connect = () => {
     ws = dial("/ws?chat");
     ws.onopen = () => {
-      banner.opened();
+      banner.opened(); own.opened();
       send({ follow: thread });
       if (split) send({ board: true });
       authorsSent = ""; authorsSoon();  // a new socket starts with no authors on the server
@@ -2016,8 +2019,9 @@
     ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
       if (m.rows) { onBoard(m); return; }
-      if (m.presence) { paintPresence(m.presence); return; }
+      if (m.presence) { paintPresence(m.presence); own.paint(m.self); return; }
       if ("link" in m) { banner.link(m.link); return; }
+      if ("setpresence" in m) { own.answered(m); return; }
       // Relayed frames name their chat: those of a chat left since (split) are dropped.
       if ("thread" in m && m.thread !== thread) return;
       if ("receipts" in m) {
@@ -2044,7 +2048,7 @@
       else if ("sent" in m) onSent(m);
     };
     ws.onclose = () => {
-      banner.closed();
+      banner.closed(); own.closed();
       typing.clear(); renderTyping();
       for (const b of asks.splice(0)) b.lost();
       sends.lost();

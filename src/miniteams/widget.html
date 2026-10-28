@@ -114,6 +114,7 @@
   <div class="seg" id="tabs"></div>
   <input id="q" type="search" placeholder="filter" autocomplete="off" spellcheck="false" aria-label="filter chats by name">
   <div class="seg" id="mode" role="group" aria-label="arrange chats" hidden></div>
+  <div id="own"></div>
   <div class="cog" id="cog"><button id="gear" title="options">⚙</button></div>
 </header>
 <div id="banner" role="status"></div>
@@ -123,7 +124,7 @@
 <div id="spin" class="spin" hidden title="loading the live list…"></div>
 <script>
 (() => {
-  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn itemKey itemOf rowActions sectionList linkBanner caret firstLine completion insertText formatBar imageQueue sendQueue
+  // ui.js defines store keep q pref el hue initials wsUrl signIn dial backoff isSeen mentioned kind rowTitle ago foldText filters named marked mentionLine preview likeTitle focusIn itemKey itemOf rowActions sectionList linkBanner ownStatus caret firstLine completion insertText formatBar imageQueue sendQueue
   /* ui.js */
   const $rows = document.getElementById("rows"), $empty = document.getElementById("empty"),
         $tabs = document.getElementById("tabs"), $banner = document.getElementById("banner"),
@@ -196,7 +197,7 @@
   });
   measure.observe($header, { box: "border-box" });
   measure.observe($banner, { box: "border-box" });
-  const banner = linkBanner($banner);
+  const banner = linkBanner($banner), own = ownStatus(document.getElementById("own"), send);
   const renderHeader = () => {
     const c = counts();
     $tabs.replaceChildren(...Object.entries(TABS).map(([k, lbl]) => {
@@ -458,7 +459,7 @@
   const retry = backoff();
   const connect = () => {
     ws = dial("/ws");
-    ws.onopen = () => { retry.reset(); banner.opened(); };
+    ws.onopen = () => { retry.reset(); banner.opened(); own.opened(); };
     ws.onmessage = (e) => {
       const msg = JSON.parse(e.data);
       // A newer widget.html on the server (restart, edit): this page is stale, reload it.
@@ -469,13 +470,14 @@
       if ("me" in msg) meName = msg.me || "";
       if ("busy" in msg) { busy = !!msg.busy; $spin.hidden = !busy; }
       if (msg.rows) { rows = msg.rows; live = !busy; secs.set(msg.sections); render(); publish(); news(); }
-      if (msg.presence) paintPresence(msg.presence);
+      if (msg.presence) { paintPresence(msg.presence); own.paint(msg.self); }
       if ("link" in msg) banner.link(msg.link);
+      if ("setpresence" in msg) own.answered(msg);
       if (msg.complete) complete.answered(msg);
       if (msg.sent) { if (msg.ok) sends.done(msg.sent); else sends.fail(msg.sent, msg.unsure ? UNSURE : msg.error || "not sent"); }
     };
     ws.onclose = () => {
-      banner.closed();
+      banner.closed(); own.closed();
       live = false; before = null; publish();
       sends.lost();
       setTimeout(connect, retry.next());  // server restarts → page recovers alone

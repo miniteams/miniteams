@@ -66,6 +66,7 @@ from .chat_verbs import (
     index_label,
     io,
     name_activity,
+    reply,
     stuck_archive_threads,
 )
 from .chats import fetch_conversations, is_meeting, is_private, last_activity
@@ -85,7 +86,7 @@ from .messages import (
     snippet,
     thread_of,
 )
-from .presence import Presence, dm_ids, dm_peer, open_cache, person
+from .presence import FORCE, Presence, dm_ids, dm_peer, open_cache, person
 from .receipts import EVENT as RECEIPT_EVENT
 from .receipts import Receipts
 from .sections import Sections
@@ -690,6 +691,7 @@ class Board:
         self.presence: Presence | None = None  # set by run(); None = no dots
         self.receipts: Receipts | None = None  # set by run(); None = no read receipts
         self._authors: dict[ServerConnection, list[str]] = {}  # chat socket → authors it shows
+        self._forcing = False  # a status pick in flight (spec 036), board-wide: no older one lands last
         self.emojis = EmojiCache(directory)
         self.chat = ChatVerbs(
             directory,
@@ -716,6 +718,7 @@ class Board:
             "dm": self._on_dm,
             "open": self._on_open,
             "authors": self._on_authors,
+            "setpresence": self._on_setpresence,
         }
         # Dispatch order: a verb carrying several keys is handled as the first one listed.
         self._handlers: dict[str, Handler] = {**board_first, **self.chat.handlers(), **board_last}
@@ -723,6 +726,7 @@ class Board:
         self._accepts: dict[str, Callable[[Any], bool]] = {
             "board": lambda value: value is True,
             "authors": lambda value: isinstance(value, list),
+            "setpresence": lambda value: True,  # a bad value gets a refusal, not silence
         }
         self._accepts |= dict.fromkeys(ANY_VALUE, lambda value: True)
         self._seen: dict[str, str] = _load_seen(seen_path)
@@ -1411,21 +1415,22 @@ class Board:
     # --- presence (spec 015) ---
 
     def _follow_presence(self) -> None:
-        """Peers of the newest 1:1 rows, plus the authors every chat page shows."""
+        """Me (the header dot, spec 036), peers of the newest 1:1 rows, the authors every chat page shows."""
         if self.presence is None:
             return
         newest = sorted(self.rows.values(), key=lambda r: str(r.get("last_activity") or ""), reverse=True)
         peers = (p for r in newest if (p := dm_peer(r["id"], self.me)))
         authors = (m for shown in self._authors.values() for m in shown)
-        followed = dict.fromkeys([*itertools.islice(peers, _PRESENCE_PEERS), *authors])
+        mine = [p] if (p := person(self.me)) else []
+        followed = dict.fromkeys([*mine, *itertools.islice(peers, _PRESENCE_PEERS), *authors])
         self.presence.want(itertools.islice(followed, _PRESENCE_MAX))
 
     def presence_frame(self) -> str:
         return json.dumps(self.presence.frame() if self.presence else {"presence": {}})
 
     def broadcast_presence(self) -> None:
-        """Every page, board or chat: the same person's dots change everywhere at once."""
-        broadcast(self.clients | self._authors.keys(), self.presence_frame())
+        """Every page, board or chat: the same person's dots change everywhere at once, my header dot too."""
+        broadcast(self.pages, self.presence_frame())
 
     def set_link(self, state: LinkState) -> None:
         if state == self.link:
@@ -1446,8 +1451,8 @@ class Board:
             await ws.send(json.dumps({"link": self.link}))
             if board_page:
                 await ws.send(self.payload())
-                if self.presence is not None:
-                    await ws.send(self.presence_frame())
+            if self.presence is not None:
+                await ws.send(self.presence_frame())  # every page shows my own dot (spec 036)
             async for raw in ws:
                 if isinstance(raw, bytes):
                     self.chat.frame(ws, raw)
@@ -1556,6 +1561,28 @@ class Board:
         self._follow_presence()
         with contextlib.suppress(ConnectionClosed):
             await ws.send(self.presence_frame())
+
+    async def _on_setpresence(self, ws: ServerConnection, verb: dict[str, Any]) -> None:
+        # An HTTP round trip: in the background, like a send, so the page's other verbs do not wait.
+        value = verb["setpresence"]
+        head = {"setpresence": value}
+        if not (isinstance(value, str) and value in FORCE):
+            log.info("presence_set_refused", reason="value")
+            await reply(ws, {**head, "ok": False, "error": "unknown status"})
+        elif self.presence is None:
+            await reply(ws, {**head, "ok": False, "error": "presence unavailable"})
+        elif self._forcing:
+            await reply(ws, {**head, "ok": False, "error": "busy"})
+        else:
+            self._forcing = True
+            self.chat.background(answer(ws, head, self._force(self.presence, value)))
+
+    async def _force(self, presence: Presence, value: str) -> dict[str, Any]:
+        try:
+            error = await presence.force(value)
+        finally:
+            self._forcing = False
+        return {"setpresence": value, "ok": not error, **({"error": error} if error else {})}
 
 
 def parse_open(verb: dict[str, Any]) -> tuple[OpenTarget, str]:
@@ -1943,6 +1970,7 @@ async def run(
             lambda: token_source(settings).presence_token(),
             board.broadcast_presence,
             cache,
+            me=me,
         )
         receipts = board.receipts = Receipts(directory, me, board._receipts_frame, cache)
         renewals = asyncio.create_task(presence.run())
