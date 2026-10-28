@@ -53,7 +53,11 @@ def data_dir(tmp_path: Path) -> Path:
 def board(quiet_directory: Any, data_dir: Path, tmp_path: Path) -> W.Board:
     """A newest, then B, then C."""
     rows = {t: row(t, NAME[t], _at(i), last_id=str(i)) for t, i in ((A, 30), (B, 20), (C, 10))}
-    return W.Board(rows, quiet_directory, me=ME, data_dir=data_dir, sections_path=tmp_path / "sections.json")
+    served = W.Board(
+        rows, quiet_directory, me=ME, data_dir=data_dir, sections_path=tmp_path / "sections.json"
+    )
+    served.link = "up"  # Teams connected: no banner showing up mid-test (spec 036)
+    return served
 
 
 @dataclass

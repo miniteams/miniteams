@@ -705,12 +705,15 @@ async def test_copy_link_says_when_the_clipboard_refuses(chat: Pages, script: st
     assert await page.get_attribute("#err", "aria-live") == "polite"
 
 
+_LIVE = "window.__ws?.readyState === 1"  # the page's socket is open (FRAMES keeps the latest)
+
+
 async def test_csp_blocks_an_inline_handler_the_sanitiser_let_through(
     board: W.Board, chat: Pages, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """011-AC6: with the real CSP, an event attribute in a message body never runs."""
     page = await chat.open(_chat(T), csp=True)
-    await page.wait_for_selector("#status:not(.off)")  # the page's own script and socket pass the CSP
+    await until(page, _LIVE)  # the page's own script and socket pass the CSP
     monkeypatch.setattr(CV, "sanitize", lambda content, *a: content)
     body = '<p>x<img src="/nope.png" onerror="window.__pwned=1"></p>'
     async with page.expect_console_message(lambda msg: "inline event handler" in msg.text):
@@ -1840,6 +1843,7 @@ class Widget:
 @pytest.fixture
 async def widget(settings: Settings, pages: Pages, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Widget]:
     board = W.Board({T: row(T, "Fictional chat", _at(1), last_id="1789466400000")}, None)
+    board.link = "up"  # Teams connected: no banner showing up mid-test (spec 036)
     board.opener = ["xdg-open"]
     verbs: list[Verb] = []
 
@@ -2910,28 +2914,24 @@ async def test_pages_redial_a_restarted_server_with_their_cookie(
     but the sign-in probe of a refused dial (a plain GET of /ws)."""
     port = test_web_chat._free_port()
     monkeypatch.setattr(test_web_chat, "_free_port", lambda: port)  # the restart binds the same port
-    live = "document.getElementById('status').title === 'live'"
     async with _served(board, settings) as host:
         pages.serve(host, board)
         opened = [await pages.open("/"), await pages.open(_chat(T))]
         requests: list[str] = []
         for page in opened:
-            await until(page, live)
+            await until(page, _LIVE)
             await until(page, "[...document.images].every(i => i.complete)")  # a late image is not a redial
             await page.evaluate("window.__same = 1")
             page.on("request", lambda r: requests.append(r.url))
     for page in opened:
-        await until(page, "document.getElementById('status').title === 'disconnected'")
+        await until(page, "window.__ws.readyState !== 1")
     async with _served(board, settings):
         for page in opened:
-            await until(page, live, tries=1500)  # backoff 1 s, then 2 s if the first dial was early
+            await until(page, _LIVE, tries=1500)  # backoff 1 s, then 2 s if the first dial was early
             assert await page.evaluate("window.__same") == 1
         await pages.close()
     assert [u for u in requests if not u.startswith("ws") and not u.endswith("/ws")] == []
     assert pages.external == []
-
-
-_LIVE = "document.getElementById('status').title === 'live'"
 
 
 @pytest.mark.parametrize("path", ["/", f"{_chat(T)}?chatnav=split"])

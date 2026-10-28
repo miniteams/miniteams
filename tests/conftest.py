@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import ipaddress
+import json
 import logging
 import socket
 import sys
@@ -172,6 +173,8 @@ async def board_socket(host: str, secret: str, *, chat: bool = False) -> AsyncIt
     async with websockets.connect(
         url, origin=websockets.Origin(f"http://{host}"), additional_headers=headers
     ) as ws:
+        # 036-AC4: every page hears the Teams link first; tests asking for it connect without this helper.
+        assert set(json.loads(await asyncio.wait_for(ws.recv(), 2))) == {"link"}
         yield ws
 
 

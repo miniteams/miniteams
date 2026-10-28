@@ -72,9 +72,7 @@ async def _open(pages: Pages, fake: Fake, init: str = "", **ctx: Any) -> Page:
         **ctx,
     )
     await page.wait_for_selector('[data-id="4"]')
-    await until(
-        page, "document.body.classList.contains('readonly') || !!document.querySelector('#status:not(.off)')"
-    )
+    await until(page, "document.body.classList.contains('readonly') || window.__ws?.readyState === 1")
     # A visible size, and loaded: the list's own scroll to the bottom as it grows would close a menu.
     await page.locator(f"{_msg('4')} img").evaluate("i => { i.style.width = i.style.height = '40px'; }")
     await until(page, "document.querySelector('[data-id=\"4\"] img').complete")

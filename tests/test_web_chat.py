@@ -154,7 +154,9 @@ def board(quiet_directory: Directory, data_dir: Path) -> W.Board:
     rows: dict[str, dict[str, Any]] = {
         B: {"id": B, "label": "B", "last_activity": _at(1), "last_id": "1", "seen_at": None, "typing": []}
     }
-    return W.Board(rows, quiet_directory, me=ME, data_dir=data_dir)
+    served = W.Board(rows, quiet_directory, me=ME, data_dir=data_dir)
+    served.link = "up"  # Teams connected: no banner showing up mid-test (spec 036)
+    return served
 
 
 @pytest.fixture
@@ -1018,8 +1020,9 @@ def _free_port() -> int:
 
 
 @contextlib.asynccontextmanager
-async def _served(board: W.Board, settings: Settings) -> AsyncIterator[str]:
-    port = _free_port()
+async def _served(board: W.Board, settings: Settings, port: int = 0) -> AsyncIterator[str]:
+    """`port` 0 draws a free one; a given one serves again where a stopped run was (pages redial it)."""
+    port = port or _free_port()
     task = asyncio.create_task(W.serve_board(board, settings, f"127.0.0.1:{port}"))
     try:
         for _ in range(500):
@@ -1878,6 +1881,40 @@ async def test_chat_socket_never_receives_the_board(board: W.Board, settings: Se
         assert json.loads(await asyncio.wait_for(chat.recv(), 2))["msg"]["id"] == "9"
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(chat.recv(), 0.3)
+
+
+async def _links(ws: Any, n: int) -> list[str]:
+    """The next `n` `link` frames a socket gets; other frames are skipped."""
+    seen: list[str] = []
+    while len(seen) < n:
+        frame = json.loads(await asyncio.wait_for(ws.recv(), 2))
+        if "link" in frame:
+            assert set(frame) == {"link"}
+            seen.append(frame["link"])
+    return seen
+
+
+async def test_every_page_hears_the_teams_link_on_connect_and_on_change(
+    board: W.Board, settings: Settings
+) -> None:
+    """036-AC4/AC5: widget and chat sockets get `{"link": …}` first on connect, then each change once."""
+    assert W.Board({}).link == "down"  # not connected yet
+    board.set_link("login")
+    async with _served(board, settings) as host:
+        connect = functools.partial(websockets.connect, origin=websockets.Origin(f"http://{host}"))
+        async with (
+            connect(f"ws://{host}/ws", additional_headers=_cookie(board)) as widget,
+            connect(f"ws://{host}/ws?chat", additional_headers=_cookie(board)) as chat,
+        ):
+            for ws in (widget, chat):
+                assert json.loads(await asyncio.wait_for(ws.recv(), 2)) == {"link": "login"}
+            for state in ("login", "up", "up", "down", "down", "up"):
+                board.set_link(state)
+            for ws in (widget, chat):
+                assert await _links(ws, 3) == ["up", "down", "up"]  # an unchanged state is not resent
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(chat.recv(), 0.3)
+    assert board.pages == set()
 
 
 async def test_a_split_chat_socket_subscribes_to_the_board(
@@ -3710,6 +3747,7 @@ def test_the_board_takes_every_chat_verb_from_chat_verbs(board: W.Board) -> None
         "dm",  # spec 023: my 1:1 with a sender
         "open",
         "authors",  # spec 015: a chat page's authors, for their presence
+        "setpresence",  # spec 036: my own status, picked in a page's header
     ]
 
 

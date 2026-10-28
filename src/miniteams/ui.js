@@ -62,6 +62,104 @@
     presence = new Map(map && typeof map === "object" && !Array.isArray(map) ? Object.entries(map) : []);
     document.querySelectorAll("[data-pmri]").forEach(presenceDot);
   };
+  // Spec 036: my own status in the header (`box`), its menu forcing a Teams status through `web`. The dot only
+  // follows presence frames: a pick changes it when the service's callback says so, never before.
+  const OWN = [["Available", "Available", "ok"], ["Busy", "Busy", "busy"], ["DoNotDisturb", "Do not disturb", "dnd"],
+    ["BeRightBack", "Be right back", "away"], ["Away", "Appear away", "away"], ["AppearOffline", "Appear offline", "off"]];
+  const OWN_ERROR_MS = 10000;
+  const ownStatus = (box, send) => {
+    let me = "", online = false, pending = false, menu = null, errTimer = 0;
+    const btn = el("button", "ownbtn"), dot = el("span"), err = el("div", "ownerr");
+    btn.id = "mystatus";
+    btn.setAttribute("aria-haspopup", "menu"); btn.setAttribute("aria-expanded", "false");
+    err.setAttribute("role", "status");  // emptied, never hidden: a live region must stay in the tree
+    btn.append(dot); box.append(btn); document.body.append(err);
+    const mine = () => { const p = presence.get(me); return p && typeof p.availability === "string" && Object.hasOwn(PRESENCE, p.availability) ? p : null; };
+    // Fixed under the button, inside the viewport: the widget header's backdrop-filter would capture a
+    // fixed child, so both boxes live in the body.
+    const under = (node) => {
+      node.style.left = "0px";  // measured from the left edge: a box placed further right is squeezed to wrap
+      const r = btn.getBoundingClientRect(), b = node.getBoundingClientRect(), w = document.documentElement.clientWidth, h = document.documentElement.clientHeight;
+      Object.assign(node.style, { left: `${Math.max(0, Math.min(r.right - b.width, w - b.width))}px`, top: `${Math.max(0, Math.min(r.bottom + 4, h - b.height))}px` });
+    };
+    const draw = () => {
+      const p = mine(), text = p ? presenceLabel({ ...p, activity: typeof p.activity === "string" ? p.activity : "" }) : "Status unknown";
+      dot.className = "pres " + (p ? PRESENCE[p.availability] + (p.confirmed ? "" : " unsure") : "unknown");
+      btn.title = text; btn.setAttribute("aria-label", "my status: " + text);
+      if (!menu) return;
+      menu.querySelector(".cur").textContent = text;
+      for (const b of menu.querySelectorAll("button")) {
+        if (b.getAttribute("role") === "menuitemradio") b.setAttribute("aria-checked", String(!!p && p.forced === b.dataset.v));
+        b.setAttribute("aria-disabled", String(!online || pending));
+      }
+      under(menu);  // a new label resizes it: keep it on the button, inside the viewport
+    };
+    const close = (back) => {
+      if (!menu) return;
+      const m = menu;
+      menu = null;  // first: Chrome's focusout on removal must find it closed
+      m.remove();
+      btn.setAttribute("aria-expanded", "false");
+      if (back) btn.focus();
+    };
+    const pick = (v) => {
+      if (!online || pending || !send({ setpresence: v })) return;
+      pending = true;
+      close(true);
+    };
+    const item = (v, text, cls, role) => {
+      const b = el("button");
+      b.dataset.v = v; b.tabIndex = -1; b.setAttribute("role", role);
+      if (cls) b.append(el("span", "pres " + cls));
+      b.append(text);
+      b.onclick = () => pick(v);
+      return b;
+    };
+    const open = (last) => {
+      menu = el("div", "rowmenu ownmenu");
+      menu.tabIndex = -1;  // a click on its padding keeps the focus, and so the menu, in it
+      menu.setAttribute("role", "menu"); menu.setAttribute("aria-label", "my status");
+      const sep = el("div", "sep");
+      sep.setAttribute("role", "separator");
+      menu.append(el("div", "cur"), ...OWN.map(([v, text, cls]) => item(v, text, cls, "menuitemradio")), sep, item("Reset", "Reset status", null, "menuitem"));
+      menu.onkeydown = (e) => {
+        const all = [...menu.querySelectorAll("button")], n = all.length, i = all.indexOf(document.activeElement);
+        const to = { ArrowDown: (i + 1) % n, ArrowUp: i < 1 ? n - 1 : i - 1, Home: 0, End: n - 1 }[e.key];
+        if (to !== undefined) all[to].focus();
+        else if (e.key === "Escape") close(true);
+        else if (e.key === "Tab") { close(true); return; }  // the Tab goes on from the button
+        else return;
+        e.preventDefault(); e.stopPropagation();
+      };
+      menu.addEventListener("focusout", (e) => { if (e.currentTarget === menu && !menu.contains(e.relatedTarget) && e.relatedTarget !== btn) close(false); });
+      document.body.append(menu);
+      btn.setAttribute("aria-expanded", "true");
+      draw();
+      const all = [...menu.querySelectorAll("button")];
+      (last ? all.at(-1) : menu.querySelector("[aria-checked=true]") || all[0]).focus({ preventScroll: true });
+    };
+    btn.onclick = () => { if (menu) close(true); else open(false); };
+    btn.onkeydown = (e) => {
+      if ((e.key !== "ArrowDown" && e.key !== "ArrowUp") || menu) return;
+      e.preventDefault(); open(e.key === "ArrowUp");
+    };
+    // Capture: a press elsewhere closes it even where the target keeps the focus from moving.
+    addEventListener("pointerdown", (e) => { if (menu && !menu.contains(e.target) && !btn.contains(e.target)) close(false); }, true);
+    addEventListener("resize", () => { if (menu) under(menu); if (err.textContent) under(err); });
+    draw();
+    return {
+      paint: (self) => { me = typeof self === "string" ? self : ""; draw(); },
+      opened: () => { online = true; draw(); },
+      closed: () => { online = false; pending = false; draw(); },  // that socket's answer will never come
+      answered: (m) => {
+        pending = false;
+        clearTimeout(errTimer);
+        err.textContent = m.ok ? "" : "status not changed: " + (typeof m.error === "string" && m.error ? m.error : "failed");
+        if (err.textContent) { under(err); errTimer = setTimeout(() => { err.textContent = ""; }, OWN_ERROR_MS); }
+        draw();
+      },
+    };
+  };
 
   // The `mt` cookie authenticates the handshake: it survives a server restart, so a redial needs nothing else.
   const wsUrl = (path) => (location.protocol === "https:" ? "wss://" : "ws://") + location.host + path;
@@ -94,6 +192,38 @@
   const backoff = () => {
     let ms = 1000;
     return { next: () => { const d = ms; ms = Math.min(ms * 2, 30000); return d; }, reset: () => { ms = 1000; } };
+  };
+  // Spec 036: the worst connection problem, under the header. Any new problem shows once it has lasted 2 s,
+  // so a reload or a quick server restart does not flash it; recovery hides it at once.
+  const BANNER_GRACE_MS = 2000;
+  const BANNER = {
+    page: () => ["Disconnected from miniteams, reconnecting…"],
+    login: () => ["Teams sign-in expired: run ", el("code", null, "miniteams login")],
+    down: () => ["Teams connection lost, reconnecting…"],
+  };
+  // Hidden by emptying, never `hidden`: a live region must stay in the tree for its new text to be announced.
+  const linkBanner = (box) => {
+    let open = false, link = null, timer = null, shown = null;  // link: the server's last word on this socket
+    // "unknown": reopened, the server's link frame not in yet; it keeps whatever shows.
+    const problem = () => !open ? "page" : link === null ? "unknown"
+      : link === "login" || link === "down" ? link : null;
+    const show = (p) => { if (p !== shown) { shown = p; box.replaceChildren(...(p ? BANNER[p]() : [])); } };
+    const update = () => {
+      const p = problem();
+      if (p === "unknown") return;
+      if (!p || p === shown) { clearTimeout(timer); timer = null; show(p); return; }
+      timer ??= setTimeout(() => {
+        timer = null;
+        const q = problem();
+        if (q && q !== "unknown") show(q);
+      }, BANNER_GRACE_MS);
+    };
+    update();
+    return {
+      opened: () => { open = true; update(); },
+      closed: () => { open = false; link = null; update(); },  // while away the Teams link is unknown
+      link: (state) => { link = state; update(); },
+    };
   };
 
   // Board rows, the widget's list and the chat page's split list alike.

@@ -81,7 +81,7 @@ async def test_the_socket_needs_the_cookie(settings: Settings) -> None:
                 origin=websockets.Origin(f"http://{host}"),
                 additional_headers={"Cookie": mixed},
             ) as ws:
-                assert "rows" in str(await ws.recv())
+                assert "link" in str(await ws.recv())
     assert secret not in repr(logs)
 
 

@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 import pytest
+import structlog.testing
 
 from miniteams import presence as P
 from miniteams import web as W
@@ -125,7 +126,7 @@ def test_parse_unknown_and_malformed_are_not_offline() -> None:
             None,
         ]
     )
-    assert found == {ANN: ("Busy", "InAMeeting"), BOB: None, CID: None}
+    assert found == {ANN: ("Busy", "InAMeeting", None), BOB: None, CID: None}
     assert P.parse("not a list") == {}
 
 
@@ -452,17 +453,17 @@ async def test_board_follows_the_50_newest_peers_plus_bounded_authors() -> None:
     rec = _Recorder()
     board.presence = rec  # type: ignore[assignment]
     board.broadcast()
-    assert rec.wanted == [_mri(100 + i) for i in range(59, 9, -1)]
+    assert rec.wanted == [ME, *(_mri(100 + i) for i in range(59, 9, -1))]  # 036-AC6: me first, always
     page: Any = _Sock()
     authors = ["28:bot", "junk", 5, *[_mri(500 + i) for i in range(70)], _mri(500)]
     await board._on_authors(page, {"authors": authors})
-    assert rec.wanted[50:] == [_mri(500 + i) for i in range(50)]
+    assert rec.wanted[51:] == [_mri(500 + i) for i in range(49)]
     assert json.loads(page.sent[-1]) == {"presence": {}}  # the page gets the current states at once
     payload = json.loads(board.payload())
     assert {r["id"]: r["peer"] for r in payload["rows"]}[_dm(3)] == _mri(103)
     for n in range(6):  # many chat tabs: the whole follow list stays bounded, peers first
         await board._on_authors(_Sock(), {"authors": [_mri(1000 + 50 * n + i) for i in range(50)]})  # type: ignore[arg-type]
-    assert len(rec.wanted) == 100 and rec.wanted[:50] == [_mri(100 + i) for i in range(59, 9, -1)]
+    assert len(rec.wanted) == 100 and rec.wanted[1:51] == [_mri(100 + i) for i in range(59, 9, -1)]
     tabs: list[Any] = [_Sock(), _Sock()]  # the same chat in two tabs counts its authors once
     board._authors.clear()
     for tab in tabs:
@@ -579,7 +580,8 @@ def test_cache_stays_bounded(settings: Settings, monkeypatch: pytest.MonkeyPatch
 async def test_no_request_publishes_own_presence_or_touches_graph(
     settings: Settings, service: Service, clock: Clock, directory: Directory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """015-AC8: the collector only reads presence and posts our own subscriptions, never Graph; web's
+    """015-AC8: the collector by itself only reads presence and posts our own subscriptions (a status menu
+    pick, spec 036, is the only set), never Graph; web's
     socket, wired with the presence hooks, still sends its usual user.activity."""
     service.states = {ANN: ("Available", "")}
     p, _ = _presence(settings, service, clock)
@@ -646,3 +648,257 @@ async def test_no_request_publishes_own_presence_or_touches_graph(
     assert seen["on_presence"] and seen["on_session"]
     assert "renewals" in calls and calls.index("follow") < calls.index("stream")  # seeded before the socket
     assert "user_activity" not in seen  # the widget's signal is untouched
+
+
+# --- own presence (spec 036) ---
+
+
+def _own(availability: str, activity: str, forced: dict[str, str] | None = None) -> dict[str, Any]:
+    """My entry as the spike recorded it (misc/presence-spike/own*.json): forcedAvailability while forced."""
+    entry = _entry(ME, availability, activity)
+    if forced is not None:
+        expiry = (
+            "9999-12-31T23:59:59.9999999Z" if forced["availability"] == "Offline" else "2026-11-04T14:39:00Z"
+        )
+        entry["presence"]["forcedAvailability"] = {
+            **forced,
+            "expiry": expiry,
+            "publishTime": "2026-10-28T14:39Z",
+        }
+    return entry
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        *(
+            (_own(a, a, {"availability": a, "activity": a}), a)
+            for a in ("Available", "Busy", "DoNotDisturb", "BeRightBack", "Away")
+        ),
+        (_own("Offline", "OffWork", {"availability": "Offline", "activity": "OffWork"}), "AppearOffline"),
+        (_own("Busy", "InAMeeting"), None),  # after a Reset: no forcedAvailability, the automatic status
+        (_own("Busy", "Busy", {"availability": "Bogus", "activity": "Busy"}), None),
+        ({"mri": ME, "presence": {"availability": "Busy", "forcedAvailability": "Busy"}}, None),
+    ],
+)
+def test_forced_availability_reads_as_the_menu_entry(entry: dict[str, Any], expected: str | None) -> None:
+    """036-AC7/AC8: each forced status of the spike reads as its menu entry; a lifted one (Reset) as none."""
+    ((_, (_, _, forced)),) = P.parse([entry]).items()  # type: ignore[misc]
+    assert forced == expected
+
+
+async def test_own_entry_carries_forced_and_others_do_not(
+    settings: Settings, service: Service, clock: Clock
+) -> None:
+    """036-AC6/AC7: the frame names my entry (`self`) and only mine carries `forced`; a lifted force alone
+    is news for the pages; a cached state of mine has none."""
+    changes: list[int] = []
+    client = httpx.AsyncClient(transport=httpx.MockTransport(service.handler))
+    p = P.Presence(
+        settings, lambda: "tok", lambda: changes.append(1), client=client, clock=clock, me=ME.upper()
+    )
+    p.want([ME, ANN])
+    busy = {"availability": "Busy", "activity": "Busy"}
+    await p.on_presence(
+        {
+            "presence": [
+                _own("Busy", "Busy", busy),
+                {
+                    **_entry(ANN, "Busy"),
+                    "presence": {**_entry(ANN, "Busy")["presence"], "forcedAvailability": busy},
+                },
+            ]
+        }
+    )
+    frame = p.frame()
+    assert frame["self"] == ME
+    assert frame["presence"][ME] == {
+        "availability": "Busy",
+        "activity": "Busy",
+        "confirmed": True,
+        "forced": "Busy",
+    }
+    assert frame["presence"][ANN] == {"availability": "Busy", "activity": "Busy", "confirmed": True}
+    changes.clear()
+    await p.on_presence({"presence": [_own("Busy", "Busy")]})  # Reset while my calendar says Busy too
+    assert p.frame()["presence"][ME]["forced"] is None and changes == [1]
+    await p.close()
+    cache = P.Cache(settings.cache_dir / "presence.sqlite3", settings.tenant_id)
+    cache.save({ME: P.State("Busy", "Busy", clock.now + 60, True, "Busy")}, clock.now)
+    cached = P.Presence(
+        settings, lambda: "tok", lambda: None, cache, client=httpx.AsyncClient(), clock=clock, me=ME
+    )
+    cached.want([ME])
+    assert cached.frame()["presence"][ME] == {
+        "availability": "Busy",
+        "activity": "Busy",
+        "confirmed": False,
+        "forced": None,
+    }
+    await cached.close()
+
+
+async def test_offline_presence_frame_has_no_self(settings: Settings, clock: Clock) -> None:
+    """036-AC6: without my MRI the frame names no entry: the pages show the unknown ring."""
+    p = P.Presence(settings, lambda: "tok", lambda: None, client=httpx.AsyncClient(), clock=clock)
+    assert p.frame() == {"presence": {}}
+    await p.close()
+
+
+SETS = {  # 036-AC7/AC8: menu value → the exact forceavailability body (spike, phase 1)
+    "Available": {"availability": "Available"},
+    "Busy": {"availability": "Busy"},
+    "DoNotDisturb": {"availability": "DoNotDisturb"},
+    "BeRightBack": {"availability": "BeRightBack"},
+    "Away": {"availability": "Away"},
+    "AppearOffline": {"availability": "Offline", "activity": "OffWork"},
+    "Reset": {"availability": "Offline"},
+}
+FORCE_URL = "https://presence.teams.microsoft.com/v1/me/forceavailability/"
+
+
+def _forcing(
+    settings: Settings, handler: Any, token: P.TokenFn = lambda: "tok"
+) -> tuple[W.Board, list[httpx.Request]]:
+    seen: list[httpx.Request] = []
+
+    async def record(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        out = handler(request)
+        return await out if asyncio.iscoroutine(out) else out  # type: ignore[no-any-return]
+
+    board = W.Board({}, me=ME)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(record))
+    board.presence = P.Presence(settings, token, board.broadcast_presence, client=client, me=ME)
+    return board, seen
+
+
+async def _ask(board: W.Board, *verbs: dict[str, Any]) -> list[dict[str, Any]]:
+    """Each verb through the socket dispatch, then every background answer awaited: the frames sent back."""
+    ws: Any = _Sock()
+    for verb in verbs:
+        key = W._verb_key(board._handlers, board._accepts, verb)
+        assert key == "setpresence"
+        await board._dispatch(ws, key, verb)
+    while board.chat._replies:
+        await asyncio.gather(*board.chat._replies)
+    return [json.loads(f) for f in ws.sent]
+
+
+async def test_each_pick_sends_its_forceavailability_call(settings: Settings) -> None:
+    """036-AC7/AC8: each menu value is one PUT with its exact body, the presence token, and an ok answer."""
+    board, seen = _forcing(settings, lambda r: httpx.Response(200))
+    for value, body in SETS.items():
+        seen.clear()
+        assert await _ask(board, {"setpresence": value}) == [{"setpresence": value, "ok": True}]
+        ((request,),) = [seen]
+        assert (request.method, str(request.url), json.loads(request.content)) == ("PUT", FORCE_URL, body)
+        assert request.headers["Authorization"] == "Bearer tok"
+    await board.presence.close()  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    "value", ["Offline", "available", "", "Reset ", "busy", 5, None, ["Busy"], {"Busy": 1}]
+)
+async def test_a_bad_value_is_refused_without_a_call(settings: Settings, value: Any) -> None:
+    """036-AC9: anything outside the menu is refused at once, the service never called."""
+    board, seen = _forcing(settings, lambda r: pytest.fail("no call for a refused value"))
+    assert await _ask(board, {"setpresence": value}) == [
+        {"setpresence": value, "ok": False, "error": "unknown status"}
+    ]
+    assert seen == []
+    await board.presence.close()  # type: ignore[union-attr]
+
+
+def _raise_token() -> str:
+    raise RuntimeError("network down")
+
+
+@pytest.mark.parametrize(
+    ("handler", "token", "error", "calls"),
+    [
+        (
+            lambda r: httpx.Response(401, json={"substatuscode": {"value": 40102}}),
+            lambda: "tok",
+            "HTTP 401",
+            1,
+        ),
+        (lambda r: httpx.Response(503), lambda: "tok", "HTTP 503", 1),
+        (lambda r: pytest.fail("no call without a token"), lambda: None, "token unavailable", 0),
+        (lambda r: pytest.fail("no call without a token"), _raise_token, "token unavailable", 0),
+        (
+            lambda r: (_ for _ in ()).throw(httpx.ConnectError("down", request=r)),
+            lambda: "tok",
+            "network error",
+            1,
+        ),
+    ],
+)
+async def test_a_failed_set_answers_its_reason_once(
+    settings: Settings, handler: Any, token: P.TokenFn, error: str, calls: int
+) -> None:
+    """036-AC9: an HTTP error, no token or a network error answers the reason; nothing is retried, my
+    state is untouched, the log has the event and never the token."""
+    board, seen = _forcing(settings, handler, token)
+    assert board.presence is not None
+    board.presence.want([ME])
+    await board.presence.on_presence({"presence": [_own("Busy", "InAMeeting")]})
+    before = board.presence_frame()
+    with structlog.testing.capture_logs() as logs:
+        assert await _ask(board, {"setpresence": "DoNotDisturb"}) == [
+            {"setpresence": "DoNotDisturb", "ok": False, "error": error}
+        ]
+    assert len(seen) == calls
+    assert board.presence_frame() == before
+    assert [e["event"] for e in logs] == ["presence_set_failed"] and "tok" not in repr(logs).replace(
+        "token", ""
+    )
+    await board.presence.close()
+
+
+async def test_offline_board_refuses_and_one_set_at_a_time(settings: Settings) -> None:
+    """036-AC9: no presence collector → refused; a pick from any page (another socket too) while one is in
+    flight answers busy: an older pick never lands after a newer one."""
+    offline = W.Board({}, me=ME)
+    assert await _ask(offline, {"setpresence": "Busy"}) == [
+        {"setpresence": "Busy", "ok": False, "error": "presence unavailable"}
+    ]
+    gate = asyncio.Event()
+
+    async def held(request: httpx.Request) -> httpx.Response:
+        await gate.wait()
+        return httpx.Response(200)
+
+    board, seen = _forcing(settings, held)
+    widget: Any = _Sock()
+    chat: Any = _Sock()
+    await board._dispatch(widget, "setpresence", {"setpresence": "Busy"})
+    await board._dispatch(widget, "setpresence", {"setpresence": "Away"})
+    await board._dispatch(chat, "setpresence", {"setpresence": "Away"})
+    assert [json.loads(f) for f in widget.sent] == [{"setpresence": "Away", "ok": False, "error": "busy"}]
+    assert [json.loads(f) for f in chat.sent] == [{"setpresence": "Away", "ok": False, "error": "busy"}]
+    gate.set()
+    while board.chat._replies:
+        await asyncio.gather(*board.chat._replies)
+    assert json.loads(widget.sent[-1]) == {"setpresence": "Busy", "ok": True} and len(seen) == 1
+    assert await _ask(board, {"setpresence": "Reset"}) == [{"setpresence": "Reset", "ok": True}]  # freed
+    await board.presence.close()  # type: ignore[union-attr]
+
+
+async def test_a_raising_set_frees_the_slot(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """036-AC9: a set that raises answers a failure and frees the board-wide slot: the next pick goes out."""
+    board, seen = _forcing(settings, lambda r: httpx.Response(200))
+    assert board.presence is not None
+    real, raised = board.presence.force, []
+
+    async def once(value: str) -> str:
+        if not raised:
+            raised.append(value)
+            raise RuntimeError("boom")
+        return await real(value)
+
+    monkeypatch.setattr(board.presence, "force", once)
+    assert await _ask(board, {"setpresence": "Busy"}) == [{"setpresence": "Busy", "error": "failed"}]
+    assert await _ask(board, {"setpresence": "Away"}) == [{"setpresence": "Away", "ok": True}]
+    assert len(seen) == 1
+    await board.presence.close()

@@ -22,6 +22,12 @@
       --shadow: 0 1px 2px #00000066, 0 6px 20px #00000055;
     }
   }
+  /* The connection banner (spec 036): in the flow under the header, wrapping in the narrow widget. */
+  #banner { flex: none; padding: 4px 12px; font-size: 12.5px; color: var(--text); overflow-wrap: anywhere;
+    background: color-mix(in srgb, var(--hot) 14%, var(--bg)); border-bottom: 1px solid var(--hot); }
+  #banner code { font: 12px ui-monospace, monospace; }
+  #banner:empty { padding: 0; border: 0; }
+  body:has(> #signin) #banner { display: none; }  /* signed out: the sign-in alert says more */
   #signin { position: fixed; inset: 0 0 auto 0; z-index: 10; padding: 8px 12px; background: var(--hot); color: #fff; font-size: 13px; }
   .switch { appearance: none; width: 32px; height: 18px; border-radius: 99px; background: var(--line); position: relative; cursor: pointer; transition: background .15s; margin: 0; }
   .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: left .15s; box-shadow: 0 1px 2px #0003; }
@@ -110,6 +116,24 @@
   .pres.away { background: #f5a524; }
   .pres.off { background: var(--panel); box-shadow: inset 0 0 0 2px var(--faint); }
   .pres.unsure { opacity: .45; }
+  /* My own status (spec 036): the header button, its menu and its error line, fixed in the body. */
+  #own { flex: none; display: flex; }
+  .ownbtn { border: 0; background: transparent; width: 28px; height: 28px; padding: 0; border-radius: 8px; cursor: pointer; display: grid; place-items: center; }
+  .ownbtn:hover, .ownbtn[aria-expanded=true] { background: var(--panel-2); }
+  .ownbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  :is(.ownbtn, .ownmenu) .pres { position: static; border: 0; flex: none; }
+  .ownmenu .pres { width: 10px; height: 10px; }
+  .ownbtn .pres.unknown { background: transparent; border: 2px dashed var(--faint); }  /* unknown, never the Offline ring */
+  .ownmenu { position: fixed; right: auto; z-index: 10; max-width: calc(100vw - 8px); }
+  .ownmenu .cur { padding: 3px 8px 5px; margin-bottom: 4px; border-bottom: 1px solid var(--line); font-size: 12px; color: var(--dim); }
+  .ownmenu .sep { margin: 4px 0; border-top: 1px solid var(--line); }
+  .ownmenu button { display: flex; align-items: center; gap: 8px; }
+  .ownmenu button[aria-checked=true]::after { content: "✓"; margin-left: auto; padding-left: 8px; color: var(--accent); }
+  .ownmenu button[aria-disabled=true] { opacity: .5; cursor: default; }
+  .ownmenu button[aria-disabled=true]:hover { background: transparent; color: inherit; }
+  .ownerr { position: fixed; z-index: 10; max-width: min(280px, calc(100vw - 8px)); padding: 3px 8px; font-size: 12px; color: var(--hot);
+    background: var(--panel); border: 1px solid var(--hot); border-radius: 8px; box-shadow: var(--shadow); }
+  .ownerr:empty { padding: 0; border: 0; box-shadow: none; }
   /* The send queue (spec 017): greyed text, a label dim like a message's time, a failure in the error colour. */
   .q .qtext { opacity: .6; }
   .q .qstate { font-size: 11.5px; color: var(--faint); overflow-wrap: anywhere; }

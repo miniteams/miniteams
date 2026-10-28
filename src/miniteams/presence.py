@@ -4,7 +4,8 @@ The followed people get a snapshot (`getpresence`) and a subscription whose deli
 own Trouter socket (`<surl>/TeamsUnifiedPresenceService`). The subscription is re-posted on every
 reconnect and every `PERIOD`; each post answers with a full snapshot callback. A state lives until
 two periods pass without a confirmation (a callback or a snapshot; a post's `20200` is not one: a dead
-socket gets it too), then it is unknown: no dot, never Offline. Our own presence is never published.
+socket gets it too), then it is unknown: no dot, never Offline. Our own presence is followed like anyone's
+and changes only on an explicit menu pick (spec 036, `force`).
 
 Latest states persist in a local SQLite cache (`<cache_dir>/presence.sqlite3`, a subset of the spike's
 proposed schema): a restart paints them at once, unconfirmed, until the first callback.
@@ -39,6 +40,13 @@ _ACCEPTED = "20200"  # per-person status of an accepted subscription
 _CACHE_MAX = 1000  # rows kept in the cache file, newest observations first
 _MRI_RE = re.compile(r"8:orgid:[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}")  # only org users have presence
 _DM_RE = re.compile(r"19:([0-9a-f-]{36})_([0-9a-f-]{36})@unq\.gbl\.spaces")
+_FORCEABLE = ("Available", "Busy", "DoNotDisturb", "BeRightBack", "Away")
+# Spec 036: menu pick → `forceavailability` body. Spike: DELETE is refused, Offline alone lifts a force.
+FORCE: dict[str, dict[str, str]] = {
+    **{a: {"availability": a} for a in _FORCEABLE},
+    "AppearOffline": {"availability": "Offline", "activity": "OffWork"},
+    "Reset": {"availability": "Offline"},
+}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS presence (
@@ -86,9 +94,19 @@ def dm_ids(me: str, mri: Any) -> tuple[str, ...]:
     return f"19:{mine}_{theirs}@unq.gbl.spaces", f"19:{theirs}_{mine}@unq.gbl.spaces"
 
 
-def parse(entries: Any) -> dict[str, tuple[str, str] | None]:
-    """`presence: [...]` of a snapshot or a callback → mri → (availability, activity); None = unknown."""
-    out: dict[str, tuple[str, str] | None] = {}
+def forced(found: dict[str, Any]) -> str | None:
+    """Spec 036: the menu entry a `forcedAvailability` stands for; None when the status is not forced."""
+    force = found.get("forcedAvailability")
+    avail = force.get("availability") if isinstance(force, dict) else None
+    if avail == "Offline":
+        return "AppearOffline"  # the only forced Offline: a Reset lifts the force instead of setting one
+    return avail if avail in _FORCEABLE else None
+
+
+def parse(entries: Any) -> dict[str, tuple[str, str, str | None] | None]:
+    """`presence: [...]` of a snapshot or a callback → mri → (availability, activity, forced);
+    None = unknown."""
+    out: dict[str, tuple[str, str, str | None] | None] = {}
     for item in entries if isinstance(entries, list) else []:
         mri = person(item.get("mri")) if isinstance(item, dict) else ""
         if not mri:
@@ -99,7 +117,7 @@ def parse(entries: Any) -> dict[str, tuple[str, str] | None]:
             out[mri] = None  # missing presence is not Offline
             continue
         activity = found.get("activity") if isinstance(found, dict) else None
-        out[mri] = (avail, activity if isinstance(activity, str) and activity else avail)
+        out[mri] = (avail, activity if isinstance(activity, str) and activity else avail, forced(found))
     return out
 
 
@@ -119,6 +137,7 @@ class State:
     activity: str
     until: float  # wall seconds: unknown past it
     confirmed: bool  # False: from the cache, or no longer followed
+    forced: str | None = None  # own state only (spec 036): the forced menu entry; never cached
 
     def frame(self) -> dict[str, Any]:
         return {"availability": self.availability, "activity": self.activity, "confirmed": self.confirmed}
@@ -242,8 +261,10 @@ class Presence:
         client: httpx.AsyncClient | None = None,
         period: float = PERIOD,
         clock: Callable[[], float] = time.time,
+        me: str = "",
     ) -> None:
         self.settings = settings
+        self.me = person(me)  # own MRI: its frame entry says which status is forced
         self.token = token  # silent presence-resource token; None = unavailable
         self.on_change = on_change
         self.cache = cache
@@ -262,8 +283,11 @@ class Presence:
     # --- what the pages see ---
 
     def frame(self) -> dict[str, Any]:
-        """Known states of the followed people; anyone else is unknown (no dot)."""
-        return {"presence": {m: self.states[m].frame() for m in sorted(self.wanted) if m in self.states}}
+        """Known states of the followed people; anyone else is unknown (no dot). `self` names my entry."""
+        shown = {m: self.states[m].frame() for m in sorted(self.wanted) if m in self.states}
+        if self.me in shown:
+            shown[self.me]["forced"] = self.states[self.me].forced
+        return {"presence": shown, "self": self.me} if self.me else {"presence": shown}
 
     # --- follow list ---
 
@@ -364,6 +388,32 @@ class Presence:
             self._apply(dict.fromkeys(refused))
             log.info("presence_subscribed", people=len(wanted), removed=len(gone), refused=len(refused))
 
+    async def force(self, value: str) -> str:
+        """Spec 036: force my status to a `FORCE` entry; "" once the service took it, else a short reason.
+        Never retried: the page shows the reason, the next pick is the retry."""
+        try:
+            token = await asyncio.to_thread(self.token)
+        except Exception as exc:  # noqa: BLE001 — MSAL re-raises network errors
+            log.warning("presence_set_failed", value=value, reason="token", error_type=type(exc).__name__)
+            return "token unavailable"
+        if not token:
+            log.warning("presence_set_failed", value=value, reason="token")
+            return "token unavailable"
+        # Our socket's endpoint as the collector's posts; without one a throwaway id, as the spike did.
+        epid = self.session[0] if self.session else str(uuid.uuid4())
+        try:
+            resp = await self.http.put(
+                f"{HOST}/v1/me/forceavailability/", headers=self._headers(token, epid), json=FORCE[value]
+            )
+        except httpx.HTTPError as exc:
+            log.warning("presence_set_failed", value=value, reason="network", error_type=type(exc).__name__)
+            return "network error"
+        if resp.is_error:
+            log.warning("presence_set_failed", value=value, reason="http", status=resp.status_code)
+            return f"HTTP {resp.status_code}"
+        log.info("presence_set", value=value)
+        return ""
+
     async def run(self) -> None:
         """Renew every period, sweep stale states in between; until cancelled."""
         while True:
@@ -413,7 +463,7 @@ class Presence:
 
     # --- states ---
 
-    def _apply(self, found: dict[str, tuple[str, str] | None]) -> None:
+    def _apply(self, found: dict[str, tuple[str, str, str | None] | None]) -> None:
         now = self.clock()
         until = now + 2 * self.period
         changed: dict[str, State] = {}
@@ -425,7 +475,7 @@ class Presence:
                 if self.states.pop(mri, None) is not None:
                     unknown.append(mri)
                 continue
-            changed[mri] = State(value[0], value[1], until, True)
+            changed[mri] = State(value[0], value[1], until, True, value[2] if mri == self.me else None)
         old = {m: self.states.get(m) for m in changed}
         self.states.update(changed)
         if changed and self.cache is not None:
@@ -435,7 +485,8 @@ class Presence:
                 log.warning("presence_cache_write_failed", error=str(exc))
         self._forget(unknown)
         # A renewed deadline alone is no news for the pages.
-        if unknown or any(o is None or o.frame() != changed[m].frame() for m, o in old.items()):
+        news = any(o is None or replace(o, until=0) != replace(changed[m], until=0) for m, o in old.items())
+        if unknown or news:
             self.on_change()
 
     def _forget(self, mris: list[str]) -> None:
