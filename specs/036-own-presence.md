@@ -1,6 +1,6 @@
 # 036 — Connection banner and own presence
 
-**Status**: in progress
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-10-28
 
@@ -63,25 +63,25 @@ Reset status).
       `misc/presence-spike/`: the answer of `forceavailability` for each of the 6 values, the reset
       call and its answer, and the presence callback for my own MRI (availability, activity,
       `forcedAvailability`) after each; the original status is restored afterwards.
-- [ ] **AC2** Neither page has the `#status` dot any more.
-- [ ] **AC3** With `web` stopped, a page shows "Disconnected from miniteams, reconnecting…" within
+- [x] **AC2** Neither page has the `#status` dot any more.
+- [x] **AC3** With `web` stopped, a page shows "Disconnected from miniteams, reconnecting…" within
       3 s; restarting `web` clears it without a manual reload. A page reload while `web` runs does
       not show it.
-- [ ] **AC4** When `web`'s Trouter session drops, every connected page shows "Teams connection lost,
+- [x] **AC4** When `web`'s Trouter session drops, every connected page shows "Teams connection lost,
       reconnecting…" until the next session is connected; a page opened meanwhile shows it after the
       same 2 s grace.
-- [ ] **AC5** When `web` waits for a login (refresh token dead), pages show the sign-in banner;
+- [x] **AC5** When `web` waits for a login (refresh token dead), pages show the sign-in banner;
       a `miniteams login` clears it once the session reconnects.
-- [ ] **AC6** My own dot shows my current availability with the spec 015 colours and label; it
+- [x] **AC6** My own dot shows my current availability with the spec 015 colours and label; it
       follows a status changed from the Teams client without a reload; unknown shows the empty ring.
-- [ ] **AC7** Picking each of the 6 entries makes `web` send the matching `forceavailability`
+- [x] **AC7** Picking each of the 6 entries makes `web` send the matching `forceavailability`
       call, and the dot shows the new status from the following callback; the menu marks the forced
       entry.
-- [ ] **AC8** Reset status lifts the forced status (`{"availability": "Offline"}`); the dot returns to
+- [x] **AC8** Reset status lifts the forced status (`{"availability": "Offline"}`); the dot returns to
       the automatic one.
-- [ ] **AC9** A failed set (HTTP error, token unavailable) leaves the dot unchanged and shows the
+- [x] **AC9** A failed set (HTTP error, token unavailable) leaves the dot unchanged and shows the
       error; nothing is retried in a loop.
-- [ ] **AC10** The menu opens and closes by mouse and keyboard, stays inside the viewport of the
+- [x] **AC10** The menu opens and closes by mouse and keyboard, stays inside the viewport of the
       narrow widget window, and closes on Escape or a click outside.
 
 ## Phases

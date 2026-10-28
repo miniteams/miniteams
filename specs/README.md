@@ -37,4 +37,4 @@
 | [033](033-mention-forms.md) | Mention by first name, last name or a free label | in progress |
 | [034](034-message-context-menu.md) | Message context menu | shipped |
 | [035](035-click-setting.md) | Choose what each click on a chat row opens | shipped |
-| [036](036-own-presence.md) | Connection banner and own presence | in progress |
+| [036](036-own-presence.md) | Connection banner and own presence | shipped |
