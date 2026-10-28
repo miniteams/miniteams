@@ -16,6 +16,19 @@ def _keep_test_logging(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "setup_logging", lambda level: None)
 
 
+class _NoAccountApp:
+    def get_accounts(self) -> list[Any]:
+        return []
+
+
+@pytest.fixture(autouse=True)
+def _offline_msal(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A send reads the sender name from the token cache; a real msal app discovers its authority online.
+    from miniteams import auth
+
+    monkeypatch.setattr(auth, "_app", lambda *a, **k: _NoAccountApp())
+
+
 def _ns(**kw: Any) -> argparse.Namespace:
     return argparse.Namespace(**kw)
 
@@ -606,7 +619,8 @@ def wire(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(files, "upload_files", upload_files)
     monkeypatch.setattr(files, "post_files", post_files)
     monkeypatch.setattr(
-        "miniteams.auth.token_source", lambda s: SimpleNamespace(sharepoint_token=lambda h: "sp")
+        "miniteams.auth.token_source",
+        lambda s: SimpleNamespace(sharepoint_token=lambda h: "sp", display_name=lambda: ""),
     )
     return seen
 

@@ -70,7 +70,7 @@ from .chat_verbs import (
 )
 from .chats import fetch_conversations, is_meeting, is_private, last_activity
 from .config import Settings, write_private
-from .directory import Directory, roster_label
+from .directory import Directory, roster_label, sender_name
 from .dump import fetch_history
 from .emojis import EmojiCache
 from .http import failure
@@ -308,6 +308,10 @@ async def row_from_conversation(
     }
 
 
+def _from(resource: dict[str, Any]) -> str:
+    return str(resource.get("from") or "").rsplit("/", 1)[-1]
+
+
 async def sender_of(resource: dict[str, Any], directory: Directory | None) -> str:
     if str(resource.get("messagetype") or "") == "Event/Call":
         # `from` is the meeting organizer, not who joined or hung up: only an ad-hoc call's
@@ -323,10 +327,10 @@ async def sender_of(resource: dict[str, Any], directory: Directory | None) -> st
     name = resource.get("imdisplayname")
     if directory is None:
         return str(name or mri)
-    directory.note_name(mri, name)
+    directory.note_declared(mri, name)
     if is_me(mri, directory.me):
         return _YOU
-    return str(name) if name else (await directory.display(mri) if mri else "")
+    return sender_name(mri, name, directory.known_name) or (await directory.display(mri) if mri else "")
 
 
 def seeded_rows(seed: dict[str, dict[str, Any]], limit: int) -> dict[str, dict[str, Any]]:
@@ -655,7 +659,7 @@ class Board:
         self.rows = rows
         self.directory = directory
         self.me = me  # own MRI: what a mention has to name
-        self.me_name = directory.name_for(me) if directory and me else ""  # the page highlights it
+        self.me_name = directory.known_name(me) if directory and me else ""  # stamped on sends, highlighted
         self.reactions = reactions
         self.typing_ttl = typing_ttl
         self.seen_path = seen_path
@@ -674,7 +678,8 @@ class Board:
         self._seed_read = time.monotonic()
         self._seed_stamp = seed_stamp  # `seed`'s index stamp, read with it: a stat here would block the loop
         self._seed_lock = asyncio.Lock()
-        self._typing_timers: dict[tuple[str, str], asyncio.TimerHandle] = {}
+        # (thread, sender MRI) → (expiry, the name announced): a name can change while they type.
+        self._typing_timers: dict[tuple[str, str], tuple[asyncio.TimerHandle, str]] = {}
         self._follows: dict[ServerConnection, tuple[str, Path | None]] = {}  # socket → (thread, media dir)
         self._relays: asyncio.Queue[tuple[str, Callable[[], Awaitable[None]]]] = asyncio.Queue(_RELAY_QUEUE)
         self._relay_task: asyncio.Task[None] | None = None  # started by the first relay, ended by close()
@@ -868,7 +873,9 @@ class Board:
             "page": page_version("chat.html"),  # an open tab reloads when chat.html changed
             "read_only": not in_scope(thread_id),  # `send` refuses channels: no composer for them
             # Live frames only say what changes: who already types is in the timers, board row or not.
-            "typing": [n for tid, n in self._typing_timers if tid == thread_id and n != _YOU],
+            "typing": [
+                n for (tid, _), (_, n) in self._typing_timers.items() if tid == thread_id and n != _YOU
+            ],
         }
         # Spec 022: the members popover opens on the label's count only (none on a 1:1, a channel's would
         # be its whole team); a roster to fetch comes later in its own frame, the socket loop never waits.
@@ -904,14 +911,13 @@ class Board:
             return
         media = medias[0]
         if resource_type == "NewMessage" and msgtype in ("Control/Typing", "Control/ClearTyping"):
-            if is_me(str(resource.get("from") or "").rsplit("/", 1)[-1], self.me):
+            if is_me(_from(resource), self.me):
                 return
-            name = await sender_of(resource, self.directory)
             if msgtype == "Control/Typing":
-                self._typing_arm(thread_id, name)
+                name = self._typing_arm(thread_id, _from(resource), await sender_of(resource, self.directory))
                 self._relay_now(thread_id, {"typing": name, "on": True})
             else:
-                self._typing_stop(thread_id, name, self._relay_now)
+                self._typing_stop(thread_id, _from(resource), self._relay_now)
             return
         if resource_type not in ("NewMessage", "MessageUpdate"):
             return
@@ -922,24 +928,35 @@ class Board:
         if "content" not in resource:
             del record["html"]  # a partial update (reaction): the page keeps the body it has
         if resource_type == "NewMessage" and not is_activity(msgtype):
-            name = await sender_of(resource, self.directory)
-            self._typing_stop(thread_id, name, self._relay_now)  # their message ends it
+            self._typing_stop(thread_id, _from(resource), self._relay_now)  # their message ends it
         self._relay_now(thread_id, {"msg" if resource_type == "NewMessage" else "edit": record})
 
     async def _record(self, resource: dict[str, Any], thread_id: str, media: Path | None) -> dict[str, Any]:
         """The relayed record; past a media read's deadline, records skip the folder for a while."""
         custom, images = self.emojis.custom(), self.emojis.images()
         name_for = self.directory.name_for if self.directory else None
+        known_name = self.directory.known_name if self.directory else None
         if media is not None and time.monotonic() >= self._media_down_until:
             try:
                 return await io(
-                    "relay", chat_record, resource, thread_id, self.me, media, custom, name_for, images
+                    "relay",
+                    chat_record,
+                    resource,
+                    thread_id,
+                    self.me,
+                    media,
+                    custom,
+                    name_for,
+                    images,
+                    known_name=known_name,
                 )
             except ArchiveUnavailable:
                 self._media_down_until = time.monotonic() + _MEDIA_BACKOFF
                 log.warning("follow_media_unavailable", thread=thread_id, retry_in=_MEDIA_BACKOFF)
         # Without a media folder sanitising reads no file: cheap enough for the loop.
-        return chat_record(resource, thread_id, self.me, None, custom, name_for, images)
+        return chat_record(
+            resource, thread_id, self.me, None, custom, name_for, images, known_name=known_name
+        )
 
     def _followers(self, thread_id: str) -> list[ServerConnection]:
         return [ws for ws, (tid, _) in self._follows.items() if tid == thread_id]
@@ -1188,7 +1205,8 @@ class Board:
             text=snippet(msgtype, str(resource.get("content") or ""), resource.get("properties")),
         )
         await self._note_mention(row, resource)
-        self._typing_stop(thread_id, sender, self._relay_queued)  # their message is the end of their typing
+        if not is_activity(msgtype):  # their message is the end of their typing
+            self._typing_stop(thread_id, _from(resource), self._relay_queued)
         self.broadcast()
 
     async def _message_update(self, thread_id: str, resource: dict[str, Any], msgtype: str) -> None:
@@ -1268,37 +1286,43 @@ class Board:
         row = self.rows.get(thread_id)
         if row is None:
             return  # a thread we never listed: nothing to annotate
-        name = await sender_of(resource, self.directory)
         if not started:
-            self._typing_stop(thread_id, name, self._relay_queued)
+            self._typing_stop(thread_id, _from(resource), self._relay_queued)
             self.broadcast()
             return
+        name = self._typing_arm(thread_id, _from(resource), await sender_of(resource, self.directory))
         if name not in row["typing"]:
             row["typing"].append(name)
-        self._typing_arm(thread_id, name)
         self.broadcast()
 
-    def _typing_arm(self, thread_id: str, name: str) -> None:
-        """(Re)start the expiry: Teams does not always send ClearTyping."""
-        key = (thread_id, name)
+    def _typing_arm(self, thread_id: str, mri: str, name: str) -> str:
+        """(Re)start the expiry: Teams does not always send ClearTyping. Returns the name announced."""
+        key = (thread_id, mri)
         if key in self._typing_timers:
-            self._typing_timers[key].cancel()
-        loop = asyncio.get_running_loop()
-        self._typing_timers[key] = loop.call_later(self.typing_ttl, self._typing_expired, thread_id, name)
-
-    def _typing_stop(self, thread_id: str, name: str, relay: Callable[[str, dict[str, Any]], None]) -> None:
-        """Clear `name`'s typing; `relay` tells a follower's page: `_relay_now` from the relay task."""
-        timer = self._typing_timers.pop((thread_id, name), None)
-        if timer:
+            timer, name = self._typing_timers[key]  # the start was announced under it: the stop must match
             timer.cancel()
-            if name != _YOU:  # my own typing on another device is not news to the page
-                relay(thread_id, {"typing": name, "on": False})
+        loop = asyncio.get_running_loop()
+        self._typing_timers[key] = (
+            loop.call_later(self.typing_ttl, self._typing_expired, thread_id, mri),
+            name,
+        )
+        return name
+
+    def _typing_stop(self, thread_id: str, mri: str, relay: Callable[[str, dict[str, Any]], None]) -> None:
+        """Clear `mri`'s typing; `relay` tells a follower's page: `_relay_now` from the relay task."""
+        entry = self._typing_timers.pop((thread_id, mri), None)
+        if entry is None:
+            return
+        timer, name = entry
+        timer.cancel()
+        if name != _YOU:  # my own typing on another device is not news to the page
+            relay(thread_id, {"typing": name, "on": False})
         row = self.rows.get(thread_id)
         if row and name in row["typing"]:
             row["typing"].remove(name)
 
-    def _typing_expired(self, thread_id: str, name: str) -> None:
-        self._typing_stop(thread_id, name, self._relay_queued)
+    def _typing_expired(self, thread_id: str, mri: str) -> None:
+        self._typing_stop(thread_id, mri, self._relay_queued)
         if thread_id in self.rows:  # a followed chat off the board has nothing to repaint
             self.broadcast()
 
@@ -1860,6 +1884,7 @@ async def run(
     open_scheme: str = "msteams",
     browser: str = "",
     me: str = "",
+    me_name: str = "",
     data_dir: Path | None = None,
 ) -> None:
     # An unusable web.json fails the start before any seeding or presence work.
@@ -1869,6 +1894,8 @@ async def run(
         directory = Directory(settings)
         directory.set_token(skype_token, bearer)
         directory.me = me
+        if me and me_name:
+            directory.note_name(me, me_name)  # what web sends stamp: the names cache may not know me yet
         seen_path = settings.config_dir / "seen.json"
         seen = _load_seen(seen_path)
         seed: dict[str, dict[str, Any]] = {}

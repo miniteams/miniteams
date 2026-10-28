@@ -135,7 +135,7 @@ def test_seed_names_our_own_last_message_you(tmp_path: Any) -> None:
                     "lastMessage": {
                         **last,
                         "from": f"https://h/contacts/{ME}",
-                        "imdisplayname": "Damien DEGOIS",
+                        "imdisplayname": "Zed Doe",
                     }
                 },
             ),
@@ -154,7 +154,7 @@ def test_seed_names_our_own_last_message_you(tmp_path: Any) -> None:
     seed = W.seed_from_archive(data_dir, ME)
     assert seed["19:a_b@unq.gbl.spaces"]["sender"] == "You"
     assert seed["19:c_d@unq.gbl.spaces"]["sender"] == "Jean Martin"
-    assert W.seed_from_archive(data_dir, "")["19:a_b@unq.gbl.spaces"]["sender"] == "Damien DEGOIS"
+    assert W.seed_from_archive(data_dir, "")["19:a_b@unq.gbl.spaces"]["sender"] == "Zed Doe"
 
 
 def test_seed_skips_out_of_scope_and_degrades_on_a_missing_or_corrupt_index(tmp_path: Any) -> None:

@@ -610,6 +610,9 @@ class _Source:
             raise AuthUnavailable("throttled")
         return {"access_token": "a", "id_token": "b", "id_token_claims": {"preferred_username": "me@example"}}
 
+    def display_name(self) -> str:
+        return ""
+
     def start_device_flow(self) -> dict[str, Any]:
         flow = {
             "user_code": f"CODE{len(self.flows)}",

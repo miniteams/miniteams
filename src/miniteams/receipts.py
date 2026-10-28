@@ -111,7 +111,7 @@ class Receipts:
         self.send(thread_id, self.frame(thread_id))
         member = parsed[0]
         # Unnamed: the next snapshot, which names members, may be a reconnect away.
-        if self.directory.name_for(member) == member.split(":")[-1]:
+        if not self.directory.known_name(member):
             self._track(self._name(thread_id, member))
 
     def open(self, thread_id: str) -> None:
@@ -154,7 +154,7 @@ class Receipts:
 
     async def _name(self, thread_id: str, member: str) -> None:
         await self.directory.resolve([member])
-        if thread_id in self.shown and self.directory.name_for(member) != member.split(":")[-1]:
+        if thread_id in self.shown and self.directory.known_name(member):
             self.send(thread_id, self.frame(thread_id))
 
     async def snapshot(self, thread_id: str) -> None:

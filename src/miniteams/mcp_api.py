@@ -25,7 +25,7 @@ _MAX_PAGES = 50  # history pages per chat
 _MAX_CHATS = 50  # chats a search reads
 _PAGE_SIZE = 100
 
-Record = Callable[[dict[str, Any]], dict[str, Any]]
+Record = Callable[[dict[str, Any], Callable[[str], str] | None], dict[str, Any]]
 
 
 class ApiReader:
@@ -107,7 +107,7 @@ class ApiReader:
             cut = str(messages[limit].get("composetime") or "")
             messages = [m for m in messages[:limit] if str(m.get("composetime") or "") < cut]
             result["next_since"] = cut
-        result["messages"] = [self.record(m) for m in messages]
+        result["messages"] = [self.record(m, self.directory.known_name) for m in messages]
         return result
 
     def search_messages(
@@ -127,7 +127,7 @@ class ApiReader:
         hits: list[dict[str, Any]] = []
         for chat_id, label in targets:
             for message in self._history(chat_id, since, until):
-                record = self.record(message)
+                record = self.record(message, self.directory.known_name)
                 if needle in fold(record["text"]):
                     hits.append({**record, "thread_id": chat_id, "chat": label})
         hits.sort(key=lambda h: h["time"], reverse=True)
