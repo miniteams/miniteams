@@ -16,10 +16,6 @@ from test_web_chat import T
 pytestmark = pytest.mark.browser
 pages, widget = browser_helpers.pages, test_browser.widget
 
-_DISPATCH = (
-    "document.querySelector('a.name').dispatchEvent("
-    "new MouseEvent('click', {button: %d, bubbles: true, cancelable: true}))"
-)
 
 _SUFFIX = {"list": "", "split": "?chatnav=split"}
 
@@ -73,20 +69,13 @@ async def test_nav_enter_on_the_filtered_selection_opens_the_chat_page(widget: W
 @pytest.mark.parametrize("browser", [True, False], ids=["browser", "no-browser"])
 async def test_nav_middle_click_opens_the_chat_page_in_a_new_tab(widget: Widget, browser: bool) -> None:
     """011-AC20: middle click in nav mode opens the chat page (through --browser when set) whatever
-    the middle-click setting; the link's default never fires too."""
+    the middle-click setting."""
     page = await _load(widget, browser, "/?nav=chat", midclick="teams")
     await widget.ctx.route(re.compile(r"/chat/"), _stub_chat)
     if browser:
         assert await widget.act(lambda: page.locator("a.name").click(button="middle")) == ([(T, "chat")], [])
     else:
         assert await widget.opens_tab(widget.base + _chat(T), button="middle") == []
-    dispatched: list[bool] = []
-
-    async def click() -> None:
-        dispatched.append(await page.evaluate(_DISPATCH % 1))
-
-    assert await widget.act(click) == ([], [])
-    assert dispatched == [False]
     assert page.url == widget.base + "/?nav=chat"
 
 
@@ -135,6 +124,23 @@ async def test_nav_ctrl_click_is_middle_click(widget: Widget, browser: bool, key
         assert await widget.opens_tab(widget.base + _chat(T), modifiers=[key]) == []
         assert await widget.opens_tab(_teams_tab(widget), modifiers=["Shift"]) == []
     assert page.url == widget.base + "/?nav=chat"
+
+
+@pytest.mark.parametrize(("click", "midclick"), [("chat", "app"), ("teams", "teams"), ("app", "chat")])
+async def test_nav_ignores_the_click_settings(widget: Widget, click: str, midclick: str) -> None:
+    """035-AC7: on `/?nav=chat` the stored Click and Middle click settings change nothing: middle and Ctrl
+    click open the chat page, a plain click navigates this tab to it."""
+    page = await _load(widget, True, "/?nav=chat", click=click, midclick=midclick)
+    await widget.ctx.route(re.compile(r"/chat/"), _stub_chat)
+    for how in ({"button": "middle"}, {"modifiers": ["Control"]}):
+        assert await widget.act(lambda h=how: page.locator("a.name").click(**h)) == ([(T, "chat")], []), how
+    assert page.url == widget.base + "/?nav=chat"
+    widget.verbs.clear()
+    await page.locator("a.name").click()
+    await page.wait_for_url(widget.base + _chat(T))
+    await _left(widget)
+    assert widget.verbs == []
+    assert len(widget.ctx.pages) == 1
 
 
 @pytest.mark.parametrize("chatnav", ["list", "split"])

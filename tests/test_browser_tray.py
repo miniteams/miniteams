@@ -11,7 +11,15 @@ from typing import Any
 
 import browser_helpers
 import pytest
-from browser_helpers import ORIGIN, Page, Pages, open_fake, row, until  # skips without playwright
+from browser_helpers import (  # skips without playwright
+    ORIGIN,
+    SOCKET_DOWN,
+    Page,
+    Pages,
+    open_fake,
+    row,
+    until,
+)
 
 from miniteams import web as W
 
@@ -88,7 +96,13 @@ async def test_without_the_bridge_the_page_is_unchanged(pages: Pages) -> None:
     fake = Fake()
     page = await _open(pages, fake)
     await page.locator("#gear").click()
-    assert await page.evaluate(MENU) == ["Theme", "Display", "Middle click", "Chat navigation"]
+    assert await page.evaluate(MENU) == [
+        "Theme",
+        "Display",
+        "Click opens",
+        "Middle click opens",
+        "Chat navigation",
+    ]
     assert await page.locator("#tray").count() == 0
     assert await page.evaluate("'__badges' in window") is False
     await pages.close()
@@ -102,7 +116,8 @@ async def test_tray_section_shows_in_the_native_window(native: Fake) -> None:
     assert await page.evaluate(MENU) == [
         "Theme",
         "Display",
-        "Middle click",
+        "Click opens",
+        "Middle click opens",
         "Chat navigation",
         "Tray",
         "Notify",
@@ -364,6 +379,51 @@ async def test_a_click_opens_the_chat_as_its_row_does(pages: Pages) -> None:
     ]
     await fake.settled()
     assert fake.of("open") == row_click * 2
+    await pages.close()
+    assert pages.external == []
+
+
+@pytest.mark.parametrize("browser", [True, False], ids=["browser", "no-browser"])
+@pytest.mark.parametrize("click", ["teams", "chat", "app"])
+async def test_a_click_follows_the_click_setting(pages: Pages, click: str, browser: bool) -> None:
+    """035-AC6: a notification's Open follows ⚙ Click opens, as a plain click on the row does: Teams web or
+    the chat page, through --browser when set, else a new window; `app` without an opener is Teams web."""
+    fake = Fake()
+    fake.first = {"opener": click != "app", "browser": browser}
+    stub = "window.__wins = []; window.open = (...a) => window.__wins.push(a);"
+    init = f"localStorage.setItem('click', {click!r}); {stub}"
+    page = await _open(pages, fake, BRIDGE + init)
+    await until(page, "typeof window.__opened === 'function'")
+    fake.send({"rows": Board().change(A, link="https://teams.microsoft.com/l/chat/a")})
+    await fake.handled()
+    await page.evaluate(f"window.__opened({A!r})")
+    await fake.settled()
+    if browser:
+        assert fake.of("open") == [{"open": A, "chat": True} if click == "chat" else {"open": A, "web": True}]
+        assert await page.evaluate("window.__wins") == []
+    else:
+        assert fake.of("open") == []
+        url = "/chat/19%3Ata%40thread.v2" if click == "chat" else "https://teams.microsoft.com/l/chat/a"
+        assert await page.evaluate("window.__wins") == [[url, "_blank", "noopener"]]
+    await pages.close()
+    assert pages.external == []
+
+
+async def test_a_click_with_the_socket_down_opens_the_row_link(pages: Pages) -> None:
+    """035-AC6: a notification's Open while the socket is down opens the row's link, not nothing."""
+    fake = Fake()
+    fake.first = {"opener": True, "browser": True}
+    stub = "window.__wins = []; window.open = (...a) => window.__wins.push(a);"
+    page = await _open(pages, fake, BRIDGE + stub)
+    await until(page, "typeof window.__opened === 'function'")
+    fake.send({"rows": Board().change(A, link="https://teams.microsoft.com/l/chat/a")})
+    await fake.handled()
+    await page.evaluate(SOCKET_DOWN)
+    await page.evaluate(f"window.__opened({A!r})")
+    assert await page.evaluate("window.__wins") == [
+        ["https://teams.microsoft.com/l/chat/a", "_blank", "noopener"]
+    ]
+    assert fake.of("open") == []
     await pages.close()
     assert pages.external == []
 
