@@ -51,7 +51,7 @@ from .compose import (
     who_reader,
 )
 from .decompose import MISREAD, Editable, brace_name, decompose
-from .directory import Directory, is_app
+from .directory import Directory, is_app, sender_name
 from .directory import humans as _humans
 from .dump import epoch_seconds, fetch_history
 from .emoji_table import SHORTCODES
@@ -380,10 +380,11 @@ def chat_record(
     name_for: Callable[[str], str] | None = None,
     images: dict[str, str] | None = None,
     saved: dict[str, str] | None = None,
+    known_name: Callable[[str], str] | None = None,
 ) -> dict[str, Any]:
     """One message as the chat page shows it (spec 011): sanitised body, reactions, mention kind.
     `custom`: the custom emoji object ids `/emoji/<id>` serves; `images`: their reaction key → object id;
-    `saved`: `page_files`."""
+    `saved`: `page_files`; `name_for` labels people, `known_name` gives only names a lookup or roster gave."""
     props = message.get("properties")
     props = props if isinstance(props, dict) else {}
     message = {**message, "properties": props}  # mention_kind reads it too
@@ -405,11 +406,13 @@ def chat_record(
                 if isinstance(m, dict)
             }
             names = file_links(props.get("files"))
-            # A known name only: name_for gives an unknown MRI's tail. Everyone (the thread) shows none.
+            # A known name only. Everyone (the thread) shows none.
             known = {
-                mri: name_for(mri) for mri in set(mentions.values()) if mri and mri != thread_id and name_for
+                mri: known_name(mri)
+                for mri in set(mentions.values())
+                if mri and mri != thread_id and known_name
             }
-            titles = {mri: name for mri, name in known.items() if name != mri.rsplit(":", 1)[-1]}
+            titles = {mri: name for mri, name in known.items() if name}
             body = sanitize(content, thread_id, media_dir, me, mentions, custom, names, named, titles)
         elif msgtype == "Text":
             body = html.escape(content)
@@ -450,7 +453,7 @@ def chat_record(
         "id": str(message.get("id") or ""),
         "at": str(message.get("composetime") or message.get("originalarrivaltime") or ""),
         "from": mri,
-        "name": str(message.get("imdisplayname") or ""),
+        "name": sender_name(mri, message.get("imdisplayname"), known_name),
         "me": is_me(mri, me),
         "type": kind,
         "editable": msgtype in TEXT_TYPES,
@@ -1668,11 +1671,12 @@ class ChatVerbs:
             found, _ = await io("search", search_chat, chat_dir, request.query, _SEARCH_HITS)
         except ArchiveUnavailable:
             return {"error": "archive unavailable"}
+        known_name = self.directory.known_name if self.directory else None
         hits = [
             {
                 "id": str(m.get("id") or ""),
                 "at": str(m.get("composetime") or ""),
-                "name": str(m.get("imdisplayname") or ""),
+                "name": sender_name(str(m.get("from") or ""), m.get("imdisplayname"), known_name),
                 "text": message_text(m),
             }
             for m in found
@@ -1801,7 +1805,8 @@ class ChatVerbs:
 
     def _reply_quote(self, message: dict[str, Any]) -> str:
         mri = str(message.get("from") or "").rsplit("/", 1)[-1]
-        name = str(message.get("imdisplayname") or "") or (
+        known_name = self.directory.known_name if self.directory else None
+        name = sender_name(mri, message.get("imdisplayname"), known_name) or (
             self.directory.name_for(mri) if self.directory else mri
         )
         return reply_quote(message, name)
@@ -1825,6 +1830,7 @@ class ChatVerbs:
                         self.directory.name_for if self.directory else None,
                         images,
                         saved,
+                        self.directory.known_name if self.directory else None,
                     )
                 )
             except Exception as exc:  # noqa: BLE001 — one malformed message must not lose the page

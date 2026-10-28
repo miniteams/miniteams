@@ -20,7 +20,7 @@ import structlog
 
 from . import attachments
 from ._io import emit
-from .directory import Directory
+from .directory import Directory, sender_name
 from .emoji_table import SHORTCODES
 from .teams_emojis import TEAMS_DIVERSE, TEAMS_EMOJIS, TEAMS_PLAIN
 
@@ -433,9 +433,9 @@ async def _print_message(resource: dict[str, Any], directory: Directory, tag: st
         log.debug("skipped_message", messagetype=msgtype)
         return
     sender_mri = resource.get("from", "")
-    sender = resource.get("imdisplayname")
-    directory.note_name(sender_mri, sender)  # feed the cache from free message metadata
-    sender = sender or await directory.display(sender_mri)
+    declared = resource.get("imdisplayname")
+    directory.note_declared(sender_mri, declared)  # a label for later, never a cached name
+    sender = sender_name(sender_mri, declared, directory.known_name) or await directory.display(sender_mri)
     when = resource.get("composetime") or resource.get("originalarrivaltime") or ""
     label = await directory.label(thread_of(resource))
     content = resource.get("content", "")
@@ -518,7 +518,8 @@ async def resource_to_record(resource: dict[str, Any], directory: Directory) -> 
     """Full-detail structured record for JSONL output — keeps the raw resource verbatim."""
     msgtype = resource.get("messagetype", "")
     sender_mri = resource.get("from", "")
-    directory.note_name(sender_mri, resource.get("imdisplayname"))
+    declared = resource.get("imdisplayname")
+    directory.note_declared(sender_mri, declared)
     content = resource.get("content", "")
     props = resource.get("properties") or {}
     thread_id = thread_of(resource)
@@ -529,7 +530,8 @@ async def resource_to_record(resource: dict[str, Any], directory: Directory) -> 
         "thread_id": thread_id,
         "thread_label": await directory.label(thread_id),
         "sender_mri": sender_mri,
-        "sender": resource.get("imdisplayname") or await directory.display(sender_mri),
+        "sender": sender_name(sender_mri, declared, directory.known_name)
+        or await directory.display(sender_mri),
         "messagetype": msgtype,
         "text": text,
         "content_raw": content,

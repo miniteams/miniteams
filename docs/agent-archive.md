@@ -73,8 +73,8 @@ Fields that matter:
 | Field | Notes |
 |---|---|
 | `composetime`, `originalarrivaltime` | ISO-8601 **UTC**, e.g. `2026-07-22T19:24:11.7020000Z` |
-| `imdisplayname` | sender display name — use this; `fromDisplayNameInToken` is absent on ~1% |
-| `from` | sender MRI URL, ends with `8:orgid:<uuid>` (stable id; avatars are named after it) |
+| `from` | sender MRI URL, ends with `8:orgid:<uuid>`: **who sent it** (stable id; avatars are named after it) |
+| `imdisplayname` | free text the sending client declares, never checked: may be empty or not the sender's name |
 | `content` | **HTML** (`RichText/Html`), not text. Empty string = deleted or activity event |
 | `messagetype` | `RichText/Html` (~99%), `Text`, `Event/Call`, `ThreadActivity/*` (join/leave/topic) |
 | `properties.emotions` | reactions: `[{key: "like", users:[{mri, time}]}]` |
@@ -83,6 +83,11 @@ Fields that matter:
 | `amsreferences` | AMS object ids → filenames under `media/` |
 
 Filter noise first: `messagetype = 'RichText/Html'` and non-empty `content`.
+
+Name a sender by the MRI at the end of `from`, looked up in the chat's `index.db` `participants`
+(`[{mri, name, role}]`, the roster); `imdisplayname` only when the roster lacks them.
+`fromDisplayNameInToken` is on most messages since 2025, absent on older ones and on some
+live-delivered copies.
 
 ## Recipes
 
@@ -100,6 +105,13 @@ import sqlite3, json, re, html
 
 def messages(thread_id, data_dir="data", since=None, until=None):
     """Yield (composetime, author, plain_text) oldest-first."""
+    idx = sqlite3.connect(f"file:{data_dir}/index.db?mode=ro", uri=True)
+    row = idx.execute("select participants from chats where id = ?", (thread_id,)).fetchone()
+    names = {  # an unresolved member is named by the bare id at the end of its MRI: skip it
+        m["mri"]: m["name"]
+        for m in json.loads(row[0] if row else "[]")
+        if m.get("name") and m["name"] != m["mri"].split(":")[-1]
+    }
     con = sqlite3.connect(f"file:{data_dir}/{thread_id}/messages.db?mode=ro", uri=True)
     sql, args = "select composetime, raw from messages where 1=1", []
     if since:
@@ -115,7 +127,8 @@ def messages(thread_id, data_dir="data", since=None, until=None):
         text = html.unescape(re.sub(r"<[^>]+>", " ", d.get("content") or ""))
         text = re.sub(r"\s+", " ", text).strip()
         if text:
-            yield ct, d.get("imdisplayname", "?"), text
+            mri = (d.get("from") or "").rsplit("/", 1)[-1]  # who sent it; imdisplayname is free text
+            yield ct, names.get(mri) or d.get("imdisplayname") or "?", text
 ```
 
 `<[^>]+>` stripping is enough — Teams HTML is flat (`<p>`, `<span>`, `<a>`, emoji `<img>`).
@@ -229,7 +242,7 @@ pairs with `<id>.transcript.vtt` by stem alone, no message lookup needed.
 | Field | Notes |
 |---|---|
 | `text` | the turn, already plain text — no HTML, no escaping |
-| `speakerDisplayName` | `"Damien DEGOIS"`, or **empty** for an unrecognised speaker |
+| `speakerDisplayName` | `"Ann Lee"`, or **empty** for an unrecognised speaker |
 | `speakerId` | `<oid>@<tid>`; the `<oid>` half matches the `8:orgid:<oid>` MRI in a message's `from` |
 | `startOffset` / `endOffset` | `"00:01:23.4567890"`, relative to the recording start |
 | `id` | `<guid>/<n>`; the VTT's sub-cues are `<guid>/<n>-0`, `-1`, … — the join key |

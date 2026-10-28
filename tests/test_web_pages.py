@@ -187,7 +187,7 @@ def _names(settings: Settings) -> Path:
     from miniteams.directory import Directory
 
     Directory(settings)._save_names()
-    return settings.cache_dir / "names.json"
+    return settings.cache_dir / "names-v2.json"
 
 
 def _sent(settings: Settings) -> Path:

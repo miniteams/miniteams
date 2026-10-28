@@ -155,7 +155,7 @@ def test_snippet_markers_for_non_text_types() -> None:
 # --- rows ---
 
 
-async def test_row_prefers_imdisplayname_then_directory(quiet_directory: Directory) -> None:
+async def test_row_names_an_unknown_sender_by_imdisplayname_then_lookup(quiet_directory: Directory) -> None:
     conv = _conv(
         "19:g@thread.v2",
         "2026-09-15T10:00:00Z",
@@ -944,9 +944,9 @@ async def test_typing_clears_queue_behind_pending_relays(
 
     board._enqueue_relay(thread, parked)
     await asyncio.sleep(0)  # the relay task is now parked on it
-    board._typing_arm(thread, "Bob")
-    board._typing_expired(thread, "Bob")
-    board._typing_arm(thread, "Bob")
+    board._typing_arm(thread, "", "Bob")  # _event() carries no `from`
+    board._typing_expired(thread, "")
+    board._typing_arm(thread, "", "Bob")
     await board.on_event(_msg(thread, "2026-09-15T12:00:00Z", "sent", msg_id="11"))
     assert frames == []
     gate.set()
@@ -1589,9 +1589,9 @@ async def test_bootstrap_scan_picks_the_newest_by_mention_time(quiet_directory: 
 
 
 def test_payload_carries_my_display_name(quiet_directory: Directory) -> None:
-    quiet_directory.note_name(ME, "Damien DEGOIS")
+    quiet_directory.note_name(ME, "Zed Doe")
     board = W.Board({}, quiet_directory, me=ME)
-    assert json.loads(board.payload())["me"] == "Damien DEGOIS"
+    assert json.loads(board.payload())["me"] == "Zed Doe"
     assert json.loads(W.Board({}, quiet_directory).payload())["me"] == ""  # no me: the page shows "@you"
 
 
@@ -2185,12 +2185,12 @@ async def test_slow_send_does_not_hold_the_page_other_verbs(
 async def test_own_messages_read_you(quiet_directory: Directory) -> None:
     """Like Teams' chat list: our own last message is "You", whatever our display name."""
     me = "8:orgid:me-guid"
-    mine = {"from": f"https://h/v1/users/ME/contacts/{me}", "imdisplayname": "Damien DEGOIS"}
+    mine = {"from": f"https://h/v1/users/ME/contacts/{me}", "imdisplayname": "Zed Doe"}
     theirs = {"from": "https://h/v1/users/ME/contacts/8:orgid:ann", "imdisplayname": "Ann"}
     started = '<partlist type="started" alt=""><part identity="{}"><name>x</name></part></partlist>'
     call = {"messagetype": "Event/Call", "from": theirs["from"]}
 
-    assert await W.sender_of(mine, quiet_directory) == "Damien DEGOIS"  # own MRI unknown: no guess
+    assert await W.sender_of(mine, quiet_directory) == "Zed Doe"  # own MRI unknown: no guess
     quiet_directory.me = me
     assert await W.sender_of(mine, quiet_directory) == "You"
     assert await W.sender_of(theirs, quiet_directory) == "Ann"

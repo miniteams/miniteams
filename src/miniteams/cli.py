@@ -187,11 +187,11 @@ def _send(
     images: list[tuple[str, bytes]],
     attached: list[tuple[str, BinaryIO, int]],
 ) -> int:
-    from .auth import self_mri
+    from .auth import self_mri, token_source
     from .send import before_images, images_body, send_images, send_message
 
     aad, skype_token = _ensure_skype_token(settings)
-    display_name = (aad.get("id_token_claims") or {}).get("name") or ""
+    display_name = token_source(settings).display_name()
     token = str(aad.get("access_token") or "")
     if not args.html and rendered is None:
         rendered = _rendered(
@@ -208,7 +208,6 @@ def _send(
         text = before_images(content) if images else content
     is_html = args.html or rendered is not None
     if attached:
-        from .auth import token_source
         from .files import onedrive, send_files
 
         drive = onedrive(settings, token, token_source(settings).sharepoint_token)
@@ -358,7 +357,7 @@ def cmd_web(settings: Settings, args: argparse.Namespace) -> int:
     import asyncio
     from pathlib import Path
 
-    from .auth import self_mri
+    from .auth import self_mri, token_source
     from .web import run
 
     aad, skype_token = _ensure_skype_token(settings)
@@ -379,6 +378,7 @@ def cmd_web(settings: Settings, args: argparse.Namespace) -> int:
                 args.open_scheme,
                 args.browser,
                 me=me,
+                me_name=token_source(settings).display_name(),
                 data_dir=Path(args.data_dir),
             )
         )

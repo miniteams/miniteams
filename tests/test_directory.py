@@ -36,7 +36,7 @@ def test_contact_url_shares_the_mri_cache(directory: Directory) -> None:
 def test_load_drops_contact_url_keys(settings: Settings) -> None:
     contact = "https://fr.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:guid"
     settings.cache_dir.mkdir(parents=True)
-    (settings.cache_dir / "names.json").write_text(json.dumps({"8:orgid:guid": "Alice", contact: "Alice"}))
+    (settings.cache_dir / "names-v2.json").write_text(json.dumps({"8:orgid:guid": "Alice", contact: "Alice"}))
     assert Directory(settings)._names == {"8:orgid:guid": "Alice"}
 
 

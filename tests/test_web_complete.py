@@ -455,7 +455,7 @@ async def test_emoji_route_serves_a_known_custom_image(
         for path in (
             "/emoji/0-weu-d1-unknown",
             "/emoji/..%2F..%2Fcfg%2Fweb.json",
-            "/emoji/../names.json",
+            "/emoji/../names-v2.json",
             f"/emoji/{OID}/x",
             f"/emoji/{OID}.png",
             "/emoji/",

@@ -136,7 +136,7 @@ def _has_token(result: dict[str, Any] | None) -> TypeGuard[dict[str, Any]]:
 
 
 def _claims(access_token: str) -> dict[str, Any]:
-    """Claims of our own AAD access token, {} when they cannot be read.
+    """Claims of our own AAD access or ID token, {} when they cannot be read.
 
     Our own token, already trusted for the API calls it authorises — the payload is decoded
     without signature verification only to learn who we are (the silent refresh returns no
@@ -301,6 +301,21 @@ class TokenSource:
                     )
                 raise AuthUnavailable(f"silent token refresh failed ({code}) — AAD-side, retryable")
             return result
+
+    def display_name(self) -> str:
+        """My display name from a cached ID token of my account, "" when none names me; no AAD call.
+
+        A silent call answered from the access-token cache returns no `id_token_claims`."""
+        with self._lock:
+            self._sync_cache()
+            accounts = self._teams.get_accounts()
+            if not accounts:
+                return ""
+            query = {"home_account_id": accounts[0].get("home_account_id")}
+            for entry in self._cache.search(msal.TokenCache.CredentialType.ID_TOKEN, query=query):
+                if name := _claims(str(entry.get("secret") or "")).get("name"):
+                    return str(name)
+            return ""
 
     def start_device_flow(self) -> dict[str, Any]:
         """Open a device-code sign-in on the Teams client; the caller shows the URL and code and

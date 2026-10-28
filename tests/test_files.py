@@ -817,7 +817,8 @@ def test_cli_sends_text_right_at_the_limit(
     doc.write_bytes(b"1")
     monkeypatch.setattr(cli, "_ensure_skype_token", lambda s: ({"access_token": AAD}, "sk"))
     monkeypatch.setattr(
-        "miniteams.auth.token_source", lambda s: SimpleNamespace(sharepoint_token=lambda h: "sp-token")
+        "miniteams.auth.token_source",
+        lambda s: SimpleNamespace(sharepoint_token=lambda h: "sp-token", display_name=lambda: ""),
     )
     args = argparse.Namespace(
         text=text, file=None, thread=THREAD, html=is_html, image=None, attach=[str(doc)]
@@ -835,6 +836,9 @@ def test_cli_attach_sends_the_files(settings: Settings, sp: FakeSharePoint, tmp_
     class Source:
         def sharepoint_token(self, host: str) -> str | None:
             return "sp-token" if host == HOST else None
+
+        def display_name(self) -> str:
+            return ""
 
     monkeypatch.setattr("miniteams.auth.token_source", lambda s: Source())
     assert cli.cmd_send(settings, _args(tmp_path, str(doc))) == 0
@@ -879,7 +883,8 @@ def test_cli_sends_images_and_files_in_one_message(
     monkeypatch.setattr(cli, "_ensure_skype_token", lambda s: ({"access_token": AAD}, "sk"))
     monkeypatch.setattr("miniteams.auth.self_mri", lambda token: ME)
     monkeypatch.setattr(
-        "miniteams.auth.token_source", lambda s: SimpleNamespace(sharepoint_token=lambda h: "sp-token")
+        "miniteams.auth.token_source",
+        lambda s: SimpleNamespace(sharepoint_token=lambda h: "sp-token", display_name=lambda: ""),
     )
     monkeypatch.setattr(send, "upload_image", lambda *a: "0-weu-d1-" + "1" * 32)
     args = _args(tmp_path, str(doc), image=[str(picture)])

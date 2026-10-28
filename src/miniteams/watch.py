@@ -19,7 +19,7 @@ import structlog
 from ._io import emit, force_blocking_stdout
 from .auth import AuthExpired, self_mri, token_source
 from .config import Settings, write_private
-from .directory import Directory
+from .directory import Directory, sender_name
 from .dump import iter_history_pages
 from .messages import SNIPPET_LEN, TEXT_TYPES, is_me, plain_text, thread_of
 from .skype import exchange_skype_token
@@ -154,7 +154,8 @@ class Watcher:
         if hit["reactor"]:
             sender = await self.directory.display(sender_mri)
         else:
-            sender = str(resource.get("imdisplayname") or "") or await self.directory.display(sender_mri)
+            known = sender_name(sender_mri, resource.get("imdisplayname"), self.directory.known_name)
+            sender = known or await self.directory.display(sender_mri)
         return {
             "event": self.watch.event,
             "thread": thread,

@@ -14,6 +14,7 @@ import asyncio
 import json
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote
 
@@ -48,6 +49,9 @@ _REACTION_LRU_MAX = 4096
 # thread costs one refetch on its next lookup.
 _THREADS_MAX = 4096
 
+# Names messages declare for their senders: free text, so never cached as a name; the stream runs for days.
+_DECLARED_MAX = 4096
+
 # Lookups run inline in the event loop and a 429 retry can take ~30s: don't repeat that per message.
 _THREAD_RETRY_AFTER = 60.0
 
@@ -75,9 +79,21 @@ def roster_label(topic: str | None, members: list[dict[str, Any]], me: str) -> s
     return ", ".join(others or apps or [str(m["name"]) for m in named])
 
 
+def sender_name(mri: str, declared: object, known_name: Callable[[str], str] | None) -> str:
+    """Who sent a message: the directory's name for `mri`, else the name this message declares, else "".
+
+    The declared `imdisplayname` is free text the sending client chose; Teams attributes by `from`."""
+    return (known_name(mri) if known_name and mri else "") or str(declared or "")
+
+
 def _bare(mri: str) -> str:
     # A message's `from` is a contact URL whose host varies by region: key the cache on the MRI.
     return mri.rsplit("/", 1)[-1]
+
+
+def _tail(mri: str) -> str:
+    """An unresolved MRI's label, e.g. the guid of `8:orgid:<guid>`; also the negative-cache marker."""
+    return mri.split(":")[-1]
 
 
 def _mri_from_userlink(user_link: str | None) -> str:
@@ -97,8 +113,10 @@ class Directory:
         self._thread_fetch: dict[str, asyncio.Task[dict[str, Any] | None]] = {}  # in flight
         # thread_id → monotonic time of a transient failure; capped like _threads.
         self._thread_failed: OrderedDict[str, float] = OrderedDict()
-        self._names_path = settings.cache_dir / "names.json"
+        # v2: the unversioned names.json also holds names messages declared; left on disk, never read.
+        self._names_path = settings.cache_dir / "names-v2.json"
         self._names: dict[str, str] = self._load_names()  # MRI → display name (persisted)
+        self._declared: OrderedDict[str, str] = OrderedDict()  # MRI → name a message declared; LRU
         # msg_id → {key → set(MRI)}; LRU-bounded (see _REACTION_LRU_MAX) to cap memory.
         self._reactions: OrderedDict[str, dict[str, set[str]]] = OrderedDict()
 
@@ -123,17 +141,32 @@ class Directory:
             self.bearer = bearer
 
     def note_name(self, mri: str, name: str | None) -> None:
+        """A name from a profile lookup or a roster: authoritative, cached and persisted."""
         mri = _bare(mri)
         if mri and name:
             self._names[mri] = name
 
+    def note_declared(self, mri: str, name: str | None) -> None:
+        """A name a message declares for its sender: a last-resort label, never a cached name."""
+        mri = _bare(mri)
+        if mri and name:
+            self._declared[mri] = name
+            self._declared.move_to_end(mri)
+            while len(self._declared) > _DECLARED_MAX:
+                self._declared.popitem(last=False)
+
     def _unknown(self, mri: str) -> bool:
-        return self._names.get(mri) == mri.split(":")[-1]  # the negative-cache marker
+        return self._names.get(mri) == _tail(mri)
+
+    def known_name(self, mri: str) -> str:
+        """The name a profile lookup or a roster gave `mri`; "" when absent or negative-cached."""
+        mri = _bare(mri)
+        return "" if self._unknown(mri) else self._names.get(mri, "")
 
     def name_for(self, mri: str) -> str:
-        # Strip the "8:orgid:" style prefix for an unresolved MRI.
+        """A label for `mri`: its known name, else the last name a message declared, else its bare id."""
         mri = _bare(mri)
-        return self._names.get(mri) or mri.split(":")[-1]
+        return self.known_name(mri) or self._declared.get(mri) or _tail(mri)
 
     async def resolve(self, mris: list[str], *, refresh: bool = False) -> None:
         """Batched MRI → display-name lookup; caches results (incl. negatives, to avoid refetch).
@@ -162,7 +195,7 @@ class Directory:
         # Negative-cache genuinely-unknown MRIs (lookup succeeded but returned no name) so we
         # don't re-query them; transient failures above return early and stay retryable.
         for mri in todo:
-            self._names.setdefault(mri, mri.split(":")[-1])
+            self._names.setdefault(mri, _tail(mri))
         self._save_names()
 
     async def display(self, mri: str) -> str:
@@ -272,7 +305,7 @@ class Directory:
         # Resolve roster members the thread didn't name (bare-guid MRIs) in one batched call.
         await self.resolve([m["mri"] for m in members if not m["name"]])
         for m in members:
-            m["name"] = m["name"] or self.name_for(m["mri"])
+            m["name"] = m["name"] or self.known_name(m["mri"]) or _tail(m["mri"])  # never a declared name
         self._save_names()  # persist friendlyName-sourced names too
 
         props = data.get("properties") or {}

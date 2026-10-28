@@ -661,7 +661,11 @@ def test_a_mention_shows_its_persons_full_name_on_hover(
     content = '<p><span itemtype="http://schema.skype.com/Mention" itemscope itemid="0">Ann</span> look</p>'
     props = {"mentions": json.dumps([{"mentionType": kind, "itemid": 0, "mri": mri}])}
     record = CV.chat_record(
-        _m("7", _at(7), content, properties=props), thread, ME, name_for=directory.name_for
+        _m("7", _at(7), content, properties=props),
+        thread,
+        ME,
+        name_for=directory.name_for,
+        known_name=directory.known_name,
     )
     cls = "mention mention-me" if mri == ME else "mention"
     assert record["html"] == f'<p><span class="{cls}" data-mri="{mri}"{title}>Ann</span> look</p>'
@@ -1251,9 +1255,9 @@ async def test_records_are_built_off_the_event_loop(
     threads: list[int] = []
     real = CV.chat_record
 
-    def spy(*args: Any) -> dict[str, Any]:
+    def spy(*args: Any, **kwargs: Any) -> dict[str, Any]:
         threads.append(threading.get_ident())
-        return real(*args)
+        return real(*args, **kwargs)
 
     monkeypatch.setattr(CV, "chat_record", spy)  # pages
     monkeypatch.setattr(W, "chat_record", spy)  # live relay
@@ -1276,7 +1280,7 @@ async def test_relay_failure_does_not_cost_the_board_its_update(
 ) -> None:
     """011-AC7: a relay that raises is logged; the row still moves and the stream goes on."""
 
-    def broken(*args: Any) -> Any:
+    def broken(*args: Any, **kwargs: Any) -> Any:
         raise TypeError("odd event")
 
     monkeypatch.setattr(W, "chat_record", broken)
@@ -1410,9 +1414,9 @@ async def test_typing_expiry_off_the_board_does_not_rebroadcast(
     board = W.Board({}, quiet_directory, me=ME, data_dir=data_dir, typing_ttl=0.05)
     sent: list[str] = []
     monkeypatch.setattr(board, "broadcast", lambda: sent.append("board"))
-    board._typing_arm(C, "Ann Lee")
+    board._typing_arm(C, ANN, "Ann Lee")
     await asyncio.sleep(0.15)
-    assert (C, "Ann Lee") not in board._typing_timers
+    assert (C, ANN) not in board._typing_timers
     assert sent == []
 
 
@@ -3142,9 +3146,9 @@ async def test_a_slow_media_folder_never_holds_the_stream(
     release = threading.Event()
     real = W.chat_record
 
-    def slow(*args: Any) -> dict[str, Any]:
+    def slow(*args: Any, **kwargs: Any) -> dict[str, Any]:
         release.wait(3)  # the NFS media glob the review measured
-        return real(*args)
+        return real(*args, **kwargs)
 
     monkeypatch.setattr(W, "chat_record", slow)
     await _following(board, C)  # off the board: every frame is the relay's
@@ -3234,11 +3238,12 @@ async def test_a_hung_media_folder_relays_without_media(
         custom: Any,
         name_for: Any = None,
         images: Any = None,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         seen.append(media)
         if media is not None:
             release.wait(5)
-        return real(message, thread_id, me, media, custom, name_for, images)
+        return real(message, thread_id, me, media, custom, name_for, images, **kwargs)
 
     monkeypatch.setattr(W, "chat_record", record)
     monkeypatch.setitem(CV._DEADLINES, "relay", 0.05)

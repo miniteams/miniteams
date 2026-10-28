@@ -26,6 +26,7 @@ from .auth import AuthExpired, AuthUnavailable, TokenSource, self_mri, token_sou
 from .chats import chat_kind, is_system, last_activity, parse_when
 from .compose import render_outgoing
 from .config import Settings
+from .directory import Directory, sender_name
 from .drafts import (
     SCHEDULE_MAX_AHEAD,
     SCHEDULE_MIN_AHEAD,
@@ -143,14 +144,15 @@ def _utc(value: str, *, end: bool = False) -> str:
         raise ToolError(f"invalid ISO date/datetime: {value!r}") from exc
 
 
-def message_record(message: dict[str, Any]) -> dict[str, Any]:
+def message_record(message: dict[str, Any], known_name: Callable[[str], str] | None = None) -> dict[str, Any]:
     props = message.get("properties") or {}
     ams = message.get("amsreferences") or []
+    mri = str(message.get("from") or "").rsplit("/", 1)[-1]
     record = {
         "id": str(message.get("id") or ""),
         "time": str(message.get("composetime") or ""),
-        "sender": str(message.get("imdisplayname") or ""),
-        "from": str(message.get("from") or "").rsplit("/", 1)[-1],
+        "sender": sender_name(mri, message.get("imdisplayname"), known_name),
+        "from": mri,
         "text": message_text(message),
         "edited": is_edited(message),
         "deleted": is_deleted(props),
@@ -162,11 +164,16 @@ def message_record(message: dict[str, Any]) -> dict[str, Any]:
 class Archive:
     """Read-only view of `--data-dir`. Every database is opened `mode=ro`; nothing is created."""
 
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(self, data_dir: Path, settings: Settings | None = None) -> None:
         self.data_dir = data_dir
+        self.settings = settings  # its cache_dir holds the names other miniteams processes resolved
 
         self._down_until = 0.0
         self._probe: Callable[[], None] = self._open_index
+
+    def _known_name(self) -> Callable[[str], str] | None:
+        # Per call: other processes rewrite the names cache, and a local file read is cheap next to the query.
+        return Directory(self.settings).known_name if self.settings else None
 
     def _unavailable(self, exc: Exception) -> ToolError:
         return ToolError(f"archive unavailable at {self.data_dir}: {exc}")
@@ -288,7 +295,8 @@ class Archive:
             cut = rows[limit][0]
             rows = [r for r in rows[:limit] if r[0] < cut]
             result["next_since"] = cut
-        result["messages"] = [message_record(json.loads(raw)) for _, raw in rows]
+        known_name = self._known_name()
+        result["messages"] = [message_record(json.loads(raw), known_name) for _, raw in rows]
         return result
 
     def search_messages(
@@ -308,13 +316,14 @@ class Archive:
             ]
         hits: list[dict[str, Any]] = []
         more = False
+        known_name = self._known_name()
         for chat_id, label, folder in targets:
             try:
                 found, extra = search_chat(folder, query, limit, since=since, until=until)
             except sqlite3.Error as exc:
                 raise self._unavailable(exc) from exc
             more = more or extra
-            hits += [{**message_record(m), "thread_id": chat_id, "chat": label} for m in found]
+            hits += [{**message_record(m, known_name), "thread_id": chat_id, "chat": label} for m in found]
         hits.sort(key=lambda h: h["time"], reverse=True)
         more = more or len(hits) > limit
         return {"chats_scanned": len(targets), "more": more, "messages": hits[:limit]}
@@ -446,9 +455,8 @@ class Session:
         return self_mri(self.provider.bearer())
 
     def display_name(self) -> str:
-        """Name stamped on outgoing messages; the silent refresh answers from the cache."""
-        claims = self.source.refresh().get("id_token_claims") or {}
-        return str(claims.get("name") or "")
+        """Name stamped on outgoing messages, read from the token cache."""
+        return self.source.display_name()
 
     def _pending(self) -> dict[str, Any]:
         assert self._flow is not None
@@ -886,7 +894,7 @@ class Server:
         stdout: IO[str] | None = None,
     ) -> None:
         self.settings = settings
-        self.archive = Archive(data_dir.resolve())
+        self.archive = Archive(data_dir.resolve(), settings)
         self.session = Session(settings)
         self.read_only = read_only
         self._in = stdin or sys.stdin

@@ -3,6 +3,7 @@
 import os
 import struct
 import zlib
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -286,6 +287,7 @@ def test_cli_send_images(settings: Settings, monkeypatch, tmp_path) -> None:
     b.write_bytes(jpeg(4, 4))
     args = _parse(monkeypatch, ["send", "hello", "--thread", "T", "--image", str(a), "--image", str(b)])
     monkeypatch.setattr(cli, "_ensure_skype_token", lambda s: ({}, "sk"))
+    monkeypatch.setattr("miniteams.auth.token_source", lambda s: SimpleNamespace(display_name=lambda: ""))
     seen: dict[str, Any] = {}
     monkeypatch.setattr(
         "miniteams.send.send_images",

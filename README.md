@@ -337,9 +337,10 @@ turns each line into an event in the session; `docs/watch.md` has the call and t
 (`gap`, `suppressed`, `stopped`).
 
 `stream` enriches each line with thread name + participants, resolves MRIs → display names
-(cached in `~/.cache/miniteams/names.json`), downloads images/files to `~/.cache/miniteams/media/`
-(full-res + optimized, shown as `file://`), and renders reactions (`↳ 👍 Alice reacted`), edits
-(`✏ …`) and deletes (`🗑 …`). `--typing` adds `✍ is typing / stopped` indicators.
+(cached in `~/.cache/miniteams/names-v2.json`; the older `names.json` is ignored), downloads
+images/files to `~/.cache/miniteams/media/` (full-res + optimized, shown as `file://`), and renders
+reactions (`↳ 👍 Alice reacted`), edits (`✏ …`) and deletes (`🗑 …`). `--typing` adds `✍ is typing /
+stopped` indicators.
 `stream --jsonl` = per-event JSON; `stream --raw` = full firehose NDJSON of every frame (all
 endpoints, presence/calls, named events), decoded.
 
