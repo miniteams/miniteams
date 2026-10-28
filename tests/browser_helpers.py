@@ -48,6 +48,10 @@ FRAMES = """(() => { const Real = WebSocket; window.__frames = []; window.__out 
     send(d) { window.__out.push(typeof d === "string" ? JSON.parse(d) : { binary: d.size ?? d.byteLength });
       super.send(d); } };
 })();"""
+# Closes the page's socket and keeps it down: every reconnection dials a closed port.
+SOCKET_DOWN = """(() => { const Live = window.WebSocket;
+  window.WebSocket = class extends Live { constructor() { super("ws://127.0.0.1:9/"); } };
+  window.__ws.close(); })()"""
 # An element's text contrast against what is under it (backgrounds and opacity up its parents).
 CONTRAST = """e => {
   const rgba = (c) => { const n = c.match(/[\\d.]+/g).map(Number), s = c.startsWith('color(') ? 255 : 1;

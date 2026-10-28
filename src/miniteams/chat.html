@@ -1699,6 +1699,18 @@
   // only a chat on the board (or followed): another one goes through the page.
   const openTab = (id) => browser && rows.some((r) => r.id === id) ? send({ open: id, chat: true, chatnav: "split" })
     : window.open(chatPath(id) + "?chatnav=split", "_blank", "noopener");
+  // What a click (`listclick`) and a middle or Ctrl/⌘ click (`listmidclick`) on a row open: the widget's
+  // targets on keys of their own (a plain click here switches in place by default). Read at each click:
+  // a ⚙ choice applies at once.
+  const TARGETS = [["app", "Teams app"], ["teams", "Teams web"], ["chat", "miniteams"]];
+  const target = (k) => TARGETS.some(([t]) => t === pref(k)) ? pref(k) : "chat";
+  const aim = (mid) => mid ? target("listmidclick") : target("listclick") === "chat" ? "here" : target("listclick");
+  // Opens row r on target `to`; null leaves it to the row's link (Teams web, a new tab in this browser).
+  // `app` without --opener or a message id falls back to Teams web, as on the widget.
+  const route = (r, to) => to === "here" ? () => switchTo(r.id, true)
+    : to === "chat" ? () => openTab(r.id)
+    : to === "app" && opener && r.last_id ? () => send({ open: r.id, web: false })
+    : browser ? () => send({ open: r.id, web: true }) : null;
   const rowOf = (r) => {
     const m = mentioned(r), dm = kind(r.id) === "dm";
     const li = el("li", (r.unread ? "unread " : "") + ((isSeen(r) || r.muted) && !m ? "seen " : "") + (r.id === thread ? "cur " : "")
@@ -1715,17 +1727,18 @@
     const name = Object.assign(marked(el("a", "name truncate"), rowTitle(r), query), { href: r.link || "#", target: "_blank", rel: "noopener", title: r.label, dir: "auto" });
     name.dataset.k = "name";
     name.tabIndex = -1;  // renderRows gives one row the Tab stop
-    const middle = (ev) => { ev.preventDefault(); openTab(r.id); };
-    // Plain click switches in place; Shift click opens Teams as on the board; middle click is onauxclick's.
+    // Plain click → `listclick`, middle or Ctrl/⌘ click → `listmidclick` (see route); Shift click opens
+    // Teams as on the board. Whatever we open ourselves prevents the link's own Teams tab;
+    // a send on a dead socket (false) leaves the click to the link.
+    const openRow = (ev, mid) => { const go = route(r, aim(mid)); if (go && go() !== false) ev.preventDefault(); };
     name.onclick = (ev) => {
-      if (ev.button === 1) { ev.preventDefault(); return; }
+      if (ev.button) return;  // the middle button is onauxclick's
       // Ctrl/⌘ click = middle click: a touchpad has no easy middle button.
-      if (ev.ctrlKey || ev.metaKey) { middle(ev); return; }
+      if (ev.ctrlKey || ev.metaKey) { openRow(ev, true); return; }
       if (ev.shiftKey) { if (browser) { ev.preventDefault(); send({ open: r.id, web: true }); } return; }
-      ev.preventDefault();
-      switchTo(r.id, true);
+      openRow(ev, false);
     };
-    name.onauxclick = (ev) => { if (ev.button === 1) middle(ev); };
+    name.onauxclick = (ev) => { if (ev.button === 1) openRow(ev, true); };
     const meta = el("span", "meta"), [acts, menu] = actions(r);
     meta.append(...acts, Object.assign(el("span", "ago", ago(r.last_activity)), { title: r.last_activity }));
     const ind = el("span", "ind");
@@ -1847,6 +1860,9 @@
   };
   const onBoard = (m) => {
     rows = m.rows; browser = !!m.browser; meName = m.me || ""; secs.set(m.sections);
+    // The follow frame sets it too, from the same server value: a row clicked before it, or with the follow
+    // failed, still reaches the desktop client.
+    if ("opener" in m) opener = !!m.opener;
     renderRows();
   };
   // A chat's whole screen state goes; its draft, quotes and open editors wait in `drafts`.
@@ -1944,7 +1960,8 @@
       // ←/→ fold a header or reach a chat's header only in an empty box: else they move the caret.
       else if (to) highlight(to, false);
       else if (e.key === "Enter" && cur?.dataset.sid !== undefined) cur.querySelector(".shead").click();
-      else if (e.key === "Enter") { const li = cur || $rows.querySelector("li[data-id]"); if (li) switchTo(li.dataset.id, true); }
+      // As a plain click does (`listclick`): the link's own new tab when nothing else opens it.
+      else if (e.key === "Enter") (cur || $rows.querySelector("li[data-id]"))?.querySelector(".name").click();
       else if (e.key === "Escape" && ($filter.value || sel)) { e.stopPropagation(); clearFilter(); }
       else return;
       e.preventDefault();
@@ -2041,8 +2058,9 @@
       setTimeout(connect, retry.next());
     };
   };
-  // ⚙: the settings this page reads, on the widget's keys: a tab opened in another browser through
-  // --browser has a storage of its own, set here. A choice drops its URL parameter: the URL outranks storage.
+  // ⚙: the settings this page reads, on the widget's keys but for the split list's clicks: a tab opened in
+  // another browser through --browser has a storage of its own, set here. A choice drops its URL parameter:
+  // the URL outranks storage.
   const $cog = document.getElementById("cog"), $gear = document.getElementById("gear");
   let cogOpen = false;
   const here = () => location.pathname + (q.size ? "?" + q : "");
@@ -2115,7 +2133,10 @@
     tools.append(left, right, reset);
     rbox.append(el("h3", null, "Reactions"), slots, tools);
     drawFavs();
-    menu.append(themes, dbox, tbox, nav, rbox);
+    // The list exists only in split mode.
+    const clicks = (split ? [["listclick", "Click opens"], ["listmidclick", "Middle click opens"]] : []).map(([key, title]) =>
+      Object.assign(segOf(title, TARGETS, target(key), (k) => choose(key, k)), { id: key }));
+    menu.append(themes, dbox, tbox, nav, ...clicks, rbox);
     $cog.append(menu);
   };
   const closeCog = (focus) => { cogOpen = false; renderCog(); if (focus) $gear.focus(); };

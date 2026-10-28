@@ -20,6 +20,7 @@ import test_web_chat
 from browser_helpers import (  # skips without playwright
     CONTRAST,
     PNG,
+    SOCKET_DOWN,
     BrowserContext,
     Page,
     Pages,
@@ -1794,12 +1795,13 @@ class Widget:
         assert self.page is not None
         return self.page.context
 
-    async def load(self, browser: bool, path: str = "/", midclick: str = "") -> Page:
+    async def load(self, browser: bool, path: str = "/", midclick: str = "", click: str = "") -> Page:
         self.board.browser = ["firefox"] if browser else None
         if self.page is None:
             self.page = await self.pages.open(path)
-        if midclick:
-            await self.page.evaluate(f"localStorage.setItem('midclick', {json.dumps(midclick)})")
+        for key, value in (("midclick", midclick), ("click", click)):
+            if value:
+                await self.page.evaluate(f"localStorage.setItem({key!r}, {json.dumps(value)})")
         await self.page.goto(self.base + path)
         await self.page.wait_for_selector("a.name")  # rows, browser and opener arrive in one frame
         return self.page
@@ -1993,7 +1995,7 @@ async def test_middle_click_chat_setting_opens_the_chat_page(
     `open`+`chat` through --browser when set, else opens /chat/<id> in a tab and sends no verb."""
     page = await widget.load(browser)
     await page.click("#gear")
-    await page.get_by_role("button", name="Chat here").click()
+    await page.locator("#midclick").get_by_role("button", name="miniteams").click()
     assert await page.evaluate("localStorage.getItem('midclick')") == "chat"
     await widget.load(browser)
     widget.part = part
@@ -2001,17 +2003,6 @@ async def test_middle_click_chat_setting_opens_the_chat_page(
         assert await widget.act(lambda: page.locator(part).click(button="middle")) == ([(T, "chat")], [])
     else:
         assert await widget.opens_tab(widget.base + _chat(T), button="middle") == []
-    # A browser that also fires `click` for button 1 must not add a verb or a second tab. dispatchEvent
-    # returns false only when the default (the link's own tab) was prevented: no tab can come later.
-    script = "new MouseEvent('click', {button: 1, bubbles: true, cancelable: true})"
-    dispatch = f"document.querySelector('a.name').dispatchEvent({script})"
-    dispatched: list[bool] = []
-
-    async def click() -> None:
-        dispatched.append(await page.evaluate(dispatch))
-
-    assert await widget.act(click) == ([], [])
-    assert dispatched == [False]
 
 
 @_PARTS
@@ -2042,6 +2033,179 @@ async def test_midclick_url_param_overrides_the_stored_choice(widget: Widget) ->
     page = await widget.load(True, "/?midclick=teams", midclick="chat")
     assert await widget.act(lambda: page.locator("a.name").click(button="middle")) == ([(T, True)], [])
     assert await page.evaluate("localStorage.getItem('midclick')") == "chat"
+
+
+# --- widget click settings (035 phase 1) ---
+
+
+async def _app_falls_back_to_teams_web(widget: Widget, browser: bool, **click: Any) -> None:
+    """A click aimed at `app`, without an opener and then without a message id, opens Teams web: through
+    --browser when set (no tab of its own), else the row's link in exactly one new tab."""
+    for opener, last_id in ((None, "1789466400000"), (["xdg-open"], "")):
+        widget.board.opener, widget.board.rows[T]["last_id"] = opener, last_id
+        page = await widget.load(browser)
+        if browser:
+            sent = await widget.act(lambda p=page: p.locator("a.name").click(**click))
+            assert sent == ([(T, True)], []), (opener, click)
+        else:
+            assert await widget.opens_tab(f"{widget.base}/teams/{last_id}", **click) == [], (opener, click)
+    widget.board.opener, widget.board.rows[T]["last_id"] = ["xdg-open"], "1789466400000"
+
+
+@pytest.mark.parametrize("browser", [True, False], ids=["browser", "no-browser"])
+async def test_click_settings_default_is_unchanged(widget: Widget, browser: bool) -> None:
+    """035-AC1: nothing stored: a plain click opens the desktop client, a middle click Teams web; without
+    an opener or a message id the plain click falls back to Teams web (through --browser when set)."""
+    page = await widget.load(browser)
+    assert await widget.act(lambda: page.locator("a.name").click()) == ([(T, False)], [])
+    if browser:
+        assert await widget.act(lambda: page.locator("a.name").click(button="middle")) == ([(T, True)], [])
+    else:
+        assert await widget.opens_tab(_teams_tab(widget), button="middle") == []
+    await _app_falls_back_to_teams_web(widget, browser)
+
+
+@pytest.mark.parametrize("browser", [True, False], ids=["browser", "no-browser"])
+async def test_click_web_opens_teams_web(widget: Widget, browser: bool) -> None:
+    """035-AC2: Click `Teams web` (stored `teams`): `open`+`web` through --browser, else the row's link in
+    a new tab and no verb."""
+    page = await widget.load(browser, click="teams")
+    if browser:
+        assert await widget.act(lambda: page.locator("a.name").click()) == ([(T, True)], [])
+    else:
+        assert await widget.opens_tab(_teams_tab(widget)) == []
+
+
+@pytest.mark.parametrize("chatnav", ["list", "split"])
+@pytest.mark.parametrize("browser", [True, False], ids=["browser", "no-browser"])
+async def test_click_chat_opens_the_chat_page(
+    widget: Widget, monkeypatch: pytest.MonkeyPatch, browser: bool, chatnav: str
+) -> None:
+    """035-AC3: Click `miniteams`: `open`+`chat` (plus `chatnav` when split) through --browser, else
+    /chat/<id> (`?chatnav=split` when split) in a new tab (one tab: the link's own Teams tab never opens
+    too); the board stays."""
+
+    async def spy(thread_id: str, target: str = "app", ws: Any = None, msg_id: str = "") -> bool:
+        widget.verbs.append((thread_id, target if target in ("chat", "split") else target == "web"))
+        return True
+
+    page = await widget.load(browser, click="chat")
+    await page.evaluate(f"localStorage.setItem('chatnav', {chatnav!r})")
+    await widget.load(browser)
+    monkeypatch.setattr(widget.board, "open_row", spy)
+    if browser:
+        target = "split" if chatnav == "split" else "chat"
+        assert await widget.act(lambda: page.locator("a.name").click()) == ([(T, target)], [])
+    else:
+        url = widget.base + _chat(T) + ("?chatnav=split" if chatnav == "split" else "")
+        assert await widget.opens_tab(url) == []
+    assert page.url == widget.base + "/"
+
+
+@pytest.mark.parametrize("browser", [True, False], ids=["browser", "no-browser"])
+async def test_middle_click_app_opens_the_desktop_client(widget: Widget, browser: bool) -> None:
+    """035-AC4: Middle click `Teams app`: a middle click and a Ctrl/⌘ click send `open`+`web: false`, no tab
+    opens; without an opener or a message id both fall back to Teams web."""
+    page = await widget.load(browser, midclick="app")
+    for click in ({"button": "middle"}, {"modifiers": ["Control"]}, {"modifiers": ["Meta"]}):
+        sent = await widget.act(lambda c=click: page.locator("a.name").click(**c))
+        assert sent == ([(T, False)], []), click
+    for click in ({"button": "middle"}, {"modifiers": ["Control"]}):
+        await _app_falls_back_to_teams_web(widget, browser, **click)
+
+
+async def _one_link_tab(page: Page, url: str, click: Callable[[], Awaitable[None]]) -> None:
+    """`click`, the socket down, opens exactly one tab, on `url`, and sends nothing."""
+    out = await page.evaluate("window.__out.length")
+    async with page.context.expect_page() as new:
+        await click()
+    tab = await new.value
+    await tab.wait_for_url(url)
+    assert await page.evaluate(f"window.__out.slice({out}).filter(v => 'open' in v)") == []
+    assert len(page.context.pages) == 2
+    await tab.close()
+
+
+@pytest.mark.parametrize(("click", "midclick"), [("teams", "app"), ("chat", "chat")])
+async def test_a_dead_socket_leaves_the_click_to_the_row_link(
+    widget: Widget, click: str, midclick: str
+) -> None:
+    """035-AC2, 035-AC4: with the socket down (--browser set), a plain click and a middle click on a target
+    the server opens (Teams web, Teams app, miniteams) open the row's link in exactly one tab, no verb."""
+    page = await widget.load(True, click=click, midclick=midclick)
+    await page.evaluate(SOCKET_DOWN)
+    name = page.locator("a.name")
+    await _one_link_tab(page, _teams_tab(widget), lambda: name.click())
+    await _one_link_tab(page, _teams_tab(widget), lambda: name.click(button="middle"))
+
+
+@pytest.mark.parametrize(
+    ("setting", "browser", "sent", "tab"),
+    [
+        ("app", True, [(T, False)], ""),
+        ("teams", True, [(T, True)], ""),
+        ("chat", True, [(T, "chat")], ""),
+        ("teams", False, [], "/teams/1789466400000"),
+        ("chat", False, [], _chat(T)),
+    ],
+)
+async def test_enter_follows_the_click_setting(
+    widget: Widget, setting: str, browser: bool, sent: list[Verb], tab: str
+) -> None:
+    """035-AC6: Enter on the row selected from the filter box does what a plain click does in each setting."""
+    page = await widget.load(browser, click=setting)
+    box = page.locator("#q")
+    await box.fill("fict")
+    await box.press("ArrowDown")
+    if not tab:
+        assert await widget.act(lambda: box.press("Enter")) == (sent, [])
+        return
+
+    async def enter() -> None:
+        async with widget.ctx.expect_page() as opened:
+            await box.press("Enter")
+        await (await opened.value).wait_for_url(widget.base + tab)
+
+    assert await widget.act(enter) == (sent, [widget.base + tab])
+
+
+@pytest.mark.parametrize("stored", ["", "teams", "chat", "app", "bogus"])
+async def test_click_menu_has_both_settings_and_they_persist(widget: Widget, stored: str) -> None:
+    """035-AC8: ⚙ shows Click opens and Middle click opens, three choices each; a stored `midclick` keeps its
+    meaning (`teams` Teams web, `chat` miniteams), an unknown one reads as the default; each choice routes
+    the next click at once and is kept on its own across a reload."""
+    page = await widget.load(True, midclick=stored)
+    await page.click("#gear")
+    heads = await page.locator(".menu h3").all_text_contents()
+    assert heads[2:4] == ["Click opens", "Middle click opens"]
+    labels = ["Teams app", "Teams web", "miniteams"]
+    assert await page.locator("#click button").all_text_contents() == labels
+    assert await page.locator("#midclick button").all_text_contents() == labels
+    shown = {"chat": "miniteams", "app": "Teams app"}.get(stored, "Teams web")
+    assert await page.locator("#click button.on").text_content() == "Teams app"
+    assert await page.locator("#midclick button.on").text_content() == shown
+    await page.locator("#click").get_by_role("button", name="miniteams").click()
+    await page.locator("#midclick").get_by_role("button", name="Teams app").click()
+    stored_now = await page.evaluate("[localStorage.getItem('click'), localStorage.getItem('midclick')]")
+    assert stored_now == ["chat", "app"]
+    await page.keyboard.press("Escape")
+    assert await page.locator(".menu").count() == 0
+    # Live, before any reload: the page routes on the choice, not only on what it stored.
+    assert await widget.act(lambda: page.locator("a.name").click()) == ([(T, "chat")], [])
+    assert await widget.act(lambda: page.locator("a.name").click(button="middle")) == ([(T, False)], [])
+    await widget.load(True)
+    await page.click("#gear")
+    assert await page.locator("#click button.on").text_content() == "miniteams"
+    assert await page.locator("#midclick button.on").text_content() == "Teams app"
+
+
+async def test_an_unknown_stored_click_reads_as_teams_app(widget: Widget) -> None:
+    """035-AC8: a stored `click` that is none of the three choices reads as the default, Teams app: ⚙ shows
+    it chosen and a plain click opens the desktop client."""
+    page = await widget.load(True, click="bogus")
+    assert await widget.act(lambda: page.locator("a.name").click()) == ([(T, False)], [])
+    await page.click("#gear")
+    assert await page.locator("#click button.on").text_content() == "Teams app"
 
 
 # --- cards, deleted runs, reaction chips (011 phase 7) ---
@@ -2485,6 +2649,213 @@ async def test_split_middle_click_opens_a_new_tab(
             await new.wait_for_url(f"http://{split.host}{_chat(L)}?chatnav=split")
             await new.close()
     assert page.url.endswith(_chat(T) + "?chatnav=split")
+
+
+# --- split list click settings (035 phase 2) ---
+
+
+@pytest.fixture
+def clicks(board: W.Board, split: Pages, monkeypatch: pytest.MonkeyPatch) -> list[Verb]:
+    """The `open` verbs the board gets, as (thread, "chat"/"split") or (thread, web); the rows' Teams links
+    become 404s of our own server, so an anchor's default tab stays local."""
+    opened: list[Verb] = []
+
+    async def spy(thread_id: str, target: str = "app", ws: Any = None, msg_id: str = "") -> bool:
+        opened.append((thread_id, target if target in ("chat", "split") else target == "web"))
+        return True
+
+    monkeypatch.setattr(board, "open_row", spy)
+    monkeypatch.setattr(W, "deep_link", lambda thread_id, msg_id="", scheme="https": f"/teams/{msg_id}")
+    return opened
+
+
+async def _split_act(
+    page: Page, opened: list[Verb], click: Callable[[], Awaitable[None]], tab: str = ""
+) -> tuple[list[Verb], list[str]]:
+    """Verbs sent and tabs opened by `click`, which must open one tab on `tab` when given (see Widget.act)."""
+    opened.clear()
+    if tab:
+        async with page.context.expect_page() as new:
+            await click()
+        await (await new.value).wait_for_url(tab)
+    else:
+        await click()
+    await page.evaluate("window.__ws.send(JSON.stringify({open: 'barrier'}))")
+    await wait(lambda: _BARRIER in opened, "barrier")
+    assert opened[-1] == _BARRIER
+    tabs = []
+    for other in page.context.pages[1:]:
+        tabs.append(other.url)
+        await other.close()
+    return opened[:-1], tabs
+
+
+async def _open_clicks(split: Pages, **stored: str) -> Page:
+    """The split page on T with `stored` in localStorage before any script reads it."""
+
+    async def prepare(ctx: Any) -> None:
+        await ctx.add_init_script(
+            f"Object.entries({json.dumps(stored)}).forEach(([k, v]) => localStorage.setItem(k, v))"
+        )
+
+    return await _open_split(split, prepare=prepare)
+
+
+@_PARTS
+@pytest.mark.parametrize("mid", [False, True], ids=["click", "middle"])
+@pytest.mark.parametrize("browser", [True, False], ids=["browser", "no-browser"])
+@pytest.mark.parametrize("setting", ["app", "teams", "", "bogus"], ids=["app", "teams", "default", "unknown"])
+async def test_split_click_settings_route_each_target(
+    board: W.Board, split: Pages, clicks: list[Verb], setting: str, browser: bool, mid: bool, part: str
+) -> None:
+    """035-AC5, 035-AC1: a row's plain click (`listclick`) and middle, Ctrl or ⌘ click (`listmidclick`) on
+    each target: `app` sends `open`+`web: false`, without an opener or a message id Teams web; `teams` sends
+    `open`+`web` through --browser, else the row's link opens in one new tab; nothing stored or an unknown
+    value is `chat`: a plain click switches in place, a middle click opens a split tab (through --browser
+    when set). A plain click elsewhere than `chat` keeps the current chat."""
+    board.browser = ["firefox"] if browser else None
+    key = "listmidclick" if mid else "listclick"
+    states = [(["xdg-open"], "39"), (None, "39"), (["xdg-open"], "")] if setting == "app" else [(None, "39")]
+    for opener, last_id in states:
+        board.opener, board.rows[L]["last_id"] = opener, last_id
+        page = await _open_clicks(split, **({key: setting} if setting else {}))
+        name = page.locator(f'#rows li[data-id="{L}"] {part.removeprefix("li ")}')
+        if setting == "app" and opener and last_id:
+            sent, tab = [(L, False)], ""
+        elif setting in ("app", "teams"):
+            sent, tab = ([(L, True)], "") if browser else ([], f"http://{split.host}/teams/{last_id}")
+        elif mid:
+            sent, tab = (
+                ([(L, "split")], "") if browser else ([], f"http://{split.host}{_chat(L)}?chatnav=split")
+            )
+        else:
+            sent, tab = [], ""
+        shapes = [{"button": "middle"}, {"modifiers": ["Control"]}, {"modifiers": ["Meta"]}] if mid else [{}]
+        for click in shapes:
+            got = await _split_act(page, clicks, lambda n=name, c=click: n.click(**c), tab)  # type: ignore[misc]
+            assert got == (sent, [tab] if tab else []), (opener, last_id, click)
+        here = L if setting not in ("app", "teams") and not mid else T
+        await page.wait_for_url(f"**{_chat(here)}?chatnav=split")
+        assert await page.locator("#rows li.cur").get_attribute("data-id") == here
+        await page.context.close()
+
+
+async def test_split_click_app_needs_no_follow_frame(
+    board: W.Board, split: Pages, clicks: list[Verb], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """035-AC5: `opener` comes with the board's rows too: with the follow failed (archive unavailable), a
+    plain click set to `app` still sends `open`+`web: false`."""
+
+    async def failed(ws: Any, thread_id: str) -> dict[str, Any]:
+        return {"follow": thread_id, "error": "archive unavailable"}
+
+    monkeypatch.setattr(board, "follow", failed)
+    board.browser, board.opener = ["firefox"], ["xdg-open"]
+
+    async def prepare(ctx: Any) -> None:
+        await ctx.add_init_script("localStorage.setItem('listclick', 'app')")
+
+    page = await split.open(_chat(T) + "?chatnav=split", prepare=prepare)
+    await _handled(page, "follow")
+    await page.wait_for_selector("#rows li", state="attached")
+    name = page.locator(f'#rows li[data-id="{L}"] a.name')
+    assert await _split_act(page, clicks, lambda: name.click()) == ([(L, False)], [])
+
+
+@pytest.mark.parametrize("midclick", ["app", "chat"])
+async def test_split_dead_socket_leaves_the_click_to_the_row_link(
+    board: W.Board, split: Pages, clicks: list[Verb], midclick: str
+) -> None:
+    """035-AC5: with the socket down (--browser set), a plain click on Teams web and a middle click on Teams
+    app or miniteams open the row's link in exactly one tab and send nothing; the current chat stays."""
+    board.browser, board.opener = ["firefox"], ["xdg-open"]
+    page = await _open_clicks(split, listclick="teams", listmidclick=midclick)
+    await page.evaluate(SOCKET_DOWN)
+    name = page.locator(f'#rows li[data-id="{L}"] a.name')
+    await _one_link_tab(page, f"http://{split.host}/teams/39", lambda: name.click())
+    await _one_link_tab(page, f"http://{split.host}/teams/39", lambda: name.click(button="middle"))
+    assert page.url.endswith(_chat(T) + "?chatnav=split")
+
+
+@pytest.mark.parametrize("how", ["filter", "row"])
+@pytest.mark.parametrize(
+    ("setting", "browser", "sent", "tab"),
+    [
+        ("app", True, [(L, False)], ""),
+        ("app", False, [(L, False)], ""),
+        ("teams", True, [(L, True)], ""),
+        ("teams", False, [], "/teams/39"),
+        ("chat", True, [], ""),
+    ],
+)
+async def test_split_enter_follows_the_click_setting(
+    board: W.Board,
+    split: Pages,
+    clicks: list[Verb],
+    setting: str,
+    browser: bool,
+    sent: list[Verb],
+    tab: str,
+    how: str,
+) -> None:
+    """035-AC6: Enter on the row selected from the filter box, or on the focused row, does what a plain click
+    does in each `listclick` setting; only `chat` leaves the current chat."""
+    board.browser, board.opener = (["firefox"] if browser else None), ["xdg-open"]
+    page = await _open_clicks(split, listclick=setting)
+    box = page.locator("#filter")
+    await box.fill("fictional l")
+    await box.press("ArrowDown")
+    if how == "row":
+        await page.locator(f'#rows li[data-id="{L}"] a.name').focus()
+    url = f"http://{split.host}{tab}" if tab else ""
+    assert await _split_act(page, clicks, lambda: page.keyboard.press("Enter"), url) == (
+        sent,
+        [url] if tab else [],
+    )
+    here = L if setting == "chat" else T
+    await page.wait_for_url(f"**{_chat(here)}?chatnav=split")
+
+
+async def test_split_settings_choose_both_clicks_live_and_keep_them(
+    board: W.Board, split: Pages, clicks: list[Verb]
+) -> None:
+    """035-AC8: the chat page's ⚙ shows Click opens and Middle click opens in split mode, three choices each,
+    `miniteams` by default; a choice routes the next click at once and survives a reload; list mode has
+    neither."""
+    board.browser, board.opener = ["firefox"], ["xdg-open"]
+    page = await _open_split(split)
+    await page.click("#gear")
+    labels = ["Teams app", "Teams web", "miniteams"]
+    for key in ("listclick", "listmidclick"):
+        assert await page.locator(f"#{key} button").all_text_contents() == labels
+        assert await page.locator(f"#{key} button.on").text_content() == "miniteams"
+    assert await page.locator("#listclick h3").text_content() == "Click opens"
+    assert await page.locator("#listmidclick h3").text_content() == "Middle click opens"
+    await page.locator("#listclick").get_by_role("button", name="Teams app").click()
+    await page.locator("#listmidclick").get_by_role("button", name="Teams web").click()
+    assert await page.locator("#listclick button.on").text_content() == "Teams app"
+    stored = await page.evaluate("[localStorage.getItem('listclick'), localStorage.getItem('listmidclick')]")
+    assert stored == ["app", "teams"]
+    await page.keyboard.press("Escape")
+    name = page.locator(f'#rows li[data-id="{L}"] a.name')
+    assert await _split_act(page, clicks, lambda: name.click()) == ([(L, False)], [])
+    assert await _split_act(page, clicks, lambda: name.click(button="middle")) == ([(L, True)], [])
+    assert page.url.endswith(_chat(T) + "?chatnav=split")
+    await page.reload()
+    await _handled(page, "history")
+    await page.click("#gear")
+    assert await page.locator("#listclick button.on").text_content() == "Teams app"
+    assert await page.locator("#listmidclick button.on").text_content() == "Teams web"
+    listed = await split.open(_chat(T))
+    await _handled(listed, "history")
+    await listed.click("#gear")
+    assert await listed.locator("#settings h3").all_text_contents() == [
+        "Theme",
+        "Display",
+        "Teams",
+        "Chat navigation",
+        "Reactions",
+    ]
 
 
 async def test_list_mode_has_no_side_pane(split: Pages) -> None:

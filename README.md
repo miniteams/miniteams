@@ -121,11 +121,11 @@ are scanned at startup on the newest rows only (50); older chats surface theirs 
 message arrives. It binds a random `127.0.0.X:PORT` drawn once and kept in `~/.config/miniteams/web.json` so the
 URL stays bookmarkable; when that address is taken, `web` exits with an error naming it and leaves `web.json` as is
 (free the address, or delete `web.json` to draw a new one, then relaunch every browser with a token); `--bind` overrides it and refuses anything but loopback (IPv6 as `[::1]:PORT`). Media files, emoji and the WebSocket
-need the auth cookie, see *First launch*. Clicking a row opens the chat at its last message through `--opener` (default `xdg-open`
+need the auth cookie, see *First launch*. A click on a row follows ⚙ **Click opens**, by default the chat at its last message through `--opener` (default `xdg-open`
 on an `msteams://` deep link, i.e. the desktop client; `--open-scheme https` for Teams web,
-`--opener none` to let the page follow its plain https link); opening does not mark the row
-seen. Middle or Ctrl/⌘ click opens the https link (or the chat page, see the ⚙ setting below), Shift click the
-https link; through `--browser firefox` when set, else in the page's own browser. `xdg-open` only works when the `msteams` handler's `.desktop` entry passes the
+`--opener none` to open Teams web instead); opening does not mark the row
+seen. Middle or Ctrl/⌘ click follows ⚙ **Middle click opens** (Teams web by default), Shift click opens Teams web.
+Teams web goes through `--browser firefox` when set, else the page's own browser. `xdg-open` only works when the `msteams` handler's `.desktop` entry passes the
 URL along (`Exec=… %u`); otherwise point `--opener` at the client binary, e.g.
 `--opener "/path/to/teams-for-linux --no-sandbox"`. Hovering a preview cut by the row width shows the whole message (up to 1000 characters).
 Hovering (or tabbing into) a row shows `✎`, `👁` (mark read in Teams) and `⋯`, a menu with **✓ Mark seen**,
@@ -140,7 +140,7 @@ accepts the change; a refused one leaves it as it was. On its first start the wi
 local `muted.json` to Teams once, then renames the file `muted.json.migrated` (a chat Teams refuses is skipped; a token, network or Teams-side failure keeps the file for the next start). `✎` (or `r` on the row selected with the arrow keys, `Tab` from the filter) opens
 a reply box under the row: Enter sends it to the chat as you and keeps the box open, Shift+Enter adds a line,
 Escape closes it and keeps the draft; a failed send stays in its queue line with why (sending: see *Composer*). The ⚙ menu picks the theme (system by default), hides avatars for a denser list, and sets
-**Middle click** and **Chat navigation** (see *Chat page*). The
+**Click opens**, **Middle click opens** and **Chat navigation** (see *Chat page*). The
 Teams session expired (refresh token dead): `web` logs `auth_expired` and waits; run `miniteams login` in another
 terminal and it reconnects within seconds (it watches the token cache file).
 
@@ -200,7 +200,7 @@ terminal and it reconnects within seconds (it watches the token cache file).
   "clear all") opens nothing; xfce4-notifyd reports a body click only as a dismissal, so there a body click opens
   nothing either.
 - Links that would open a new window or tab (and any page other than the board) open in the system browser;
-  rows open chats as in the browser widget. A chat page ("Chat here" without `--browser`) gets `web.json`'s current
+  rows open chats as in the browser widget. A chat page (⚙ "miniteams" without `--browser`) gets `web.json`'s current
   token in its fragment, as with `--browser`, so that browser signs in.
 - Chromium's sandbox needs unprivileged user namespaces or a setuid `chrome-sandbox`. Where AppArmor restricts the
   namespaces (`kernel.apparmor_restrict_unprivileged_userns=1`, Ubuntu's default), QtWebEngine uses
@@ -221,16 +221,21 @@ terminal and it reconnects within seconds (it watches the token cache file).
 
 A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings are per browser (`localStorage`).
 
-- **Middle click**, Ctrl/⌘ click alike (widget ⚙): `Teams web` (default) or `Chat here`, which opens the chat page through `--browser` when set,
-  else in a new tab. The same `--browser` serves chat pages opened from the widget.
+- **Click opens** and **Middle click opens** (Ctrl/⌘ click alike), in the widget's ⚙ and, for the split list, the chat
+  page's: `Teams app` (the desktop client through `--opener`; Teams web without an opener or a message id), `Teams web`
+  (through `--browser` when set, else a new tab) or `miniteams` (the chat page). Enter on the selected row follows Click.
+  - Widget: Click `Teams app`, Middle click `Teams web` by default; `miniteams` opens the chat page through `--browser`
+    when set, else in a new tab; a notification click (native window) follows Click.
+  - Split list: `miniteams` by default for both: a click switches chats in place, a middle click opens a new tab
+    (through `--browser` when set). A click on `Teams app` or `Teams web` keeps the chat shown.
 - **`/?nav=chat`**: the board as a chat picker; the chat page's ◀ goes there. Click opens the chat in the same tab,
   middle or Ctrl/⌘ click in a new one, Shift click opens Teams.
 - **Chat navigation** (⚙, on the widget and on the chat page): `List` (default) or `Split`. `Split` shows the list on the
-  chat page's left instead of ◀: a click switches chats in place (Back returns), each chat keeps its draft and quotes.
+  chat page's left instead of ◀: a click switches chats in place by default (Back returns), each chat keeps its draft and quotes.
   The widget adds `?chatnav=split` to the chat URLs it opens, so a page in another browser follows the setting.
   - Drag the list's edge to resize (or focus it: ←/→, Home/End, Enter or double click resets); width and fold are kept per browser.
   - ☰ folds the list, or opens it over the chat below 700px.
-  - Ctrl+K jumps to the list's filter: ↑/↓ pick a row, Enter opens it. Seen and Muted sit behind ⋯ in a narrow list.
+  - Ctrl+K jumps to the list's filter: ↑/↓ pick a row, Enter opens it as a click does. Seen and Muted sit behind ⋯ in a narrow list.
   - **Sections** (see above) work the same here, with their own Recent / Sections choice and folds.
 - **Images**: served from the archive's `media/` folder, else fetched from Teams by `web` (memory only, never written
   to the archive; archives run with `--no-media` or without `images` in `--media` show theirs this way). One the page cannot load yet is retried

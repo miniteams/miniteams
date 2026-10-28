@@ -244,7 +244,7 @@ class Tray(QObject):
 
 
 def browse(url: QUrl | str, base: str, config_dir: Path) -> None:
-    """`url` in the system browser: web pages only; a chat page of ours ("Chat here" without --browser)
+    """`url` in the system browser: web pages only; a chat page of ours (⚙ "miniteams" without --browser)
     with the launch token, as that browser has no cookie."""
     link = url.toString() if isinstance(url, QUrl) else url
     if is_external(link):

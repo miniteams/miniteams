@@ -138,7 +138,11 @@
   let tab = TABS[pref("tab")] ? pref("tab") : "all";
   let theme = THEMES.includes(pref("theme")) ? pref("theme") : "auto";
   let avatars = pref("avatars") !== "0";
-  let midclick = pref("midclick") === "chat" ? "chat" : "teams";
+  // What a click (`click`) and a middle or Ctrl/⌘ click (`midclick`) open; `teams` is Teams web, the
+  // spelling `midclick` has stored since 011.
+  const TARGETS = [["app", "Teams app"], ["teams", "Teams web"], ["chat", "miniteams"]];
+  const target = (k, or) => TARGETS.some(([t]) => t === pref(k)) ? pref(k) : or;
+  const aims = { click: target("click", "app"), midclick: target("midclick", "teams") };
   let chatnav = pref("chatnav") === "split" ? "split" : "list";
   // The setting travels in the URL: the chat page may open in a browser without our storage (--browser).
   const chatPage = (id) => "/chat/" + encodeURIComponent(id) + (chatnav === "split" ? "?chatnav=split" : "");
@@ -205,17 +209,21 @@
     const dbox = el("div"), lab = el("label", null, "Show avatars"), sw = el("input", "switch");
     sw.type = "checkbox"; sw.checked = avatars; sw.onchange = () => { avatars = sw.checked; keep("avatars", avatars ? "1" : "0"); render(); };
     lab.append(sw); dbox.append(el("h3", null, "Display"), lab);
-    const mbox = el("div"), mseg = el("div", "seg");
-    for (const [k, lbl] of [["teams", "Teams web"], ["chat", "Chat here"]]) {
-      const b = el("button", midclick === k ? "on" : "", lbl); b.onclick = () => { midclick = k; keep("midclick", k); render(); }; mseg.append(b);
-    }
-    mbox.append(el("h3", null, "Middle click"), mseg);
+    const aboxes = [["click", "Click opens"], ["midclick", "Middle click opens"]].map(([key, title]) => {
+      const box = el("div"), seg = el("div", "seg");
+      box.id = key;
+      for (const [k, lbl] of TARGETS) {
+        const b = el("button", aims[key] === k ? "on" : "", lbl); b.onclick = () => { aims[key] = k; keep(key, k); render(); }; seg.append(b);
+      }
+      box.append(el("h3", null, title), seg);
+      return box;
+    });
     const nbox = el("div"), nseg = el("div", "seg");
     for (const [k, lbl] of [["list", "List"], ["split", "Split"]]) {
       const b = el("button", chatnav === k ? "on" : "", lbl); b.onclick = () => { chatnav = k; keep("chatnav", k); render(); }; nseg.append(b);
     }
     nbox.append(el("h3", null, "Chat navigation"), nseg);
-    menu.append(tbox, dbox, mbox, nbox);
+    menu.append(tbox, dbox, ...aboxes, nbox);
     if (tray) {
       const ybox = el("div"), yseg = el("div", "seg");
       ybox.id = "tray";
@@ -232,9 +240,17 @@
     $cog.append(menu);
   };
 
-  // A plain click on a row; null leaves it to its link (the Teams link, in a new tab).
-  const opens = (r) => nav ? () => location.assign(chatPage(r.id))
-    : opener && r.last_id ? () => send({ open: r.id, web: false }) : null;
+  // Where a click on a row goes: `?nav=chat` keeps its own (plain = this tab, middle = the chat page).
+  const aim = (mid) => nav ? (mid ? "chat" : "here") : aims[mid ? "midclick" : "click"];
+  // Opens row r on target `to`; null leaves it to the row's link (Teams web, a new tab in this browser).
+  // `app` without --opener or a message id falls back to Teams web: without a message id the only link
+  // form is chat-only, which the desktop client cannot route in page (it reloads, dropping a call).
+  // `chat` never opens in place: in the native window it would replace the board.
+  const route = (r, to) => to === "here" ? () => location.assign(chatPage(r.id))
+    : to === "chat" ? () => browser ? send({ open: r.id, chat: true, ...(chatnav === "split" && { chatnav }) })
+      : window.open(chatPage(r.id), "_blank", "noopener")
+    : to === "app" && opener && r.last_id ? () => send({ open: r.id, web: false })
+    : browser ? () => send({ open: r.id, web: true }) : null;
   const render = () => {
     if (actions.held()) return;
     if (theme === "auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = theme;
@@ -258,29 +274,19 @@
       }
       const name = Object.assign(marked(el("a", "name truncate"), rowTitle(r), query), { href: r.link || "#", target: "_blank", rel: "noopener", title: r.label, dir: "auto" });
       name.dataset.k = "name";  // a broadcast keeps the focus on it
-      // Plain click → the server opens the chat (desktop client); Shift click → the https link, through
-      // the server's --browser when set, else in this browser; middle click → `middle`.
-      const chatHere = nav || midclick === "chat";
-      // Without --browser, the Teams link's native new tab (middle or Ctrl click alike) does the work.
-      const middle = (ev) => {
-        if (chatHere) {
-          ev.preventDefault();
-          if (browser) send({ open: r.id, chat: true, ...(chatnav === "split" && { chatnav }) });
-          else window.open(chatPage(r.id), "_blank", "noopener");
-        } else if (browser) { ev.preventDefault(); send({ open: r.id, web: true }); }
-      };
-      // Without a message id the only link form is chat-only, which the desktop client cannot
-      // route in page (it reloads, dropping a call): let that one open in the browser instead.
+      // Plain click → `click`, middle or Ctrl/⌘ click → `midclick` (see route); Shift click → the https
+      // link, through the server's --browser when set, else in this browser. Whatever we open ourselves
+      // prevents the link's own Teams tab; a send on a dead socket (false) leaves the click to the link.
+      const openRow = (ev, mid) => { const go = route(r, aim(mid)); if (go && go() !== false) ev.preventDefault(); };
       name.onclick = (ev) => {
         if (ev.detail > 0) name.blur();  // a pointer's focus would pin the row's ✎ 👁 ⋯ through the next broadcast
-        if (ev.button === 1) { if (chatHere || browser) ev.preventDefault(); return; }  // onauxclick owns it: no Teams tab from the link too
+        if (ev.button) return;  // the middle button is onauxclick's
         // Ctrl/⌘ click = middle click: a touchpad has no easy middle button.
-        if (ev.ctrlKey || ev.metaKey) { middle(ev); return; }
+        if (ev.ctrlKey || ev.metaKey) { openRow(ev, true); return; }
         if (ev.shiftKey) { if (browser) { ev.preventDefault(); send({ open: r.id, web: true }); } return; }
-        const go = opens(r);
-        if (go) { ev.preventDefault(); go(); }
+        openRow(ev, false);
       };
-      name.onauxclick = (ev) => { if (ev.button === 1) middle(ev); };
+      name.onauxclick = (ev) => { if (ev.button === 1) openRow(ev, true); };
       const replyBtn = el("button", "reply", "✎"); replyBtn.title = "reply (r)"; replyBtn.dataset.k = "reply";
       replyBtn.onclick = () => openReply(r.id);
       const meta = el("span", "meta"), [acts, menu] = actions(r);
@@ -411,7 +417,7 @@
 
   $q.oninput = () => { query = foldText($q.value.trim())[0]; sel = ""; render(); };
   // Arrow keys walk the list, section headers included, without leaving the filter box; Enter opens the
-  // selection exactly as a plain click does — through the server, which hands the chat to the desktop client.
+  // selection exactly as a plain click does (the `click` setting).
   const reveal = () => { const li = $rows.querySelector("li.sel"); li?.scrollIntoView({ block: "nearest" }); $say.textContent = li?.querySelector(".name, .sname")?.textContent || ""; };
   const move = (delta) => {
     const list = [...$rows.children].map(itemKey).filter(Boolean);
@@ -473,8 +479,8 @@
     t.settings.connect(() => { menuOpen = true; renderHeader(); });
     // A notification clicked: the window is shown, the chat opens as a click on its row does.
     t.opened.connect((id) => {
-      const r = rows.find((x) => x.id === id), go = r && opens(r);
-      if (go) go(); else if (r?.link) window.open(r.link, "_blank", "noopener");
+      const r = rows.find((x) => x.id === id), go = r && route(r, aim(false));
+      if (!(go && go() !== false) && r?.link) window.open(r.link, "_blank", "noopener");
     });
     publish(); renderHeader();
   });

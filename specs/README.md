@@ -36,3 +36,4 @@
 | [032](032-live-media-sweep.md) | Media sweep inside `archive --live` | approved |
 | [033](033-mention-forms.md) | Mention by first name, last name or a free label | in progress |
 | [034](034-message-context-menu.md) | Message context menu | shipped |
+| [035](035-click-setting.md) | Choose what each click on a chat row opens | shipped |

@@ -798,8 +798,8 @@ def main(argv: list[str] | None = None) -> int:
     p_web.add_argument(
         "--opener",
         default="xdg-open",
-        help="command run with the chat's deep link on row click (default: xdg-open; 'none' = the page "
-        "just follows its https link)",
+        help="command run with the chat's deep link by a click set to Teams app (⚙) and by the chat page's "
+        "Open in Teams (default: xdg-open; 'none' = those open Teams web instead)",
     )
     p_web.add_argument(
         "--open-scheme",
@@ -810,8 +810,9 @@ def main(argv: list[str] | None = None) -> int:
     p_web.add_argument(
         "--browser",
         default="",
-        help="command run with Teams web links (Shift/Ctrl/middle click) and with chat pages opened from the "
-        "widget (e.g. firefox); default: the page's own browser",
+        help="command run with Teams web links a list row opens (a click set to Teams web, or to Teams app "
+        "without an opener or a message id; Shift click) and with chat pages opened from the widget or the "
+        "split list (e.g. firefox); default: the page's own browser",
     )
     p_web.set_defaults(func=cmd_web)
 

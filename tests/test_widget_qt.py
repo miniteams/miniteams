@@ -300,7 +300,7 @@ async def test_new_window_links_go_to_the_system_browser(opened: tuple[widget_qt
 async def test_a_chat_page_opens_signed_in_with_the_current_token(
     opened: tuple[widget_qt.Window, list[str]], settings: Settings
 ) -> None:
-    """024-AC6: "Chat here" without --browser opens the chat page in the system browser, which has no
+    """024-AC6: ⚙ "miniteams" without --browser opens the chat page in the system browser, which has no
     cookie: it goes with web.json's current token, read at that moment; no chat URL leaves without one."""
     window, urls = opened
     base, _ = widget.target(settings.config_dir)
