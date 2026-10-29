@@ -238,10 +238,10 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
 
 - **Click opens** and **Middle click opens** (Ctrl/⌘ click alike), in the widget's ⚙ and, for the split list, the chat
   page's: `Teams app` (the desktop client through `--opener`; Teams web without an opener or a message id), `Teams web`
-  (through `--browser` when set, else a new tab) or `miniteams` (the chat page). Enter on the selected row follows Click.
-  - Widget: Click `Teams app`, Middle click `Teams web` by default; `miniteams` opens the chat page through `--browser`
+  (through `--browser` when set, else a new tab) or `miniteams chat` (the chat page). Enter on the selected row follows Click.
+  - Widget: Click `Teams app`, Middle click `Teams web` by default; `miniteams chat` opens the chat page through `--browser`
     when set, else in a new tab; a notification click (native window) follows Click.
-  - Split list: `miniteams` by default for both: a click switches chats in place, a middle click opens a new tab
+  - Split list: `miniteams chat` by default for both: a click switches chats in place, a middle click opens a new tab
     (through `--browser` when set). A click on `Teams app` or `Teams web` keeps the chat shown.
 - **`/?nav=chat`**: the board as a chat picker; the chat page's ◀ goes there. Click opens the chat in the same tab,
   middle or Ctrl/⌘ click in a new one, Shift click opens Teams.

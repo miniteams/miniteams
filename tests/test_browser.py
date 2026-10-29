@@ -1999,7 +1999,7 @@ async def test_middle_click_chat_setting_opens_the_chat_page(
     `open`+`chat` through --browser when set, else opens /chat/<id> in a tab and sends no verb."""
     page = await widget.load(browser)
     await page.click("#gear")
-    await page.locator("#midclick").get_by_role("button", name="miniteams").click()
+    await page.locator("#midclick").get_by_role("button", name="miniteams chat").click()
     assert await page.evaluate("localStorage.getItem('midclick')") == "chat"
     await widget.load(browser)
     widget.part = part
@@ -2173,6 +2173,33 @@ async def test_enter_follows_the_click_setting(
     assert await widget.act(enter) == (sent, [widget.base + tab])
 
 
+# What the line under each ⚙ click setting says of each target.
+TIPS = [
+    "Opens the chat in the Teams desktop app",
+    "Opens the chat in Teams, in a new browser tab",
+    "Opens the chat in miniteams' own chat page, in a new browser tab",
+]
+
+
+async def _says(page: Page, key: str, tips: list[str], chosen: str) -> None:
+    """The line under ⚙ `key` reads the chosen target, a pointed or focused one's at once, the chosen
+    one's again when the pointer leaves, the menu keeping its width; each target is described by it."""
+    box, hint = page.locator(f"#{key}"), page.locator(f"#{key} .hint")
+    buttons, width = box.locator("button"), "() => document.querySelector('.menu').offsetWidth"
+    assert await hint.text_content() == chosen
+    wide = await page.evaluate(width)
+    for i, tip in enumerate(tips):
+        await buttons.nth(i).hover()
+        assert await hint.text_content() == tip  # no wait: it must not lag
+        assert await page.evaluate(width) == wide  # nor move the buttons under the pointer
+    await box.locator("h3").hover()
+    assert await hint.text_content() == chosen
+    await buttons.nth(1).focus()
+    assert await hint.text_content() == tips[1]
+    ids = await buttons.evaluate_all("bs => bs.map(b => b.getAttribute('aria-describedby'))")
+    assert ids == [await hint.get_attribute("id")] * len(tips)
+
+
 @pytest.mark.parametrize("stored", ["", "teams", "chat", "app", "bogus"])
 async def test_click_menu_has_both_settings_and_they_persist(widget: Widget, stored: str) -> None:
     """035-AC8: ⚙ shows Click opens and Middle click opens, three choices each; a stored `midclick` keeps its
@@ -2182,13 +2209,15 @@ async def test_click_menu_has_both_settings_and_they_persist(widget: Widget, sto
     await page.click("#gear")
     heads = await page.locator(".menu h3").all_text_contents()
     assert heads[2:4] == ["Click opens", "Middle click opens"]
-    labels = ["Teams app", "Teams web", "miniteams"]
+    labels = ["Teams app", "Teams web", "miniteams chat"]
     assert await page.locator("#click button").all_text_contents() == labels
     assert await page.locator("#midclick button").all_text_contents() == labels
-    shown = {"chat": "miniteams", "app": "Teams app"}.get(stored, "Teams web")
+    shown = {"chat": "miniteams chat", "app": "Teams app"}.get(stored, "Teams web")
     assert await page.locator("#click button.on").text_content() == "Teams app"
     assert await page.locator("#midclick button.on").text_content() == shown
-    await page.locator("#click").get_by_role("button", name="miniteams").click()
+    await _says(page, "click", TIPS, TIPS[0])
+    await _says(page, "midclick", TIPS, TIPS[labels.index(shown)])
+    await page.locator("#click").get_by_role("button", name="miniteams chat").click()
     await page.locator("#midclick").get_by_role("button", name="Teams app").click()
     stored_now = await page.evaluate("[localStorage.getItem('click'), localStorage.getItem('midclick')]")
     assert stored_now == ["chat", "app"]
@@ -2199,7 +2228,7 @@ async def test_click_menu_has_both_settings_and_they_persist(widget: Widget, sto
     assert await widget.act(lambda: page.locator("a.name").click(button="middle")) == ([(T, False)], [])
     await widget.load(True)
     await page.click("#gear")
-    assert await page.locator("#click button.on").text_content() == "miniteams"
+    assert await page.locator("#click button.on").text_content() == "miniteams chat"
     assert await page.locator("#midclick button.on").text_content() == "Teams app"
 
 
@@ -2829,10 +2858,13 @@ async def test_split_settings_choose_both_clicks_live_and_keep_them(
     board.browser, board.opener = ["firefox"], ["xdg-open"]
     page = await _open_split(split)
     await page.click("#gear")
-    labels = ["Teams app", "Teams web", "miniteams"]
+    labels = ["Teams app", "Teams web", "miniteams chat"]
     for key in ("listclick", "listmidclick"):
         assert await page.locator(f"#{key} button").all_text_contents() == labels
-        assert await page.locator(f"#{key} button.on").text_content() == "miniteams"
+        assert await page.locator(f"#{key} button.on").text_content() == "miniteams chat"
+    here = [*TIPS[:2], "Switches to the chat right here"]  # a plain click switches in place
+    await _says(page, "listclick", here, here[2])
+    await _says(page, "listmidclick", TIPS, TIPS[2])
     assert await page.locator("#listclick h3").text_content() == "Click opens"
     assert await page.locator("#listmidclick h3").text_content() == "Middle click opens"
     await page.locator("#listclick").get_by_role("button", name="Teams app").click()
@@ -2992,10 +3024,14 @@ async def test_the_native_window_says_to_restart_itself_to_sign_in(
 
 @pytest.mark.parametrize("theme", ["light", "dark"])
 async def test_both_settings_menus_share_one_style(chat: Pages, theme: str) -> None:
-    """H6: one ⚙ menu style (ui.css) in both pages: the same layer, headings at 4.5:1 or more."""
-    for path in (f"/?theme={theme}", f"{_chat(T)}?theme={theme}"):
-        page = await chat.open(path)
+    """H6: one ⚙ menu style (ui.css) in both pages: the same layer, headings at 4.5:1 or more, inside
+    a short window."""
+    for path in (f"/?theme={theme}", f"{_chat(T)}?theme={theme}&chatnav=split"):
+        page = await chat.open(path, viewport={"width": 700, "height": 320})
         await page.locator("#gear").click()
+        assert await page.evaluate(
+            "document.querySelector('.menu').getBoundingClientRect().bottom <= innerHeight"
+        ), path
         assert await page.locator(".menu").evaluate("m => getComputedStyle(m).zIndex") == "6", path
         ratios = await page.locator(".menu h3").evaluate_all(f"hs => hs.map({CONTRAST})")
         assert ratios and min(ratios) >= 4.5, (path, ratios)

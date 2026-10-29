@@ -15,11 +15,11 @@ from a middle click. The split list on the chat page has no setting at all.
 
 Each list gets two settings in its ⚙ menu, **Click opens** and **Middle click opens**, set
 independently. Both offer the same three targets: `Teams app` (the desktop client), `Teams web`,
-`miniteams` (the chat page). Defaults keep today's behaviour.
+`miniteams chat` (the chat page). Defaults keep today's behaviour.
 
 ## Scope
 
-- Stored values, both keys: `app` (Teams app), `teams` (Teams web), `chat` (miniteams), the spelling
+- Stored values, both keys: `app` (Teams app), `teams` (Teams web), `chat` (miniteams chat), the spelling
   `midclick` has used since spec 011. An unknown value reads as the key's default.
 - **Widget** (board): keys `click` (default `app`) and `midclick` (default `teams`).
 - **Split list** (chat page, `chatnav=split`): keys `listclick` (default `chat`) and `listmidclick`
@@ -81,9 +81,9 @@ independently. Both offer the same three targets: `Teams app` (the desktop clien
 
 ## Decisions
 
-- Labels `Teams app`, `Teams web`, `miniteams` under "Click opens" / "Middle click opens" (babs asked
+- Labels `Teams app`, `Teams web`, `miniteams chat` under "Click opens" / "Middle click opens" (babs asked
   for "Open in" wording naming native, browser and miniteams).
-- `miniteams` on a widget plain click opens a new tab (or `--browser`): in the native widget window,
+- `miniteams chat` on a widget plain click opens a new tab (or `--browser`): in the native widget window,
   opening it in place would replace the board (babs, 2026-10-28).
 - The split list has its own keys: its default plain click switches in place, the widget's opens the
   desktop client; one shared key would change one of them.

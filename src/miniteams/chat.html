@@ -1703,7 +1703,10 @@
   // What a click (`listclick`) and a middle or Ctrl/⌘ click (`listmidclick`) on a row open: the widget's
   // targets on keys of their own (a plain click here switches in place by default). Read at each click:
   // a ⚙ choice applies at once.
-  const TARGETS = [["app", "Teams app"], ["teams", "Teams web"], ["chat", "miniteams"]];
+  const TARGETS = [["app", "Teams app", "Opens the chat in the Teams desktop app"],
+    ["teams", "Teams web", "Opens the chat in Teams, in a new browser tab"],
+    ["chat", "miniteams chat", "Opens the chat in miniteams' own chat page, in a new browser tab"]];
+  const HERE = TARGETS.map((t) => t[0] === "chat" ? [...t.slice(0, 2), "Switches to the chat right here"] : t);  // a plain click on "chat" switches in place, see aim()
   const target = (k) => TARGETS.some(([t]) => t === pref(k)) ? pref(k) : "chat";
   const aim = (mid) => mid ? target("listmidclick") : target("listclick") === "chat" ? "here" : target("listclick");
   // Opens row r on target `to`; null leaves it to the row's link (Teams web, a new tab in this browser).
@@ -2080,6 +2083,7 @@
       seg.append(b);
     }
     box.append(el("h3", null, title), seg);
+    if (items[0][2]) box.append(describe(seg, items.map((i) => i[2])));
     return box;
   };
   const renderCog = () => {
@@ -2138,7 +2142,7 @@
     drawFavs();
     // The list exists only in split mode.
     const clicks = (split ? [["listclick", "Click opens"], ["listmidclick", "Middle click opens"]] : []).map(([key, title]) =>
-      Object.assign(segOf(title, TARGETS, target(key), (k) => choose(key, k)), { id: key }));
+      Object.assign(segOf(title, key === "listclick" ? HERE : TARGETS, target(key), (k) => choose(key, k)), { id: key }));
     menu.append(themes, dbox, tbox, nav, ...clicks, rbox);
     $cog.append(menu);
   };

@@ -441,3 +441,38 @@ async def test_remembered_notifications_are_capped(native: Fake) -> None:
     assert len(await _notes(native, without(1), ROWS + mentioned)) == 501  # 500 kept: m1 is one of them
     notes = await _notes(native, without(0), ROWS + mentioned)
     assert [n[0] for n in notes[501:]] == ["19:m0@thread.v2"]  # 501 would have kept m0
+
+
+# Every ⚙ control drawn whole: inside the menu, inside the window, no segment scrolled out of sight;
+# the menu itself ends inside the window.
+CLIPPED = """(() => { const m = document.querySelector('.menu').getBoundingClientRect(), out = [];
+  for (const e of document.querySelectorAll('.menu button, .menu .switch')) {
+    const r = e.getBoundingClientRect();
+    if (r.left < Math.max(m.left, 0) || r.right > Math.min(m.right, innerWidth))
+      out.push(e.textContent || 'switch');
+  }
+  for (const s of document.querySelectorAll('.menu .seg'))
+    if (s.scrollWidth > s.clientWidth) out.push(s.parentNode.id || 'seg');
+  if (m.bottom > innerHeight) out.push('bottom');
+  return out; })()"""
+
+
+@pytest.mark.parametrize(("width", "height"), [(267, 700), (200, 700), (267, 450)])
+async def test_settings_fit_a_narrow_window(native: Fake, width: int, height: int) -> None:
+    """The native window is narrow, sometimes short: every ⚙ choice and the avatars switch show whole,
+    none cut by the window edge or hidden in a scrolled segment; the menu scrolls to its last choice."""
+    page = native.page
+    assert page is not None
+    await page.set_viewport_size({"width": width, "height": height})
+    await page.locator("#gear").click()
+    await page.locator(".menu #notify").wait_for()
+    assert await page.evaluate(CLIPPED) == []
+    top = "document.querySelector('.menu').scrollTop"
+    await page.locator("#notify button").last.click()
+    assert await page.locator("#notify button.on").text_content() == "None"
+    if height < 700:  # scrolled: a choice or a live frame rebuilds the menu where it was
+        assert (scrolled := await page.evaluate(top)) > 0
+        await page.evaluate("window.__menu = document.querySelector('.menu')")
+        native.send({"rows": ROWS, "page": "1", "opener": False, "browser": False, "me": "Me"})
+        await until(page, "document.querySelector('.menu') !== window.__menu")
+        assert await page.evaluate(top) == scrolled
