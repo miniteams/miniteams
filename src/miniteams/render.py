@@ -9,7 +9,7 @@ import html
 import json
 import re
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -636,10 +636,26 @@ def _json(value: object) -> object:
         return None
 
 
-def card_from_message(message: dict[str, Any]) -> list[dict[str, Any]] | None:
+def card_entries(message: dict[str, Any]) -> dict[str | int, dict[str, Any]]:
+    """`properties.cards` keyed by `cardClientId` (its index when it has none)."""
+    props = message.get("properties")
+    cards = _json(props.get("cards")) if isinstance(props, dict) else None
+    by_id: dict[str | int, dict[str, Any]] = {}
+    if isinstance(cards, list):
+        # An edit can append the unfurl card again under the same cardClientId: one card, the last copy.
+        for i, c in enumerate(cards):
+            if isinstance(c, dict):
+                by_id[_str(c.get("cardClientId")) or i] = c
+    return by_id
+
+
+def card_from_message(
+    message: dict[str, Any], overrides: Mapping[str, dict[str, Any]] | None = None
+) -> list[dict[str, Any]] | None:
     """The cards a message carries, as `{"content", "type", "app", "fallback"}`; None when none.
 
-    `Media_Card` puts them base64 in `<Swift b64>`, `RichText/Html` in `properties.cards`."""
+    `Media_Card` puts them base64 in `<Swift b64>`, `RichText/Html` in `properties.cards`;
+    `overrides` (cardClientId → card, spec 037) replaces a `properties.cards` entry's content."""
     found: list[dict[str, Any]] = []
     swift = _SWIFT_RE.search(_str(message.get("content")))
     if swift:
@@ -657,15 +673,9 @@ def card_from_message(message: dict[str, Any]) -> list[dict[str, Any]] | None:
             )
             if not found and summary:
                 found.append({"summary": summary})
-    props = message.get("properties")
-    cards = _json(props.get("cards")) if isinstance(props, dict) else None
-    if isinstance(cards, list):
-        # An edit can append the unfurl card again under the same cardClientId: one card, the last copy.
-        by_id: dict[str | int, dict[str, Any]] = {}
-        for i, c in enumerate(cards):
-            if isinstance(c, dict):
-                by_id[_str(c.get("cardClientId")) or i] = c
-        found += by_id.values()
+    for key, c in card_entries(message).items():
+        override = overrides.get(key) if overrides and isinstance(key, str) else None
+        found.append({**c, "content": override} if isinstance(override, dict) else c)
     out = []
     for att in found:
         content = att.get("content")
@@ -676,12 +686,16 @@ def card_from_message(message: dict[str, Any]) -> list[dict[str, Any]] | None:
     return out or None
 
 
-def cards_html(message: dict[str, Any], media_url: MediaUrl | None = None) -> str:
+def cards_html(
+    message: dict[str, Any],
+    media_url: MediaUrl | None = None,
+    overrides: Mapping[str, dict[str, Any]] | None = None,
+) -> str:
     """Every card of `message` rendered, its app name on top; a body that renders nothing shows
-    the card's summary or fallbackText instead."""
+    the card's summary or fallbackText instead. `overrides`: as `card_from_message`."""
     out = []
     renderer = _CardRenderer(media_url)
-    for card in (card_from_message(message) or [])[:_MSG_CARDS]:
+    for card in (card_from_message(message, overrides) or [])[:_MSG_CARDS]:
         renderer.nodes = 0
         body = renderer.card(card["content"], content_type=card["type"])
         if not body and card["fallback"]:

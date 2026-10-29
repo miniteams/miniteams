@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -381,10 +381,12 @@ def chat_record(
     images: dict[str, str] | None = None,
     saved: dict[str, str] | None = None,
     known_name: Callable[[str], str] | None = None,
+    cards: Mapping[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """One message as the chat page shows it (spec 011): sanitised body, reactions, mention kind.
     `custom`: the custom emoji object ids `/emoji/<id>` serves; `images`: their reaction key → object id;
-    `saved`: `page_files`; `name_for` labels people, `known_name` gives only names a lookup or roster gave."""
+    `saved`: `page_files`; `name_for` labels people, `known_name` gives only names a lookup or roster gave;
+    `cards`: refreshed app cards by cardClientId (spec 037)."""
     props = message.get("properties")
     props = props if isinstance(props, dict) else {}
     message = {**message, "properties": props}  # mention_kind reads it too
@@ -418,9 +420,9 @@ def chat_record(
             body = html.escape(content)
         if msgtype == "RichText/Media_Card" or props.get("cards"):
             # Appended after sanitize(), never through it: the card markup is its own allowlist.
-            cards = cards_html(message, media_url=lambda u: media_url(thread_id, media_dir, u))
-            body += cards
-            kind = "text" if cards and kind == "other" else kind
+            shown = cards_html(message, lambda u: media_url(thread_id, media_dir, u), cards)
+            body += shown
+            kind = "text" if shown and kind == "other" else kind
         local = functools.partial(local_file, thread_id, media_dir, saved or {})
         files = "" if kind in ("system", "call") else files_html(props.get("files"), named, local)
         if files:  # 027-AC1: after the text, replacing the 📎 marker
