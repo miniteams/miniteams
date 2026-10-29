@@ -140,7 +140,9 @@
   let avatars = pref("avatars") !== "0";
   // What a click (`click`) and a middle or Ctrl/⌘ click (`midclick`) open; `teams` is Teams web, the
   // spelling `midclick` has stored since 011.
-  const TARGETS = [["app", "Teams app"], ["teams", "Teams web"], ["chat", "miniteams"]];
+  const TARGETS = [["app", "Teams app", "Opens the chat in the Teams desktop app"],
+    ["teams", "Teams web", "Opens the chat in Teams, in a new browser tab"],
+    ["chat", "miniteams chat", "Opens the chat in miniteams' own chat page, in a new browser tab"]];
   const target = (k, or) => TARGETS.some(([t]) => t === pref(k)) ? pref(k) : or;
   const aims = { click: target("click", "app"), midclick: target("midclick", "teams") };
   let chatnav = pref("chatnav") === "split" ? "split" : "list";
@@ -206,7 +208,8 @@
     }));
     secs.paint($mode);
     $cog.classList.toggle("open", menuOpen);
-    $cog.querySelector(".menu")?.remove();
+    const old = $cog.querySelector(".menu"), scrolled = old?.scrollTop ?? 0;  // every render rebuilds it
+    old?.remove();
     if (!menuOpen) return;
     const menu = el("div", "menu"); menu.onclick = (e) => e.stopPropagation();
     const tbox = el("div"), tseg = el("div", "seg");
@@ -223,7 +226,7 @@
       for (const [k, lbl] of TARGETS) {
         const b = el("button", aims[key] === k ? "on" : "", lbl); b.onclick = () => { aims[key] = k; keep(key, k); render(); }; seg.append(b);
       }
-      box.append(el("h3", null, title), seg);
+      box.append(el("h3", null, title), seg, describe(seg, TARGETS.map((t) => t[2])));
       return box;
     });
     const nbox = el("div"), nseg = el("div", "seg");
@@ -246,6 +249,7 @@
       ybox.append(el("h3", null, "Tray"), yseg); abox.append(el("h3", null, "Notify"), aseg); menu.append(ybox, abox);
     }
     $cog.append(menu);
+    menu.scrollTop = scrolled;
   };
 
   // Where a click on a row goes: `?nav=chat` keeps its own (plain = this tab, middle = the chat page).

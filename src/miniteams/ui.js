@@ -4,6 +4,19 @@
   // URL params override the stored choices without replacing them (bookmarks, screenshots).
   const q = new URLSearchParams(location.search), pref = (k) => q.get(k) ?? store(k);
   const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+  // The line under a ⚙ choice: what the chosen option does, or at once the one pointed at or focused.
+  let hints = 0;
+  const describe = (seg, tips) => {
+    const line = el("div", "hint"), say = (b) => { line.textContent = tips[[...seg.children].indexOf(b)] ?? ""; };
+    const back = () => say(seg.querySelector(".on"));
+    line.id = `hint-${++hints}`;
+    for (const b of seg.children) b.setAttribute("aria-describedby", line.id);
+    seg.addEventListener("pointerover", (e) => { const b = e.target.closest("button"); if (b) say(b); });
+    seg.addEventListener("focusin", (e) => say(e.target));
+    for (const t of ["pointerleave", "focusout", "click"]) seg.addEventListener(t, back);
+    back();
+    return line;
+  };
   // A /media image not served yet (archiver a moment behind, Teams slow) is asked again for about 30 s,
   // then said. Delegated, in capture: `error` does not bubble, and the CSP forbids inline handlers.
   // A Giphy GIF (spec 031) then tries Giphy itself, then reads as the link to it; one the web fetched
