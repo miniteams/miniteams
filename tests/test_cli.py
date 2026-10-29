@@ -769,13 +769,13 @@ def test_a_text_without_mentions_is_refused_before_auth(settings: Settings, monk
 
 @pytest.mark.parametrize(
     ("aad", "bearer"),
-    [({"access_token": "aad", "id_token": "idt"}, "idt"), ({"access_token": "aad"}, "aad")],
+    [({"access_token": "aad", "id_token": "idt"}, "aad"), ({"access_token": "aad"}, "aad")],
     ids=["id-token", "access-token-only"],
 )
 def test_the_roster_lookup_gets_the_bearer_every_directory_gets(
     settings: Settings, wire: dict[str, Any], aad: dict[str, str], bearer: str
 ) -> None:
-    """029-AC10: the id token, else the access token, as stream, archive and watch give the Directory."""
+    """029-AC10: the access token, never the id_token beside it, as every Directory gets."""
     wire["aad"] = aad
     assert cli.cmd_send(settings, _send_ns("@Ann Lee hi")) == 0
     assert wire["bearers"] == [bearer] and wire["roster"] == [GROUP]

@@ -197,7 +197,7 @@ def _send(
         rendered = _rendered(
             text,
             args.thread,
-            lambda: _roster(settings, skype_token, str(aad.get("id_token") or token), args.thread),
+            lambda: _roster(settings, skype_token, token, args.thread),
             lambda: self_mri(token),
         )
         if rendered is None:
@@ -315,7 +315,7 @@ def cmd_emojis(settings: Settings, args: argparse.Namespace) -> int:
     if not csa_token:
         log.error("csa_token_unavailable", hint="run `miniteams login`")
         return 1
-    bearer = str(aad.get("id_token") or aad["access_token"])
+    bearer = str(aad["access_token"])
     asyncio.run(
         list_emojis(settings, skype_token, bearer, csa_token, jsonl=args.jsonl, download=args.download)
     )
@@ -329,7 +329,7 @@ def cmd_dump(settings: Settings, args: argparse.Namespace) -> int:
     from .dump import dump_conversation
 
     aad, skype_token = _ensure_skype_token(settings)
-    bearer = str(aad.get("id_token") or aad["access_token"])
+    bearer = str(aad["access_token"])
     asyncio.run(
         dump_conversation(
             settings, skype_token, args.thread, args.page_size, args.max_pages, args.jsonl, bearer
@@ -347,7 +347,7 @@ def cmd_chats(settings: Settings, args: argparse.Namespace) -> int:
     since = parse_when(args.since) if args.since else None
     until = parse_when(args.until, end=True) if args.until else None
     aad, skype_token = _ensure_skype_token(settings)
-    bearer = str(aad.get("id_token") or aad["access_token"])
+    bearer = str(aad["access_token"])
     asyncio.run(list_chats(settings, skype_token, bearer, args.limit, since, until, args.all, args.jsonl))
     return 0
 
@@ -361,7 +361,7 @@ def cmd_web(settings: Settings, args: argparse.Namespace) -> int:
     from .web import run
 
     aad, skype_token = _ensure_skype_token(settings)
-    bearer = str(aad.get("id_token") or aad["access_token"])
+    bearer = str(aad["access_token"])
     me = self_mri(str(aad["access_token"]))
     if not me:
         log.warning("self_mri_unknown")  # mentions cannot be detected; the list still works

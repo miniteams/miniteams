@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     csa_url: str = "https://teams.microsoft.com/api/csa/emea"
     # Custom emoji image host the composer writes into a message; same fallback-only rule as contacts_host.
     asyncgw_host: str = "fr-prod.asyncgw.teams.microsoft.com"
-    # Batched MRI → display-name lookup (teams_contacts.c TEAMS_PROFILES_PREFIX). Bearer id_token.
+    # Batched MRI → display-name lookup (teams_contacts.c TEAMS_PROFILES_PREFIX). Bearer access token.
     profiles_url: str = (
         "https://teams.microsoft.com/api/mt/beta/users/fetchShortProfile"
         "?isMailAddress=false&canBeSmtpAddress=false&enableGuest=true"

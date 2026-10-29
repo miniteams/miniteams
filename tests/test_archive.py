@@ -355,7 +355,7 @@ def test_refreshing_token_reexchanges_before_expiry(settings: Settings, monkeypa
 
     assert prov.token() == "sk1"  # first call mints
     assert prov.token() == "sk1"  # cached (well before expiry)
-    assert prov.bearer() == "b"
+    assert prov.bearer() == "a"  # never the id_token: the profile lookup refuses it
     clock["t"] += 600  # past expiry - margin (600 - 300)
     assert prov.token() == "sk2"  # re-minted
     assert len(exchanges) == 2

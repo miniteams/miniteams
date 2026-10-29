@@ -102,7 +102,7 @@ class RefreshingToken:
         aad = self.source.refresh()  # silent-only; raises AuthExpired when the RT is dead
         skype = exchange_skype_token(self.settings, aad["access_token"])
         self._token = skype["skype_token"]
-        self._bearer = str(aad.get("id_token") or aad["access_token"])
+        self._bearer = str(aad["access_token"])
         self.region = str(skype.get("region") or "")
         self._deadline = time.monotonic() + float(skype.get("expires_in") or 3600) - self._MARGIN
 
