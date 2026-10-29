@@ -44,12 +44,18 @@ class Service:
         self.states: dict[str, tuple[str, str]] = {}
         self.fail = False
         self.refused: set[str] = set()  # 40020 on subscribe whatever the snapshot said
+        self.endpoint_fail = False  # 503 on publishing our endpoint only
+        self.endpoint_gone = False  # 404 on activity reports: the service forgot our endpoint
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         if self.fail:
             return httpx.Response(503)
         body = json.loads(request.content)
+        if request.url.path == "/v1/me/endpoints/":
+            return httpx.Response(503 if self.endpoint_fail else 200)
+        if request.url.path == "/v1/me/reportmyactivity/":
+            return httpx.Response(404 if self.endpoint_gone else 200)
         if request.url.path == "/v1/presence/getpresence/":
             out = []
             for item in body:
@@ -305,7 +311,11 @@ async def test_renewal_every_period_confirms_unchanged_states(
     renewals = asyncio.create_task(p.run())
     await _until(lambda: service.requests)
     renewals.cancel()
-    assert [r.url.path for r in service.requests] == [f"/v1/pubsub/subscriptions/{EPID}"]
+    assert [r.url.path for r in service.requests] == [
+        "/v1/me/endpoints/",
+        "/v1/me/reportmyactivity/",
+        f"/v1/pubsub/subscriptions/{EPID}",
+    ]
     await p.on_presence({"presence": [_entry(ANN, "Away")]})  # the renewal's snapshot callback
     assert p.states[ANN].until == clock.now + 2 * PERIOD
     clock.now += PERIOD
@@ -348,7 +358,11 @@ async def test_an_unchanged_follow_list_is_posted_again_only_to_renew(
     await p.sync()
     assert service.requests == []
     await p.sync(renew=True)
-    assert [r.url.path for r in service.requests] == [f"/v1/pubsub/subscriptions/{EPID}"]
+    assert [r.url.path for r in service.requests] == [
+        "/v1/me/endpoints/",
+        "/v1/me/reportmyactivity/",
+        f"/v1/pubsub/subscriptions/{EPID}",
+    ]
     await p.close()
 
 
@@ -376,7 +390,7 @@ async def test_a_raising_token_or_sync_never_ends_the_renewals(
     assert len(calls) == 2
     renewals = asyncio.create_task(p.run())
     clock.now += PERIOD
-    await _until(lambda: len(calls) == 3)
+    await _until(lambda: len(calls) >= 3)  # the renewal, and the periodic activity report
     clock.now += PERIOD + 1
     await _until(lambda: _shown(p) == {})
     assert not renewals.done()
@@ -577,11 +591,11 @@ def test_cache_stays_bounded(settings: Settings, monkeypatch: pytest.MonkeyPatch
 # --- own presence, Graph ---
 
 
-async def test_no_request_publishes_own_presence_or_touches_graph(
+async def test_the_collector_publishes_only_its_endpoint_never_graph(
     settings: Settings, service: Service, clock: Clock, directory: Directory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """015-AC8: the collector by itself only reads presence and posts our own subscriptions (a status menu
-    pick, spec 036, is the only set), never Graph; web's
+    """015-AC8: the collector by itself only reads presence, posts our own subscriptions and publishes its
+    socket as my endpoint (a status menu pick, spec 036, is the only forced status), never Graph; web's
     socket, wired with the presence hooks, still sends its usual user.activity."""
     service.states = {ANN: ("Available", "")}
     p, _ = _presence(settings, service, clock)
@@ -592,6 +606,8 @@ async def test_no_request_publishes_own_presence_or_touches_graph(
     await p.close()
     assert {r.url.host for r in service.requests} == {"presence.teams.microsoft.com"}
     assert {(r.method, r.url.path) for r in service.requests} == {
+        ("PUT", "/v1/me/endpoints/"),
+        ("POST", "/v1/me/reportmyactivity/"),
         ("POST", "/v1/presence/getpresence/"),
         ("POST", f"/v1/pubsub/subscriptions/{EPID}"),
     }
@@ -902,3 +918,267 @@ async def test_a_raising_set_frees_the_slot(settings: Settings, monkeypatch: pyt
     assert await _ask(board, {"setpresence": "Away"}) == [{"setpresence": "Away", "ok": True}]
     assert len(seen) == 1
     await board.presence.close()
+
+
+async def test_the_socket_is_published_as_my_endpoint(
+    settings: Settings, service: Service, clock: Clock
+) -> None:
+    """With the Teams client closed, no endpoint of mine is left: Offline, and a forced status shows nowhere.
+    Each socket is published once as my endpoint (Transport activity), again on renewal and reconnect."""
+    service.states = {ANN: ("Available", "")}
+    p, _ = _presence(settings, service, clock)
+    p.want([ANN])
+    await p.on_session(EPID, SURL)
+    await _settle(p)
+    assert service.bodies("/v1/me/endpoints/") == [
+        {
+            "id": EPID,
+            "availability": "Available",
+            "activity": "Available",
+            "activityReporting": "Transport",
+            "deviceType": "Desktop",
+        }
+    ]
+    p.want([ANN, BOB])
+    await _settle(p)  # a follow change is not a new socket
+    assert len(service.bodies("/v1/me/endpoints/")) == 1
+    await p.sync(renew=True)
+    await p.on_session(EPID, SURL + "2/")  # the id is persisted: a reconnect keeps it
+    await _settle(p)
+    assert [b["id"] for b in service.bodies("/v1/me/endpoints/")] == [EPID, EPID, EPID]
+    await p.close()
+
+
+async def test_a_refused_endpoint_keeps_the_dots(settings: Settings, service: Service, clock: Clock) -> None:
+    """A refused publish is logged and tried again by the next post; the subscription still goes out."""
+    service.states, service.endpoint_fail = {ANN: ("Available", "")}, True
+    p, _ = _presence(settings, service, clock)
+    p.want([ANN])
+    await p.on_session(EPID, SURL)
+    await _settle(p)
+    assert p.subscribed == {ANN} and p.published is None
+    service.endpoint_fail = False
+    await p.sync()  # unchanged follow list: the publish alone is retried
+    assert p.published == EPID and p.subscribed == {ANN}
+    await p.close()
+
+
+async def test_an_empty_follow_list_still_publishes(
+    settings: Settings, service: Service, clock: Clock
+) -> None:
+    """Nobody followed yet (no rows, `me` unresolved): the socket is still published as my endpoint."""
+    p, _ = _presence(settings, service, clock)
+    await p.on_session(EPID, SURL)
+    await _settle(p)
+    assert p.published == EPID and service.bodies("/v1/pubsub/") == []
+    await p.close()
+
+
+async def test_a_reconnect_during_a_publish_publishes_again(
+    settings: Settings, service: Service, clock: Clock
+) -> None:
+    """A new socket under the same id while a publish is in flight: the new socket is published too."""
+    p, _ = _presence(settings, service, clock)
+    real = service.handler
+
+    def reconnect_meanwhile(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/me/endpoints/" and p.session == (EPID, SURL):
+            p.session, p.published = (EPID, SURL + "2/"), None  # what on_session does, mid-request
+        return real(request)
+
+    p.http = httpx.AsyncClient(transport=httpx.MockTransport(reconnect_meanwhile))
+    await p.on_session(EPID, SURL)
+    await _settle(p)
+    assert p.published is None
+    await p.sync()
+    assert p.published == EPID and len(service.bodies("/v1/me/endpoints/")) == 2
+    await p.close()
+
+
+async def test_the_sweep_retries_a_refused_publish(
+    settings: Settings, service: Service, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused publish is retried by the sweep, not left until the next renewal."""
+    service.states, service.endpoint_fail = {ANN: ("Available", "")}, True
+    p, _ = _presence(settings, service, clock)
+    p.want([ANN])
+    await p.on_session(EPID, SURL)
+    await _settle(p)
+    service.endpoint_fail = False
+    p.renewed = clock()  # no renewal due: only the retry can publish
+    monkeypatch.setattr(P, "_SWEEP", 0.01)
+    loop = asyncio.create_task(p.run())
+    for _ in range(200):
+        if p.published == EPID:
+            break
+        await asyncio.sleep(0.01)
+    loop.cancel()
+    assert p.published == EPID
+    await p.close()
+
+
+async def _activity_presence(
+    settings: Settings, service: Service, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> P.Presence:
+    monkeypatch.setattr(P, "_IDLE_AFTER", 0.05)
+    p, _ = _presence(settings, service, clock)
+    await p.on_session(EPID, SURL)
+    await _settle(p)
+    return p
+
+
+async def _reports(p: P.Presence, service: Service) -> list[bool]:
+    for _ in range(3):  # spawned reports, then their HTTP round trip
+        await asyncio.gather(*p._tasks)
+        await asyncio.sleep(0)
+    return [b["isActive"] for b in service.bodies("/v1/me/reportmyactivity/")]
+
+
+async def test_my_endpoint_is_active_while_a_page_is_open(
+    settings: Settings, service: Service, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No page of ours open for a while: my endpoint reports inactive, so Teams shows me Away; a page open:
+    active at once. The publish reports the state the pages left."""
+    p = await _activity_presence(settings, service, clock, monkeypatch)
+    assert service.bodies("/v1/me/reportmyactivity/") == [{"endpointId": EPID, "isActive": False}]
+    p.pages(1)
+    assert await _reports(p, service) == [False, True]
+    p.pages(2)
+    assert await _reports(p, service) == [False, True]  # still active: nothing new to say
+    p.pages(0)
+    assert await _reports(p, service) == [False, True]  # not yet: the idle delay runs
+    await asyncio.sleep(0.1)
+    assert await _reports(p, service) == [False, True, False]
+    await p.close()
+
+
+async def test_a_reload_does_not_flap_my_activity(
+    settings: Settings, service: Service, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The last page closing then a page opening within the idle delay (a reload, a restart): no report."""
+    p = await _activity_presence(settings, service, clock, monkeypatch)
+    p.pages(1)
+    p.pages(0)
+    p.pages(1)
+    await asyncio.sleep(0.1)
+    assert await _reports(p, service) == [False, True]
+    await p.close()
+
+
+async def test_activity_waits_for_the_publish(
+    settings: Settings, service: Service, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before my endpoint is published nothing is reported; the publish then reports the latest state."""
+    monkeypatch.setattr(P, "_IDLE_AFTER", 0.05)
+    service.endpoint_fail = True
+    p, _ = _presence(settings, service, clock)
+    await p.on_session(EPID, SURL)
+    await _settle(p)
+    p.pages(1)
+    assert await _reports(p, service) == []
+    service.endpoint_fail = False
+    await p.sync()
+    assert await _reports(p, service) == [True]
+    await p.close()
+
+
+async def _loop_for(p: P.Presence, seconds: float = 0.2) -> None:
+    loop = asyncio.create_task(p.run())
+    await asyncio.sleep(seconds)
+    loop.cancel()
+
+
+async def test_a_refused_publish_backs_off(
+    settings: Settings, service: Service, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A publish refused for good is retried 30 s, 60 s, … apart (up to a period), not every sweep."""
+    service.states, service.endpoint_fail = {ANN: ("Available", "")}, True
+    p, _ = _presence(settings, service, clock)
+    p.want([ANN])
+    await p.on_session(EPID, SURL)
+    await _settle(p)
+    p.renewed = clock()
+    monkeypatch.setattr(P, "_SWEEP", 0.005)
+    tries = lambda: len(service.bodies("/v1/me/endpoints/"))  # noqa: E731
+    await _loop_for(p)
+    assert tries() == 2  # the first retry, then the wait
+    clock.now += 30
+    await _loop_for(p)
+    assert tries() == 3
+    clock.now += 30
+    await _loop_for(p)
+    assert tries() == 3  # the wait doubled
+    clock.now += 30
+    await _loop_for(p)
+    assert tries() == 4
+    await p.on_session(EPID, SURL + "2/")  # a new socket starts the wait over
+    await _settle(p)
+    assert tries() == 5
+    await _loop_for(p)
+    assert tries() == 6  # retried at once, then 30 s
+    clock.now += 30
+    await _loop_for(p)
+    assert tries() == 7
+    service.endpoint_fail = False
+    clock.now += 60
+    await _loop_for(p)
+    assert p.published == EPID and tries() == 8
+    service.endpoint_fail = True
+    p.published = None  # dropped again: the wait starts over from 30 s
+    await _loop_for(p)
+    assert tries() == 9
+    clock.now += 30
+    await _loop_for(p)
+    assert tries() == 10
+    await p.close()
+
+
+async def test_a_forgotten_endpoint_is_published_again(
+    settings: Settings, service: Service, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An activity report answered 404 means the service dropped my endpoint: the sweep publishes it again."""
+    p = await _activity_presence(settings, service, clock, monkeypatch)
+    service.endpoint_gone = True
+    p.pages(1)
+    await _reports(p, service)
+    assert p.published is None
+    service.endpoint_gone = False
+    p.renewed = clock()
+    monkeypatch.setattr(P, "_SWEEP", 0.005)
+    await _loop_for(p)
+    assert p.published == EPID and len(service.bodies("/v1/me/endpoints/")) == 2
+    await p.close()
+
+
+async def test_my_activity_is_said_again_periodically(
+    settings: Settings, service: Service, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The latest activity is reported again every two minutes, failed attempts included, never in a spin."""
+    p = await _activity_presence(settings, service, clock, monkeypatch)
+    p.pages(1)
+    assert await _reports(p, service) == [False, True]
+    p.renewed = clock()
+    monkeypatch.setattr(P, "_SWEEP", 0.005)
+    await _loop_for(p)
+    assert await _reports(p, service) == [False, True]  # not due yet
+    clock.now += 120
+    await _loop_for(p)
+    assert await _reports(p, service) == [False, True, True]
+    p.token = lambda: None  # the login died: one failed attempt per two minutes, not per sweep
+    clock.now += 120
+    await _loop_for(p)
+    assert await _reports(p, service) == [False, True, True]
+    assert p.reported == clock()
+    await p.close()
+
+
+async def test_closing_cancels_a_pending_idle_report(
+    settings: Settings, service: Service, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The last page closing at shutdown leaves no idle report to fire after the client is gone."""
+    p = await _activity_presence(settings, service, clock, monkeypatch)
+    p.pages(1)
+    p.pages(0)
+    idle = p._idle
+    await p.close()
+    assert idle is not None and idle.cancelled()

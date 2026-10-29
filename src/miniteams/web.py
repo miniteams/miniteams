@@ -1446,6 +1446,10 @@ class Board:
         """Every page, board or chat: the same person's dots change everywhere at once, my header dot too."""
         broadcast(self.pages, self.presence_frame())
 
+    def _pages_changed(self) -> None:
+        if self.presence is not None:
+            self.presence.pages(len(self.pages))  # no page left for a while: Teams shows me Away
+
     def set_link(self, state: LinkState) -> None:
         if state == self.link:
             return  # every keepalive reports "up"
@@ -1461,6 +1465,7 @@ class Board:
         if board_page:
             self.clients.add(ws)
         self.pages.add(ws)
+        self._pages_changed()
         try:
             await ws.send(json.dumps({"link": self.link}))
             if board_page:
@@ -1483,6 +1488,7 @@ class Board:
         finally:
             self.clients.discard(ws)
             self.pages.discard(ws)
+            self._pages_changed()
             self._follows.pop(ws, None)
             if self.receipts is not None:
                 self.receipts.retain({tid for tid, _ in self._follows.values()})

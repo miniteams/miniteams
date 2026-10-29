@@ -5,7 +5,8 @@ own Trouter socket (`<surl>/TeamsUnifiedPresenceService`). The subscription is r
 reconnect and every `PERIOD`; each post answers with a full snapshot callback. A state lives until
 two periods pass without a confirmation (a callback or a snapshot; a post's `20200` is not one: a dead
 socket gets it too), then it is unknown: no dot, never Offline. Our own presence is followed like anyone's
-and changes only on an explicit menu pick (spec 036, `force`).
+and is forced only by an explicit menu pick (spec 036, `force`). The socket is published as one of my
+endpoints, so closing the Teams client does not leave me Offline.
 
 Latest states persist in a local SQLite cache (`<cache_dir>/presence.sqlite3`, a subset of the spike's
 proposed schema): a restart paints them at once, unconfirmed, until the first callback.
@@ -18,7 +19,7 @@ import re
 import sqlite3
 import time
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Coroutine, Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,8 @@ HOST = "https://presence.teams.microsoft.com"
 PATHS = ("/TeamsUnifiedPresenceService", "/unifiedPresenceService")  # Trouter delivery urls
 PERIOD = 600.0  # seconds between renewals; spike: deltas kept coming 45 min unrenewed
 _SWEEP = 30.0  # seconds between staleness checks
+_IDLE_AFTER = 120.0  # seconds without any page before my endpoint reports inactive: a reload must not flap
+_REPORT_EVERY = 120.0  # my activity is said again this often, as purple-teams does: a report may expire
 _DEBOUNCE = 2.0  # seconds a follow-list change waits for its siblings (a burst of row moves)
 _UNKNOWN = "PresenceUnknown"
 _ACCEPTED = "20200"  # per-person status of an accepted subscription
@@ -276,6 +279,12 @@ class Presence:
         self.subscribed: frozenset[str] = frozenset()  # accepted on the current socket
         self.session: tuple[str, str] | None = None  # (endpoint id, surl) of the current socket
         self.renewed = 0.0  # wall seconds of the last full post
+        self.published: str | None = None  # the endpoint id last published as mine
+        self.active = False  # a page of ours is open; none for a while and Teams shows me Away
+        self._idle: asyncio.TimerHandle | None = None
+        self._reporting = asyncio.Lock()  # one activity report at a time, each sends the latest state
+        self.reported = 0.0  # wall seconds of the last activity report sent
+        self._retry_at, self._retry_wait = 0.0, _SWEEP  # a refused publish is retried, backing off
         self._lock = asyncio.Lock()  # one post at a time: a renewal must not interleave a diff
         self._pending: asyncio.TimerHandle | None = None
         self._tasks: set[asyncio.Task[None]] = set()
@@ -310,9 +319,60 @@ class Presence:
 
     def _spawn(self) -> None:
         self._pending = None
-        task = asyncio.create_task(self.sync())
+        self._start(self.sync())
+
+    def _start(self, work: Coroutine[Any, Any, None]) -> None:
+        task = asyncio.create_task(work)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    # --- my activity: the pages connected to `web` ---
+
+    def pages(self, count: int) -> None:
+        """Any page open: active at once; none left for `_IDLE_AFTER`: inactive."""
+        if self._idle is not None:
+            self._idle.cancel()
+            self._idle = None
+        if count:
+            self._activity(True)
+        else:
+            self._idle = asyncio.get_running_loop().call_later(_IDLE_AFTER, self._activity, False)
+
+    def _activity(self, active: bool) -> None:
+        self._idle = None
+        if active != self.active:
+            self.active = active
+            self._start(self.report())
+
+    async def report(self) -> None:
+        """Tell the service whether my endpoint is active; nothing before it is published."""
+        if self.session is None or self.published != self.session[0]:
+            return  # the publish reports the state once it goes through
+        epid = self.session[0]
+        self.reported = self.clock()  # an attempt, failed or not: the periodic one must not spin
+        try:
+            token = await asyncio.to_thread(self.token)
+        except Exception as exc:  # noqa: BLE001 — MSAL re-raises network errors
+            log.warning("presence_activity_failed", error_type=type(exc).__name__)
+            return
+        if not token:
+            log.warning("presence_activity_failed", error_type="token")
+            return
+        await self._report(self._headers(token, epid), epid)
+
+    async def _report(self, headers: dict[str, str], epid: str) -> None:
+        async with self._reporting:  # in order: each send carries the state current when it goes out
+            self.reported = self.clock()
+            body = {"endpointId": epid, "isActive": self.active}
+            try:
+                resp = await self.http.post(f"{HOST}/v1/me/reportmyactivity/", headers=headers, json=body)
+                resp.raise_for_status()
+            except httpx.HTTPError as exc:
+                log.warning("presence_activity_failed", error=str(exc), error_type=type(exc).__name__)
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404:
+                    self.published = None  # the service dropped my endpoint: the sweep publishes it again
+                return
+            log.debug("presence_activity", active=body["isActive"])
 
     # --- Trouter hooks ---
 
@@ -320,6 +380,8 @@ class Presence:
         """A (re)registered socket: a new callback url needs the whole set subscribed again."""
         self.session = (epid, surl)
         self.subscribed = frozenset()
+        self.published = None  # the id is persisted: a new socket under the same id is published again
+        self._retry_at, self._retry_wait = 0.0, _SWEEP
         self._schedule(0)  # not awaited: the socket's frames must not wait on HTTP
 
     async def on_presence(self, body: dict[str, Any]) -> None:
@@ -345,7 +407,9 @@ class Presence:
                 return
             epid, surl = self.session
             wanted, gone = self.wanted, self.subscribed - self.wanted
-            if (not wanted and not gone) or (wanted == self.subscribed and not renew):
+            publish = renew or self.published != epid
+            idle = (not wanted and not gone) or (wanted == self.subscribed and not renew)
+            if idle and not publish:
                 return
             try:
                 token = await asyncio.to_thread(self.token)
@@ -356,6 +420,13 @@ class Presence:
                 log.warning("presence_token_unavailable")
                 return
             headers = self._headers(token, epid)
+            if publish:
+                await self._publish(headers, epid)  # its failure must not cost the dots their subscription
+                if self.session != (epid, surl):
+                    self.published = None  # a new socket under the same id came in meanwhile
+                    return  # its own sync is queued
+            if idle:
+                return
             try:
                 if fresh := sorted(wanted - self.subscribed):
                     resp = await self.http.post(
@@ -387,6 +458,27 @@ class Presence:
             refused = [m for m, s in answered.items() if s != _ACCEPTED]
             self._apply(dict.fromkeys(refused))
             log.info("presence_subscribed", people=len(wanted), removed=len(gone), refused=len(refused))
+
+    async def _publish(self, headers: dict[str, str], epid: str) -> None:
+        """Our socket as one of my Teams endpoints: with none left (Teams client closed) I am Offline and
+        a forced status shows nowhere. Transport: its activity comes from `reportmyactivity` (`report`)."""
+        body = {
+            "id": epid,
+            "availability": "Available",
+            "activity": "Available",
+            "activityReporting": "Transport",
+            "deviceType": "Desktop",
+        }  # purple-teams' shape
+        try:
+            resp = await self.http.put(f"{HOST}/v1/me/endpoints/", headers=headers, json=body)
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            log.warning("presence_endpoint_failed", error=str(exc), error_type=type(exc).__name__)
+            return
+        self.published = epid
+        self._retry_at, self._retry_wait = 0.0, _SWEEP
+        log.info("presence_endpoint_published")
+        await self._report(headers, epid)  # a published endpoint starts from what the pages say
 
     async def force(self, value: str) -> str:
         """Spec 036: force my status to a `FORCE` entry; "" once the service took it, else a short reason.
@@ -423,6 +515,13 @@ class Presence:
                 if self.session is not None and self.clock() - self.renewed >= self.period:
                     self.renewed = self.clock()  # one attempt per period, failed or not
                     await self.sync(renew=True)
+                elif self.session is not None and self.published != self.session[0]:
+                    if self.clock() >= self._retry_at:  # offline until a publish goes through
+                        self._retry_at = self.clock() + self._retry_wait
+                        self._retry_wait = min(self._retry_wait * 2, self.period)
+                        await self.sync()
+                elif self.session is not None and self.clock() - self.reported >= _REPORT_EVERY:
+                    await self.report()
             except Exception as exc:  # noqa: BLE001 — a dead loop would leave every dot up forever
                 log.warning("presence_renewal_failed", error=str(exc), error_type=type(exc).__name__)
 
@@ -439,6 +538,8 @@ class Presence:
         """Drop our subscriptions (never the contact list) and release the client."""
         if self._pending is not None:
             self._pending.cancel()
+        if self._idle is not None:
+            self._idle.cancel()
         for task in self._tasks:
             task.cancel()
         try:

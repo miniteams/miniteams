@@ -14,7 +14,7 @@ import threading
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote
 
 import httpx
@@ -4381,3 +4381,28 @@ def test_concurrent_first_saves_lose_no_row(tmp_path: Path) -> None:
             t.join()
         ids = [f"{side}-{i}" for side in (0, 1) for i in range(5)]
         assert len(store.load_many(CT, ids)) == 10, n
+
+
+async def test_open_pages_drive_my_endpoint_activity(board: W.Board, settings: Settings) -> None:
+    """Every page socket, board or chat, counts as me being here; the last one closing hands the count to
+    the presence collector, which reports inactive after its idle delay (Teams: Away)."""
+    counts: list[int] = []
+
+    class Seen:
+        def pages(self, count: int) -> None:
+            counts.append(count)
+
+        def frame(self) -> dict[str, Any]:
+            return {"presence": {}}
+
+        def want(self, mris: Any) -> None:
+            list(mris)
+
+    board.presence = cast(Any, Seen())
+    async with _served(board, settings):
+        async with _connect(board):
+            await wait(lambda: counts == [1], "widget counted")
+            async with _chat_socket(board):
+                await wait(lambda: counts == [1, 2], "chat page counted")
+            await wait(lambda: counts == [1, 2, 1], "chat page gone")
+        await wait(lambda: counts == [1, 2, 1, 0], "no page left")

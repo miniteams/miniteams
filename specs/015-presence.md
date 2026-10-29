@@ -34,13 +34,13 @@ hover gives the label ("Busy · In a meeting"). Unknown presence shows no dot.
   (`~/.cache/miniteams/presence.sqlite3`, not the NAS data dir), shown at start as unconfirmed until
   the first callback. Single writer, latest state only, no history. Schema: a subset of
   `misc/presence-spike/schema-proposal.sql` (no names stored), shared later with the read-receipts horizons (spec 011).
-- **Own presence** is never published or forced by the collector; the widget's existing
-  `user.activity` signal is unchanged.
+- **Own presence** is never forced by the collector; the widget's existing `user.activity` signal is
+  unchanged. Since 2026-10-29 `web`'s socket is published as one of my endpoints (see Decisions).
 
 ## Out of scope
 
 - Presence on group rows, read-receipt avatars, the MCP or the CLI.
-- Setting or overriding the user's own presence; status messages; out-of-office notes.
+- Forcing the user's own status (spec 036 does); status messages; out-of-office notes.
 - Presence history.
 
 ## Acceptance criteria
@@ -60,8 +60,9 @@ hover gives the label ("Busy · In a meeting"). Unknown presence shows no dot.
       chat changes (subscriptions added and removed).
 - [x] **AC7** A `web` restart shows cached presence as unconfirmed at once, confirmed after the first
       callback; the cache lives on local disk.
-- [x] **AC8** The presence collector publishes nothing (no own-presence call of its own) and never
-      calls Graph; the widget's existing `user.activity` signal is unchanged.
+- [x] **AC8** The presence collector forces no status of its own (2026-10-29: it publishes only
+      `web`'s endpoint and its activity) and never calls Graph; the widget's existing `user.activity`
+      signal is unchanged.
 
 ## Phases
 
@@ -95,7 +96,8 @@ None left from phase 1 (answers in Decisions, evidence in `misc/presence-spike/R
 - The `web` process collects on its own Trouter socket; peers of ~50 recent 1:1 rows + open chat
   authors; snapshot then Trouter updates; local SQLite cache for restarts (babs, 2026-10-13).
 - Finish the spike with a long observation before coding; renew on reconnect and periodically;
-  stale after two periods → unknown; own presence never published (babs, 2026-10-13).
+  stale after two periods → unknown; own presence never published (babs, 2026-10-13; reversed
+  2026-10-29, below).
 - Separate spec from the read-receipts amendment (spec 011), sharing the spike harness and the
   local cache (babs, 2026-10-13).
 - **Renewal period: 10 min** (spike, 2026-10-13). 60 min observation of 50 peers: 19 availability
@@ -108,4 +110,10 @@ None left from phase 1 (answers in Decisions, evidence in `misc/presence-spike/R
   message loss after the connect flood, `user.activity` not needed. Verified on a fresh probe
   endpoint with the `web` registration, not inside the running `web` process.
 - **`web` keeps sending `user.activity`** (babs, 2026-10-14): it keeps the user active in Teams;
-  dropping it was a regression. The presence collector itself publishes nothing.
+  dropping it was a regression. The presence collector itself publishes nothing (until 2026-10-29).
+- **`web` is one of my Teams endpoints** (babs, 2026-10-29), reversing "own presence never
+  published": with the Teams client closed no endpoint of mine was left, so I showed Offline and a
+  spec 036 status pick showed nowhere. `web` publishes its socket (`PUT /v1/me/endpoints/`,
+  `activityReporting: Transport`, purple-teams' shape) on each socket and renewal, and reports it
+  active (`POST /v1/me/reportmyactivity/`) while a page is connected, inactive after 2 min without
+  one, so Teams shows me Away.

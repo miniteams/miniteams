@@ -223,8 +223,9 @@ watches the token cache file).
 - Unknown presence (no answer, `PresenceUnknown`, refused subscription) shows no dot, never Offline.
 - Followed: you, the peers of the 50 newest 1:1 rows, and the authors an open chat page shows (50 per page, 100 people in all).
 - Native presence service + `web`'s own Trouter socket, no Graph; re-subscribed on every reconnect and every 10 min.
-  Two periods (20 min) without a confirmation and the dots go. The collector never publishes your own presence
-  by itself: only a pick in the status menu sets it.
+  Two periods (20 min) without a confirmation and the dots go. `web` counts as one of your Teams
+  devices, so closing the Teams client does not leave you Offline: active while a miniteams page (widget
+  or chat page; the widget counts even hidden in the tray) is open, inactive (Away) 2 min after the last one closes. Only a pick in the status menu forces a status.
 - Latest states are cached in `~/.cache/miniteams/presence.sqlite3` (local disk, `0600`): after a restart they show
   at once, faded and `(unconfirmed)`, until the service confirms them. Delete the file anytime; it is regenerated.
 
