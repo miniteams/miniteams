@@ -1291,7 +1291,7 @@
 
   // No `html`: a partial update (a reaction), whose other fields are blank, not news.
   // An edit may come without its clientmessageid: the message stays the echo of its send.
-  const patch = (old, r) => "html" in r ? { ...r, cmid: r.cmid || old.cmid } : { ...old, reactions: r.reactions, deleted: r.deleted };
+  const patch = (old, r) => "html" in r ? { ...old, ...r, cmid: r.cmid || old.cmid } : { ...old, reactions: r.reactions, deleted: r.deleted };
   const replace = (r) => {
     if (replacing()) hist.liveEdits.push(r);
     const held = hist.live.findIndex((x) => x.id === r.id);  // detached: it is shown once the latest page is

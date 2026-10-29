@@ -326,6 +326,9 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   Hover any reaction chip to see all the message's reactions, grouped by emoji with their participants.
   Native skin tones (`yes-tone1` → 👍🏻 through `yes-tone5` → 👍🏿) are preserved on supported emoji.
   Cards from bots and apps are rendered; runs of deleted messages are folded.
+- **Up-to-date app cards** (spec 037): an app card that declares a refresh (a Jira link card, …) is asked again
+  from its bot when shown, as Teams does, at most every 10 minutes; the row updates in place. The latest card is
+  kept in `data/cards.db` and shown first next time, after a restart too; the archived message is unchanged.
 - **Editing** (✎, spec 019): the message turns into an editor like the composer: `:emoji` / `@member` completion,
   Ctrl+B / Ctrl+I and a mini toolbar with a 👁 preview. It opens on the message's own markdown (formatting, links,
   emojis, mentions kept as picked), its reply quotes above and its pasted images under it, each removable (✕ / ×),
@@ -371,12 +374,14 @@ before.
 
 `archive` builds a resumable local archive under `./data/`: `index.db` (chat metadata) plus
 one folder per conversation with a `messages.db` (every message as raw API JSON, keyed by id)
-and a `media/` folder (attachments at original quality). Interrupt anytime — re-running resumes
-from the oldest stored message, tops up new ones, and skips media already on disk. Assets the
-archive gave up on are remembered per chat: a 403 (deleted object, lost share permission) or a
-413 (transcript over the 50 MiB cap) is permanent, a 404 backs off (1h → 6h → 12h → 24h → 48h,
-then every 48h) because it may just be a transcript still being generated, and a 415 (transcript
-of the wrong content type or encoding) backs off the same way. `--retry-assets` forces them all, and refuses to run under `--loop`
+and a `media/` folder (attachments at original quality). `cards.db` beside them holds the latest
+refreshed app cards (spec 037), written by `web`, never by `archive`. Interrupt anytime —
+re-running resumes from the oldest stored message, tops up new ones, and skips media already on
+disk. Assets the archive gave up on are remembered per chat: a 403 (deleted object, lost share
+permission) or a 413 (transcript over the 50 MiB cap) is permanent, a 404 backs off (1h → 6h →
+12h → 24h → 48h, then every 48h) because it may just be a transcript still being generated, and
+a 415 (transcript of the wrong content type or encoding) backs off the same way.
+`--retry-assets` forces them all, and refuses to run under `--loop`
 — a one-shot override on a timer is not an override. Likewise a chat whose whole history is
 403 (revoked meeting access) is skipped on later runs; `--retry-denied` re-attempts it. Every run
 ends with an `archive_recap` log line (chats, failures, new messages, media files, avatars,

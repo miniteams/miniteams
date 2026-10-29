@@ -13,6 +13,7 @@ import functools
 import hashlib
 import html
 import json
+import math
 import mimetypes
 import re
 import sqlite3
@@ -32,8 +33,17 @@ import structlog
 from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import ConnectionClosed
 
-from .archive_store import chat_label, find_chat_dir, messages_by_id, read_page, saved_files, search_chat
+from .archive_store import (
+    chat_label,
+    find_chat_dir,
+    message_version,
+    messages_by_id,
+    read_page,
+    saved_files,
+    search_chat,
+)
 from .attachments import LIVE_HOST_RE, LIVE_VIEW_RE, existing, giphy, giphy_image, live_image, remote_gif
+from .card_refresh import CardRefresher, Cards, Row
 from .chats import chat_kind
 from .compose import (
     MAX_FREE_NAME,
@@ -82,7 +92,7 @@ from .messages import (
     reaction_key,
     snippet,
 )
-from .render import STEM_RE, cards_html, file_links, file_urls, files_html, media_url, sanitize
+from .render import STEM_RE, card_entries, cards_html, file_links, file_urls, files_html, media_url, sanitize
 from .send import (
     attach_images,
     before_images,
@@ -138,6 +148,9 @@ _DEADLINES: dict[IoKind, float] = {
     "relay": 5.0,
 }
 _ACTIVITY = "_activity"  # record key: a system line's (msgtype, Activity), until named
+CARDS_MARK = "_cards"  # record key: (message, cards shown, media dir, cards.db rows | None) of a due card
+_CARD_JOBS = 256  # messages refreshing their cards at once (spec 037)
+_RELAYED_MAX = 256  # messages whose last live version is kept, for the refresh frames (spec 037)
 _LOOKUP_PAGE = 20  # API messages read ending at an older message the latest page lacks
 _FORMATS = ("inline", "full")
 _FRAMES_WAIT = 30.0  # seconds a send waits for its next attachment frame: a slow link keeps going
@@ -974,8 +987,12 @@ class ChatVerbs:
         me_name: str = "",
         data_dir: Path | None = None,
         latest: Latest = lambda _: "",
+        cards: CardRefresher | None = None,
+        relay: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.directory = directory
+        self.cards = cards  # spec 037; None: cards show as posted
+        self.relay = relay  # a frame to the thread's followers, behind the queued relays
         self.emojis = emojis
         self.scope = scope
         self.latest = latest
@@ -997,6 +1014,10 @@ class ChatVerbs:
         self._echoes: dict[tuple[str, str], asyncio.Event] = {}
         self._live: Downloads[tuple[bytes, str]] = Downloads(_LIVE_FAILED_TTL, _LIVE_FAILED_MAX)
         self._live_gate = asyncio.Semaphore(_LIVE_CONCURRENCY)  # a history page can hold dozens
+        # (thread, message) → its card refresh and the version it rebuilds from, while it runs
+        self._card_jobs: dict[tuple[str, str], tuple[asyncio.Task[None], float]] = {}
+        # (thread, message) → the newest version relayed live: no older refresh frame may follow it
+        self._relayed: OrderedDict[tuple[str, str], float] = OrderedDict()
 
     # --- socket wiring ---
 
@@ -1209,6 +1230,7 @@ class ChatVerbs:
         try:
             page = await self.history(request)
             await name_activity(page.get("messages") or [], self.directory, self.me)
+            self.cards_shown(request.thread, page.get("messages") or [])
             return {**head, **page}
         except ArchiveUnavailable:
             return {**head, "error": "archive unavailable"}
@@ -1821,24 +1843,134 @@ class ChatVerbs:
         records = []
         custom, images = self.emojis.custom(), self.emojis.images()
         saved = page_files(media, messages)
+        rows = self._card_rows(thread_id, messages)
         for message in messages:
             try:
-                records.append(
-                    chat_record(
-                        message,
-                        thread_id,
-                        self.me,
-                        media,
-                        custom,
-                        self.directory.name_for if self.directory else None,
-                        images,
-                        saved,
-                        self.directory.known_name if self.directory else None,
-                    )
+                build = functools.partial(
+                    chat_record,
+                    message,
+                    thread_id,
+                    self.me,
+                    media,
+                    custom,
+                    self.directory.name_for if self.directory else None,
+                    images,
+                    saved,
+                    self.directory.known_name if self.directory else None,
                 )
+                records.append(self.with_cards(thread_id, message, media, build, rows))
             except Exception as exc:  # noqa: BLE001 — one malformed message must not lose the page
                 log.warning("chat_record_skipped", thread=thread_id, error_type=type(exc).__name__)
         return records
+
+    def _card_rows(self, thread_id: str, messages: list[dict[str, Any]]) -> dict[str, dict[str, Row]]:
+        """The `cards.db` rows of the messages carrying app cards, one read (spec 037). Blocking."""
+        ids = [str(m.get("id") or "") for m in messages if card_entries(m)]
+        return self.cards.store.load_many(thread_id, ids) if self.cards is not None and ids else {}
+
+    def with_cards(
+        self,
+        thread_id: str,
+        message: dict[str, Any],
+        media: Path | None,
+        build: Callable[..., dict[str, Any]],
+        rows: dict[str, dict[str, Row]] | None = None,
+        stored: bool = True,
+    ) -> dict[str, Any]:
+        """`build(cards=…)`'s record with the message's refreshed cards (spec 037), marked with
+        `CARDS_MARK` when one may be due a refresh. `rows`: the page's `_card_rows`; None: read here,
+        blocking. Not `stored`: this process's saves only, the refresh reads `cards.db`."""
+        if self.cards is None:
+            return build(cards={})
+        if rows is None and stored:
+            rows = self._card_rows(thread_id, [message])
+        mine = (rows or {}).get(str(message.get("id") or ""), {})
+        cards = self.cards.stored(thread_id, message, mine)
+        record = build(cards=cards)
+        if self.cards.due(thread_id, message, self.me, mine):
+            record[CARDS_MARK] = (message, cards, media, mine if stored else None)
+        return record
+
+    def cards_shown(self, thread_id: str, records: list[dict[str, Any]]) -> None:
+        """Pop the records' `CARDS_MARK`: each marked message's cards are refreshed in the background, a
+        change pushed as an `edit` frame (spec 037). One refresh per message, the newest version's."""
+        directory = self.directory
+        for record in records:
+            mark = record.pop(CARDS_MARK, None)
+            if mark is None or self.relay is None or directory is None:
+                continue
+            if not directory.skype_token or not directory.bearer:
+                continue
+            message, cards, media, rows = mark
+            key, version = (thread_id, str(record["id"])), message_version(message)
+            running = self._card_jobs.get(key)
+            if running is not None:
+                if running[1] >= version:
+                    continue
+                running[0].cancel()
+            elif len(self._card_jobs) >= _CARD_JOBS:
+                continue
+            task = asyncio.create_task(self._card_job(key, message, cards, media, rows))
+            self._card_jobs[key] = (task, version)
+            task.add_done_callback(functools.partial(self._card_job_done, key))
+
+    def _card_job_done(self, key: tuple[str, str], task: asyncio.Task[None]) -> None:
+        if (job := self._card_jobs.get(key)) is not None and job[0] is task:
+            del self._card_jobs[key]
+
+    async def _card_job(
+        self,
+        key: tuple[str, str],
+        message: dict[str, Any],
+        shown: Cards,
+        media: Path | None,
+        rows: dict[str, Row] | None,
+    ) -> None:
+        thread_id = key[0]
+        assert self.cards is not None and self.directory is not None and self.relay is not None
+        try:
+            cards = await self.cards.refresh(
+                thread_id,
+                message,
+                me=self.me,
+                skype_token=self.directory.skype_token,
+                bearer=self.directory.bearer,
+                rows=rows,
+            )
+            if cards == shown:
+                return
+            # Rebuilt by the page builder: `records` reads the cards the refresh just stored.
+            records = await self.cards.blocking(self.records, [message], thread_id, media)
+        except ArchiveUnavailable:
+            return
+        except Exception as exc:  # noqa: BLE001 — the row keeps the card it shows
+            log.warning("card_push_failed", thread=thread_id, error_type=type(exc).__name__)
+            return
+        # Checked and queued in one step: a newer relay is either already counted or queued after.
+        if not records or self._relayed.get(key, -1.0) > message_version(message):
+            return
+        # Only what a card changes: the page merges it, the reactions and the rest stay as last relayed.
+        self.relay(thread_id, {"edit": {k: records[0][k] for k in ("id", "html", "type")}})
+
+    def relayed(self, thread_id: str, message: dict[str, Any]) -> None:
+        """A live version of the message is queued for its followers: an older one's refresh frame
+        must not follow it (spec 037). A reaction leaves the body, the refresh frame's only part."""
+        msg_id = str(message.get("id") or "")
+        props = message.get("properties")
+        whole = "content" in message or is_deleted(props if isinstance(props, dict) else {})
+        if self.cards is None or not msg_id or not whole:
+            return
+        key = (thread_id, msg_id)
+        # Without a version it cannot be ordered: every refresh frame of the message is dropped.
+        self._relayed[key] = max(self._relayed.pop(key, -1.0), message_version(message) or math.inf)
+        # ponytail: past this many updated messages, an archive copy older than the live one may push
+        while len(self._relayed) > _RELAYED_MAX:
+            self._relayed.popitem(last=False)
+
+    def close(self) -> None:
+        """Cancel the card refreshes (spec 037)."""
+        for task, _ in list(self._card_jobs.values()):
+            task.cancel()
 
     def _archive_records(
         self, chat_dir: Path, thread_id: str, side: tuple[str, str], size: int

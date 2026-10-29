@@ -9,7 +9,7 @@ import math
 import sqlite3
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -18,6 +18,7 @@ from urllib.parse import quote
 import httpx
 import structlog
 
+from .archive_store import message_version
 from .config import Settings
 from .render import card_entries
 
@@ -33,7 +34,8 @@ _CARD_MAX = 256 * 1024  # bytes; a bigger reply is a failure
 _DEFINITIONS_MAX = 1 << 20  # bytes of a batchedDefinitions reply
 _POST_DEADLINE = 15.0  # seconds for a whole request, connect to last byte: httpx times each read alone
 _RETRY_MAX = 86400.0
-_BUSY_TIMEOUT = 5.0  # seconds a cards.db lock is waited for
+_BUSY_TIMEOUT = 2.0  # seconds a cards.db lock is waited for: under the web relay deadline (5 s)
+_IDS_PER_QUERY = 500  # message ids per `load_many` query, under SQLite's variable limit
 _ADAPTIVE = "application/vnd.microsoft.card.adaptive"
 APPS_URL = "https://teams.microsoft.com/api/mt/beta/users/apps/batchedDefinitions"
 _SCHEMA = """CREATE TABLE IF NOT EXISTS cards (
@@ -42,6 +44,8 @@ _SCHEMA = """CREATE TABLE IF NOT EXISTS cards (
 )"""
 
 Cards = dict[str, dict[str, Any]]
+# Runs a blocking call off the loop, `asyncio.to_thread`'s shape.
+type Blocking = Callable[..., Awaitable[Any]]
 
 
 def _text(value: object) -> str:
@@ -92,28 +96,35 @@ class CardStore:
 
     def load(self, thread_id: str, message_id: str) -> dict[str, Row]:
         """card id → its row; {} when the file is missing or locked."""
-        if not self.path.is_file():
+        return self.load_many(thread_id, [message_id]).get(message_id, {})
+
+    def load_many(self, thread_id: str, message_ids: list[str]) -> dict[str, dict[str, Row]]:
+        """message id → card id → its row, for a page's messages in few queries; {} when missing or locked."""
+        if not message_ids or not self.path.is_file():
             return {}
+        rows = []
         try:
             db = sqlite3.connect(f"{self.path.absolute().as_uri()}?mode=rw", uri=True, timeout=_BUSY_TIMEOUT)
             try:
-                rows = db.execute(
-                    "SELECT card_id, card, refreshed_at, retry_at FROM cards"
-                    " WHERE thread_id = ? AND message_id = ?",
-                    (thread_id, message_id),
-                ).fetchall()
+                for i in range(0, len(message_ids), _IDS_PER_QUERY):
+                    chunk = message_ids[i : i + _IDS_PER_QUERY]
+                    rows += db.execute(
+                        "SELECT message_id, card_id, card, refreshed_at, retry_at FROM cards"
+                        f" WHERE thread_id = ? AND message_id IN ({', '.join('?' * len(chunk))})",
+                        (thread_id, *chunk),
+                    ).fetchall()
             finally:
                 db.close()
         except sqlite3.Error as exc:
-            log.info("card_store_read_failed", error=str(exc))
+            log.info("card_store_read_failed", error=str(exc), error_type=type(exc).__name__)
             return {}
-        out: dict[str, Row] = {}
-        for card_id, text, refreshed_at, retry_at in rows:
+        out: dict[str, dict[str, Row]] = {}
+        for message_id, card_id, text, refreshed_at, retry_at in rows:
             try:
                 card = json.loads(text) if text else None
             except ValueError, RecursionError:
                 card = None
-            out[str(card_id)] = Row(
+            out.setdefault(str(message_id), {})[str(card_id)] = Row(
                 card if isinstance(card, dict) else None, _epoch(refreshed_at), _epoch(retry_at)
             )
         return out
@@ -144,7 +155,7 @@ class CardStore:
             finally:
                 db.close()
         except sqlite3.Error as exc:
-            log.info("card_store_write_failed", error=str(exc))
+            log.info("card_store_write_failed", error=str(exc), error_type=type(exc).__name__)
 
 
 class Failed(Exception):
@@ -173,10 +184,12 @@ class CardRefresher:
         *,
         transport: httpx.AsyncBaseTransport | None = None,
         clock: Callable[[], float] = time.time,
+        blocking: Blocking = asyncio.to_thread,
     ) -> None:
         self.settings = settings
         self.store = store
         self.clock = clock
+        self.blocking = blocking  # the store's reads and writes; a failure is a failed read or write
         self._transport = transport
         # app id → (bot id or "", expiry, the failure behind a negative entry); process-wide (037-AC7)
         self._bots: OrderedDict[str, tuple[str, float, Failed | None]] = OrderedDict()
@@ -189,17 +202,42 @@ class CardRefresher:
         """Fresh per-loop state: the MCP runs each tool in its own `asyncio.run`."""
         self._loop = loop
         self._sem = asyncio.Semaphore(_CONCURRENCY)
-        self._inflight: dict[tuple[str, str], asyncio.Task[Cards]] = {}
+        # (thread, message, version) → its refresh: an edit's new cards are not folded into the old one's
+        self._inflight: dict[tuple[str, str, int], asyncio.Task[Cards]] = {}
         self._lookups: dict[str, asyncio.Task[tuple[str, float, Failed | None]]] = {}
 
-    def stored(self, thread_id: str, message: dict[str, Any]) -> Cards:
-        """The refreshed cards of `message` kept so far, by cardClientId. Blocking."""
+    def stored(self, thread_id: str, message: dict[str, Any], rows: dict[str, Row] | None = None) -> Cards:
+        """The refreshed cards of `message` kept so far, by cardClientId. Blocking unless given its `rows`."""
         message_id = _text(message.get("id"))
         ids = [k for k in card_entries(message) if isinstance(k, str)]
         if not message_id or not ids:
             return {}
-        rows = self._merged(thread_id, message_id, ids, self.store.load(thread_id, message_id))
-        return {cid: row.card for cid, row in rows.items() if row.card is not None}
+        if rows is None:
+            rows = self.store.load(thread_id, message_id)
+        merged = self._merged(thread_id, message_id, ids, rows)
+        return {cid: row.card for cid, row in merged.items() if row.card is not None}
+
+    def due(self, thread_id: str, message: dict[str, Any], me: str, rows: dict[str, Row]) -> bool:
+        """Whether a card of `message` is due a refresh for `me`, given its `cards.db` rows."""
+        message_id = _text(message.get("id"))
+        entries = {k: e for k, e in card_entries(message).items() if isinstance(k, str)}
+        if not message_id or not entries:
+            return False
+        return bool(self._due(entries, self._merged(thread_id, message_id, list(entries), rows), me))
+
+    def _due(
+        self, entries: dict[str, dict[str, Any]], rows: dict[str, Row], me: str
+    ) -> list[tuple[str, str, dict[str, Any]]]:
+        """(card id, app id, refresh action) of the cards due: eligible on their latest copy, retry passed."""
+        now = self.clock()
+        due = []
+        for cid, entry in entries.items():
+            row = rows.get(cid)
+            latest = {**entry, "content": row.card} if row is not None and row.card is not None else entry
+            action = refresh_action(latest, me)
+            if action is not None and (row is None or row.retry <= now):
+                due.append((cid, _text(entry.get("appId")), action))
+        return due
 
     def _merged(
         self, thread_id: str, message_id: str, ids: list[str], rows: dict[str, Row]
@@ -220,17 +258,25 @@ class CardRefresher:
         return out
 
     async def refresh(
-        self, thread_id: str, message: dict[str, Any], *, me: str, skype_token: str, bearer: str
+        self,
+        thread_id: str,
+        message: dict[str, Any],
+        *,
+        me: str,
+        skype_token: str,
+        bearer: str,
+        rows: dict[str, Row] | None = None,
     ) -> Cards:
-        """The message's cards after asking the bots of those due; one request per message at a time."""
+        """The message's cards after asking the bots of those due; one request per message version at a time.
+        `rows`: its `cards.db` rows when the caller read them, else read here."""
         if (loop := asyncio.get_running_loop()) is not self._loop:
             if self._inflight and self._loop is not None and not self._loop.is_closed():
                 raise RuntimeError("CardRefresher used from two event loops")
             self._bind(loop)
-        key = (thread_id, _text(message.get("id")))
+        key = (thread_id, _text(message.get("id")), message_version(message))
         task = self._inflight.get(key)
         if task is None:
-            task = asyncio.ensure_future(self._refresh(key, message, me, skype_token, bearer))
+            task = asyncio.ensure_future(self._refresh(key[:2], message, me, skype_token, bearer, rows))
             self._inflight[key] = task
             # A callback, not a finally: it also runs for a task cancelled before it started.
             task.add_done_callback(
@@ -240,24 +286,29 @@ class CardRefresher:
         return await asyncio.shield(task)
 
     async def _refresh(
-        self, key: tuple[str, str], message: dict[str, Any], me: str, skype_token: str, bearer: str
+        self,
+        key: tuple[str, str],
+        message: dict[str, Any],
+        me: str,
+        skype_token: str,
+        bearer: str,
+        stored: dict[str, Row] | None,
     ) -> Cards:
         thread_id, message_id = key
         entries = {k: e for k, e in card_entries(message).items() if isinstance(k, str)}
         if not message_id or not entries:
             return {}
-        stored = await asyncio.to_thread(self.store.load, thread_id, message_id)
-        rows = self._merged(thread_id, message_id, list(entries), stored)
+        if stored is None:
+            try:
+                stored = await self.blocking(self.store.load, thread_id, message_id)
+            except Exception as exc:  # noqa: BLE001 — an unreadable store: this process's saves only
+                log.info("card_store_read_failed", error_type=type(exc).__name__)
+                stored = {}
+        rows = self._merged(thread_id, message_id, list(entries), stored or {})
         cards = {cid: row.card for cid, row in rows.items() if row.card is not None}
         if not skype_token or not bearer:
             return cards
-        now = self.clock()
-        due = []
-        for cid, entry in entries.items():
-            latest = {**entry, "content": cards[cid]} if cid in cards else entry
-            action = refresh_action(latest, me)
-            if action is not None and (cid not in rows or rows[cid].retry <= now):
-                due.append((cid, _text(entry.get("appId")), action))
+        due = self._due(entries, rows, me)
         if not due:
             return cards
         # One client per message, closed with it: it cannot outlive its loop.
@@ -340,7 +391,10 @@ class CardRefresher:
         self._saved.move_to_end(key)
         while len(self._saved) > _SAVED_MAX:
             self._saved.popitem(last=False)
-        await asyncio.to_thread(self.store.save, thread_id, message_id, card_id, card, now, retry)
+        try:
+            await self.blocking(self.store.save, thread_id, message_id, card_id, card, now, retry)
+        except Exception as exc:  # noqa: BLE001 — kept in `_saved`, as an unwritable store is
+            log.info("card_store_write_failed", error_type=type(exc).__name__)
 
     async def _bot(self, app_id: str, skype_token: str, bearer: str) -> str:
         """The app's bot id, cached per process (037-AC7); an app without one is negative-cached."""

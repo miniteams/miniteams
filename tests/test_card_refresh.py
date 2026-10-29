@@ -6,6 +6,7 @@ import contextlib
 import copy
 import gc
 import json
+import logging
 import sqlite3
 import sys
 import threading
@@ -16,6 +17,7 @@ from typing import Any
 
 import httpx
 import pytest
+import structlog
 from conftest import wait
 from structlog.testing import capture_logs
 
@@ -699,7 +701,7 @@ async def test_inflight_cleared_on_error_and_concurrency_capped(
     """037-AC6 (client side): an exception still clears the in-flight entry; at most 4 bot calls at once."""
     refresher = make(Teams())
 
-    monkeypatch.setattr(refresher.store, "load", lambda *a: (_ for _ in ()).throw(RuntimeError("bug")))
+    monkeypatch.setattr(refresher, "_due", lambda *a: (_ for _ in ()).throw(RuntimeError("bug")))
     with pytest.raises(RuntimeError):
         await _go(refresher, _msg())
     assert refresher._inflight == {}
@@ -715,6 +717,42 @@ async def test_inflight_cleared_on_error_and_concurrency_capped(
     assert teams.paths().count(INVOKE) == CR._CONCURRENCY
     teams.gate.set()
     assert len(await task) == 8
+
+
+async def test_a_failing_store_runner_is_a_failed_read_and_write(settings: Settings, tmp_path: Path) -> None:
+    """037-AC5: the store runner raising (archive pool refusing, past its deadline) keeps the card shown so
+    far and the refreshed one in memory; nothing raises, nothing stays in flight; no token logged."""
+
+    async def refusing(fn: Callable[..., Any], *args: Any) -> Any:
+        raise CV.ArchiveUnavailable("archive unavailable (relay)")
+
+    teams = Teams()
+    settings.contacts_host = "chat.example.test"
+    refresher = CR.CardRefresher(
+        settings, CR.CardStore(tmp_path / "cards.db"), transport=httpx.MockTransport(teams), blocking=refusing
+    )
+    structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG))
+    with capture_logs() as logs:
+        got = await _go(refresher, _msg())
+    assert _text(got["card-1"]) == "Ticket: DONE" and refresher._inflight == {}
+    assert {e["event"] for e in logs} == {"card_store_read_failed", "card_store_write_failed"}
+    assert SKYPE not in str(logs) and BEARER not in str(logs)
+    assert not (tmp_path / "cards.db").exists()
+    assert _text(refresher.stored(T, _msg())["card-1"]) == "Ticket: DONE"  # this process's save
+
+
+def test_load_many_reads_a_page_in_chunks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """037-AC2: one page's rows in few queries, each under the variable limit; the same rows as `load`."""
+    monkeypatch.setattr(CR, "_IDS_PER_QUERY", 2)
+    store = CR.CardStore(tmp_path / "cards.db")
+    for i in range(5):
+        store.save(T, str(i), "card-1", _content(f"S{i}"), T0, T0 + 60)
+    store.save("19:other@thread.v2", "1", "card-1", _content("X"), T0, T0 + 60)
+    rows = store.load_many(T, [str(i) for i in range(6)])
+    assert sorted(rows) == ["0", "1", "2", "3", "4"]
+    assert all(rows[str(i)] == store.load(T, str(i)) for i in range(5))
+    assert _text(rows["4"]["card-1"].card) == "Ticket: S4" and rows["4"]["card-1"].retry == T0 + 60
+    assert store.load_many(T, []) == {} and CR.CardStore(tmp_path / "none.db").load_many(T, ["1"]) == {}
 
 
 async def test_no_tokens_no_request(make: Callable[[Teams], CR.CardRefresher]) -> None:
@@ -971,10 +1009,31 @@ async def test_a_cancelled_first_caller_leaves_the_shared_lookup(
     second = asyncio.create_task(_go(refresher, _msg(mid="1700000000903")))
     await wait(lambda: len(asked) == 1 and len(refresher._inflight) == 2, "both waiting on the lookup")
     await asyncio.sleep(0.02)
-    refresher._inflight[(T, "1700000000001")].cancel()
+    refresher._inflight[(T, "1700000000001", 0)].cancel()
     with pytest.raises(asyncio.CancelledError):
         await first
     gate.set()
     async with asyncio.timeout(2):
         assert _text((await second)["card-1"]) == "Ticket: DONE"
     assert len(asked) == 1
+
+
+async def test_a_newer_version_does_not_join_the_older_ones_refresh(
+    make: Callable[[Teams], CR.CardRefresher],
+) -> None:
+    """037-AC6: two views of one version share a request; an edit adding a card, refreshed meanwhile, gets
+    its own, so the added card is asked too."""
+    teams = Teams()
+    teams.gate = asyncio.Event()
+    refresher = make(teams)
+    old = _msg(version="1000")
+    first = asyncio.create_task(_go(refresher, old))
+    again = asyncio.create_task(_go(refresher, dict(old)))
+    await wait(lambda: teams.paths().count(INVOKE) == 1, "the first invoke")
+    edited = _msg(_entry(), _entry(cardClientId="card-2"), version="2000")
+    newer = asyncio.create_task(_go(refresher, edited))
+    await wait(lambda: len(refresher._inflight) == 2, "the newer refresh")
+    teams.gate.set()
+    assert sorted(await newer) == ["card-1", "card-2"]
+    assert sorted(await first) == sorted(await again) == ["card-1"]
+    assert refresher._inflight == {}

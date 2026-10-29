@@ -53,8 +53,11 @@ from websockets.typing import Origin
 
 from .archive_store import read_chats
 from .auth import token_source
+from .card_refresh import CardRefresher, CardStore
 from .chat_verbs import (
+    _DEADLINES,
     ANY_VALUE,
+    CARDS_MARK,
     MSG_ID_RE,
     ArchiveUnavailable,
     ChatVerbs,
@@ -124,6 +127,7 @@ _CLOSE_GRACE = 12.0  # seconds pages get to close at exit: above websockets' clo
 _RELAY_QUEUE = 256  # live events waiting for their followers; past it one is dropped, the stream never waits
 _RELAY_MAX = 10.0  # seconds one relay may take (name lookups included) before the next one goes
 _MEDIA_BACKOFF = 30.0  # seconds relayed records skip the media folder after a read outlived its deadline
+_CARD_STORE_IO = 2  # cards.db reads and writes (and card row rebuilds) on the archive pool at once
 _COOKIE_FILE = "web-secret"
 _SECRET_RE = re.compile(r"[\w-]{32,}", re.ASCII)
 _COOKIE = "mt"
@@ -656,6 +660,7 @@ class Board:
         seed: dict[str, dict[str, Any]] | None = None,
         data_dir: Path | None = None,
         seed_stamp: tuple[int, ...] = _NO_INDEX,
+        cards: CardRefresher | None = None,
     ) -> None:
         self.rows = rows
         self.directory = directory
@@ -701,6 +706,8 @@ class Board:
             self.me_name,
             data_dir,
             lambda thread_id: str(self.rows.get(thread_id, {}).get("last_id") or ""),
+            cards,
+            self._relay_queued,
         )
         # Ids are kept while their chat is off the board: the board holds only the newest chats.
         self.sections = Sections(sections_path, lambda: self.rows)
@@ -933,8 +940,10 @@ class Board:
         await name_activity([record], self.directory, self.me)
         if "content" not in resource:
             del record["html"]  # a partial update (reaction): the page keeps the body it has
+            record.pop(CARDS_MARK, None)  # nor can a refresh rebuild it whole
         if resource_type == "NewMessage" and not is_activity(msgtype):
             self._typing_stop(thread_id, _from(resource), self._relay_now)  # their message ends it
+        self.chat.cards_shown(thread_id, [record])  # its refresh starts once this frame is out
         self._relay_now(thread_id, {"msg" if resource_type == "NewMessage" else "edit": record})
 
     async def _record(self, resource: dict[str, Any], thread_id: str, media: Path | None) -> dict[str, Any]:
@@ -943,26 +952,28 @@ class Board:
         name_for = self.directory.name_for if self.directory else None
         known_name = self.directory.known_name if self.directory else None
         if media is not None and time.monotonic() >= self._media_down_until:
+            build = functools.partial(
+                chat_record,
+                resource,
+                thread_id,
+                self.me,
+                media,
+                custom,
+                name_for,
+                images,
+                known_name=known_name,
+            )
             try:
-                return await io(
-                    "relay",
-                    chat_record,
-                    resource,
-                    thread_id,
-                    self.me,
-                    media,
-                    custom,
-                    name_for,
-                    images,
-                    known_name=known_name,
-                )
+                return await io("relay", self.chat.with_cards, thread_id, resource, media, build)
             except ArchiveUnavailable:
                 self._media_down_until = time.monotonic() + _MEDIA_BACKOFF
                 log.warning("follow_media_unavailable", thread=thread_id, retry_in=_MEDIA_BACKOFF)
-        # Without a media folder sanitising reads no file: cheap enough for the loop.
-        return chat_record(
-            resource, thread_id, self.me, None, custom, name_for, images, known_name=known_name
+        # Without a media folder sanitising reads no file: cheap enough for the loop. The stored cards
+        # (spec 037) are not read here: its refresh reads them and pushes any this record lacks.
+        build = functools.partial(
+            chat_record, resource, thread_id, self.me, None, custom, name_for, images, known_name=known_name
         )
+        return self.chat.with_cards(thread_id, resource, None, build, stored=False)
 
     def _followers(self, thread_id: str) -> list[ServerConnection]:
         return [ws for ws, (tid, _) in self._follows.items() if tid == thread_id]
@@ -1079,6 +1090,8 @@ class Board:
             self.receipts.on_event(thread_id, resource)
         await self._board_event(thread_id, resource_type, resource, msgtype)
         if any(tid == thread_id for tid, _ in self._follows.values()):
+            if resource_type in ("NewMessage", "MessageUpdate") and not msgtype.startswith("Control/"):
+                self.chat.relayed(thread_id, resource)
             # Queued, not awaited: a record globs the (NFS) media folder, the shared stream must not wait.
             forward = functools.partial(self._forward, thread_id, resource_type, resource, msgtype)
             self._enqueue_relay(thread_id, forward)
@@ -1128,10 +1141,11 @@ class Board:
         self._relay_now(thread_id, frame)
 
     def close(self) -> None:
-        """Stop the relays (run() owns the archive pool)."""
+        """Stop the relays and the card refreshes (run() owns the archive pool)."""
         if self._relay_task is not None:
             self._relay_task.cancel()
             self._relay_task = None
+        self.chat.close()
 
     async def _board_event(
         self, thread_id: str, resource_type: Any, resource: dict[str, Any], msgtype: str
@@ -1912,6 +1926,32 @@ async def fill_from_listing(
         board.set_busy(False)  # a spinner that never stops is worse than no spinner
 
 
+def card_refresher(
+    settings: Settings, data_dir: Path | None, transport: httpx.AsyncBaseTransport | None = None
+) -> CardRefresher | None:
+    """The web process's card refresher (spec 037); None without an archive: cards show as posted."""
+    if data_dir is None:
+        return None
+    # A burst of card saves must not fill the archive pool's backlog the pages and relays share. One loop
+    # per web process: the gate binds to it on its first wait.
+    gate = asyncio.Semaphore(_CARD_STORE_IO)
+
+    async def blocking(fn: Callable[..., Any], /, *args: Any) -> Any:
+        """`cards.db` beside the archive (NFS): on the archive pool, with its deadline, few at a time;
+        ArchiveUnavailable when the gate stays full past that deadline (a hung mount holds it)."""
+        try:
+            async with asyncio.timeout(_DEADLINES["relay"]):
+                await gate.acquire()
+        except TimeoutError:
+            raise ArchiveUnavailable("archive unavailable (cards.db)") from None
+        try:
+            return await io("relay", fn, *args)
+        finally:
+            gate.release()
+
+    return CardRefresher(settings, CardStore(data_dir / "cards.db"), transport=transport, blocking=blocking)
+
+
 async def run(
     settings: Settings,
     skype_token: str,
@@ -1961,6 +2001,7 @@ async def run(
             seed=seed,
             data_dir=data_dir,
             seed_stamp=stamp,
+            cards=card_refresher(settings, data_dir),
         )
         log.info("web_seeded", rows=len(board.rows), seeded=len(seed), limit=cap, me=bool(me))
         cache = open_cache(settings)
