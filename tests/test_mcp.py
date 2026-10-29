@@ -1,7 +1,11 @@
 """MCP server (spec 008): the protocol over text streams, find_chats and read_messages on a fixture."""
 
+import asyncio
+import base64
 import io
 import json
+import logging
+import sqlite3
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -10,9 +14,12 @@ from typing import Any
 
 import httpx
 import pytest
+import structlog
+from structlog.testing import capture_logs
 
 from miniteams import archive as AR
-from miniteams import compose
+from miniteams import card_refresh as CR
+from miniteams import compose, render
 from miniteams import drafts as D
 from miniteams import mcp as M
 from miniteams import mcp_api as API
@@ -1534,3 +1541,498 @@ def test_an_escaped_free_label_stays_literal_and_asks_no_roster(
     asked = _roster(monkeypatch)
     assert not _call(server, "send_message", thread_id=GROUP, text=r"\@{Ann Lee|x}")["error"]
     assert asked == [] and calls == [("send", GROUP, "@{Ann Lee|x}", "", True, None)]
+
+
+# --- app cards (spec 037) ---
+
+
+CARD_APP = "aaaaaaaa-0000-4000-8000-000000000001"
+CARD_BOT = "bbbbbbbb-0000-4000-8000-000000000002"
+CARD_SKYPE = "skype-secret-token"
+CARD_BEARER = "x." + base64.urlsafe_b64encode(json.dumps({"oid": "me"}).encode()).decode().rstrip("=") + ".y"
+_REFRESH = {"action": {"type": "Action.Execute", "verb": "refreshCard", "data": {"ticket": "T-1"}}}
+
+
+def _ticket(status: str) -> dict[str, Any]:
+    return {
+        "type": "AdaptiveCard",
+        "refresh": _REFRESH,
+        "body": [
+            {"type": "TextBlock", "text": "[T-1: Fix the build](https://tracker.example.test/T-1)"},
+            {"type": "TextBlock", "text": "Priority: **High**"},
+            {
+                "type": "ColumnSet",
+                "columns": [
+                    {
+                        "type": "Column",
+                        "items": [
+                            {
+                                "type": "FactSet",
+                                "facts": [
+                                    {"title": "Status", "value": status},
+                                    {"title": "Assignee", "value": "_Unassigned_"},
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "type": "ActionSet",
+                "actions": [{"type": "Action.OpenUrl", "title": "Open", "url": "https://x.test"}],
+            },
+        ],
+    }
+
+
+def _carded(
+    mid: str, when: str, status: str = "OPEN", users: list[str] | None = None, **props: Any
+) -> dict[str, Any]:
+    entry = {"appId": CARD_APP, "cardClientId": "card-1", "content": _ticket(status)}
+    if users is not None:
+        entry["content"]["refresh"] = {**_REFRESH, "userIds": users}
+    return _msg(mid, when, properties={"cards": json.dumps([entry]), **props})
+
+
+def _line(status: str) -> str:
+    return f"T-1: Fix the build · Priority: High · Status: {status} · Assignee: Unassigned"
+
+
+class _Bot:
+    """Fake batchedDefinitions + invoke: answers `status`, after `delay` seconds."""
+
+    def __init__(self, status: str = "DONE", delay: float = 0.0, lookup_delay: float = 0.0) -> None:
+        self.status, self.delay, self.lookup_delay = status, delay, lookup_delay
+        self.invokes = self.lookups = 0
+        self.cancelled = 0
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("batchedDefinitions"):
+            self.lookups += 1
+            await asyncio.sleep(self.lookup_delay)
+            return httpx.Response(200, json=[{"id": CARD_APP, "bots": [{"id": CARD_BOT}]}])
+        self.invokes += 1
+        try:
+            await asyncio.sleep(self.delay)
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        card = _ticket(self.status)
+        return httpx.Response(200, json={"statusCode": 200, "type": CR._ADAPTIVE, "value": card})
+
+
+def _card_server(
+    settings: Settings, data: Path, bot: _Bot | None, messages: list[dict[str, Any]], tokens: bool = True
+) -> M.Server:
+    store = ChatStore(data, PRIVATE)
+    store.insert_page(messages)
+    store.close()
+    settings.contacts_host = "chat.example.test"
+    server = _server(settings, data)
+    transport = httpx.MockTransport(bot or _no_bot)
+    server.archive.cards = CR.CardRefresher(settings, CR.CardStore(data / "cards.db"), transport=transport)
+    if tokens:
+        server.session.quiet_tokens = lambda timeout: (CARD_SKYPE, CARD_BEARER)  # type: ignore[method-assign]
+    return server
+
+
+def _no_bot(request: httpx.Request) -> httpx.Response:
+    raise AssertionError(f"bot asked: {request.url.path}")
+
+
+def _cards_of(result: dict[str, Any]) -> dict[str, list[str]]:
+    return {m["id"]: m["cards"] for m in result["messages"]}
+
+
+def test_records_carry_one_text_line_per_card(settings: Settings, data: Path) -> None:
+    """037-AC8: `cards` is the card's text joined by " · ", markdown reduced, actions out; [] without a card,
+    on a deleted message too; a Swift card's text comes along."""
+    swift_card = {
+        "attachments": [{"content": {"type": "AdaptiveCard", "body": [{"type": "TextBlock", "text": "Hi"}]}}]
+    }
+    b64 = base64.b64encode(json.dumps(swift_card).encode()).decode()
+    messages = [
+        _carded("10", "2026-07-05T09:00:00.1000000Z"),
+        _carded("11", "2026-07-05T09:01:00.1000000Z", deletetime="1"),
+        _msg(
+            "12",
+            "2026-07-05T09:02:00.1000000Z",
+            messagetype="RichText/Media_Card",
+            content=f'<Swift b64="{b64}"/>',
+        ),
+    ]
+    server = _card_server(settings, data, None, messages, tokens=False)
+    server.session.quiet_tokens = lambda timeout: None  # type: ignore[method-assign]
+    got = _cards_of(_call(server, "read_messages", thread_id=PRIVATE))
+    assert got == {"1": [], "2": [], "3": [], "4": [], "10": [_line("OPEN")], "11": [], "12": ["Hi"]}
+    assert "cards" in M.message_record({}) and M.message_record({})["cards"] == []
+
+
+def test_card_text_survives_hostile_shapes() -> None:
+    """037-AC8: depth, node, size and type limits: a hostile card gives a bounded line, never a crash."""
+    deep: dict[str, Any] = {"type": "TextBlock", "text": "too deep"}
+    for _ in range(20):
+        deep = {"type": "Container", "items": [deep]}
+    body: list[Any] = [
+        {"type": "TextBlock", "text": 42},
+        {"type": "TextBlock", "text": ["x"]},
+        {"type": "RichTextBlock", "inlines": ["bare", {"text": None}, {"text": "run"}]},
+        {"type": "FactSet", "facts": [{"title": 1, "value": {"x": 1}}, {"name": "N", "value": "v"}]},
+        {"type": "Table", "rows": [{"cells": [{"items": [{"type": "TextBlock", "text": "cell"}]}]}, "junk"]},
+        {"type": ["odd"], "text": "odd kind"},
+        deep,
+        *({"type": "TextBlock", "text": "y" * 600} for _ in range(2000)),
+    ]
+    card = {"appId": CARD_APP, "cardClientId": "c", "content": {"type": "AdaptiveCard", "body": body}}
+    message = {
+        "properties": {"cards": json.dumps([card] + [{**card, "cardClientId": f"c{i}"} for i in range(30)])}
+    }
+    lines = render.cards_text(message)
+    assert len(lines) == 20
+    assert lines[0].startswith("run · N: v · cell · odd kind · yyy") and "too deep" not in lines[0]
+    assert all(len(line) == 500 and line.endswith("…") for line in lines)
+    assert render.cards_text({"properties": {"cards": "[1, null, {}]"}}) == []
+
+
+def test_read_messages_refreshes_a_stale_card_and_keeps_it(settings: Settings, data: Path) -> None:
+    """037-AC9, AC8: a stale eligible card is asked of its bot and the record shows the reply; within the
+    interval the next call asks nothing; after a restart, the stored card shows before any request (AC3)."""
+    bot = _Bot("DONE")
+    server = _card_server(settings, data, bot, [_carded("10", "2026-07-05T09:00:00.1000000Z")])
+    assert _cards_of(_call(server, "read_messages", thread_id=PRIVATE))["10"] == [_line("DONE")]
+    assert _cards_of(_call(server, "read_messages", thread_id=PRIVATE))["10"] == [_line("DONE")]
+    assert bot.invokes == 1
+    restarted = _server(settings, data)
+    restarted.session.quiet_tokens = lambda timeout: None  # type: ignore[method-assign]
+    assert _cards_of(_call(restarted, "read_messages", thread_id=PRIVATE))["10"] == [_line("DONE")]
+    found = _call(restarted, "search_messages", query="hi there", thread_id=PRIVATE, since="2026-07-01")
+    assert {m["id"]: m["cards"] for m in found["messages"]}["10"] == [_line("DONE")]
+
+
+def test_one_budget_for_the_whole_call(settings: Settings, data: Path, monkeypatch) -> None:
+    """037-AC9, AC5: six cards, four requests at a time, each 0.4 s, 0.8 s for requests: the first four come
+    back refreshed; the last two, cut at the deadline, fail as timeouts and wait the interval in this process
+    only (cards.db keeps them due for the web); the call ends within its budget, nothing left in flight."""
+    monkeypatch.setattr(M, "_CARDS_BUDGET", 1.0)
+    monkeypatch.setattr(M, "_CARDS_GRACE", 0.2)
+    bot = _Bot("DONE", delay=0.4)
+    messages = [_carded(str(20 + i), f"2026-07-05T09:0{i}:00.1000000Z") for i in range(6)]
+    server = _card_server(settings, data, bot, messages)
+    refresher = server.archive.cards
+    assert refresher is not None
+    started = time.monotonic()
+    with capture_logs() as logs:
+        got = _cards_of(_call(server, "read_messages", thread_id=PRIVATE))
+    assert time.monotonic() - started < 1.0
+    assert [got[str(20 + i)] for i in range(6)] == [[_line("DONE")]] * 4 + [[_line("OPEN")]] * 2
+    assert bot.invokes == 6 and bot.cancelled == 2
+    assert [e["reason"] for e in logs if e["event"] == "card_refresh_failed"] == ["timeout"] * 2
+    assert not refresher._inflight and not refresher._lookups
+    assert CR.CardStore(data / "cards.db").load_many(PRIVATE, ["24", "25"]) == {}
+    assert all(refresher._saved[(PRIVATE, m, "card-1")].retry > time.time() + 500 for m in ("24", "25"))
+    bot.delay = 0.0  # the next call, on its own loop, asks none of them again
+    got = _cards_of(_call(server, "read_messages", thread_id=PRIVATE))
+    assert got["24"] == [_line("OPEN")] and bot.invokes == 6
+
+
+def test_a_lookup_cut_by_the_deadline_is_held_here_only(settings: Settings, data: Path, monkeypatch) -> None:
+    """037-AC9, AC7: a definitions reply slower than the 0.3 s deadline: the app is held for the interval in
+    this process (no lookup on the next call), nothing saved to cards.db for both cards sharing the lookup;
+    past the interval, the reply fast, the lookup runs again and refreshes them."""
+    monkeypatch.setattr(M, "_CARDS_BUDGET", 0.4)
+    monkeypatch.setattr(M, "_CARDS_GRACE", 0.1)
+    bot = _Bot("DONE", lookup_delay=1.0)
+    messages = [_carded("10", "2026-07-05T09:00:00.1000000Z"), _carded("11", "2026-07-05T09:01:00.1000000Z")]
+    server = _card_server(settings, data, bot, messages)
+    now = [time.time()]
+    refresher = CR.CardRefresher(
+        settings, CR.CardStore(data / "cards.db"), transport=httpx.MockTransport(bot), clock=lambda: now[0]
+    )
+    server.archive.cards = refresher
+    started = time.monotonic()
+    got = _cards_of(_call(server, "read_messages", thread_id=PRIVATE))
+    assert time.monotonic() - started < 0.8
+    assert got["10"] == got["11"] == [_line("OPEN")] and bot.lookups == 1 and bot.invokes == 0
+    _, until, failed = refresher._bots[CARD_APP]
+    assert failed is not None and failed.reason == "cut" and until == now[0] + CR.REFRESH_INTERVAL
+    assert not refresher._holds and not refresher._saved
+    bot.lookup_delay = 0.0
+    now[0] += 60
+    assert _cards_of(_call(server, "read_messages", thread_id=PRIVATE))["10"] == [_line("OPEN")]
+    assert bot.lookups == 1 and bot.invokes == 0
+    assert CR.CardStore(data / "cards.db").load_many(PRIVATE, ["10", "11"]) == {}
+    now[0] += CR.REFRESH_INTERVAL
+    got = _cards_of(_call(server, "read_messages", thread_id=PRIVATE))
+    assert got["10"] == got["11"] == [_line("DONE")] and bot.lookups == 2 and bot.invokes == 2
+
+
+def test_a_queued_card_is_asked_on_the_next_call(settings: Settings, data: Path, monkeypatch) -> None:
+    """037-AC9, AC5: a bot that never answers: the four requests running at the deadline are kept as
+    timeouts by this process; the two still queued are not, and the next call asks them, and only them."""
+    monkeypatch.setattr(M, "_CARDS_BUDGET", 0.3)
+    monkeypatch.setattr(M, "_CARDS_GRACE", 0.1)
+    bot = _Bot("DONE", delay=30.0)
+    messages = [_carded(str(20 + i), f"2026-07-05T09:0{i}:00.1000000Z") for i in range(6)]
+    server = _card_server(settings, data, bot, messages)
+    for asked in (4, 6, 6):
+        started = time.monotonic()
+        got = _cards_of(_call(server, "read_messages", thread_id=PRIVATE))
+        assert time.monotonic() - started < 0.8
+        assert bot.invokes == asked and all(c == [_line("OPEN")] for c in got.values() if c)
+    assert server.archive.cards is not None and len(server.archive.cards._saved) == 6
+    assert CR.CardStore(data / "cards.db").load_many(PRIVATE, [str(20 + i) for i in range(6)]) == {}
+
+
+def test_a_spent_budget_asks_nothing(settings: Settings, data: Path, monkeypatch) -> None:
+    """037-AC9: the requests' deadline already passed: stored cards, nothing asked, nothing saved (no lookup
+    failure cached either), the tool still answers."""
+    monkeypatch.setattr(M, "_CARDS_BUDGET", 0.3)
+    monkeypatch.setattr(M, "_CARDS_GRACE", 0.5)
+    bot = _Bot("DONE", delay=5.0)
+    server = _card_server(settings, data, bot, [_carded("10", "2026-07-05T09:00:00.1000000Z")])
+    started = time.monotonic()
+    got = _call(server, "read_messages", thread_id=PRIVATE)
+    assert time.monotonic() - started < 1.0
+    assert not got["error"] and _cards_of(got)["10"] == [_line("OPEN")] and bot.invokes == 0
+    assert server.archive.cards is not None and not server.archive.cards._bots
+    assert CR.CardStore(data / "cards.db").load(PRIVATE, "10") == {}
+
+
+@pytest.mark.parametrize("state", ["dead", "down"])
+def test_no_tokens_shows_stored_cards_and_starts_no_sign_in(
+    settings: Settings, data: Path, state: str
+) -> None:
+    """037-AC9: a dead or unreachable credential: stored cards, no error, no device-code flow started."""
+    server = _card_server(settings, data, None, [_carded("10", "2026-07-05T09:00:00.1000000Z")], tokens=False)
+    source = _Source(state)
+    server.session._source = source  # type: ignore[assignment]
+    got = _call(server, "read_messages", thread_id=PRIVATE)
+    assert not got["error"] and _cards_of(got)["10"] == [_line("OPEN")]
+    assert source.flows == []
+
+
+def test_search_never_asks_and_cards_logs_hold_no_secret(settings: Settings, data: Path, capsys) -> None:
+    """037-AC8: search_messages shows stored cards, asking nothing; a failed refresh logs no token or text."""
+    server = _card_server(settings, data, None, [_carded("10", "2026-07-05T09:00:00.1000000Z")])
+    found = _call(server, "search_messages", query="hi there", thread_id=PRIVATE, since="2026-07-01")
+    assert {m["id"]: m["cards"] for m in found["messages"]}["10"] == [_line("OPEN")]
+    with capture_logs() as logs:
+        got = _call(server, "read_messages", thread_id=PRIVATE)  # _no_bot raises: a failed refresh
+    assert _cards_of(got)["10"] == [_line("OPEN")]
+    assert logs and not any(s in repr(logs) for s in (CARD_SKYPE, CARD_BEARER, "Fix the", "OPEN"))
+
+
+class _Provider:
+    """A RefreshingToken double: counts fetches, waits on `gate`, fails when `fail`."""
+
+    def __init__(self, fail: bool = False, gate: threading.Event | None = None) -> None:
+        self.fail, self.gate, self.calls = fail, gate, 0
+
+    def token(self) -> str:
+        self.calls += 1
+        if self.gate is not None:
+            self.gate.wait(5)
+        if self.fail:
+            raise AuthUnavailable("down")
+        return CARD_SKYPE
+
+    def bearer(self) -> str:
+        return CARD_BEARER
+
+
+def _provided(server: M.Server, provider: _Provider) -> _Provider:
+    server.session._provider = provider  # type: ignore[assignment]
+    return provider
+
+
+def test_no_token_for_cards_nobody_refreshes(settings: Settings, data: Path) -> None:
+    """037-AC9: a card without refresh, or one refreshed within the interval: no token is fetched."""
+    plain = _carded("10", "2026-07-05T09:00:00.1000000Z")
+    entry = json.loads(plain["properties"]["cards"])[0]
+    del entry["content"]["refresh"]
+    plain["properties"]["cards"] = json.dumps([entry])
+    server = _card_server(settings, data, None, [plain], tokens=False)
+    provider = _provided(server, _Provider(fail=True))
+    _call(server, "read_messages", thread_id=PRIVATE)
+    assert provider.calls == 0
+    now = time.time()
+    CR.CardStore(data / "cards.db").save(PRIVATE, "10", "card-1", _ticket("DONE"), now, now + 600)
+    assert _cards_of(_call(server, "read_messages", thread_id=PRIVATE))["10"] == [_line("DONE")]
+    assert provider.calls == 0
+
+
+def test_a_failed_token_fetch_is_held(settings: Settings, data: Path) -> None:
+    """037-AC9: a failing credential is asked once for two calls in a row; both show the stored card."""
+    server = _card_server(settings, data, None, [_carded("10", "2026-07-05T09:00:00.1000000Z")], tokens=False)
+    provider = _provided(server, _Provider(fail=True))
+    for _ in range(2):
+        assert _cards_of(_call(server, "read_messages", thread_id=PRIVATE))["10"] == [_line("OPEN")]
+    assert provider.calls == 1
+
+
+def test_a_slow_token_fetch_stays_in_the_budget(settings: Settings, data: Path, monkeypatch) -> None:
+    """037-AC9: a token fetch that hangs cannot push the call past its budget; one fetch at a time, and the
+    next call uses it once it lands."""
+    monkeypatch.setattr(M, "_CARDS_BUDGET", 0.3)
+    monkeypatch.setattr(M, "_CARDS_GRACE", 0.1)
+    bot = _Bot("DONE")
+    server = _card_server(settings, data, bot, [_carded("10", "2026-07-05T09:00:00.1000000Z")], tokens=False)
+    gate = threading.Event()
+    provider = _provided(server, _Provider(gate=gate))
+    try:
+        for _ in range(2):
+            started = time.monotonic()
+            assert _cards_of(_call(server, "read_messages", thread_id=PRIVATE))["10"] == [_line("OPEN")]
+            assert time.monotonic() - started < 0.6
+        assert provider.calls == 1 and bot.invokes == 0
+    finally:
+        gate.set()
+    monkeypatch.setattr(M, "_CARDS_BUDGET", 2.0)
+    assert _cards_of(_call(server, "read_messages", thread_id=PRIVATE))["10"] == [_line("DONE")]
+
+
+def test_a_refresh_that_raises_keeps_the_stored_cards(settings: Settings, data: Path) -> None:
+    """037-AC9: an unexpected error out of the refresher is logged by type and the stored card is shown."""
+    server = _card_server(settings, data, None, [_carded("10", "2026-07-05T09:00:00.1000000Z")])
+    refresher = server.archive.cards
+    assert refresher is not None
+
+    async def broken(*args: Any, **kw: Any) -> CR.Cards:
+        raise RuntimeError(CARD_SKYPE)
+
+    refresher.refresh = broken  # type: ignore[method-assign]
+    with capture_logs() as logs:
+        got = _call(server, "read_messages", thread_id=PRIVATE)
+    assert not got["error"] and _cards_of(got)["10"] == [_line("OPEN")]
+    failed = [e for e in logs if e["event"] == "mcp_card_refresh_failed"]
+    assert failed == [
+        {"event": "mcp_card_refresh_failed", "error_type": "RuntimeError", "log_level": "warning"}
+    ]
+
+
+def test_card_text_of_legacy_snippet_and_toggled_cards() -> None:
+    """037-AC8: a MessageCard's title, text, sections and facts; a code snippet's title and code; a toggled
+    TextBlock left out, as the page hides it."""
+    legacy = {
+        "title": "Build",
+        "text": "**failed** on main",
+        "sections": [
+            {"activityTitle": "Pipeline 7", "text": "_stage_ test", "facts": [{"name": "By", "value": "ci"}]}
+        ],
+    }
+    snippet = {"title": "main.py", "text": "print(1)\nprint(2)"}
+    toggled = {
+        "type": "AdaptiveCard",
+        "body": [
+            {
+                "type": "TextBlock",
+                "text": "Show details",
+                "selectAction": {"type": "Action.ToggleVisibility"},
+            },
+            {"type": "TextBlock", "text": "details"},
+        ],
+    }
+    cards = [
+        {"cardClientId": "a", "content": legacy},
+        {
+            "cardClientId": "b",
+            "contentType": "application/vnd.microsoft.card.codesnippet",
+            "content": snippet,
+        },
+        {"cardClientId": "c", "content": toggled},
+    ]
+    assert render.cards_text({"properties": {"cards": json.dumps(cards)}}) == [
+        "Build · failed on main · Pipeline 7 · stage test · By: ci",
+        "main.py · print(1) · print(2)",
+        "details",
+    ]
+
+
+def test_card_text_stops_reading_a_long_text_at_the_line_cap(monkeypatch) -> None:
+    """037-AC8: past the line cap, the rest of a many-line text is not read."""
+    calls: list[str] = []
+    real = render._CardText.plain
+
+    def spy(self: Any, text: str, md: bool = True) -> str:
+        calls.append(text)
+        return real(self, text, md)
+
+    monkeypatch.setattr(render._CardText, "plain", spy)
+    card = {"type": "AdaptiveCard", "body": [{"type": "TextBlock", "text": "abcdefghi\n" * 1000}]}
+    (line,) = render.cards_text(
+        {"properties": {"cards": json.dumps([{"cardClientId": "a", "content": card}])}}
+    )
+    assert len(line) == 500 and len(calls) < 60
+
+
+def test_a_busy_cards_db_adds_at_most_its_lock_waits(settings: Settings, data: Path, monkeypatch) -> None:
+    """037-AC9: cards.db write-locked by another process: requests stop on time, the saves still running
+    at the budget's end hold the call by at most the store's two lock waits; the late cards are counted."""
+    monkeypatch.setattr(M, "_CARDS_BUDGET", 1.0)
+    monkeypatch.setattr(M, "_CARDS_GRACE", 0.4)
+    monkeypatch.setattr(CR, "_BUSY_TIMEOUT", 0.8)
+    structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.INFO))
+    bot = _Bot("DONE", delay=0.45)
+    messages = [_carded(str(30 + i), f"2026-07-05T09:0{i}:00.1000000Z") for i in range(4)]
+    server = _card_server(settings, data, bot, messages)
+    CR.CardStore(data / "cards.db").save("19:other@thread.v2", "1", "c", None, time.time(), time.time())
+    lock = sqlite3.connect(data / "cards.db", isolation_level=None)
+    try:
+        lock.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        with capture_logs() as logs:
+            got = _call(server, "read_messages", thread_id=PRIVATE)
+        took = time.monotonic() - started
+    finally:
+        lock.close()
+    assert not got["error"] and bot.invokes == 4
+    assert 1.0 <= took < 1.0 + 2 * 0.8 + 0.4
+    spent = [e for e in logs if e["event"] == "mcp_card_budget_spent"]
+    assert len(spent) == 1 and spent[0]["late"] >= 1 and spent[0]["due"] == 4
+    assert any(e["event"] == "card_store_write_failed" for e in logs)
+
+
+def test_a_cut_request_leaves_cards_db_due_for_others(settings: Settings, data: Path, monkeypatch) -> None:
+    """037-AC5: a token fetch eats the budget; the invoke cut by this call's deadline is not the bot's
+    failure: cards.db keeps the card due for another process, this one does not ask again in the interval."""
+    monkeypatch.setattr(M, "_CARDS_BUDGET", 0.6)
+    monkeypatch.setattr(M, "_CARDS_GRACE", 0.1)
+    bot = _Bot("DONE", delay=0.5)
+    message = _carded("10", "2026-07-05T09:00:00.1000000Z")
+    server = _card_server(settings, data, bot, [message], tokens=False)
+
+    def slow_tokens(timeout: float) -> tuple[str, str]:
+        time.sleep(max(0.0, timeout - 0.15))
+        return CARD_SKYPE, CARD_BEARER
+
+    server.session.quiet_tokens = slow_tokens  # type: ignore[method-assign]
+    assert _cards_of(_call(server, "read_messages", thread_id=PRIVATE))["10"] == [_line("OPEN")]
+    assert bot.invokes == 1 and bot.cancelled == 1
+    other = CR.CardRefresher(settings, CR.CardStore(data / "cards.db"))
+    assert other.due(PRIVATE, message, ME, other.store.load(PRIVATE, "10"))
+    server.session.quiet_tokens = lambda timeout: (CARD_SKYPE, CARD_BEARER)  # type: ignore[method-assign]
+    _call(server, "read_messages", thread_id=PRIVATE)
+    assert bot.invokes == 1
+
+
+def test_a_card_for_me_is_refreshed(settings: Settings, data: Path) -> None:
+    """037-AC4, AC9: `refresh.userIds` lists the session's own MRI: the card is asked and refreshed."""
+    bot = _Bot("DONE")
+    server = _card_server(
+        settings, data, bot, [_carded("10", "2026-07-05T09:00:00.1000000Z", users=[OTHER, ME])]
+    )
+    assert _cards_of(_call(server, "read_messages", thread_id=PRIVATE))["10"] == [_line("DONE")]
+    assert bot.invokes == 1
+
+
+def test_a_card_for_someone_else_is_never_asked(settings: Settings, data: Path) -> None:
+    """037-AC4, AC9: `refresh.userIds` lists only another user: the bot is never asked. The token is fetched
+    (once, then cached by the provider): who I am comes with it."""
+    bot = _Bot("DONE")
+    server = _card_server(
+        settings, data, bot, [_carded("10", "2026-07-05T09:00:00.1000000Z", users=[OTHER])], tokens=False
+    )
+    provider = _provided(server, _Provider())
+    for _ in range(2):
+        assert _cards_of(_call(server, "read_messages", thread_id=PRIVATE))["10"] == [_line("OPEN")]
+    assert bot.invokes == 0 and bot.lookups == 0 and provider.calls == 2

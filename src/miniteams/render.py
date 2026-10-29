@@ -9,7 +9,7 @@ import html
 import json
 import re
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -636,10 +636,26 @@ def _json(value: object) -> object:
         return None
 
 
-def card_from_message(message: dict[str, Any]) -> list[dict[str, Any]] | None:
+def card_entries(message: dict[str, Any]) -> dict[str | int, dict[str, Any]]:
+    """`properties.cards` keyed by `cardClientId` (its index when it has none)."""
+    props = message.get("properties")
+    cards = _json(props.get("cards")) if isinstance(props, dict) else None
+    by_id: dict[str | int, dict[str, Any]] = {}
+    if isinstance(cards, list):
+        # An edit can append the unfurl card again under the same cardClientId: one card, the last copy.
+        for i, c in enumerate(cards):
+            if isinstance(c, dict):
+                by_id[_str(c.get("cardClientId")) or i] = c
+    return by_id
+
+
+def card_from_message(
+    message: dict[str, Any], overrides: Mapping[str, dict[str, Any]] | None = None
+) -> list[dict[str, Any]] | None:
     """The cards a message carries, as `{"content", "type", "app", "fallback"}`; None when none.
 
-    `Media_Card` puts them base64 in `<Swift b64>`, `RichText/Html` in `properties.cards`."""
+    `Media_Card` puts them base64 in `<Swift b64>`, `RichText/Html` in `properties.cards`;
+    `overrides` (cardClientId → card, spec 037) replaces a `properties.cards` entry's content."""
     found: list[dict[str, Any]] = []
     swift = _SWIFT_RE.search(_str(message.get("content")))
     if swift:
@@ -657,15 +673,9 @@ def card_from_message(message: dict[str, Any]) -> list[dict[str, Any]] | None:
             )
             if not found and summary:
                 found.append({"summary": summary})
-    props = message.get("properties")
-    cards = _json(props.get("cards")) if isinstance(props, dict) else None
-    if isinstance(cards, list):
-        # An edit can append the unfurl card again under the same cardClientId: one card, the last copy.
-        by_id: dict[str | int, dict[str, Any]] = {}
-        for i, c in enumerate(cards):
-            if isinstance(c, dict):
-                by_id[_str(c.get("cardClientId")) or i] = c
-        found += by_id.values()
+    for key, c in card_entries(message).items():
+        override = overrides.get(key) if overrides and isinstance(key, str) else None
+        found.append({**c, "content": override} if isinstance(override, dict) else c)
     out = []
     for att in found:
         content = att.get("content")
@@ -676,12 +686,16 @@ def card_from_message(message: dict[str, Any]) -> list[dict[str, Any]] | None:
     return out or None
 
 
-def cards_html(message: dict[str, Any], media_url: MediaUrl | None = None) -> str:
+def cards_html(
+    message: dict[str, Any],
+    media_url: MediaUrl | None = None,
+    overrides: Mapping[str, dict[str, Any]] | None = None,
+) -> str:
     """Every card of `message` rendered, its app name on top; a body that renders nothing shows
-    the card's summary or fallbackText instead."""
+    the card's summary or fallbackText instead. `overrides`: as `card_from_message`."""
     out = []
     renderer = _CardRenderer(media_url)
-    for card in (card_from_message(message) or [])[:_MSG_CARDS]:
+    for card in (card_from_message(message, overrides) or [])[:_MSG_CARDS]:
         renderer.nodes = 0
         body = renderer.card(card["content"], content_type=card["type"])
         if not body and card["fallback"]:
@@ -690,3 +704,113 @@ def cards_html(message: dict[str, Any], media_url: MediaUrl | None = None) -> st
             app = f'<div class="card-app">{html.escape(card["app"])}</div>' if card["app"] else ""
             out.append(f'<div class="card">{app}{body}</div>')
     return "".join(out)
+
+
+_CARD_LINE = 500  # chars of a card's text line
+
+
+def _md_plain(m: re.Match[str]) -> str:
+    label, _, bold, italic = m.groups()
+    return label if label is not None else bold if bold is not None else italic
+
+
+class _CardText:
+    """A card's visible text in the renderer's reading order and limits; actions and images left out."""
+
+    def __init__(self) -> None:
+        self.parts: list[str] = []
+        self.size = 0  # chars in `parts`, per card
+        self.nodes = 0  # per card
+        self.md_left = _MSG_MD  # per message
+
+    def plain(self, text: str, md: bool = True) -> str:
+        """`text` on one line, its markdown reduced to the words shown; spends the message's budget."""
+        text = text[: min(_MD_MAX, self.md_left)]
+        self.md_left -= len(text)
+        return " ".join((_MD_INLINE.sub(_md_plain, text) if md else text).split())
+
+    def add(self, text: str, md: bool = True) -> None:
+        for line in text[: min(_MD_MAX, self.md_left)].splitlines():
+            if self.size > _CARD_LINE:
+                return
+            if part := self.plain(line, md):
+                self.parts.append(part)
+                self.size += len(part) + 3
+
+    def many(self, items: object, depth: int, fn: Callable[[dict[str, Any], int], None]) -> None:
+        if not isinstance(items, list) or depth > _CARD_DEPTH:
+            return
+        for item in items:
+            if self.nodes >= _CARD_NODES or self.size > _CARD_LINE:
+                return
+            self.nodes += 1
+            if isinstance(item, dict):
+                fn(item, depth)
+
+    def card(self, card: dict[str, Any], content_type: str) -> None:
+        if content_type == _CODESNIPPET:
+            self.add(_str(card.get("title")), md=False)
+            self.add(_str(card.get("text")), md=False)
+        elif card.get("type") != "AdaptiveCard" and "body" not in card:
+            self.add(_str(card.get("title")), md=False)
+            self.add(_str(card.get("text")))
+            self.many(card.get("sections"), 1, self.section)
+        else:
+            self.many(card.get("body"), 1, self.element)
+
+    def section(self, sec: dict[str, Any], depth: int) -> None:
+        self.add(_str(sec.get("activityTitle")))
+        self.add(_str(sec.get("text")))
+        self.many(sec.get("facts"), depth + 1, self.fact)
+
+    def fact(self, fact: dict[str, Any], depth: int) -> None:
+        title = self.plain(_str(fact.get("title")) or _str(fact.get("name")), md=False)
+        value = self.plain(_str(fact.get("value")))
+        self.add(f"{title}: {value}" if title and value else title or value, md=False)
+
+    def row(self, row: dict[str, Any], depth: int) -> None:
+        self.many(row.get("cells"), depth + 1, self.cell)
+
+    def cell(self, cell: dict[str, Any], depth: int) -> None:
+        self.many(cell.get("items"), depth + 1, self.element)
+
+    def element(self, el: dict[str, Any], depth: int) -> None:
+        kind = el.get("type")
+        if kind in ("TextBlock", "RichTextBlock") and _is_toggle(el):
+            return
+        if kind == "TextBlock":
+            self.add(_str(el.get("text")))
+        elif kind == "RichTextBlock":
+            inlines = el.get("inlines")
+            runs = inlines[:_CARD_NODES] if isinstance(inlines, list) else []
+            self.add(
+                "".join(
+                    _str(r.get("text"))[:_MD_MAX] for r in runs if isinstance(r, dict) and not _is_toggle(r)
+                ),
+                md=False,
+            )
+        elif kind == "ColumnSet":
+            self.many(el.get("columns"), depth + 1, self.element)
+        elif kind in ("Container", "Column"):
+            self.many(el.get("items"), depth + 1, self.element)
+        elif kind == "FactSet":
+            self.many(el.get("facts"), depth + 1, self.fact)
+        elif kind == "Table":
+            self.many(el.get("rows"), depth + 1, self.row)
+        elif kind not in ("Image", "ImageSet", "ActionSet"):
+            text = next((t for k in ("text", "title", "label", "placeholder") if (t := _str(el.get(k)))), "")
+            self.add(text, md=False)
+
+
+def cards_text(message: dict[str, Any], overrides: Mapping[str, dict[str, Any]] | None = None) -> list[str]:
+    """One plain-text line per card of `message`, its text joined by " · " (the summary or fallbackText when
+    it has none), at most `_CARD_LINE` chars; the cards `cards_html` shows. `overrides`: as there."""
+    out = []
+    walker = _CardText()
+    for card in (card_from_message(message, overrides) or [])[:_MSG_CARDS]:
+        walker.parts, walker.size, walker.nodes = [], 0, 0
+        walker.card(card["content"], card["type"])
+        line = " · ".join(walker.parts) or " ".join(card["fallback"][: _CARD_LINE * 2].split())
+        if line:
+            out.append(line if len(line) <= _CARD_LINE else line[: _CARD_LINE - 1] + "…")
+    return out

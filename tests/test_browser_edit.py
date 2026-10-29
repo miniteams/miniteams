@@ -562,3 +562,19 @@ async def test_an_undo_in_an_edit_keeps_the_kept_mention_its_own(
     assert not isinstance(anchored, str)
     got = resolve_mentions(request.text, roster, T, "8:orgid:me", picks=anchored)
     assert [p["mri"] for p in got] == outcome
+
+
+@BOTH
+async def test_a_body_only_edit_frame_keeps_the_rest_of_the_row(fake: Fake) -> None:
+    """037-AC1: a refreshed card comes as `{id, html, type}`: the row's body changes, its reactions and
+    edited mark stay."""
+    page = fake.page
+    assert page is not None
+    reactions = [{"key": "like", "emoji": "👍", "count": 1, "mine": False, "people": ["Ann Lee"]}]
+    shown = _record("<p>card OPEN</p>", E1)
+    await _frame(page, {**shown, "edit": {**shown["edit"], "edited": True, "reactions": reactions}})
+    await page.locator('[data-id="1"] .edited').wait_for()
+    await _frame(page, {"edit": {"id": "1", "html": "<p>card DONE</p>", "type": "text"}, "thread": T})
+    await until(page, "document.querySelector('[data-id=\"1\"] .html').textContent.includes('card DONE')")
+    assert await page.locator('[data-id="1"] .edited').count() == 1
+    assert "👍" in await page.locator('[data-id="1"]').inner_text()

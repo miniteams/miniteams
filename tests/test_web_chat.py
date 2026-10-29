@@ -7,6 +7,7 @@ import functools
 import hashlib
 import json
 import logging
+import math
 import socket
 import sqlite3
 import threading
@@ -22,7 +23,9 @@ import structlog
 import structlog.testing
 import websockets
 from conftest import board_socket, cookie_header, wait
+from test_card_refresh import Teams, _entry, _ok
 
+from miniteams import card_refresh as CR
 from miniteams import chat_verbs as CV
 from miniteams import compose
 from miniteams import web as W
@@ -3856,3 +3859,512 @@ async def test_dm_verb_on_the_chat_socket(
             await ws.send(json.dumps({"dm": cy}))
             assert await _frame(ws) == {"dm": cy, "error": "no private chat with them yet"}
     assert [e for e in logs if e["event"] == "verb_failed"] == []
+
+
+# --- app cards brought up to date on the page (spec 037 phase 2) ---
+
+CT = "19:cards@thread.v2"  # archived, holds a refreshable app card
+
+
+def _card_msg(msg_id: str = "6", version: str = "1000", content: str = "<p>see</p>") -> dict[str, Any]:
+    return _m(
+        msg_id, _at(int(msg_id)), content, version=version, properties={"cards": json.dumps([_entry()])}
+    )
+
+
+@pytest.fixture
+def card_teams() -> Teams:
+    return Teams()
+
+
+@pytest.fixture
+def card_board(quiet_directory: Directory, data_dir: Path, settings: Settings, card_teams: Teams) -> W.Board:
+    _archive(data_dir, CT, [_card_msg()])
+    quiet_directory.bearer = "bearer-fake"
+    settings.contacts_host = "chat.example.test"
+    refresher = W.card_refresher(settings, data_dir, httpx.MockTransport(card_teams))
+    served = W.Board({}, quiet_directory, me=ME, data_dir=data_dir, cards=refresher)
+    served.link = "up"
+    return served
+
+
+def _invokes(teams: Teams) -> int:
+    return sum(p.endswith("/invoke") for p in teams.paths())
+
+
+def _shows(record: dict[str, Any], status: str) -> bool:
+    return f"Ticket: {status}" in record["html"]
+
+
+async def test_a_history_row_gets_its_refreshed_card_as_an_edit(
+    card_board: W.Board, settings: Settings, card_teams: Teams
+) -> None:
+    """037-AC1: the page shows the posted card, then the bot's current one in an `edit` frame, no reload;
+    the internal `_cards` mark never reaches the page."""
+    async with _served(card_board, settings), _connect(card_board) as ws:
+        await ws.recv()
+        await ws.send(json.dumps({"follow": CT}))
+        assert (await _frame(ws))["ok"]
+        await ws.send(json.dumps({"history": CT}))
+        [row] = (await _frame(ws))["messages"]
+        assert _shows(row, "OPEN") and CV.CARDS_MARK not in row
+        frame = await _frame(ws)
+        assert frame["thread"] == CT and frame["edit"]["id"] == "6"
+        assert _shows(frame["edit"], "DONE") and not _shows(frame["edit"], "OPEN")
+        assert CV.CARDS_MARK not in frame["edit"]
+        await _silent(ws)
+    assert _invokes(card_teams) == 1
+    assert card_board.chat._card_jobs == {}
+    card_board.close()
+
+
+async def test_a_live_row_gets_its_refreshed_card_as_an_edit(
+    card_board: W.Board, card_teams: Teams, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """037-AC1: a relayed message with a stale card is followed by an `edit` frame with the current one."""
+    frames = _relayed(monkeypatch)
+    await _following(card_board, CT)
+    live = _card_msg("7", "2000")
+    await card_board.on_event(_event("NewMessage", CT, **live))
+    await _settled(frames, 2)
+    assert _shows(frames[0]["msg"], "OPEN") and CV.CARDS_MARK not in frames[0]["msg"]
+    assert frames[1]["edit"]["id"] == "7" and _shows(frames[1]["edit"], "DONE")
+    assert _invokes(card_teams) == 1
+    card_board.close()
+
+
+async def test_a_stored_card_shows_first_on_history_and_live_rows(
+    card_board: W.Board, data_dir: Path, card_teams: Teams, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """037-AC3: a card refreshed before (by an earlier process) is what a history page and a live row
+    render, with no request and no edit frame while it is fresh."""
+    done = _ok("DONE")["value"]
+    store = CR.CardStore(data_dir / "cards.db")
+    for msg_id in ("6", "7"):
+        store.save(CT, msg_id, "card-1", done, time.time(), time.time() + CR.REFRESH_INTERVAL)
+    frames = _relayed(monkeypatch)
+    assert card_board.chat.cards is not None
+    refreshes: list[Any] = []
+    monkeypatch.setattr(card_board.chat.cards, "refresh", lambda *a, **k: refreshes.append(a))
+    await _following(card_board, CT)
+    [row] = (await _history(card_board, CT))["messages"]
+    assert _shows(row, "DONE") and not _shows(row, "OPEN")
+    await card_board.on_event(_event("NewMessage", CT, **_card_msg("7", "2000")))
+    await _settled(frames, 1)
+    assert _shows(frames[0]["msg"], "DONE")
+    await asyncio.sleep(0.2)
+    assert len(frames) == 1 and card_teams.calls == [] and refreshes == []
+    assert card_board.chat._card_jobs == {}
+    card_board.close()
+
+
+async def test_two_pages_on_one_message_make_one_request(
+    card_board: W.Board, card_teams: Teams, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """037-AC6: two pages showing one message: one bot request, one `edit` frame to both followers."""
+    sent: list[tuple[int, dict[str, Any]]] = []
+    monkeypatch.setattr(W, "broadcast", lambda sockets, frame: sent.append((len(sockets), json.loads(frame))))
+    card_teams.gate = asyncio.Event()
+    await _following(card_board, CT)
+    await _following(card_board, CT)
+    first, second = await asyncio.gather(_history(card_board, CT), _history(card_board, CT))
+    assert _shows(first["messages"][0], "OPEN") and _shows(second["messages"][0], "OPEN")
+    await wait(lambda: _invokes(card_teams) == 1, "the request")
+    card_teams.gate.set()
+    await wait(lambda: any("edit" in f for _, f in sent), "the edit frame")
+    await asyncio.sleep(0.2)
+    edits = [(n, f) for n, f in sent if "edit" in f]
+    assert len(edits) == 1 and edits[0][0] == 2 and _shows(edits[0][1]["edit"], "DONE")
+    assert _invokes(card_teams) == 1
+    card_board.close()
+
+
+async def test_a_refresh_never_overwrites_a_newer_live_version(
+    card_board: W.Board, card_teams: Teams, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """037-AC1: a message edited while its card refreshes gets no frame of the older copy: the refreshed
+    card comes on the newer one."""
+    frames = _relayed(monkeypatch)
+    card_teams.gate = asyncio.Event()
+    await _following(card_board, CT)
+    await _history(card_board, CT)
+    await wait(lambda: _invokes(card_teams) == 1, "the request")
+    edited = _card_msg("6", "1500", "<p>edited</p>")
+    await card_board.on_event(_event("MessageUpdate", CT, **edited))
+    await _settled(frames, 1)
+    card_teams.gate.set()
+    await _settled(frames, 2)
+    await asyncio.sleep(0.2)
+    assert [f["edit"]["html"].startswith("<p>edited</p>") for f in frames] == [True, True]
+    assert _shows(frames[0]["edit"], "OPEN") and _shows(frames[1]["edit"], "DONE")
+
+    card_board.close()
+
+
+async def test_a_message_deleted_while_its_card_refreshes_gets_no_refresh_frame(
+    card_board: W.Board, card_teams: Teams, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """037-AC1: the delete is the last frame the page gets for the message."""
+    frames = _relayed(monkeypatch)
+    card_teams.gate = asyncio.Event()
+    await _following(card_board, CT)
+    await _history(card_board, CT)
+    await wait(lambda: _invokes(card_teams) == 1, "the request")
+    gone = {**_card_msg("6", "1600", ""), "properties": {"deletetime": "1789466600000"}}
+    await card_board.on_event(_event("MessageUpdate", CT, **gone))
+    await _settled(frames, 1)
+    card_teams.gate.set()
+    await wait(lambda: card_board.chat._card_jobs == {}, "the refresh")
+    await asyncio.sleep(0.2)
+    assert len(frames) == 1 and frames[0]["edit"]["deleted"] is True
+    card_board.close()
+
+
+async def test_an_archive_copy_older_than_the_live_one_pushes_nothing(
+    card_board: W.Board, card_teams: Teams, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """037-AC1: the archiver lags: a history page still reads the copy before a live edit; its refresh
+    frame would undo that edit, so none goes out."""
+    frames = _relayed(monkeypatch)
+    await _following(card_board, CT)
+    plain = _m("6", _at(6), "<p>no more card</p>", version="1500")
+    await card_board.on_event(_event("MessageUpdate", CT, **plain))
+    await _settled(frames, 1)
+    [row] = (await _history(card_board, CT))["messages"]
+    assert _shows(row, "OPEN")  # the archive's copy, as before spec 037
+    await wait(lambda: _invokes(card_teams) == 1, "the request")
+    await wait(lambda: card_board.chat._card_jobs == {}, "the refresh")
+    await asyncio.sleep(0.2)
+    assert len(frames) == 1
+    card_board.close()
+
+
+async def test_an_older_copy_leaves_the_running_refresh_of_a_newer_one(
+    card_board: W.Board, card_teams: Teams, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """037-AC1: a live edit's card refresh runs; a history page then reads the archive's older copy: the
+    refresh still pushes the edited copy."""
+    frames = _relayed(monkeypatch)
+    card_teams.gate = asyncio.Event()
+    await _following(card_board, CT)
+    await card_board.on_event(_event("MessageUpdate", CT, **_card_msg("6", "1500", "<p>edited</p>")))
+    await wait(lambda: _invokes(card_teams) == 1, "the request")
+    await _history(card_board, CT)
+    card_teams.gate.set()
+    await _settled(frames, 2)
+    await asyncio.sleep(0.2)
+    assert len(frames) == 2 and frames[1]["edit"]["html"].startswith("<p>edited</p>")
+    assert _shows(frames[1]["edit"], "DONE")
+    card_board.close()
+
+
+async def test_closing_the_board_cancels_the_refreshes(card_board: W.Board, card_teams: Teams) -> None:
+    """037-AC1: shutdown mid-refresh: the refresh tasks are cancelled, nothing is queued after."""
+    card_teams.gate = asyncio.Event()
+    await _following(card_board, CT)
+    await _history(card_board, CT)
+    await wait(lambda: _invokes(card_teams) == 1, "the request")
+    [(task, _)] = card_board.chat._card_jobs.values()
+    card_board.close()
+    await asyncio.wait({task}, timeout=1)
+    assert task.cancelled() and card_board.chat._card_jobs == {}
+    card_teams.gate.set()
+    await asyncio.sleep(0.1)
+    assert card_board._relay_task is None
+
+
+async def test_a_page_gone_or_no_token_gets_no_refresh_frame(
+    card_board: W.Board, card_teams: Teams, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """037-AC1: no follower left when the card comes back: nothing is sent; without a bearer no refresh
+    starts."""
+    sent: list[str] = []
+    monkeypatch.setattr(W, "broadcast", lambda sockets, frame: sent.append(frame))
+    card_teams.gate = asyncio.Event()
+    ws = await _following(card_board, CT)
+    await _history(card_board, CT)
+    await wait(lambda: _invokes(card_teams) == 1, "the request")
+    assert (await card_board.follow(ws, T))["ok"]  # the page moved to another chat
+    card_teams.gate.set()
+    await wait(lambda: card_board.chat._card_jobs == {}, "the refresh")
+    await asyncio.sleep(0.1)
+    assert sent == []
+
+    assert card_board.directory is not None
+    card_board.directory.bearer = ""
+    await _following(card_board, CT)
+    await _history(card_board, CT)
+    assert card_board.chat._card_jobs == {}
+    card_board.close()
+
+
+async def test_cards_db_is_read_once_per_page_and_only_on_the_archive_pool(
+    card_board: W.Board, data_dir: Path, card_teams: Teams, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """037-AC2: a page's cards come from one `cards.db` read; every read and write of the web process runs
+    on the bounded archive pool, never on the loop nor the default executor the Teams calls share."""
+    _archive(data_dir, CT, [_card_msg("8", "1000"), _m("9", _at(9))])
+    calls: list[tuple[str, str]] = []
+    for name in ("load", "load_many", "save"):
+        real = getattr(CR.CardStore, name)
+
+        def spy(*args: Any, _real: Any = real, _name: str = name) -> Any:
+            calls.append((_name, threading.current_thread().name))
+            return _real(*args)
+
+        monkeypatch.setattr(CR.CardStore, name, spy)
+    frames = _relayed(monkeypatch)
+    await _following(card_board, CT)
+    assert len((await _history(card_board, CT))["messages"]) == 3
+    assert calls == [("load_many", calls[0][1])]
+    await _settled(frames, 2)  # both cards refreshed
+    await card_board.on_event(_event("NewMessage", CT, **_card_msg("10", "3000")))
+    await _settled(frames, 4)
+    await wait(lambda: card_board.chat._card_jobs == {}, "the refreshes")
+    assert {n for n, _ in calls} == {"load_many", "save"}
+    assert all(thread.startswith(CV._THREAD_PREFIX) for _, thread in calls), calls
+    card_board.close()
+
+
+async def test_a_refusing_archive_pool_keeps_the_refresh_going(
+    card_board: W.Board, card_teams: Teams, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """037-AC5: `cards.db` writes refused (hung mount): the refreshed card still reaches the page, from
+    memory; no refresh is left in flight."""
+
+    assert card_board.chat.cards is not None
+    real = card_board.chat.cards.blocking
+
+    async def refusing(fn: Any, *args: Any) -> Any:
+        if getattr(fn, "__name__", "") == "save":
+            raise CV.ArchiveUnavailable("archive unavailable (relay)")
+        return await real(fn, *args)
+
+    monkeypatch.setattr(card_board.chat.cards, "blocking", refusing)
+    frames = _relayed(monkeypatch)
+    await _following(card_board, CT)
+    await _history(card_board, CT)
+    await _settled(frames, 1)
+    assert _shows(frames[0]["edit"], "DONE")
+    await wait(lambda: card_board.chat._card_jobs == {}, "the refresh")
+    assert card_board.chat.cards._inflight == {}
+    card_board.close()
+
+
+async def test_refreshes_at_once_are_capped(
+    card_board: W.Board, data_dir: Path, card_teams: Teams, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """037-AC6: past the cap a due card is not scheduled; the page shows its stored card."""
+    monkeypatch.setattr(CV, "_CARD_JOBS", 1)
+    _archive(data_dir, CT, [_card_msg("8", "1000")])
+    card_teams.gate = asyncio.Event()
+    await _following(card_board, CT)
+    await _history(card_board, CT)
+    await wait(lambda: _invokes(card_teams) == 1, "the request")
+    await asyncio.sleep(0.1)
+    assert list(card_board.chat._card_jobs) == [(CT, "6")] and _invokes(card_teams) == 1
+    card_board.close()
+
+
+@pytest.mark.parametrize("error", [TypeError("odd"), CV.ArchiveUnavailable("archive unavailable (relay)")])
+async def test_a_failed_rebuild_sends_nothing(
+    card_board: W.Board, card_teams: Teams, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    """037-AC1: the record cannot be rebuilt: no frame, the row keeps its card; an unexpected failure logs
+    one line (its class only), a refusing archive pool none of its own."""
+    frames = _relayed(monkeypatch)
+    card_teams.gate = asyncio.Event()
+    await _following(card_board, CT)
+    await _history(card_board, CT)
+    await wait(lambda: _invokes(card_teams) == 1, "the request")
+
+    def broken(*args: Any) -> list[dict[str, Any]]:
+        raise error
+
+    monkeypatch.setattr(card_board.chat, "records", broken)
+    with structlog.testing.capture_logs() as logs:
+        card_teams.gate.set()
+        await wait(lambda: card_board.chat._card_jobs == {}, "the refresh")
+    await asyncio.sleep(0.1)
+    assert frames == []
+    pushed = [e for e in logs if e["event"] == "card_push_failed"]
+    if isinstance(error, CV.ArchiveUnavailable):
+        assert pushed == []
+    else:
+        assert pushed == [
+            {"event": "card_push_failed", "log_level": "warning", "thread": CT, "error_type": "TypeError"}
+        ]
+    card_board.close()
+
+
+def test_relayed_versions_are_bounded_and_only_grow(
+    card_board: W.Board, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """037-AC1: the newest live body version per message, for the last few messages only; no version
+    orders after every one; a reaction (no body) is not a body version, a delete is."""
+    monkeypatch.setattr(CV, "_RELAYED_MAX", 2)
+    chat = card_board.chat
+    chat.relayed(CT, {"id": "1", "version": "50", "content": "a"})
+    chat.relayed(CT, {"id": "1", "version": "40", "content": "b"})
+    chat.relayed(CT, {"id": "1", "version": "70", "properties": {"emotions": []}})
+    assert chat._relayed[(CT, "1")] == 50
+    chat.relayed(CT, {"id": "2", "content": ""})
+    assert chat._relayed[(CT, "2")] == math.inf
+    chat.relayed(CT, {"id": "3", "version": "60", "properties": {"deletetime": "1789466600000"}})
+    assert list(chat._relayed) == [(CT, "2"), (CT, "3")]
+    chat.relayed(CT, {"id": "", "content": ""})
+    assert len(chat._relayed) == 2
+
+
+async def test_an_unarchived_live_row_shows_its_stored_card_without_asking(
+    card_board: W.Board, data_dir: Path, card_teams: Teams, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """037-AC2, 037-AC3: a chat without an archive folder renders its live row on the loop, without
+    `cards.db`; the refresh reads it there: a fresh stored card comes as an edit, the bot is not asked."""
+    card_board.rows[B] = {"id": B, "label": "B", "last_activity": _at(1), "last_id": "1", "typing": []}
+    now = time.time()
+    CR.CardStore(data_dir / "cards.db").save(B, "6", "card-1", _ok("DONE")["value"], now, now + 600)
+    frames = _relayed(monkeypatch)
+    await _following(card_board, B)
+    await card_board.on_event(_event("MessageUpdate", B, **_card_msg("6", "1500", "<p>edited</p>")))
+    await _settled(frames, 2)
+    await wait(lambda: card_board.chat._card_jobs == {}, "the refresh")
+    await asyncio.sleep(0.1)
+    assert _shows(frames[0]["edit"], "OPEN") and _shows(frames[1]["edit"], "DONE") and len(frames) == 2
+    assert _invokes(card_teams) == 0
+    card_board.close()
+
+
+async def test_a_reaction_during_a_refresh_keeps_its_frame_and_the_frame_keeps_the_reaction(
+    card_board: W.Board, card_teams: Teams, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """037-AC1: a reaction while the card refreshes does not cost the refresh its frame; that frame
+    carries only what a card changes (id, body, type), so it cannot undo the reaction on the page."""
+    frames = _relayed(monkeypatch)
+    card_teams.gate = asyncio.Event()
+    await _following(card_board, CT)
+    await _history(card_board, CT)
+    await wait(lambda: _invokes(card_teams) == 1, "the request")
+    emotions = {"emotions": [{"key": "like", "users": [{"mri": ME, "time": 1}]}]}
+    reaction = {"id": "6", "composetime": _at(6), "messagetype": "RichText/Html", "properties": emotions}
+    await card_board.on_event(_event("MessageUpdate", CT, **reaction, version="1500"))
+    await _settled(frames, 1)
+    assert "html" not in frames[0]["edit"]
+    card_teams.gate.set()
+    await _settled(frames, 2)
+    assert set(frames[1]["edit"]) == {"id", "html", "type"}
+    assert frames[1]["edit"]["id"] == "6" and _shows(frames[1]["edit"], "DONE")
+    card_board.close()
+
+
+async def test_a_partial_update_carrying_cards_starts_no_refresh(
+    card_board: W.Board, card_teams: Teams, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """037-AC1: an update without the body cannot be rebuilt whole: no refresh, no refresh frame."""
+    frames = _relayed(monkeypatch)
+    await _following(card_board, CT)
+    partial = {"id": "6", "composetime": _at(6), "messagetype": "RichText/Html", "version": "1500"}
+    await card_board.on_event(
+        _event("MessageUpdate", CT, **partial, properties={"cards": json.dumps([_entry()])})
+    )
+    await _settled(frames, 1)
+    assert "html" not in frames[0]["edit"] and card_board.chat._card_jobs == {}
+    await asyncio.sleep(0.2)
+    assert len(frames) == 1 and card_teams.calls == []
+    card_board.close()
+
+
+async def test_a_burst_of_card_saves_leaves_the_archive_pool_room(
+    card_board: W.Board, data_dir: Path, card_teams: Teams, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """037-AC5: a page of 100 card messages whose app lookup fails saves 100 retry rows: few at a time on
+    the archive pool, so its queue never nears the backlog the pages and relays share, and every row lands
+    (the next process waits the interval too)."""
+    many = "19:many-cards@thread.v2"
+    _archive(data_dir, many, [_card_msg(str(i), "1000") for i in range(100, 200)])
+    card_teams.apps = httpx.Response(500)
+    # A healthy mount: a slow run must not turn a queued save into a deadline refusal.
+    monkeypatch.setitem(CV._DEADLINES, "relay", 60.0)
+    queued: list[int] = []
+    real = CR.CardStore.save
+
+    def save(*args: Any) -> None:
+        queued.append(CV.archive_pool("relay")._work_queue.qsize())
+        real(*args)
+
+    monkeypatch.setattr(CR.CardStore, "save", save)
+    await _following(card_board, many)
+    assert len((await _history(card_board, many))["messages"]) == 100
+    await wait(lambda: len(queued) == 100 and card_board.chat._card_jobs == {}, "the saves", tries=3000)
+    assert max(queued) < CV._BACKLOG // 4, max(queued)
+    rows = CR.CardStore(data_dir / "cards.db").load_many(many, [str(i) for i in range(100, 200)])
+    assert len(rows) == 100 and all(r["card-1"].card is None and r["card-1"].retry > 0 for r in rows.values())
+    card_board.close()
+
+
+async def test_the_row_rebuild_shares_the_card_store_gate(
+    card_board: W.Board, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """037-AC1: rebuilding a refreshed row reads the archive like a `cards.db` call: through the same
+    few-at-a-time gate, never straight onto the archive pool."""
+    assert card_board.chat.cards is not None
+    real, through = card_board.chat.cards.blocking, []
+
+    async def gated(fn: Any, *args: Any) -> Any:
+        through.append(getattr(fn, "__name__", ""))
+        return await real(fn, *args)
+
+    monkeypatch.setattr(card_board.chat.cards, "blocking", gated)
+    frames = _relayed(monkeypatch)
+    await _following(card_board, CT)
+    await _history(card_board, CT)
+    await _settled(frames, 1)
+    assert through == ["save", "records"]
+    card_board.close()
+
+
+async def test_a_full_card_store_gate_gives_up_at_the_relay_deadline(
+    settings: Settings, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """037-AC5: a hung `cards.db` call holds the gate: the next one waits no longer than the relay
+    deadline, then fails as an unavailable archive; the gate works again once the call returns."""
+    monkeypatch.setattr(W, "_CARD_STORE_IO", 1)
+    refresher = W.card_refresher(settings, data_dir)
+    assert refresher is not None
+    entered, release = threading.Event(), threading.Event()
+
+    def hung() -> bool:
+        entered.set()
+        return release.wait(5)
+
+    holder = asyncio.create_task(refresher.blocking(hung))
+    assert await asyncio.to_thread(entered.wait, 2)
+    monkeypatch.setitem(CV._DEADLINES, "relay", 0.1)  # the holder's own read keeps the 5 s it started with
+    started = time.monotonic()
+    with pytest.raises(CV.ArchiveUnavailable):
+        await refresher.blocking(lambda: "never")
+    assert time.monotonic() - started < 1
+    release.set()
+    assert await holder is True
+    assert await refresher.blocking(lambda: "after") == "after"  # no permit lost to the timed-out wait
+
+
+def test_concurrent_first_saves_lose_no_row(tmp_path: Path) -> None:
+    """037-AC5: two pool threads writing a fresh `cards.db` at once: the WAL switch of one would make the
+    other's write fail at once (SQLITE_BUSY, no busy wait), losing its retry row."""
+    for n in range(50):
+        store = CR.CardStore(tmp_path / f"cards-{n}.db")
+        start = threading.Barrier(2)
+
+        def write(side: int, store: CR.CardStore = store, start: threading.Barrier = start) -> None:
+            start.wait()
+            for i in range(5):
+                store.save(CT, f"{side}-{i}", "card-1", None, time.time(), time.time() + 600)
+
+        threads = [threading.Thread(target=write, args=(side,)) for side in (0, 1)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        ids = [f"{side}-{i}" for side in (0, 1) for i in range(5)]
+        assert len(store.load_many(CT, ids)) == 10, n
