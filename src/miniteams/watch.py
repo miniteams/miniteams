@@ -248,7 +248,7 @@ async def run_watch(settings: Settings, watch: Watch) -> int:
     started_ms = int(time.time() * 1000)
     watcher = Watcher(settings, watch, self_mri(str(aad["access_token"])), started_ms)
     skype = exchange_skype_token(settings, aad["access_token"])
-    watcher.directory.set_token(skype["skype_token"], str(aad.get("id_token") or aad["access_token"]))
+    watcher.directory.set_token(skype["skype_token"], str(aad["access_token"]))
     if watch.after:
         await catch_up(watcher, skype["skype_token"])
         if watcher.done.is_set():

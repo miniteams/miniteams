@@ -117,7 +117,7 @@ async def test_directory_token_is_renewed_before_expiry(
     directory.set_token("ST1", "I1")
     # 80% of the lifetime, then the floor after a failed renewal, then 80% of the new lifetime.
     assert await _refresh_sleeps(settings, directory, 3694.0, 3) == [3694.0 * 0.8, 60.0, 3600 * 0.8]
-    assert (directory.skype_token, directory.bearer) == ("ST2", "I2")
+    assert (directory.skype_token, directory.bearer) == ("ST2", "A2")  # not the id_token beside it
 
 
 async def test_dead_refresh_token_stops_the_refresher(
@@ -180,6 +180,7 @@ async def test_run_forever_renews_directory_token_and_stops_the_refresher(
     class _Client:
         def __init__(self, *_a: Any, **_kw: Any) -> None:
             sessions.append(1)
+            seen.append(directory.bearer)  # the connect-time pair
 
         async def run(self) -> None:  # the session stays up until the refresher has renewed the pair
             async with asyncio.timeout(5):
@@ -190,7 +191,7 @@ async def test_run_forever_renews_directory_token_and_stops_the_refresher(
     monkeypatch.setattr(S, "TrouterClient", _Client)
     await S.run_forever(settings, directory=directory)  # 2nd session: refresh raises AuthExpired → returns
     await asyncio.sleep(0)
-    assert (seen, len(sessions)) == (["I2"], 1)  # renewed mid-session, not by reconnecting
+    assert (seen, len(sessions)) == (["A1", "A2"], 1)  # renewed mid-session, not by reconnecting
     leftover = [t for t in asyncio.all_tasks() if t.get_coro().__name__ == "_refresh_directory_token"]  # type: ignore[union-attr]
     assert all(t.done() for t in leftover)
 

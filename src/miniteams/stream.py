@@ -100,11 +100,9 @@ class TrouterClient:
 
     @property
     def _bearer(self) -> str:
-        # purple-teams sends the id_token here (teams_trouter.c: user.authenticate + registrar).
-        # Earlier notes said access_token; the purple-teams source wins. If Trouter 401s on
-        # user.authenticate or the registrar, flip the order below.
+        # Never the id_token a real refresh returns: the profile lookup answers it 401.
         # Prefer the Directory's pair: the refresher renews it, the connect-time `aad` expires in ~1h.
-        return self.directory.bearer or str(self.aad.get("id_token") or self.aad["access_token"])
+        return self.directory.bearer or str(self.aad["access_token"])
 
     def _ws_url(self) -> str:
         wss = self.info["socketio"].replace("https://", "wss://", 1)
@@ -352,7 +350,7 @@ async def _refresh_directory_token(
             log.warning("directory_token_refresh_failed", error=str(exc), error_type=type(exc).__name__)
             delay = _TOKEN_REFRESH_MIN
             continue
-        directory.set_token(skype["skype_token"], str(aad.get("id_token") or aad["access_token"]))
+        directory.set_token(skype["skype_token"], str(aad["access_token"]))
         lifetime = _lifetime(skype)
         delay = lifetime * _TOKEN_REFRESH_RATIO
         log.info("directory_token_refreshed", expires_in=lifetime)
@@ -419,7 +417,7 @@ async def run_forever(
             aad = tokens.refresh()  # silent; raises AuthExpired when the refresh token is dead
             skype = exchange_skype_token(settings, aad["access_token"])
             skype_token = skype["skype_token"]
-            directory.set_token(skype_token, str(aad.get("id_token") or aad["access_token"]))
+            directory.set_token(skype_token, str(aad["access_token"]))
             epid = epid or get_or_create_epid(settings, epid_name)
             info = trouter_info(settings, skype_token, epid)
             session_id = handshake(settings, info, skype_token, epid)

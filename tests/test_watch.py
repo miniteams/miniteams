@@ -245,6 +245,7 @@ def test_once_prints_one_line_and_exits_0_even_when_two_arrive_together(
         "note": "why",
     }
     assert stream.calls[0]["prompt"] is False and stream.calls[0]["epid"]
+    assert stream.calls[0]["directory"].bearer == FAKE_TOKEN  # not the id_token beside it
 
 
 def test_each_process_gets_its_own_endpoint_id(settings: Settings, monkeypatch, capsys) -> None:

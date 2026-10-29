@@ -105,7 +105,7 @@ class Directory:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.skype_token = ""
-        self.bearer = ""  # AAD id_token, for the profile lookup (Bearer auth)
+        self.bearer = ""  # AAD access token, for the profile lookup (Bearer auth)
         self.me = ""  # own MRI; left out of roster-built labels (a 1:1 is named after the other)
         self.media = DEFAULT_MEDIA  # `stream --media`: attachment types printed and downloaded
         # thread_id → (monotonic time fetched, info); LRU-bounded (see _THREADS_MAX).
@@ -188,7 +188,7 @@ class Directory:
                 resp.raise_for_status()
                 data = resp.json()
         except Exception as exc:  # noqa: BLE001 — transient failure: leave uncached, retry later
-            log.debug("profile_resolve_failed", count=len(todo), error=failure(exc))
+            log.warning("profile_resolve_failed", count=len(todo), error=failure(exc))
             return
         for user in data.get("value") or data.get("resolvedUsers") or []:
             self.note_name(user.get("mri", ""), user.get("displayName"))
@@ -302,9 +302,8 @@ class Directory:
             self.note_name(mri, name)
             members.append({"mri": mri, "name": name, "role": m.get("role")})
 
-        # Resolve roster members the thread didn't name (bare-guid MRIs) in one batched call. Negatives
-        # are asked again: a lookup that once missed them would otherwise show their id until a restart.
-        await self.resolve([m["mri"] for m in members if not m["name"]], refresh=True)
+        # Resolve roster members the thread didn't name (bare-guid MRIs) in one batched call.
+        await self.resolve([m["mri"] for m in members if not m["name"]])
         for m in members:
             m["name"] = m["name"] or self.known_name(m["mri"]) or _tail(m["mri"])  # never a declared name
         self._save_names()  # persist friendlyName-sourced names too
