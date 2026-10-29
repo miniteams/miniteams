@@ -678,6 +678,27 @@ async def test_after_the_upgrade_a_roster_is_resolved_in_one_batch(
     assert [m["name"] for m in info["members"]] == ["Ann Lee", "Bob Roe", "cy"]
 
 
+@pytest.mark.parametrize("persisted", [False, True])  # unknown to this process's lookup, or to another's
+async def test_a_roster_fetch_asks_again_for_members_once_unknown(
+    directory: Directory, monkeypatch: pytest.MonkeyPatch, persisted: bool
+) -> None:
+    if persisted:
+        directory.settings.cache_dir.mkdir(parents=True, exist_ok=True)
+        (directory.settings.cache_dir / "names-v2.json").write_text(json.dumps({ANN: ANN.rsplit(":", 1)[1]}))
+        directory = Directory(directory.settings)
+    else:
+        directory.note_name(ANN, ANN.rsplit(":", 1)[1])  # the negative-cache marker
+    directory.note_name("8:orgid:bob", "Bob Roe")
+    directory.set_token("sk", "bearer")
+    members = [{"mri": m, "friendlyName": ""} for m in (ANN, "8:orgid:bob")]
+    profiles = _Profiles({ANN: "Ann Lee", "8:orgid:bob": "Bob Roe"}, {"members": members})
+    monkeypatch.setattr(D.httpx, "AsyncClient", profiles.client)
+    info = await directory.thread(T)
+    assert info is not None
+    assert profiles.batches == [[ANN]]  # a known name is not re-asked
+    assert [m["name"] for m in info["members"]] == ["Ann Lee", "Bob Roe"]
+
+
 @pytest.mark.parametrize("followed", [False, True])  # the board alone, and board plus relay
 async def test_a_thread_activity_from_the_typist_does_not_end_their_typing(
     quiet_directory: Directory,  # noqa: F811

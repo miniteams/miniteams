@@ -302,8 +302,9 @@ class Directory:
             self.note_name(mri, name)
             members.append({"mri": mri, "name": name, "role": m.get("role")})
 
-        # Resolve roster members the thread didn't name (bare-guid MRIs) in one batched call.
-        await self.resolve([m["mri"] for m in members if not m["name"]])
+        # Resolve roster members the thread didn't name (bare-guid MRIs) in one batched call. Negatives
+        # are asked again: a lookup that once missed them would otherwise show their id until a restart.
+        await self.resolve([m["mri"] for m in members if not m["name"]], refresh=True)
         for m in members:
             m["name"] = m["name"] or self.known_name(m["mri"]) or _tail(m["mri"])  # never a declared name
         self._save_names()  # persist friendlyName-sourced names too
