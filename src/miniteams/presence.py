@@ -5,7 +5,9 @@ own Trouter socket (`<surl>/TeamsUnifiedPresenceService`). The subscription is r
 reconnect and every `PERIOD`; each post answers with a full snapshot callback. A state lives until
 two periods pass without a confirmation (a callback or a snapshot; a post's `20200` is not one: a dead
 socket gets it too), then it is unknown: no dot, never Offline. Our own presence is followed like anyone's
-and changes only on an explicit menu pick (spec 036, `force`).
+and is forced by an explicit menu pick (spec 036, `force`), or set Away after 5 min of desktop idle or 2 min
+without a page of ours until I come back. The socket is published as one of my endpoints, so closing the Teams
+client does not leave me Offline.
 
 Latest states persist in a local SQLite cache (`<cache_dir>/presence.sqlite3`, a subset of the spike's
 proposed schema): a restart paints them at once, unconfirmed, until the first callback.
@@ -18,8 +20,9 @@ import re
 import sqlite3
 import time
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +30,7 @@ import httpx
 import structlog
 
 from .config import Settings
+from .idle import DesktopIdle
 
 log = structlog.get_logger()
 
@@ -34,6 +38,14 @@ HOST = "https://presence.teams.microsoft.com"
 PATHS = ("/TeamsUnifiedPresenceService", "/unifiedPresenceService")  # Trouter delivery urls
 PERIOD = 600.0  # seconds between renewals; spike: deltas kept coming 45 min unrenewed
 _SWEEP = 30.0  # seconds between staleness checks
+_PUBLISH_EVERY = 240.0  # seconds between re-puts of my endpoint: unrenewed, inactive at ~6 min, gone at ~11
+_AWAY_AFTER = 300.0  # seconds of desktop idle before auto-Away, as the Teams desktop client
+_NO_PAGE_AFTER = (
+    120.0  # seconds without any page (widget, chat page) before auto-Away: a reload must not flap
+)
+_AWAY_HOLD = 900.0  # seconds an auto-Away is forced for: a crash leaves it this long, not Teams' 7 days
+_AWAY_RENEW = 600.0  # an auto-Away with less than this left is forced again while still idle
+_NETWORK = "network error"  # a set that may have reached the service
 _DEBOUNCE = 2.0  # seconds a follow-list change waits for its siblings (a burst of row moves)
 _UNKNOWN = "PresenceUnknown"
 _ACCEPTED = "20200"  # per-person status of an accepted subscription
@@ -103,10 +115,13 @@ def forced(found: dict[str, Any]) -> str | None:
     return avail if avail in _FORCEABLE else None
 
 
-def parse(entries: Any) -> dict[str, tuple[str, str, str | None] | None]:
-    """`presence: [...]` of a snapshot or a callback → mri → (availability, activity, forced);
+Found = tuple[str, str, str | None, str | None]  # availability, activity, forced entry, its expiry
+
+
+def parse(entries: Any) -> dict[str, Found | None]:
+    """`presence: [...]` of a snapshot or a callback → mri → (availability, activity, forced, expiry);
     None = unknown."""
-    out: dict[str, tuple[str, str, str | None] | None] = {}
+    out: dict[str, Found | None] = {}
     for item in entries if isinstance(entries, list) else []:
         mri = person(item.get("mri")) if isinstance(item, dict) else ""
         if not mri:
@@ -117,7 +132,14 @@ def parse(entries: Any) -> dict[str, tuple[str, str, str | None] | None]:
             out[mri] = None  # missing presence is not Offline
             continue
         activity = found.get("activity") if isinstance(found, dict) else None
-        out[mri] = (avail, activity if isinstance(activity, str) and activity else avail, forced(found))
+        force = found.get("forcedAvailability")
+        expiry = force.get("expiry") if isinstance(force, dict) else None
+        out[mri] = (
+            avail,
+            activity if isinstance(activity, str) and activity else avail,
+            forced(found),
+            expiry if isinstance(expiry, str) else None,
+        )
     return out
 
 
@@ -138,6 +160,7 @@ class State:
     until: float  # wall seconds: unknown past it
     confirmed: bool  # False: from the cache, or no longer followed
     forced: str | None = None  # own state only (spec 036): the forced menu entry; never cached
+    expiry: str | None = None  # own state only: when the forced status lifts (ISO UTC); never cached
 
     def frame(self) -> dict[str, Any]:
         return {"availability": self.availability, "activity": self.activity, "confirmed": self.confirmed}
@@ -249,6 +272,10 @@ def open_cache(settings: Settings) -> Cache | None:
 TokenFn = Callable[[], str | None]
 
 
+def _iso(at: float) -> str:
+    return datetime.fromtimestamp(at, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class Presence:
     """Follow list → native snapshot + subscription; Trouter callbacks → states → `on_change`."""
 
@@ -262,6 +289,7 @@ class Presence:
         period: float = PERIOD,
         clock: Callable[[], float] = time.time,
         me: str = "",
+        idle: Callable[[], Awaitable[float | None]] | None = None,
     ) -> None:
         self.settings = settings
         self.me = person(me)  # own MRI: its frame entry says which status is forced
@@ -276,6 +304,15 @@ class Presence:
         self.subscribed: frozenset[str] = frozenset()  # accepted on the current socket
         self.session: tuple[str, str] | None = None  # (endpoint id, surl) of the current socket
         self.renewed = 0.0  # wall seconds of the last full post
+        self.published: str | None = None  # the endpoint id last published as mine
+        self._publish_due, self._publish_wait = 0.0, _SWEEP  # next publish; a failed one backs off
+        self.idle = idle or DesktopIdle()  # desktop idle seconds; None = unknown
+        self.idle_seconds: float | None = None  # the latest sample; None = unknown (no X11)
+        self._pageless_since: float | None = clock()  # since when no page is open; None: one is
+        self._setting = asyncio.Lock()  # one forceavailability at a time: a pick and the idle check
+        self._set_at = 0.0  # wall seconds of the last accepted forceavailability
+        self._own_at = 0.0  # wall seconds of my last confirmed state
+        self._away: list[float] = []  # auto-Away expiries sent, newest first, at most 2; [] = none
         self._lock = asyncio.Lock()  # one post at a time: a renewal must not interleave a diff
         self._pending: asyncio.TimerHandle | None = None
         self._tasks: set[asyncio.Task[None]] = set()
@@ -320,6 +357,8 @@ class Presence:
         """A (re)registered socket: a new callback url needs the whole set subscribed again."""
         self.session = (epid, surl)
         self.subscribed = frozenset()
+        self.published = None  # the id is persisted: a new socket under the same id is published again
+        self._publish_due, self._publish_wait = 0.0, _SWEEP
         self._schedule(0)  # not awaited: the socket's frames must not wait on HTTP
 
     async def on_presence(self, body: dict[str, Any]) -> None:
@@ -337,15 +376,18 @@ class Presence:
             "x-ms-correlation-id": str(uuid.uuid4()),
         }
 
-    async def sync(self, renew: bool = False) -> None:
+    async def sync(self, renew: bool = False, publish: bool = False) -> None:
         """Snapshot the newcomers, then post the whole followed set (purging the previous one);
-        an unchanged set is posted again only to `renew` it."""
+        an unchanged set is posted again only to `renew` it. My endpoint goes first when unpublished,
+        on `renew` and on `publish`."""
         async with self._lock:
             if self.session is None:
                 return
             epid, surl = self.session
             wanted, gone = self.wanted, self.subscribed - self.wanted
-            if (not wanted and not gone) or (wanted == self.subscribed and not renew):
+            publish = publish or renew or self.published != epid
+            nothing_to_post = (not wanted and not gone) or (wanted == self.subscribed and not renew)
+            if nothing_to_post and not publish:
                 return
             try:
                 token = await asyncio.to_thread(self.token)
@@ -356,6 +398,13 @@ class Presence:
                 log.warning("presence_token_unavailable")
                 return
             headers = self._headers(token, epid)
+            if publish:
+                await self._publish(headers, epid)  # its failure must not cost the dots their subscription
+                if self.session != (epid, surl):
+                    self.published = None  # a new socket under the same id came in meanwhile
+                    return  # its own sync is queued
+            if nothing_to_post:
+                return
             try:
                 if fresh := sorted(wanted - self.subscribed):
                     resp = await self.http.post(
@@ -388,9 +437,42 @@ class Presence:
             self._apply(dict.fromkeys(refused))
             log.info("presence_subscribed", people=len(wanted), removed=len(gone), refused=len(refused))
 
+    async def _publish(self, headers: dict[str, str], epid: str) -> None:
+        """Our socket as one of my Teams endpoints: with none left (Teams client closed) I am Offline and
+        a forced status shows nowhere. Refused: unpublished, the sweep retries it."""
+        body = {
+            "id": epid,
+            "availability": "Available",
+            "activity": "Available",
+            "activityReporting": "Transport",
+            "deviceType": "Desktop",
+        }  # purple-teams' shape
+        try:
+            resp = await self.http.put(f"{HOST}/v1/me/endpoints/", headers=headers, json=body)
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            log.warning("presence_endpoint_failed", error=str(exc), error_type=type(exc).__name__)
+            self.published = None
+            return
+        self.published = epid
+        self._publish_due, self._publish_wait = self.clock() + _PUBLISH_EVERY, _SWEEP
+        log.info("presence_endpoint_published")
+
     async def force(self, value: str) -> str:
         """Spec 036: force my status to a `FORCE` entry; "" once the service took it, else a short reason.
-        Never retried: the page shows the reason, the next pick is the retry."""
+        Never retried: the page shows the reason, the next pick is the retry. A pick taken ends an
+        auto-Away: the pick owns my status from then on."""
+        async with self._setting:
+            error = await self._set(value)
+            if not error:
+                self._away = []
+            return error
+
+    async def _set(self, value: str, until: float | None = None, renew: bool = False) -> str:
+        """`FORCE[value]`, expiring at `until` (else Teams' default); a `renew` keeps my confirmed state."""
+        body = dict(FORCE[value])
+        if until is not None:
+            body["desiredExpirationTime"] = _iso(until)
         try:
             token = await asyncio.to_thread(self.token)
         except Exception as exc:  # noqa: BLE001 — MSAL re-raises network errors
@@ -401,28 +483,132 @@ class Presence:
             return "token unavailable"
         # Our socket's endpoint as the collector's posts; without one a throwaway id, as the spike did.
         epid = self.session[0] if self.session else str(uuid.uuid4())
+        sent = self.clock()  # my callback may come before the answer: a state after this one is fresh
         try:
             resp = await self.http.put(
-                f"{HOST}/v1/me/forceavailability/", headers=self._headers(token, epid), json=FORCE[value]
+                f"{HOST}/v1/me/forceavailability/", headers=self._headers(token, epid), json=body
             )
         except httpx.HTTPError as exc:
             log.warning("presence_set_failed", value=value, reason="network", error_type=type(exc).__name__)
-            return "network error"
+            return _NETWORK
         if resp.is_error:
             log.warning("presence_set_failed", value=value, reason="http", status=resp.status_code)
             return f"HTTP {resp.status_code}"
+        if not renew:
+            self._set_at = sent
         log.info("presence_set", value=value)
         return ""
 
+    @property
+    def auto_away(self) -> bool:
+        return bool(self._away)
+
+    def _ours(self, own: State) -> bool:
+        """My Away is the one auto-Away forced: an Away picked in Teams meanwhile has another expiry."""
+        return own.forced == "Away" and (own.expiry or "")[:19] in {_iso(at)[:19] for at in self._away}
+
+    async def _reread(self) -> State | None:
+        """My presence asked again (`getpresence`): a late callback must not end an auto-Away. None when
+        unknown or the call failed."""
+        try:
+            token = await asyncio.to_thread(self.token)
+        except Exception as exc:  # noqa: BLE001 — MSAL re-raises network errors
+            log.warning("presence_reread_failed", reason="token", error_type=type(exc).__name__)
+            return None
+        if not token:
+            log.warning("presence_reread_failed", reason="token")
+            return None
+        epid = self.session[0] if self.session else str(uuid.uuid4())
+        try:
+            resp = await self.http.post(
+                f"{HOST}/v1/presence/getpresence/",
+                headers=self._headers(token, epid),
+                json=[{"mri": self.me}],
+            )
+            resp.raise_for_status()
+            found = parse(resp.json())
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("presence_reread_failed", reason="http", error_type=type(exc).__name__)
+            return None
+        if found.get(self.me) is None or self.me not in self.wanted:
+            return None  # an answer `_apply` would drop would leave the old state to decide on
+        self._apply(found)
+        return self.states.get(self.me)
+
+    def pages(self, count: int) -> None:
+        """The pages connected to `web` (widget, chat pages): none for `_NO_PAGE_AFTER` counts as away."""
+        if count:
+            self._pageless_since = None
+        elif self._pageless_since is None:
+            self._pageless_since = self.clock()
+
+    async def away(self) -> None:
+        """Auto-Away: desktop idle `_AWAY_AFTER` or no page for `_NO_PAGE_AFTER`, over my published
+        endpoint, no status forced and not Busy or Do not disturb, forces Away for `_AWAY_HOLD`, forced again
+        while I stay away; back (a page open, the desktop not idle), that Away is lifted, any other status
+        left alone. Decides only on a state of mine confirmed since the last set; unknown state: nothing."""
+        own = self.states.get(self.me)
+        if own is None or not own.confirmed or self._own_at <= self._set_at:
+            return
+        idle_away = self.idle_seconds is not None and self.idle_seconds >= _AWAY_AFTER  # unknown: not idle
+        pageless = self._pageless_since is not None and self.clock() - self._pageless_since >= _NO_PAGE_AFTER
+        absent, present = idle_away or pageless, self._pageless_since is None and not idle_away
+        if not self._away:
+            published = self.session is not None and self.published == self.session[0]
+            busy = own.availability in ("Busy", "DoNotDisturb")  # a meeting, a call, presenting: never hidden
+            if not absent or own.forced is not None or busy or not published:
+                return
+            async with self._setting:
+                if self._own_at <= self._set_at:
+                    return  # a pick went out while we waited: it owns my status
+                # Before the PUT: a set cut short (shutdown, network) may have landed, it stays ours to lift.
+                self._away = [self.clock() + _AWAY_HOLD]
+                error = await self._set("Away", self._away[0])
+                if error and error != _NETWORK:
+                    self._away = []  # refused: retried by a later sweep
+                elif not error:
+                    log.info("presence_auto_away", source="idle" if idle_away else "no page")
+            return
+        if not self._ours(own):
+            mine = await self._reread()
+            if mine is None:
+                return  # unknown: asked again on a later sweep
+            if not self._ours(mine):
+                if self._away:  # not cleared by a pick meanwhile
+                    self._away = []  # changed in Teams meanwhile, lapsed or never landed: that status stays
+                    log.info("presence_auto_back", reset=False)
+                return
+        if present:
+            async with self._setting:
+                if self._away and not await self._set("Reset"):  # a pick meanwhile cleared it
+                    self._away = []
+                    log.info("presence_auto_back", reset=True)
+        elif absent and self._away[0] - self.clock() < _AWAY_RENEW:
+            async with self._setting:
+                if not self._away:
+                    return  # a pick meanwhile ended it
+                # The previous expiry kept: my state may still carry it until the callback.
+                standing, self._away = self._away, [self.clock() + _AWAY_HOLD, self._away[0]]
+                if (error := await self._set("Away", self._away[0], renew=True)) and error != _NETWORK:
+                    self._away = standing  # refused: renewed by a later sweep
+
     async def run(self) -> None:
-        """Renew every period, sweep stale states in between; until cancelled."""
+        """Renew every period, sweep stale states and sample the desktop idle in between; until cancelled."""
         while True:
             await asyncio.sleep(_SWEEP)
             try:
                 self.sweep()
+                if self.me:  # no own presence, no auto-Away: nothing to sample for
+                    self.idle_seconds = await self.idle()
                 if self.session is not None and self.clock() - self.renewed >= self.period:
                     self.renewed = self.clock()  # one attempt per period, failed or not
                     await self.sync(renew=True)
+                elif self.session is not None and self.clock() >= self._publish_due:
+                    # Until a publish goes through (any failure, token included): backing off.
+                    self._publish_due = self.clock() + self._publish_wait
+                    self._publish_wait = min(self._publish_wait * 2, self.period)
+                    await self.sync(publish=True)
+                await self.away()
             except Exception as exc:  # noqa: BLE001 — a dead loop would leave every dot up forever
                 log.warning("presence_renewal_failed", error=str(exc), error_type=type(exc).__name__)
 
@@ -436,12 +622,14 @@ class Presence:
             self.on_change()
 
     async def close(self) -> None:
-        """Drop our subscriptions (never the contact list) and release the client."""
+        """Lift an auto-Away, drop our subscriptions (never the contact list) and release the client."""
         if self._pending is not None:
             self._pending.cancel()
         for task in self._tasks:
             task.cancel()
         try:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._lift(), 3)
             if self.session is not None and self.subscribed:
                 epid, surl = self.session
                 token = await asyncio.to_thread(self.token)
@@ -461,9 +649,16 @@ class Presence:
             if self.cache is not None:
                 self.cache.close()
 
+    async def _lift(self) -> None:
+        """Not left forced Away by a process that is gone; a status set in Teams meanwhile stays."""
+        async with self._setting:
+            own = self.states.get(self.me)
+            if self._away and (own is None or own.forced is None or self._ours(own)):
+                await self._set("Reset")
+
     # --- states ---
 
-    def _apply(self, found: dict[str, tuple[str, str, str | None] | None]) -> None:
+    def _apply(self, found: dict[str, Found | None]) -> None:
         now = self.clock()
         until = now + 2 * self.period
         changed: dict[str, State] = {}
@@ -475,7 +670,10 @@ class Presence:
                 if self.states.pop(mri, None) is not None:
                     unknown.append(mri)
                 continue
-            changed[mri] = State(value[0], value[1], until, True, value[2] if mri == self.me else None)
+            mine = mri == self.me
+            changed[mri] = State(value[0], value[1], until, True, *(value[2:] if mine else (None, None)))
+            if mine:
+                self._own_at = now
         old = {m: self.states.get(m) for m in changed}
         self.states.update(changed)
         if changed and self.cache is not None:

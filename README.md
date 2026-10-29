@@ -223,8 +223,8 @@ watches the token cache file).
 - Unknown presence (no answer, `PresenceUnknown`, refused subscription) shows no dot, never Offline.
 - Followed: you, the peers of the 50 newest 1:1 rows, and the authors an open chat page shows (50 per page, 100 people in all).
 - Native presence service + `web`'s own Trouter socket, no Graph; re-subscribed on every reconnect and every 10 min.
-  Two periods (20 min) without a confirmation and the dots go. The collector never publishes your own presence
-  by itself: only a pick in the status menu sets it.
+  Two periods (20 min) without a confirmation and the dots go. `web` counts as one of your Teams
+  devices (published every 4 min), so closing the Teams client does not leave you Offline.
 - Latest states are cached in `~/.cache/miniteams/presence.sqlite3` (local disk, `0600`): after a restart they show
   at once, faded and `(unconfirmed)`, until the service confirms them. Delete the file anytime; it is regenerated.
 
@@ -235,6 +235,15 @@ watches the token cache file).
 - `web` sets it on the native presence service (`PUT /v1/me/forceavailability/`), once, no retry; the dot changes
   when Teams confirms it. A failure shows "status not changed: <reason>" under the dot. Teams' own expiry applies
   (Busy and Do not disturb 1 day, Available, Be right back and Away 7 days, Appear offline never).
+- Auto-Away: after 5 min without keyboard or mouse input, or 2 min without any miniteams page (widget, chat page)
+  connected to `web`, with no status forced and not Busy or Do not disturb (meeting, call, presenting), `web` sets
+  you Away. It lifts it when you are back, a page connected and the desktop active (unless you changed it in Teams
+  meanwhile). A pick in the menu ends it and is never reset; stopping `web` lifts it, and it expires by itself
+  within 15 min if `web` dies. Desktop idle is read from X11: on Wayland or without a display, Away comes only
+  from no page connected. While it is set, activity on another device (phone, laptop) and a meeting or call that
+  starts meanwhile show Away until you are back here. Run one `web` per account: a second one (another machine, a
+  test instance on the real account) fights it, the one without pages forces Away and the other never lifts an
+  Away it did not set.
 
 ### Chat page
 
