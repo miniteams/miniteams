@@ -34,13 +34,14 @@ hover gives the label ("Busy · In a meeting"). Unknown presence shows no dot.
   (`~/.cache/miniteams/presence.sqlite3`, not the NAS data dir), shown at start as unconfirmed until
   the first callback. Single writer, latest state only, no history. Schema: a subset of
   `misc/presence-spike/schema-proposal.sql` (no names stored), shared later with the read-receipts horizons (spec 011).
-- **Own presence** is never forced by the collector; the widget's existing `user.activity` signal is
-  unchanged. Since 2026-10-29 `web`'s socket is published as one of my endpoints (see Decisions).
+- **Own presence** is forced by the collector only for auto-Away (desktop idle or no page, see Decisions); the
+  widget's existing `user.activity` signal is unchanged. Since 2026-10-29 `web`'s socket is published
+  as one of my endpoints (see Decisions).
 
 ## Out of scope
 
 - Presence on group rows, read-receipt avatars, the MCP or the CLI.
-- Forcing the user's own status (spec 036 does); status messages; out-of-office notes.
+- Forcing the user's own status from a pick (spec 036 does); status messages; out-of-office notes.
 - Presence history.
 
 ## Acceptance criteria
@@ -60,9 +61,9 @@ hover gives the label ("Busy · In a meeting"). Unknown presence shows no dot.
       chat changes (subscriptions added and removed).
 - [x] **AC7** A `web` restart shows cached presence as unconfirmed at once, confirmed after the first
       callback; the cache lives on local disk.
-- [x] **AC8** The presence collector forces no status of its own (2026-10-29: it publishes only
-      `web`'s endpoint and its activity) and never calls Graph; the widget's existing `user.activity`
-      signal is unchanged.
+- [x] **AC8** The presence collector forces no status of its own except auto-Away (2026-10-29: it
+      publishes `web`'s endpoint, and forces Away after 5 min of desktop idle or 2 min without a page
+      while no status is forced) and never calls Graph; the widget's existing `user.activity` signal is unchanged.
 
 ## Phases
 
@@ -114,6 +115,32 @@ None left from phase 1 (answers in Decisions, evidence in `misc/presence-spike/R
 - **`web` is one of my Teams endpoints** (babs, 2026-10-29), reversing "own presence never
   published": with the Teams client closed no endpoint of mine was left, so I showed Offline and a
   spec 036 status pick showed nowhere. `web` publishes its socket (`PUT /v1/me/endpoints/`,
-  `activityReporting: Transport`, purple-teams' shape) on each socket and renewal, and reports it
-  active (`POST /v1/me/reportmyactivity/`) while a page is connected, inactive after 2 min without
-  one, so Teams shows me Away.
+  `activityReporting: Transport`, purple-teams' shape) on each socket, on renewal and every 4 min:
+  unrenewed, the endpoint shows inactive after ~6 min and Offline after ~11 (spike, 2026-10-29); a
+  re-put of the same id lifts inactive back to Available.
+- **No activity reporting** (spike, 2026-10-29): `POST /v1/me/reportmyactivity/` answers 200 with no
+  visible effect and does not extend the endpoint (404 once it expired); an endpoint cannot carry
+  Away (400 for Transport) nor AvailableIdle. Activity from "a page is connected" is wrong anyway:
+  the widget stays connected in the tray.
+- **Auto-Away from desktop idle or no page** (babs, 2026-10-29): after 5 min without keyboard or
+  mouse input (the Teams desktop client's delay), or 2 min without any page (widget, chat page)
+  connected to `web` (a reload must not flap), with my endpoint published, no status forced and my
+  availability neither Busy nor Do not disturb (meeting, call, presenting), `web` forces Away (spec
+  036's call, `{"availability": "Away"}`, the only lasting Away the spike found). Back (a page
+  connected and the desktop not idle; idle unknown counts as not idle), an Away still ours is lifted
+  (Reset); a status changed in Teams meanwhile stays. A menu pick ends auto-Away and is never reset;
+  stopping `web` lifts an auto-Away. A forced Away lasts 7 days by default, so auto-Away sends
+  `desiredExpirationTime` = now + 15 min (honoured: the read-back `forcedAvailability.expiry`
+  equals it; a field named `expiry` is ignored) and forces it again while still away once less than
+  10 min are left: a `web` crash leaves at most ~15 min of Away. Menu picks keep Teams' default
+  expiry. Desktop idle is read from X11 (screen saver extension) in a child process, cut after 2 s:
+  Xlib exits the process on an X I/O error and a hung X server blocks the call. X11 idle is
+  optional: the endpoint is published whenever `web` runs; without it (Wayland, no display, library
+  missing) Away comes only from no page connected. Trade-off: while auto-Away is forced, activity on
+  another device (phone, laptop) and a meeting or call that starts meanwhile show Away until I am
+  back here. Before ending an auto-Away on a callback that no longer shows it, my presence is read
+  again (`getpresence`): a late callback must not end it. An Away is ours only while its
+  `forcedAvailability.expiry` matches the `desiredExpirationTime` sent (to the second): an Away
+  picked in the Teams client meanwhile is never renewed nor lifted. One `web` per account: a second
+  instance (another machine, a test instance on the real account) fights auto-Away, the one
+  without pages forces Away and the other never lifts an Away it did not set.

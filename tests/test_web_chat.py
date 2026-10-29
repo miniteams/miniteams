@@ -4383,9 +4383,9 @@ def test_concurrent_first_saves_lose_no_row(tmp_path: Path) -> None:
         assert len(store.load_many(CT, ids)) == 10, n
 
 
-async def test_open_pages_drive_my_endpoint_activity(board: W.Board, settings: Settings) -> None:
-    """Every page socket, board or chat, counts as me being here; the last one closing hands the count to
-    the presence collector, which reports inactive after its idle delay (Teams: Away)."""
+async def test_open_pages_feed_the_auto_away_count(board: W.Board, settings: Settings) -> None:
+    """Every page socket, board or chat, counts as me being here; the last one closing hands 0 to the
+    presence collector, whose auto-Away waits its delay (a reload must not flap)."""
     counts: list[int] = []
 
     class Seen:

@@ -138,3 +138,5 @@ None.
 - 2 s grace before any banner — so reloads, quick restarts and `web`'s first Teams connect do not
   flash it.
 - No MCP/CLI command — not asked; a later spec if wanted.
+- Auto-Away (spec 015, 2026-10-29) never overrides a pick: it acts only while no status is forced,
+  and a pick ends it.

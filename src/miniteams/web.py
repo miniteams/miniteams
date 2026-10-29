@@ -1448,7 +1448,7 @@ class Board:
 
     def _pages_changed(self) -> None:
         if self.presence is not None:
-            self.presence.pages(len(self.pages))  # no page left for a while: Teams shows me Away
+            self.presence.pages(len(self.pages))  # none left for a while: auto-Away
 
     def set_link(self, state: LinkState) -> None:
         if state == self.link:
