@@ -2788,6 +2788,19 @@ async def test_search_folds_case_and_accents_newest_first(searchable: W.Board, n
     assert (await _search(searchable, T, "absent"))["hits"] == []
 
 
+async def test_search_names_a_placeholder_quote(
+    tmp_path: Path, quiet_directory: Directory, no_api: None
+) -> None:
+    """A Reply block written with Teams' "Display Name" placeholder reads with its author's name."""
+    quiet_directory.note_name(ME, "Me Self")
+    quoted = compose.reply_quote(
+        {"id": "1", "messagetype": "RichText/Html", "content": "<p>q</p>", "from": ME}, "Display Name"
+    )
+    data = _archive(tmp_path / "d", T, [_m("2", _at(2), quoted + "<p>answer</p>")])
+    board = W.Board({}, quiet_directory, me=ME, data_dir=data)
+    assert [h["text"] for h in (await _search(board, T, "answer"))["hits"]] == ["Me Self q answer"]
+
+
 async def test_search_caps_at_fifty_newest(tmp_path: Path, quiet_directory: Directory, no_api: None) -> None:
     """011-AC18: at most 50 hits, the newest ones, over the whole history."""
     data = _archive(tmp_path / "d", T, [_m(str(i), _at(i), f"<p>hit {i}</p>") for i in range(120)])

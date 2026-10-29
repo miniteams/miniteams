@@ -41,6 +41,8 @@ _EMOJI_ALT_RE = re.compile(r'<emoji\b[^>]*\balt="([^"]*)"[^>]*>')
 # A forward is a blockquote too, but its content IS the message — only a reply quotes another.
 # Repeated: a reply quoting two messages carries two Reply blocks.
 _REPLY_QUOTE_RE = re.compile(r"\A(?:\s*<blockquote\b(?![^>]*Forward)[^>]*>.*?</blockquote>)+", re.DOTALL)
+# A Reply block's author, as Teams and compose.reply_quote write it.
+_QUOTE_AUTHOR_RE = re.compile(r'(<strong itemprop="mri" itemid="([^"<>]{1,200})">)[^<]{0,500}</strong>')
 SNIPPET_LEN = 1000  # the row tooltip shows it whole; CSS truncates the visible line
 # Non-text last messages: a short marker instead of the raw HTML/card payload.
 _TYPE_MARKERS = {
@@ -264,10 +266,33 @@ def plain_text(content: str) -> str:
     return " ".join(html.unescape(TAG_RE.sub(" ", _EMOJI_ALT_RE.sub(r"\1", content))).split())
 
 
-def message_text(message: dict[str, Any]) -> str:
-    """Plain text of a message as search and the MCP tools show it; `[Type]` for anything else."""
+def quote_names(content: str, known_name: Callable[[str], str] | None) -> str:
+    """`content` with each Reply block's author written as the name known for its MRI.
+
+    Teams clients write a "Display Name" placeholder there and show the name of the `itemid` instead."""
+    if known_name is None:
+        return content
+
+    def named(m: re.Match[str]) -> str:
+        name = known_name(html.unescape(m[2]))
+        return f"{m[1]}{html.escape(name, quote=False)}</strong>" if name else m[0]
+
+    return _QUOTE_AUTHOR_RE.sub(named, content)
+
+
+def _body_text(msgtype: str, content: str, known_name: Callable[[str], str] | None) -> str:
+    """A printed body: HTML as text with its quotes' authors named, plain text as is, else nothing."""
+    if msgtype == "RichText/Html":
+        return strip_html(quote_names(content, known_name))
+    return content if msgtype == "Text" else ""
+
+
+def message_text(message: dict[str, Any], known_name: Callable[[str], str] | None = None) -> str:
+    """Plain text of a message as search and the MCP tools show it; `[Type]` for anything else.
+    `known_name` names the authors of its quotes."""
     msgtype = str(message.get("messagetype") or "")
     content = str(message.get("content") or "")
+    content = quote_names(content, known_name) if msgtype == "RichText/Html" else content
     text = plain_text(content) if msgtype in TEXT_TYPES else f"[{msgtype.rsplit('/', 1)[-1]}]"
     return text[:SNIPPET_LEN]
 
@@ -449,7 +474,7 @@ async def _print_message(resource: dict[str, Any], directory: Directory, tag: st
         media=directory.media,
         files=message_files(resource),
     )
-    text = strip_html(content) if msgtype == "RichText/Html" else content if msgtype == "Text" else ""
+    text = _body_text(msgtype, content, directory.known_name)
     suffix = (" " + " ".join(notes)) if notes else ""
     await emit(f"[{when}] ({label}) {tag}{sender}: {text}{suffix}".rstrip() + "\n")
 
@@ -523,7 +548,7 @@ async def resource_to_record(resource: dict[str, Any], directory: Directory) -> 
     content = resource.get("content", "")
     props = resource.get("properties") or {}
     thread_id = thread_of(resource)
-    text = strip_html(content) if msgtype == "RichText/Html" else content if msgtype == "Text" else ""
+    text = _body_text(msgtype, content, directory.known_name)
     return {
         "id": resource.get("id"),
         "time": resource.get("composetime") or resource.get("originalarrivaltime"),

@@ -88,6 +88,7 @@ from .messages import (
     mention_kind,
     message_text,
     parse_activity,
+    quote_names,
     reaction_emoji,
     reaction_key,
     snippet,
@@ -415,6 +416,7 @@ def chat_record(
     elif not deleted:
         named: set[str] = set()  # 027-AC6: the reference entries the body already links
         if msgtype == "RichText/Html":
+            content = quote_names(content, known_name)
             mentions = {
                 str(m.get("itemid")): str(m.get("mri") or "")
                 for m in json_list(props.get("mentions"))
@@ -1702,7 +1704,7 @@ class ChatVerbs:
                 "id": str(m.get("id") or ""),
                 "at": str(m.get("composetime") or ""),
                 "name": sender_name(str(m.get("from") or ""), m.get("imdisplayname"), known_name),
-                "text": message_text(m),
+                "text": message_text(m, known_name),
             }
             for m in found
         ]
@@ -2025,6 +2027,8 @@ class ChatVerbs:
         props = copy.get("properties")
         mentions = json_list((props if isinstance(props, dict) else {}).get("mentions"))
         members = (await self._members(thread_id) if mentions else None) or []
+        if copy.get("messagetype") == "RichText/Html" and self.directory:  # the save keeps the names
+            copy = {**copy, "content": quote_names(str(copy.get("content") or ""), self.directory.known_name)}
         return decompose(copy, self.emojis.names, _humans(members))
 
     async def _members(self, thread_id: str) -> list[dict[str, Any]] | None:

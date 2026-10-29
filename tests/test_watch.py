@@ -11,6 +11,7 @@ import pytest
 from miniteams import cli
 from miniteams import watch as W
 from miniteams.auth import AuthExpired
+from miniteams.compose import reply_quote
 from miniteams.config import Settings
 
 ME = "8:orgid:me"
@@ -246,6 +247,16 @@ def test_once_prints_one_line_and_exits_0_even_when_two_arrive_together(
     }
     assert stream.calls[0]["prompt"] is False and stream.calls[0]["epid"]
     assert stream.calls[0]["directory"].bearer == FAKE_TOKEN  # not the id_token beside it
+
+
+def test_a_reply_names_the_quoted_author(settings: Settings, monkeypatch, capsys) -> None:
+    """A Reply block written with Teams' "Display Name" placeholder reads with its author's name."""
+    quoted = {"id": "1", "messagetype": "RichText/Html", "content": "<p>q</p>", "from": ME}
+    stream = _Stream([_message(content=reply_quote(quoted, "Display Name") + "<p>answer</p>")])
+    _wire(monkeypatch, stream)
+    monkeypatch.setattr(W.Directory, "known_name", lambda self, mri: "Me Self" if mri == ME else "")
+    _, lines = _run(settings, W.Watch(thread=THREAD, once=True), capsys)
+    assert lines[0]["text"] == "Me Self q answer"
 
 
 def test_each_process_gets_its_own_endpoint_id(settings: Settings, monkeypatch, capsys) -> None:
