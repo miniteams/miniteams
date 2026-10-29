@@ -40,7 +40,16 @@ from .drafts import (
 )
 from .http import failure
 from .mcp_api import ApiReader
-from .messages import SNIPPET_LEN, fold, is_deleted, is_edited, json_list, message_text, plain_text
+from .messages import (
+    SNIPPET_LEN,
+    fold,
+    is_deleted,
+    is_edited,
+    json_list,
+    message_text,
+    plain_text,
+    quote_names,
+)
 from .render import card_entries, cards_text
 from .send import NOTES_THREAD, edit_message, send_message
 from .watch import note_sent
@@ -175,7 +184,7 @@ def message_record(
         "time": str(message.get("composetime") or ""),
         "sender": sender_name(mri, message.get("imdisplayname"), known_name),
         "from": mri,
-        "text": message_text(message),
+        "text": message_text(message, known_name),
         "edited": is_edited(message),
         "deleted": is_deleted(props),
         "attachments": len(json_list(props.get("files"))) + len(ams),
@@ -795,14 +804,16 @@ def _send_message(server: Server, args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _scheduled_record(draft: dict[str, Any], labels: dict[str, str]) -> dict[str, Any]:
+def _scheduled_record(
+    draft: dict[str, Any], labels: dict[str, str], known_name: Callable[[str], str] | None
+) -> dict[str, Any]:
     thread_id = str(draft.get("innerThreadId") or "").split(";messageid=")[0]
     return {
         "id": str(draft.get("id") or ""),
         "thread_id": thread_id,
         "chat": labels.get(thread_id, ""),
         "send_at": _iso_ms(int((draft.get("draftDetails") or {}).get("sendAt") or 0)),
-        "text": plain_text(str(draft.get("content") or ""))[:SNIPPET_LEN],
+        "text": plain_text(quote_names(str(draft.get("content") or ""), known_name))[:SNIPPET_LEN],
     }
 
 
@@ -817,9 +828,9 @@ def _list_scheduled(server: Server, args: dict[str, Any]) -> dict[str, Any]:
     store = server.drafts()
     wanted = _inner_thread(server, args["thread_id"], skype_token) if args.get("thread_id") else ""
     now_ms = int(time.time() * 1000)
-    labels = _labels(server)
+    labels, known_name = _labels(server), server.archive._known_name()
     pending = [
-        _scheduled_record(d, labels)
+        _scheduled_record(d, labels, known_name)
         for d in _write(store.list, "list")
         if draft_state(d, now_ms) == "pending"
         and (not wanted or str(d.get("innerThreadId") or "").split(";messageid=")[0] == wanted)

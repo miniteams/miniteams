@@ -21,7 +21,7 @@ from .auth import AuthExpired, self_mri, token_source
 from .config import Settings, write_private
 from .directory import Directory, sender_name
 from .dump import iter_history_pages
-from .messages import SNIPPET_LEN, TEXT_TYPES, is_me, plain_text, thread_of
+from .messages import SNIPPET_LEN, TEXT_TYPES, is_me, plain_text, quote_names, thread_of
 from .skype import exchange_skype_token
 from .stream import run_forever
 
@@ -156,6 +156,7 @@ class Watcher:
         else:
             known = sender_name(sender_mri, resource.get("imdisplayname"), self.directory.known_name)
             sender = known or await self.directory.display(sender_mri)
+        content = quote_names(str(resource.get("content") or ""), self.directory.known_name)
         return {
             "event": self.watch.event,
             "thread": thread,
@@ -163,7 +164,7 @@ class Watcher:
             "sender": sender,
             "message_id": str(resource.get("id") or ""),
             "time": str(resource.get("composetime") or resource.get("originalarrivaltime") or ""),
-            "text": plain_text(str(resource.get("content") or ""))[:SNIPPET_LEN],
+            "text": plain_text(content)[:SNIPPET_LEN],
             "reaction": hit["reaction"],
             "note": self.watch.note,
         }

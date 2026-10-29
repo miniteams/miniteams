@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from miniteams import messages as M
+from miniteams.compose import reply_quote
 from miniteams.directory import Directory
 from miniteams.messages import (
     _decode_body,
@@ -87,6 +88,25 @@ async def test_resource_to_record_surfaces_fields(directory: Directory) -> None:
     assert rec["thread_label"] == "Notes to self"
     assert rec["sequenceId"] == 9
     assert rec["raw"] is res
+
+
+async def test_printed_and_recorded_replies_name_the_quoted_author(directory: Directory, capsys) -> None:
+    """A Reply block written with Teams' "Display Name" placeholder reads with its author's name."""
+    directory.note_name("8:orgid:ann", "Ann Lee")
+    quoted = {"id": "1", "messagetype": "RichText/Html", "content": "<p>q</p>", "from": "8:orgid:ann"}
+    res = {
+        "id": "2",
+        "messagetype": "RichText/Html",
+        "from": "8:orgid:guid",
+        "imdisplayname": "Alice",
+        "content": reply_quote(quoted, "Display Name") + "<p>answer</p>",
+        "composetime": "t",
+        "conversationLink": NOTES_LINK,
+    }
+    assert (await resource_to_record(res, directory))["text"] == "Ann Leeqanswer"  # strip_html joins blocks
+    body = {"type": "EventMessage", "resourceType": "NewMessage", "resource": res}
+    await handle_delivery({"url": "https://h/x/messaging", "body": json.dumps(body)}, directory)
+    assert "Alice: Ann Leeqanswer" in capsys.readouterr().out
 
 
 async def test_event_to_record_includes_delivery_envelope(directory: Directory, monkeypatch) -> None:

@@ -426,6 +426,19 @@ async def test_kept_items_are_named_by_key_across_an_edit_elsewhere(
     assert writes[0][2] == _quoted("3", "Bo") + f"<p>x</p><p>{_image(IMG_A)}</p>"
 
 
+async def test_the_editor_names_a_placeholder_quote_and_the_save_keeps_it(
+    edit_board: W.Board, writes: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Reply block written with Teams' "Display Name" placeholder opens and saves with Ann's name."""
+    assert edit_board.directory is not None
+    edit_board.directory.note_name(ANN, "Ann Lee")
+    quoted = {"id": "1", "messagetype": "RichText/Html", "content": "<p>q1</p>", "from": ANN}
+    _edited_elsewhere(edit_board, monkeypatch, reply_quote(quoted, "Display Name") + "<p>x</p>")
+    assert (await _editable(edit_board, "10"))["quotes"] == [{"key": "1", "name": "Ann Lee", "line": "q1"}]
+    assert (await _edit(edit_board, "10", "y", keep_quotes=["1"], keep_images=[]))["ok"]
+    assert writes[0][2].startswith(reply_quote(quoted, "Ann Lee"))
+
+
 async def test_opening_an_editor_has_its_own_busy_slot(edit_board: W.Board, writes: list[Any]) -> None:
     """019-AC4: a pending reaction, delete or send never makes opening an editor answer `busy`."""
 
