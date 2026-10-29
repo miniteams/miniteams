@@ -87,7 +87,11 @@ from (`source`) and carry the archiver's heartbeat (`archiver_seen`, `archiver_s
 `sync_started_at`, and `media_sweep: running` during an `archive --live --verify-media` sweep, written
 by `archive` into `index.db`), so an agent can tell a stopped archiver
 from a quiet one. When the archive cannot be reached (no `index.db`, or no answer in 3 s) the
-first three read from the API instead, with `source: "api"`. `send_message` and `update_message`
+first three read from the API instead, with `source: "api"`. Message records carry `cards`, one
+plain-text line per app or bot card (`[]` when none). From the archive that is the latest refreshed
+version kept in `cards.db` (spec 037), and `read_messages` first asks the apps again for their stale
+cards, its requests stopping at 5 s per call (saving to a busy `cards.db` can take up to 4 s more),
+returning the stored cards past that. `send_message` and `update_message`
 write to Teams as you; with `send_at` (ISO 8601 with an offset, 5 seconds to 125 days ahead)
 `send_message` schedules instead, and `list_scheduled`, `update_scheduled` and `cancel_scheduled`
 manage what Teams is holding (`docs/scheduled-send-wire.md`). Their text, like `miniteams send`'s
@@ -100,7 +104,7 @@ name settles a shared one) shown as `label`, the whole `@{Who|label}` read raw, 
 mention @Lee: Ann Lee, Bob Lee (\@ for a literal @)`), a malformed label, a roster that cannot be fetched, `@everyone` on a 1:1,
 more than 50 mentions or 28 KB of HTML refuse the send (an MCP error, exit 2 for the CLI), nothing written. `--read-only` keeps every writing tool
 out of the list. Nothing needs a token until the
-API is called; a dead credential makes that call return a device-login URL and code, and `login` reports the
+API is called or `read_messages` meets an app card due a refresh (with no token: the stored card, no sign-in started); a dead credential makes an API call return a device-login URL and code, and `login` reports the
 same flow. The server needs the project's `.env` and `data/`, so register it as
 `uv run --directory /path/to/miniteams miniteams mcp` (a gitignored `.mcp.json` at the repo root
 does it for Claude Code).
@@ -375,7 +379,7 @@ before.
 `archive` builds a resumable local archive under `./data/`: `index.db` (chat metadata) plus
 one folder per conversation with a `messages.db` (every message as raw API JSON, keyed by id)
 and a `media/` folder (attachments at original quality). `cards.db` beside them holds the latest
-refreshed app cards (spec 037), written by `web`, never by `archive`. Interrupt anytime —
+refreshed app cards (spec 037), written by `web` and the MCP server, never by `archive`. Interrupt anytime —
 re-running resumes from the oldest stored message, tops up new ones, and skips media already on
 disk. Assets the archive gave up on are remembered per chat: a 403 (deleted object, lost share
 permission) or a 413 (transcript over the 50 MiB cap) is permanent, a 404 backs off (1h → 6h →

@@ -1037,3 +1037,43 @@ async def test_a_newer_version_does_not_join_the_older_ones_refresh(
     assert sorted(await newer) == ["card-1", "card-2"]
     assert sorted(await first) == sorted(await again) == ["card-1"]
     assert refresher._inflight == {}
+
+
+@pytest.mark.parametrize("deadline", [None, 60.0])
+async def test_a_lookup_timing_out_on_its_own_is_negative_cached(
+    make: Callable[[Teams], CR.CardRefresher], monkeypatch: pytest.MonkeyPatch, deadline: float | None
+) -> None:
+    """037-AC7: a definitions lookup past its own request deadline (no caller deadline, or a later one) is
+    negative-cached and its card waits the interval, as before the MCP budget."""
+    monkeypatch.setattr(CR, "_POST_DEADLINE", 0.1)
+    teams = Teams()
+
+    async def slow(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(1.0)
+        return httpx.Response(200, json=[])
+
+    refresher = make(teams)
+    refresher._transport = httpx.MockTransport(slow)
+    when = None if deadline is None else CR.time.monotonic() + deadline
+    await refresher.refresh(T, _msg(), me=ME, skype_token=SKYPE, bearer=BEARER, deadline=when)
+    bot, _, failed = refresher._bots[APP]
+    assert bot == "" and failed is not None and failed.reason == "timeout"
+    assert CR.CardStore(refresher.store.path).load(T, "1700000000001")["card-1"].retry > T0
+
+
+def test_a_busy_writer_gives_up_after_the_lock_wait(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """037-AC5: another thread holding this store's writer: the save gives up after `_BUSY_TIMEOUT`, logs
+    one line, writes nothing."""
+    monkeypatch.setattr(CR, "_BUSY_TIMEOUT", 0.05)
+    store = CR.CardStore(tmp_path / "cards.db")
+    holder = threading.Thread(target=store._writing.acquire)
+    holder.start()
+    holder.join()
+    structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.DEBUG))
+    try:
+        with capture_logs() as logs:
+            store.save(T, "1", "card-1", _content("DONE"), T0, T0 + 1)
+    finally:
+        store._writing.release()
+    assert [(e["event"], e["error"]) for e in logs] == [("card_store_write_failed", "writer busy")]
+    assert store.load(T, "1") == {} and not (tmp_path / "cards.db").exists()

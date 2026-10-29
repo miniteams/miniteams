@@ -704,3 +704,113 @@ def cards_html(
             app = f'<div class="card-app">{html.escape(card["app"])}</div>' if card["app"] else ""
             out.append(f'<div class="card">{app}{body}</div>')
     return "".join(out)
+
+
+_CARD_LINE = 500  # chars of a card's text line
+
+
+def _md_plain(m: re.Match[str]) -> str:
+    label, _, bold, italic = m.groups()
+    return label if label is not None else bold if bold is not None else italic
+
+
+class _CardText:
+    """A card's visible text in the renderer's reading order and limits; actions and images left out."""
+
+    def __init__(self) -> None:
+        self.parts: list[str] = []
+        self.size = 0  # chars in `parts`, per card
+        self.nodes = 0  # per card
+        self.md_left = _MSG_MD  # per message
+
+    def plain(self, text: str, md: bool = True) -> str:
+        """`text` on one line, its markdown reduced to the words shown; spends the message's budget."""
+        text = text[: min(_MD_MAX, self.md_left)]
+        self.md_left -= len(text)
+        return " ".join((_MD_INLINE.sub(_md_plain, text) if md else text).split())
+
+    def add(self, text: str, md: bool = True) -> None:
+        for line in text[: min(_MD_MAX, self.md_left)].splitlines():
+            if self.size > _CARD_LINE:
+                return
+            if part := self.plain(line, md):
+                self.parts.append(part)
+                self.size += len(part) + 3
+
+    def many(self, items: object, depth: int, fn: Callable[[dict[str, Any], int], None]) -> None:
+        if not isinstance(items, list) or depth > _CARD_DEPTH:
+            return
+        for item in items:
+            if self.nodes >= _CARD_NODES or self.size > _CARD_LINE:
+                return
+            self.nodes += 1
+            if isinstance(item, dict):
+                fn(item, depth)
+
+    def card(self, card: dict[str, Any], content_type: str) -> None:
+        if content_type == _CODESNIPPET:
+            self.add(_str(card.get("title")), md=False)
+            self.add(_str(card.get("text")), md=False)
+        elif card.get("type") != "AdaptiveCard" and "body" not in card:
+            self.add(_str(card.get("title")), md=False)
+            self.add(_str(card.get("text")))
+            self.many(card.get("sections"), 1, self.section)
+        else:
+            self.many(card.get("body"), 1, self.element)
+
+    def section(self, sec: dict[str, Any], depth: int) -> None:
+        self.add(_str(sec.get("activityTitle")))
+        self.add(_str(sec.get("text")))
+        self.many(sec.get("facts"), depth + 1, self.fact)
+
+    def fact(self, fact: dict[str, Any], depth: int) -> None:
+        title = self.plain(_str(fact.get("title")) or _str(fact.get("name")), md=False)
+        value = self.plain(_str(fact.get("value")))
+        self.add(f"{title}: {value}" if title and value else title or value, md=False)
+
+    def row(self, row: dict[str, Any], depth: int) -> None:
+        self.many(row.get("cells"), depth + 1, self.cell)
+
+    def cell(self, cell: dict[str, Any], depth: int) -> None:
+        self.many(cell.get("items"), depth + 1, self.element)
+
+    def element(self, el: dict[str, Any], depth: int) -> None:
+        kind = el.get("type")
+        if kind in ("TextBlock", "RichTextBlock") and _is_toggle(el):
+            return
+        if kind == "TextBlock":
+            self.add(_str(el.get("text")))
+        elif kind == "RichTextBlock":
+            inlines = el.get("inlines")
+            runs = inlines[:_CARD_NODES] if isinstance(inlines, list) else []
+            self.add(
+                "".join(
+                    _str(r.get("text"))[:_MD_MAX] for r in runs if isinstance(r, dict) and not _is_toggle(r)
+                ),
+                md=False,
+            )
+        elif kind == "ColumnSet":
+            self.many(el.get("columns"), depth + 1, self.element)
+        elif kind in ("Container", "Column"):
+            self.many(el.get("items"), depth + 1, self.element)
+        elif kind == "FactSet":
+            self.many(el.get("facts"), depth + 1, self.fact)
+        elif kind == "Table":
+            self.many(el.get("rows"), depth + 1, self.row)
+        elif kind not in ("Image", "ImageSet", "ActionSet"):
+            text = next((t for k in ("text", "title", "label", "placeholder") if (t := _str(el.get(k)))), "")
+            self.add(text, md=False)
+
+
+def cards_text(message: dict[str, Any], overrides: Mapping[str, dict[str, Any]] | None = None) -> list[str]:
+    """One plain-text line per card of `message`, its text joined by " · " (the summary or fallbackText when
+    it has none), at most `_CARD_LINE` chars; the cards `cards_html` shows. `overrides`: as there."""
+    out = []
+    walker = _CardText()
+    for card in (card_from_message(message, overrides) or [])[:_MSG_CARDS]:
+        walker.parts, walker.size, walker.nodes = [], 0, 0
+        walker.card(card["content"], card["type"])
+        line = " · ".join(walker.parts) or " ".join(card["fallback"][: _CARD_LINE * 2].split())
+        if line:
+            out.append(line if len(line) <= _CARD_LINE else line[: _CARD_LINE - 1] + "…")
+    return out

@@ -8,7 +8,7 @@ local SQLite + files — no network, no auth, no Teams API.
 ```
 data/
   index.db                          # one row per conversation (the channel directory)
-  cards.db                          # latest refreshed app cards (spec 037); written by web, not the archiver
+  cards.db                          # latest refreshed app cards (spec 037); written by web and mcp, not the archiver
   <thread-id>/                      # thread id with `/` → `_`; usually verbatim
     messages.db                     # every message of that conversation, raw API JSON
     media/                          # attachments of the --media selection (default images,

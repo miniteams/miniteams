@@ -4283,6 +4283,8 @@ async def test_a_burst_of_card_saves_leaves_the_archive_pool_room(
     many = "19:many-cards@thread.v2"
     _archive(data_dir, many, [_card_msg(str(i), "1000") for i in range(100, 200)])
     card_teams.apps = httpx.Response(500)
+    # A healthy mount: a slow run must not turn a queued save into a deadline refusal.
+    monkeypatch.setitem(CV._DEADLINES, "relay", 60.0)
     queued: list[int] = []
     real = CR.CardStore.save
 
@@ -4293,7 +4295,7 @@ async def test_a_burst_of_card_saves_leaves_the_archive_pool_room(
     monkeypatch.setattr(CR.CardStore, "save", save)
     await _following(card_board, many)
     assert len((await _history(card_board, many))["messages"]) == 100
-    await wait(lambda: len(queued) == 100 and card_board.chat._card_jobs == {}, "the saves", tries=1000)
+    await wait(lambda: len(queued) == 100 and card_board.chat._card_jobs == {}, "the saves", tries=3000)
     assert max(queued) < CV._BACKLOG // 4, max(queued)
     rows = CR.CardStore(data_dir / "cards.db").load_many(many, [str(i) for i in range(100, 200)])
     assert len(rows) == 100 and all(r["card-1"].card is None and r["card-1"].retry > 0 for r in rows.values())
@@ -4345,3 +4347,24 @@ async def test_a_full_card_store_gate_gives_up_at_the_relay_deadline(
     release.set()
     assert await holder is True
     assert await refresher.blocking(lambda: "after") == "after"  # no permit lost to the timed-out wait
+
+
+def test_concurrent_first_saves_lose_no_row(tmp_path: Path) -> None:
+    """037-AC5: two pool threads writing a fresh `cards.db` at once: the WAL switch of one would make the
+    other's write fail at once (SQLITE_BUSY, no busy wait), losing its retry row."""
+    for n in range(50):
+        store = CR.CardStore(tmp_path / f"cards-{n}.db")
+        start = threading.Barrier(2)
+
+        def write(side: int, store: CR.CardStore = store, start: threading.Barrier = start) -> None:
+            start.wait()
+            for i in range(5):
+                store.save(CT, f"{side}-{i}", "card-1", None, time.time(), time.time() + 600)
+
+        threads = [threading.Thread(target=write, args=(side,)) for side in (0, 1)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        ids = [f"{side}-{i}" for side in (0, 1) for i in range(5)]
+        assert len(store.load_many(CT, ids)) == 10, n

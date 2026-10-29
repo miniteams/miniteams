@@ -10,7 +10,7 @@ import sqlite3
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,6 +23,7 @@ from . import __version__
 from .archive import RefreshingToken
 from .archive_store import chat_dir_name, find_chat_dir, read_chats, read_meta, search_chat
 from .auth import AuthExpired, AuthUnavailable, TokenSource, self_mri, token_source
+from .card_refresh import _BUSY_TIMEOUT, CardRefresher, Cards, CardStore
 from .chats import chat_kind, is_system, last_activity, parse_when
 from .compose import render_outgoing
 from .config import Settings
@@ -40,6 +41,7 @@ from .drafts import (
 from .http import failure
 from .mcp_api import ApiReader
 from .messages import SNIPPET_LEN, fold, is_deleted, is_edited, json_list, message_text, plain_text
+from .render import card_entries, cards_text
 from .send import NOTES_THREAD, edit_message, send_message
 from .watch import note_sent
 
@@ -50,6 +52,8 @@ _PARSE_ERROR, _INVALID_REQUEST, _METHOD_NOT_FOUND, _INVALID_PARAMS = -32700, -32
 _SEARCH_DAYS = 7  # default window of search_messages, and of read_messages on the API
 _PROBE_DEADLINE = 3.0  # seconds an archive gets to answer before the API takes over
 _PROBE_HOLD = 60.0  # seconds the archive counts as unavailable after a failed probe
+_CARDS_BUDGET = 5.0  # seconds of card refreshes per read_messages call, tokens in; a running save outlasts it
+_CARDS_GRACE = 0.5  # seconds of that budget left after the last request for its save
 _LOGIN_HINT = "An archiver that stopped on the expired credential has to be started again after signing in."
 _INSTRUCTIONS = (
     "miniteams: your own Microsoft Teams chats, read from a local archive. Results carry `source` and, "
@@ -144,8 +148,26 @@ def _utc(value: str, *, end: bool = False) -> str:
         raise ToolError(f"invalid ISO date/datetime: {value!r}") from exc
 
 
-def message_record(message: dict[str, Any], known_name: Callable[[str], str] | None = None) -> dict[str, Any]:
-    props = message.get("properties") or {}
+def _props(message: dict[str, Any]) -> dict[str, Any]:
+    props = message.get("properties")
+    return props if isinstance(props, dict) else {}
+
+
+def _shows_cards(message: dict[str, Any]) -> bool:
+    """The chat page shows the message's cards: not deleted, a card message or one with app cards."""
+    props = _props(message)
+    return not is_deleted(props) and (
+        message.get("messagetype") == "RichText/Media_Card" or bool(props.get("cards"))
+    )
+
+
+def message_record(
+    message: dict[str, Any],
+    known_name: Callable[[str], str] | None = None,
+    cards: Mapping[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """`cards`: refreshed app cards by cardClientId (spec 037), shown instead of the posted ones."""
+    props = _props(message)
     ams = message.get("amsreferences") or []
     mri = str(message.get("from") or "").rsplit("/", 1)[-1]
     record = {
@@ -157,16 +179,20 @@ def message_record(message: dict[str, Any], known_name: Callable[[str], str] | N
         "edited": is_edited(message),
         "deleted": is_deleted(props),
         "attachments": len(json_list(props.get("files"))) + len(ams),
+        "cards": cards_text(message, cards) if _shows_cards(message) else [],
     }
     return record
 
 
 class Archive:
-    """Read-only view of `--data-dir`. Every database is opened `mode=ro`; nothing is created."""
+    """Read-only view of `--data-dir`: every archive database is opened `mode=ro`, none is created. Only
+    `cards.db`, the app card cache beside them (spec 037), is written."""
 
     def __init__(self, data_dir: Path, settings: Settings | None = None) -> None:
         self.data_dir = data_dir
         self.settings = settings  # its cache_dir holds the names other miniteams processes resolved
+        # One per process: its bot ids and holds outlive a call.
+        self.cards = CardRefresher(settings, CardStore(data_dir / "cards.db")) if settings else None
 
         self._down_until = 0.0
         self._probe: Callable[[], None] = self._open_index
@@ -270,7 +296,77 @@ class Archive:
         found.sort(key=lambda c: c["last_activity"], reverse=True)
         return found[:limit]
 
-    def read_messages(self, thread_id: str, since: str, until: str, limit: int) -> dict[str, Any]:
+    def _cards(
+        self,
+        thread_id: str,
+        messages: list[dict[str, Any]],
+        tokens: Callable[[float], tuple[str, str] | None] | None = None,
+    ) -> dict[str, Cards]:
+        """message id → its refreshed app cards as stored; with `tokens` (given a timeout), the stale eligible
+        ones are asked of their bots first, tokens and all within `_CARDS_BUDGET` (037-AC9): past it, as
+        stored."""
+        carded = {str(m.get("id") or ""): m for m in messages if _shows_cards(m) and card_entries(m)}
+        carded.pop("", None)
+        if self.cards is None or not carded:
+            return {}
+        refresher = self.cards
+        end = time.monotonic() + _CARDS_BUDGET
+        deadline = end - _CARDS_GRACE
+        rows = refresher.store.load_many(thread_id, list(carded))
+        out = {mid: refresher.stored(thread_id, m, rows.get(mid, {})) for mid, m in carded.items()}
+        # Tokens only for a card some user would refresh now: `me` comes with them.
+        if tokens is None or not any(
+            refresher.due(thread_id, m, None, rows.get(mid, {})) for mid, m in carded.items()
+        ):
+            return out
+        pair = tokens(deadline - time.monotonic())
+        if pair is None:
+            return out
+        skype_token, bearer = pair
+        me = self_mri(bearer)
+        due = {mid: m for mid, m in carded.items() if refresher.due(thread_id, m, me, rows.get(mid, {}))}
+        if not due:
+            return out
+
+        async def refresh_all() -> None:
+            tasks = {
+                mid: asyncio.ensure_future(
+                    refresher.refresh(
+                        thread_id,
+                        m,
+                        me=me,
+                        skype_token=skype_token,
+                        bearer=bearer,
+                        rows=rows.get(mid, {}),
+                        deadline=deadline,
+                    )
+                )
+                for mid, m in due.items()
+            }
+            await asyncio.wait(tasks.values(), timeout=max(0.0, end - time.monotonic()))
+            late = 0
+            for mid, task in tasks.items():
+                if not task.done():  # asyncio.run cancels it on return, closing its clients
+                    late += 1
+                elif task.exception() is not None:
+                    log.warning("mcp_card_refresh_failed", error_type=type(task.exception()).__name__)
+                else:
+                    out[mid] = task.result()
+            if late:
+                log.info("mcp_card_budget_spent", late=late, due=len(tasks))
+
+        asyncio.run(refresh_all())
+        return out
+
+    def read_messages(
+        self,
+        thread_id: str,
+        since: str,
+        until: str,
+        limit: int,
+        tokens: Callable[[float], tuple[str, str] | None] | None = None,
+    ) -> dict[str, Any]:
+        """`tokens`: (skype token, bearer) within its timeout, or None, given to refresh the app cards."""
         path = self.chat_dir(thread_id) / "messages.db"
         if not path.is_file():
             return {"thread_id": thread_id, "messages": []}
@@ -296,7 +392,11 @@ class Archive:
             rows = [r for r in rows[:limit] if r[0] < cut]
             result["next_since"] = cut
         known_name = self._known_name()
-        result["messages"] = [message_record(json.loads(raw), known_name) for _, raw in rows]
+        messages = [json.loads(raw) for _, raw in rows]
+        cards = self._cards(thread_id, messages, tokens)
+        result["messages"] = [
+            message_record(m, known_name, cards.get(str(m.get("id") or ""))) for m in messages
+        ]
         return result
 
     def search_messages(
@@ -323,7 +423,15 @@ class Archive:
             except sqlite3.Error as exc:
                 raise self._unavailable(exc) from exc
             more = more or extra
-            hits += [{**message_record(m, known_name), "thread_id": chat_id, "chat": label} for m in found]
+            cards = self._cards(chat_id, found)
+            hits += [
+                {
+                    **message_record(m, known_name, cards.get(str(m.get("id") or ""))),
+                    "thread_id": chat_id,
+                    "chat": label,
+                }
+                for m in found
+            ]
         hits.sort(key=lambda h: h["time"], reverse=True)
         more = more or len(hits) > limit
         return {"chats_scanned": len(targets), "more": more, "messages": hits[:limit]}
@@ -378,8 +486,8 @@ class Archive:
 class Session:
     """Credentials for the API paths: silent refresh, and a device-code sign-in when that is dead.
 
-    Nothing here is touched while the archive answers, so a read-only session never rotates the
-    refresh token under `web` or `archive --live`."""
+    While the archive answers, only `quiet_tokens` touches it, for a page with app cards (spec 037);
+    other reads never refresh the token under `web` or `archive --live`."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -388,6 +496,8 @@ class Session:
         self._flow: dict[str, Any] | None = None
         self._flow_result: dict[str, Any] | None = None
         self._lock = threading.Lock()
+        self._quiet: tuple[threading.Thread, dict[str, Any]] | None = None  # the fetch of `quiet_tokens`
+        self._quiet_hold = 0.0  # monotonic end of a failed fetch's hold
 
     @property
     def source(self) -> TokenSource:
@@ -409,6 +519,33 @@ class Session:
             raise self._login_error() from None
         except AuthUnavailable as exc:
             raise ToolError(f"Microsoft did not answer the token refresh ({exc}); retry later") from exc
+
+    def quiet_tokens(self, timeout: float) -> tuple[str, str] | None:
+        """(skype token, bearer) for an optional call within `timeout` s, else None; no sign-in starts.
+
+        Fetched in a thread, as `Archive.available` probes: a slow fetch carries on for the next call, one at
+        a time, and a failure holds for `_PROBE_HOLD`."""
+        if time.monotonic() < self._quiet_hold:
+            return None
+        worker, outcome = self._quiet or (None, {})
+        if worker is None or not worker.is_alive() and "error" not in outcome:
+            outcome = {}
+            worker = threading.Thread(target=self._fetch_quiet, args=(outcome,), daemon=True)
+            worker.start()
+            self._quiet = (worker, outcome)
+        worker.join(max(0.0, timeout))
+        if "error" in outcome:
+            log.info("mcp_tokens_unavailable", error_type=outcome["error"])
+            self._quiet, self._quiet_hold = None, time.monotonic() + _PROBE_HOLD
+            return None
+        pair: tuple[str, str] | None = outcome.get("pair")
+        return pair
+
+    def _fetch_quiet(self, outcome: dict[str, Any]) -> None:
+        try:
+            outcome["pair"] = (self.provider.token(), self.provider.bearer())
+        except Exception as exc:  # noqa: BLE001 — the caller does without; the type only, never the text
+            outcome["error"] = type(exc).__name__
 
     def _login_error(self) -> ToolError:
         pending = self.login()
@@ -502,7 +639,10 @@ def _read_messages(server: Server, args: dict[str, Any]) -> dict[str, Any]:
     thread_id, limit = args["thread_id"], args.get("limit", 100)
     if server.archive.available():
         archive = server.archive
-        return {**archive.meta(), **archive.read_messages(thread_id, since, until, limit)}
+        return {
+            **archive.meta(),
+            **archive.read_messages(thread_id, since, until, limit, server.session.quiet_tokens),
+        }
     page = server.api().read_messages(thread_id, since or _default_since(), until, limit)
     return {"source": "api", **page}
 
@@ -774,7 +914,9 @@ TOOLS: tuple[Tool, ...] = (
     Tool(
         "read_messages",
         "Messages of one chat as plain text, oldest first, inside [since, until). A cut page carries "
-        "`next_since` to resume from.",
+        "`next_since` to resume from. `cards`: one text line per app or bot card ([] when none); from the "
+        f"archive, a stale card is first asked again of its app: requests stop at {_CARDS_BUDGET:.0f} s per "
+        f"call, saving to a busy cards.db can take up to {2 * _BUSY_TIMEOUT:.0f} s more.",
         {
             "thread_id": {"type": "string"},
             "since": {"type": "string", "description": "ISO date/datetime (UTC unless an offset is given)"},
@@ -787,7 +929,8 @@ TOOLS: tuple[Tool, ...] = (
     Tool(
         "search_messages",
         "Find messages whose text contains a word or phrase (case and accents ignored), newest first, across "
-        "the chats active in the window or inside one chat. `since` defaults to 7 days back.",
+        "the chats active in the window or inside one chat. `since` defaults to 7 days back. `cards`: as "
+        "read_messages, never asked again.",
         {
             "query": {"type": "string"},
             "since": {"type": "string", "description": "ISO date/datetime; default: 7 days ago"},

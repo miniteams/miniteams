@@ -7,6 +7,7 @@ import asyncio
 import json
 import math
 import sqlite3
+import threading
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
@@ -52,8 +53,9 @@ def _text(value: object) -> str:
     return value if isinstance(value, str) else ""
 
 
-def refresh_action(entry: object, me: str) -> dict[str, Any] | None:
-    """The `refresh.action` of a `properties.cards[]` entry Teams refreshes for `me` (037-AC4), else None."""
+def refresh_action(entry: object, me: str | None) -> dict[str, Any] | None:
+    """The `refresh.action` of a `properties.cards[]` entry Teams refreshes for `me` (037-AC4), else None;
+    `me` None: for some user, the `userIds` rule left out."""
     if not isinstance(entry, dict) or not _text(entry.get("appId")) or not _text(entry.get("cardClientId")):
         return None
     content = entry.get("content")
@@ -66,7 +68,7 @@ def refresh_action(entry: object, me: str) -> dict[str, Any] | None:
     ):
         return None
     users = refresh.get("userIds") if isinstance(refresh, dict) else None
-    if users not in (None, []) and not (me and isinstance(users, list) and me in users):
+    if me is not None and users not in (None, []) and not (me and isinstance(users, list) and me in users):
         return None
     return action
 
@@ -82,6 +84,10 @@ def _epoch(value: object) -> float:
         return 0.0  # unreadable: due now
 
 
+def _late(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
 class Row(NamedTuple):
     card: dict[str, Any] | None  # the last good card
     refreshed: float  # epoch of that card, 0 when none
@@ -93,6 +99,8 @@ class CardStore:
 
     def __init__(self, path: Path) -> None:
         self.path = path
+        # One writer per process: two connections creating the file (WAL switch) get SQLITE_BUSY at once.
+        self._writing = threading.Lock()
 
     def load(self, thread_id: str, message_id: str) -> dict[str, Row]:
         """card id → its row; {} when the file is missing or locked."""
@@ -140,6 +148,9 @@ class CardStore:
     ) -> None:
         """A refreshed `card`, or (None) a failure that keeps the stored card and only moves `retry_at`."""
         text = json.dumps(card, ensure_ascii=False, separators=(",", ":")) if card is not None else ""
+        if not self._writing.acquire(timeout=_BUSY_TIMEOUT):
+            log.info("card_store_write_failed", error="writer busy", error_type="TimeoutError")
+            return
         try:
             db = sqlite3.connect(self.path, timeout=_BUSY_TIMEOUT)
             try:
@@ -156,6 +167,8 @@ class CardStore:
                 db.close()
         except sqlite3.Error as exc:
             log.info("card_store_write_failed", error=str(exc), error_type=type(exc).__name__)
+        finally:
+            self._writing.release()
 
 
 class Failed(Exception):
@@ -217,8 +230,8 @@ class CardRefresher:
         merged = self._merged(thread_id, message_id, ids, rows)
         return {cid: row.card for cid, row in merged.items() if row.card is not None}
 
-    def due(self, thread_id: str, message: dict[str, Any], me: str, rows: dict[str, Row]) -> bool:
-        """Whether a card of `message` is due a refresh for `me`, given its `cards.db` rows."""
+    def due(self, thread_id: str, message: dict[str, Any], me: str | None, rows: dict[str, Row]) -> bool:
+        """Whether a card of `message` is due a refresh for `me` (None: for some user), given its rows."""
         message_id = _text(message.get("id"))
         entries = {k: e for k, e in card_entries(message).items() if isinstance(k, str)}
         if not message_id or not entries:
@@ -226,7 +239,7 @@ class CardRefresher:
         return bool(self._due(entries, self._merged(thread_id, message_id, list(entries), rows), me))
 
     def _due(
-        self, entries: dict[str, dict[str, Any]], rows: dict[str, Row], me: str
+        self, entries: dict[str, dict[str, Any]], rows: dict[str, Row], me: str | None
     ) -> list[tuple[str, str, dict[str, Any]]]:
         """(card id, app id, refresh action) of the cards due: eligible on their latest copy, retry passed."""
         now = self.clock()
@@ -266,9 +279,11 @@ class CardRefresher:
         skype_token: str,
         bearer: str,
         rows: dict[str, Row] | None = None,
+        deadline: float | None = None,
     ) -> Cards:
         """The message's cards after asking the bots of those due; one request per message version at a time.
-        `rows`: its `cards.db` rows when the caller read them, else read here."""
+        `rows`: its `cards.db` rows when the caller read them, else read here. `deadline`, `time.monotonic()`
+        time: a request still running then fails as a timeout; one not started is left for a later call."""
         if (loop := asyncio.get_running_loop()) is not self._loop:
             if self._inflight and self._loop is not None and not self._loop.is_closed():
                 raise RuntimeError("CardRefresher used from two event loops")
@@ -276,7 +291,9 @@ class CardRefresher:
         key = (thread_id, _text(message.get("id")), message_version(message))
         task = self._inflight.get(key)
         if task is None:
-            task = asyncio.ensure_future(self._refresh(key[:2], message, me, skype_token, bearer, rows))
+            task = asyncio.ensure_future(
+                self._refresh(key[:2], message, me, skype_token, bearer, rows, deadline)
+            )
             self._inflight[key] = task
             # A callback, not a finally: it also runs for a task cancelled before it started.
             task.add_done_callback(
@@ -293,6 +310,7 @@ class CardRefresher:
         skype_token: str,
         bearer: str,
         stored: dict[str, Row] | None,
+        deadline: float | None,
     ) -> Cards:
         thread_id, message_id = key
         entries = {k: e for k, e in card_entries(message).items() if isinstance(k, str)}
@@ -315,7 +333,7 @@ class CardRefresher:
         async with httpx.AsyncClient(transport=self._transport, timeout=_TIMEOUT) as client:
             got = await asyncio.gather(
                 *(
-                    self._one(client, thread_id, message, a, app, cid, skype_token, bearer)
+                    self._one(client, thread_id, message, a, app, cid, skype_token, bearer, deadline)
                     for cid, app, a in due
                 )
             )
@@ -332,18 +350,23 @@ class CardRefresher:
         card_id: str,
         skype_token: str,
         bearer: str,
+        deadline: float | None,
     ) -> dict[str, Any] | None:
         message_id = _text(message.get("id"))
         card = None
         try:
             async with self._sem:
+                if _late(deadline):
+                    return None  # not asked: nothing saved, a later call asks it
                 if not self._held(app_id):
-                    bot = await self._bot(app_id, skype_token, bearer)
+                    bot = await self._bot(app_id, skype_token, bearer, deadline)
                     if not self._held(app_id):  # a 429 elsewhere may have held the app during the lookup
                         card = await self._invoke(
-                            client, thread_id, message, action, app_id, bot, skype_token
+                            client, thread_id, message, action, app_id, bot, skype_token, deadline
                         )
         except Exception as exc:  # noqa: BLE001 — any failure keeps the stored card (037-AC5)
+            if isinstance(exc, Failed) and exc.reason == "cut":
+                return None  # its lookup was cut by the caller's deadline: unsaved, as a queued card
             failed = exc if isinstance(exc, Failed) else Failed("error")
             extra = {} if isinstance(exc, Failed) else {"error": type(exc).__name__}
             log.warning(
@@ -353,7 +376,9 @@ class CardRefresher:
                 retry = self._hold(app_id, failed.wait)
             else:
                 retry = self.clock() + min(max(REFRESH_INTERVAL, failed.wait), _RETRY_MAX)
-            await self._save(thread_id, message_id, card_id, None, retry)
+            # Cut by the caller's deadline, not the bot: this process waits, cards.db stays due for others.
+            cut = failed.reason == "timeout" and _late(deadline)
+            await self._save(thread_id, message_id, card_id, None, retry, shared=not cut)
             return None
         if card is None:  # held by a 429: no request, the card waits for the hold's end
             await self._save(thread_id, message_id, card_id, None, self._held(app_id) or self.clock())
@@ -381,8 +406,15 @@ class CardRefresher:
         return until
 
     async def _save(
-        self, thread_id: str, message_id: str, card_id: str, card: dict[str, Any] | None, retry: float
+        self,
+        thread_id: str,
+        message_id: str,
+        card_id: str,
+        card: dict[str, Any] | None,
+        retry: float,
+        shared: bool = True,
     ) -> None:
+        """Kept in this process, and in `cards.db` when `shared`."""
         now = self.clock()
         key = (thread_id, message_id, card_id)
         prev = self._saved.get(key)
@@ -391,18 +423,20 @@ class CardRefresher:
         self._saved.move_to_end(key)
         while len(self._saved) > _SAVED_MAX:
             self._saved.popitem(last=False)
+        if not shared:
+            return
         try:
             await self.blocking(self.store.save, thread_id, message_id, card_id, card, now, retry)
         except Exception as exc:  # noqa: BLE001 — kept in `_saved`, as an unwritable store is
             log.info("card_store_write_failed", error_type=type(exc).__name__)
 
-    async def _bot(self, app_id: str, skype_token: str, bearer: str) -> str:
+    async def _bot(self, app_id: str, skype_token: str, bearer: str, deadline: float | None = None) -> str:
         """The app's bot id, cached per process (037-AC7); an app without one is negative-cached."""
         hit = self._bots.get(app_id)
         if hit is None or hit[1] <= self.clock():
             task = self._lookups.get(app_id)
             if task is None:
-                task = asyncio.ensure_future(self._lookup(app_id, skype_token, bearer))
+                task = asyncio.ensure_future(self._lookup(app_id, skype_token, bearer, deadline))
                 self._lookups[app_id] = task
                 task.add_done_callback(
                     lambda done: self._lookups.pop(app_id) if self._lookups.get(app_id) is done else None
@@ -416,12 +450,15 @@ class CardRefresher:
             raise Failed(failed.reason, failed.status, failed.wait)
         return bot
 
-    async def _lookup(self, app_id: str, skype_token: str, bearer: str) -> tuple[str, float, Failed | None]:
-        """One definition lookup, cached: the bot id, or the failure until its expiry."""
+    async def _lookup(
+        self, app_id: str, skype_token: str, bearer: str, deadline: float | None
+    ) -> tuple[str, float, Failed | None]:
+        """One definition lookup, cached: the bot id, or the failure until its expiry. One cut by the caller's
+        `deadline` holds the app for the interval in this process only: its cards are left unsaved."""
         try:
             async with httpx.AsyncClient(transport=self._transport, timeout=_TIMEOUT) as client:
                 hit: tuple[str, float, Failed | None] = (
-                    await self._fetch_bot(client, app_id, skype_token, bearer),
+                    await self._fetch_bot(client, app_id, skype_token, bearer, deadline),
                     math.inf,
                     None,
                 )
@@ -430,20 +467,23 @@ class CardRefresher:
             end = (
                 self._hold(app_id, exc.wait) if exc.reason == "throttled" else self.clock() + REFRESH_INTERVAL
             )
-            hit = ("", end, Failed(exc.reason, exc.status, exc.wait))
+            cut = exc.reason == "timeout" and _late(deadline)  # the caller's deadline, not the app
+            hit = ("", end, Failed("cut") if cut else Failed(exc.reason, exc.status, exc.wait))
         self._bots[app_id] = hit
         self._bots.move_to_end(app_id)
         while len(self._bots) > _BOTS_MAX:
             self._bots.popitem(last=False)
         return hit
 
-    async def _fetch_bot(self, client: httpx.AsyncClient, app_id: str, skype_token: str, bearer: str) -> str:
+    async def _fetch_bot(
+        self, client: httpx.AsyncClient, app_id: str, skype_token: str, bearer: str, deadline: float | None
+    ) -> str:
         headers = {
             "Authorization": f"Bearer {bearer}",
             "X-Skypetoken": skype_token,
             "User-Agent": self.settings.user_agent,
         }
-        resp, body = await self._post(client, APPS_URL, headers, [app_id], _DEFINITIONS_MAX)
+        resp, body = await self._post(client, APPS_URL, headers, [app_id], _DEFINITIONS_MAX, deadline)
         if resp.status_code == 429 or (isinstance(body, dict) and body.get("statusCode") == 429):
             raise Failed("throttled", 429, _retry_wait(resp, body))
         if resp.status_code != 200:
@@ -475,6 +515,7 @@ class CardRefresher:
         app_id: str,
         bot: str,
         skype_token: str,
+        deadline: float | None,
     ) -> dict[str, Any]:
         url = f"https://{self.settings.contacts_host}/v1/agents/{quote(f'28:{bot}', safe='')}/invoke"
         headers = {
@@ -493,7 +534,7 @@ class CardRefresher:
             "clientMessageId": _text(message.get("clientmessageid")),
             "conversation": {"id": thread_id},
         }
-        resp, body = await self._post(client, url, headers, payload, _CARD_MAX)
+        resp, body = await self._post(client, url, headers, payload, _CARD_MAX, deadline)
         status = body.get("statusCode") if isinstance(body, dict) else None
         if resp.status_code == 429 or status == 429:
             raise Failed("throttled", 429, _retry_wait(resp, body))
@@ -507,12 +548,20 @@ class CardRefresher:
         return card
 
     async def _post(
-        self, client: httpx.AsyncClient, url: str, headers: dict[str, str], payload: object, limit: int
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        headers: dict[str, str],
+        payload: object,
+        limit: int,
+        deadline: float | None,
     ) -> tuple[httpx.Response, object]:
-        """POST, the reply read up to `limit` bytes within `_POST_DEADLINE`; body None when it is not JSON."""
+        """POST, the reply read up to `limit` bytes within `_POST_DEADLINE` and by `deadline`; body None when
+        it is not JSON."""
+        wait = _POST_DEADLINE if deadline is None else min(_POST_DEADLINE, deadline - time.monotonic())
         try:
             async with (
-                asyncio.timeout(_POST_DEADLINE),
+                asyncio.timeout(wait),
                 client.stream("POST", url, headers=headers, json=payload) as resp,
             ):
                 raw = bytearray()
