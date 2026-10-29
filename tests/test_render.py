@@ -892,6 +892,24 @@ def test_properties_cards_carrier(as_string: bool) -> None:
     )
 
 
+def test_properties_cards_same_client_id_render_once() -> None:
+    """An edited message can carry the same unfurl card twice; Teams shows it once."""
+
+    def card(client_id: str, text: str) -> dict[str, Any]:
+        return {"appName": "Jira", "cardClientId": client_id, "content": _ac(_tb(text))}
+
+    no_id = {"content": _ac(_tb("no id"))}
+    odd_id = {"cardClientId": ["c1"], "content": _ac(_tb("odd id"))}
+    msg = {
+        "properties": {
+            "cards": [card("c1", "old"), card("c2", "other"), card("c1", "new"), no_id, no_id, odd_id]
+        }
+    }
+    out = cards_html(msg)
+    assert out.count('<div class="card">') == 5
+    assert "old" not in out and out.index("new") < out.index("other") and "odd id" in out
+
+
 def test_unknown_only_body_shows_summary_or_fallback_text() -> None:
     """011-AC24: a card that renders nothing falls back to summary, then fallbackText."""
     body = {"type": "Future.Thing"}

@@ -660,7 +660,12 @@ def card_from_message(message: dict[str, Any]) -> list[dict[str, Any]] | None:
     props = message.get("properties")
     cards = _json(props.get("cards")) if isinstance(props, dict) else None
     if isinstance(cards, list):
-        found += [c for c in cards if isinstance(c, dict)]
+        # An edit can append the unfurl card again under the same cardClientId: one card, the last copy.
+        by_id: dict[str | int, dict[str, Any]] = {}
+        for i, c in enumerate(cards):
+            if isinstance(c, dict):
+                by_id[_str(c.get("cardClientId")) or i] = c
+        found += by_id.values()
     out = []
     for att in found:
         content = att.get("content")

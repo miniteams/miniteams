@@ -158,9 +158,10 @@ click opens Teams web (2026-10-14 decision).
     own storage.
 - **Cards.** Bot and app messages carry an Adaptive Card: `RichText/Media_Card` holds it base64
   in `<Swift b64>` (`attachments[].content`, with `summary`), a `RichText/Html` may hold one in
-  `properties.cards[].content`. The server renders the card body to the same sanitised HTML
-  subset, no script, no external fetch: `TextBlock` and `RichTextBlock` (weight, size, wrap;
-  the Teams markdown subset bold/italic/links/lists), `Container`, `ColumnSet`/`Column` (as a
+  `properties.cards[].content`; entries sharing a `cardClientId` render once, the last copy. The
+  server renders the card body to the same sanitised HTML subset, no script, no external fetch:
+  `TextBlock` and `RichTextBlock` (weight, size, wrap; the Teams markdown subset
+  bold/italic/links/lists), `Container`, `ColumnSet`/`Column` (as a
   flex row), `FactSet` (a two-column table), `Image` (archived or asyncgw → `/media`, else alt
   text, never a link to its external `url`, unlike a message `<img>`; a `/media` one that never loads
   reads "[image not archived]"),
