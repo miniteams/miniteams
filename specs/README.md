@@ -38,4 +38,4 @@
 | [034](034-message-context-menu.md) | Message context menu | shipped |
 | [035](035-click-setting.md) | Choose what each click on a chat row opens | shipped |
 | [036](036-own-presence.md) | Connection banner and own presence | shipped |
-| [037](037-card-refresh.md) | Up-to-date app cards | in progress |
+| [037](037-card-refresh.md) | Up-to-date app cards | shipped |

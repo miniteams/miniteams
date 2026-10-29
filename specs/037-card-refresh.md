@@ -1,6 +1,6 @@
 # 037 — Up-to-date app cards
 
-**Status**: in progress
+**Status**: shipped
 **Requested by**: the user
 **Date**: 2026-10-29
 
@@ -52,29 +52,29 @@ latest card is kept in the archive, so the next view, a restart or an offline re
 
 ## Acceptance criteria
 
-- [ ] **AC1** Given a chat page showing a message whose app card declares an eligible refresh, when
+- [x] **AC1** Given a chat page showing a message whose app card declares an eligible refresh, when
       the stored card is older than the refresh interval, then miniteams asks the bot and the row
       shows the returned card without a reload.
-- [ ] **AC2** A card refreshed less than the refresh interval ago is shown from `data/cards.db`
+- [x] **AC2** A card refreshed less than the refresh interval ago is shown from `data/cards.db`
       without asking the bot again.
-- [ ] **AC3** After a restart, the page and the MCP show the last refreshed card before any new
+- [x] **AC3** After a restart, the page and the MCP show the last refreshed card before any new
       request.
-- [ ] **AC4** A card whose `refresh.userIds` does not list the user, a card without `refresh`, or a
+- [x] **AC4** A card whose `refresh.userIds` does not list the user, a card without `refresh`, or a
       Swift card is never refreshed.
-- [ ] **AC5** Any failure (no app definition, no bot id, non-200, a `statusCode` other than 200, a
+- [x] **AC5** Any failure (no app definition, no bot id, non-200, a `statusCode` other than 200, a
       type other than an adaptive card, a timeout) keeps the card shown so far, logs one structured
       line without tokens, and is not retried before the refresh interval; a `429` waits at least
       its `retryAfter`, capped at a day.
-- [ ] **AC6** One message shown twice at once (two pages of one web process) triggers one request;
+- [x] **AC6** One message shown twice at once (two pages of one web process) triggers one request;
       requests per process are capped in concurrency.
-- [ ] **AC7** Bot ids are looked up once per app per process lifetime, with a bounded cache; an app
+- [x] **AC7** Bot ids are looked up once per app per process lifetime, with a bounded cache; an app
       without one is negative-cached for the refresh interval.
-- [ ] **AC8** MCP `read_messages` records carry `cards`: one plain-text line per card (its text
+- [x] **AC8** MCP `read_messages` records carry `cards`: one plain-text line per card (its text
       blocks), the refreshed version when there is one.
-- [ ] **AC9** MCP `read_messages` refreshes stale eligible cards within a total time budget;
+- [x] **AC9** MCP `read_messages` refreshes stale eligible cards within a total time budget;
       past it, it returns the stored cards.
-- [ ] **AC10** The stored raw message and its versions are unchanged by a refresh.
-- [ ] **AC11** A real Jira link card whose issue changed since it was posted shows the current
+- [x] **AC10** The stored raw message and its versions are unchanged by a refresh.
+- [x] **AC11** A real Jira link card whose issue changed since it was posted shows the current
       status and assignee in the chat page and in MCP `read_messages`.
 
 ## Phases
@@ -122,4 +122,7 @@ latest card is kept in the archive, so the next view, a restart or an offline re
 - A `429` from either endpoint holds every card of that app until its longest wait ends, with no
   request and no log line; 64 held apps at most.
 - The refreshed card is keyed by `cardClientId`; an edit that keeps the id keeps the refreshed card.
+- MCP: tokens are fetched only when a card is due, without starting a sign-in; the 5 s budget
+  includes the fetch, and saving to a busy `cards.db` can add up to 4 s. A request or lookup cut by
+  the budget is held in that process only, so `cards.db` stays due for the web.
 - The member-count limit is ignored: one user's views, throttled by the interval.
