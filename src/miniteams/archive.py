@@ -592,6 +592,7 @@ async def run_archive(
     data_dir = data_dir.resolve()
     index = Index(data_dir)
     directory = Directory(settings)
+    directory.start_roster_import(data_dir)
     run_start = time.monotonic()
     totals = {"new": 0, "media": 0, "avatars": 0}
     failed = denied = 0

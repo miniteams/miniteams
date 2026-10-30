@@ -1981,6 +1981,8 @@ async def run(
         directory.me = me
         if me and me_name:
             directory.note_name(me, me_name)  # what web sends stamp: the names cache may not know me yet
+        if data_dir is not None:
+            directory.start_roster_import(data_dir)
         seen_path = settings.config_dir / "seen.json"
         seen = _load_seen(seen_path)
         seed: dict[str, dict[str, Any]] = {}

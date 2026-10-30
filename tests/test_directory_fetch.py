@@ -7,6 +7,7 @@ import pytest
 
 from miniteams import directory as directory_mod
 from miniteams.directory import Directory
+from miniteams.names_store import Row
 
 
 class _Resp:
@@ -113,7 +114,8 @@ async def test_resolve_keys_a_contact_url_on_its_mri(directory: Directory, monke
         directory_mod.httpx, "AsyncClient", lambda *a, **k: _AsyncClientPost(lambda url: _Resp({"value": []}))
     )
     await directory.resolve(["https://fr.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:zzz"])
-    assert directory._names == {"8:orgid:zzz": "zzz"}
+    assert directory._store is not None
+    assert directory._store.get(["8:orgid:zzz"]) == {"8:orgid:zzz": Row("", 0, True)}  # noted, not named
 
 
 async def test_display_negative_caches_unresolved(directory: Directory, monkeypatch) -> None:
@@ -137,7 +139,7 @@ async def test_resolve_refresh_retries_negatives(
     """A user unknown to an old lookup (not yet visible, a transient partial answer) stays unknown
     forever unless a caller that shows every name asks again."""
     directory.set_token("sk", bearer="id-tok")
-    directory.note_name("8:orgid:zzz", "zzz")  # negative-cache marker
+    directory._note_missed(["8:orgid:zzz"])  # an earlier lookup named nobody
     directory.note_name("8:orgid:bob", "Bob")
     asked: list[Any] = []
 

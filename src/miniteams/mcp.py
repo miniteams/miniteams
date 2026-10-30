@@ -199,16 +199,27 @@ class Archive:
 
     def __init__(self, data_dir: Path, settings: Settings | None = None) -> None:
         self.data_dir = data_dir
-        self.settings = settings  # its cache_dir holds the names other miniteams processes resolved
+        self.settings = settings  # its config_dir holds names.db, the names every miniteams process learned
         # One per process: its bot ids and holds outlive a call.
         self.cards = CardRefresher(settings, CardStore(data_dir / "cards.db")) if settings else None
 
         self._down_until = 0.0
         self._probe: Callable[[], None] = self._open_index
+        self._directory: Directory | None = None
+
+    def directory(self) -> Directory | None:
+        """The process's names, over names.db; made on first use."""
+        if self._directory is None and self.settings:
+            self._directory = Directory(self.settings)
+        return self._directory
 
     def _known_name(self) -> Callable[[str], str] | None:
-        # Per call: other processes rewrite the names cache, and a local file read is cheap next to the query.
-        return Directory(self.settings).known_name if self.settings else None
+        # One store open per process, refreshed per call: other processes improve names meanwhile.
+        directory = self.directory()
+        if directory is None:
+            return None
+        directory.refresh()
+        return directory.known_name
 
     def _unavailable(self, exc: Exception) -> ToolError:
         return ToolError(f"archive unavailable at {self.data_dir}: {exc}")
@@ -1058,7 +1069,11 @@ class Server:
     def api(self) -> ApiReader:
         """A reader on the chat service with fresh tokens; raises the login ToolError when signed out."""
         skype_token, bearer = self.session.tokens()
-        return ApiReader(self.settings, skype_token, bearer, record=message_record)
+        directory = self.archive.directory()
+        assert directory is not None  # a Server always has settings
+        directory.refresh()
+        directory.set_token(skype_token, bearer)
+        return ApiReader(self.settings, skype_token, directory, record=message_record)
 
     def drafts(self) -> DraftsStore:
         ic3, region = self.session.proxy()
@@ -1069,6 +1084,8 @@ class Server:
 
     def serve(self) -> int:
         """Read requests until EOF. Every line written is one JSON-RPC message."""
+        if directory := self.archive.directory():
+            directory.start_roster_import(self.archive.data_dir)
         for line in self._in:
             if not line.strip():
                 continue

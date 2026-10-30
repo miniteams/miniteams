@@ -417,6 +417,7 @@ async def run_live(
         download_avatars=download_avatars,
         media_types=media_types,
     )
+    Directory(settings).start_roster_import(live.data_dir)
     stream = asyncio.create_task(
         run_forever(
             settings,

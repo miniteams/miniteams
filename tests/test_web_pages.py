@@ -186,8 +186,8 @@ def _marks(settings: Settings) -> Path:
 def _names(settings: Settings) -> Path:
     from miniteams.directory import Directory
 
-    Directory(settings)._save_names()
-    return settings.cache_dir / "names-v2.json"
+    Directory(settings).note_name("8:orgid:ann", "Ann Lee")
+    return settings.config_dir / "names.db"
 
 
 def _sent(settings: Settings) -> Path:

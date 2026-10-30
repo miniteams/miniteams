@@ -459,7 +459,7 @@ async def _print_message(resource: dict[str, Any], directory: Directory, tag: st
         return
     sender_mri = resource.get("from", "")
     declared = resource.get("imdisplayname")
-    directory.note_declared(sender_mri, declared)  # a label for later, never a cached name
+    directory.note_declared(sender_mri, declared)  # stored at the declared rank, never a known name
     sender = sender_name(sender_mri, declared, directory.known_name) or await directory.display(sender_mri)
     when = resource.get("composetime") or resource.get("originalarrivaltime") or ""
     label = await directory.label(thread_of(resource))

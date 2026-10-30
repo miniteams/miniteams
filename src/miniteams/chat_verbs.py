@@ -399,7 +399,7 @@ def chat_record(
 ) -> dict[str, Any]:
     """One message as the chat page shows it (spec 011): sanitised body, reactions, mention kind.
     `custom`: the custom emoji object ids `/emoji/<id>` serves; `images`: their reaction key → object id;
-    `saved`: `page_files`; `name_for` labels people, `known_name` gives only names a lookup or roster gave;
+    `saved`: `page_files`; `name_for` labels people, `known_name` gives only live or archived names;
     `cards`: refreshed app cards by cardClientId (spec 037)."""
     props = message.get("properties")
     props = props if isinstance(props, dict) else {}

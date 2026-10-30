@@ -656,12 +656,12 @@ def test_record_mentions_and_me() -> None:
     ],
 )
 def test_a_mention_shows_its_persons_full_name_on_hover(
-    thread: str, mri: str, known: dict[str, str], title: str
+    directory: Directory, thread: str, mri: str, known: dict[str, str], title: str
 ) -> None:
     """033-AC9: a mention span carries its person's full name as `title`, from the directory (which holds the
     chats' roster names); unknown, or everyone, no title."""
-    directory = Directory.__new__(Directory)
-    directory._names = dict(known)
+    for person, name in known.items():
+        directory.note_name(person, name)
     kind = "everyone" if mri == thread else "person"
     content = '<p><span itemtype="http://schema.skype.com/Mention" itemscope itemid="0">Ann</span> look</p>'
     props = {"mentions": json.dumps([{"mentionType": kind, "itemid": 0, "mri": mri}])}
@@ -697,7 +697,7 @@ async def test_history_names_reaction_people(
         quiet_directory,
         data_dir=_archive(tmp_path / "d", T, [_m("1", _at(1), properties={"emotions": emotions})]),
     )
-    quiet_directory._names[ANN] = "Ann Lee"
+    quiet_directory.note_name(ANN, "Ann Lee")
     [message] = (await _history(board, T))["messages"]
     assert message["reactions"][0]["people"] == ["Ann Lee"]
 
@@ -1112,7 +1112,7 @@ async def test_follow_relays_messages_edits_deletes_reactions_and_typing(
 
         emotions = {"emotions": [{"key": "like", "users": [{"mri": ME, "time": 1}]}]}
         assert board.directory is not None
-        board.directory._names[ME] = "Me Self"
+        board.directory.note_name(ME, "Me Self")
         reaction = {"id": "9", "composetime": _at(9), "messagetype": "RichText/Html", "properties": emotions}
         await board.on_event(_event("MessageUpdate", T, **reaction))
         edit = (await _frame(ws))["edit"]
@@ -1410,7 +1410,7 @@ async def test_follow_answers_who_already_types(
         await ws.send(json.dumps({"follow": B}))
         assert (await _frame(ws))["typing"] == ["Ann Lee"]  # my own typing is not news to the page
         assert await _frame(ws) == {"typing": "Ann Lee", "on": False, "thread": B}  # TTL, no ClearTyping
-        assert board.rows[B]["typing"] == []
+        await wait(lambda: board.rows[B]["typing"] == [], "my own typing expired")  # armed just after Ann's
 
 
 async def test_typing_expiry_off_the_board_does_not_rebroadcast(

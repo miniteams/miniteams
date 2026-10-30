@@ -373,7 +373,7 @@ turns each line into an event in the session; `docs/watch.md` has the call and t
 (`gap`, `suppressed`, `stopped`).
 
 `stream` enriches each line with thread name + participants, resolves MRIs → display names
-(cached in `~/.cache/miniteams/names-v2.json`; the older `names.json` is ignored), downloads
+(kept in `~/.config/miniteams/names.db`, shared by every miniteams process), downloads
 images/files to `~/.cache/miniteams/media/` (full-res + optimized, shown as `file://`), and renders
 reactions (`↳ 👍 Alice reacted`), edits (`✏ …`) and deletes (`🗑 …`). `--typing` adds `✍ is typing /
 stopped` indicators.

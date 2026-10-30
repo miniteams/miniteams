@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import sqlite3
+from contextlib import closing
 from typing import Any
 
 import httpx
@@ -33,11 +35,13 @@ def test_contact_url_shares_the_mri_cache(directory: Directory) -> None:
     assert directory.name_for(contact.format("apac")) == "Alice"  # another region's host
 
 
-def test_load_drops_contact_url_keys(settings: Settings) -> None:
+def test_import_drops_contact_url_keys(settings: Settings) -> None:
     contact = "https://fr.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:guid"
     settings.cache_dir.mkdir(parents=True)
     (settings.cache_dir / "names-v2.json").write_text(json.dumps({"8:orgid:guid": "Alice", contact: "Alice"}))
-    assert Directory(settings)._names == {"8:orgid:guid": "Alice"}
+    assert Directory(settings).known_name("8:orgid:guid") == "Alice"
+    with closing(sqlite3.connect(settings.config_dir / "names.db")) as db:
+        assert db.execute("SELECT mri FROM names").fetchall() == [("8:orgid:guid",)]
 
 
 def test_note_name_ignores_empty(directory: Directory) -> None:

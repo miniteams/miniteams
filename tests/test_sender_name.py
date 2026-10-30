@@ -4,7 +4,9 @@ import argparse
 import asyncio
 import base64
 import functools
+import io
 import json
+import sqlite3
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -21,10 +23,13 @@ from miniteams import auth as A
 from miniteams import chat_verbs as CV
 from miniteams import cli, messages, send
 from miniteams import directory as D
+from miniteams import mcp as M
 from miniteams import watch as WA
 from miniteams import web as W
+from miniteams.archive_store import Index
 from miniteams.config import Settings
 from miniteams.directory import Directory, sender_name
+from miniteams.names_store import DECLARED, LIVE, Row
 
 ID = "uid.utid"  # the cached account, see test_auth._cache_doc
 BOGUS = "Zorglub Testeur"  # free text a sending client may declare
@@ -185,13 +190,23 @@ async def test_the_web_stamps_the_name_it_starts_with(
 
 # --- display side: the directory's name for `from`, else this message's declared name ---
 
-TAIL = ANN.split(":")[-1]  # the negative-cache marker, and an unresolved MRI's label
+TAIL = ANN.split(":")[-1]  # an unresolved MRI's label
+
+
+def _named(directory: Directory, name: str) -> None:
+    """`marker`: a lookup named nobody; else a live name."""
+    if name == "marker":
+        directory._note_missed([ANN])
+    else:
+        directory.note_name(ANN, name)
+
+
 REAL = "Real Name"  # what a second message from the same unknown sender declares
 
 
 def test_sender_name_rule(directory: Directory) -> None:
     directory.note_name(ANN, "Ann Lee")
-    directory.note_name("8:orgid:gone", "gone")  # negative-cached
+    directory._note_missed(["8:orgid:gone"])  # a lookup named nobody
     directory.note_declared("8:orgid:new", BOGUS)  # a label, not a name
     known = directory.known_name
     assert sender_name(ANN, BOGUS, known) == "Ann Lee"
@@ -316,7 +331,7 @@ async def test_each_site_shows_the_directory_name_first(
     shown: str | None,
 ) -> None:
     if cached is not None:
-        quiet_directory.note_name(ANN, TAIL if cached == "marker" else cached)
+        _named(quiet_directory, cached)
     show, fallback = SITES[site]
     message = _m("1", _at(1), imdisplayname=declared)
     assert await show(message, quiet_directory, tmp_path, monkeypatch) == (
@@ -336,42 +351,41 @@ async def test_each_message_of_an_unknown_sender_shows_its_own_name(
     negative: bool,
 ) -> None:
     if negative:
-        quiet_directory.note_name(ANN, TAIL)
+        quiet_directory._note_missed([ANN])
     show, _ = SITES[site]
     for n, declared in enumerate([BOGUS, REAL, BOGUS]):
         message = _m("1", _at(1), imdisplayname=declared)
         assert await show(message, quiet_directory, tmp_path / str(n), monkeypatch) == declared
     assert quiet_directory.known_name(ANN) == ""
-    quiet_directory._save_names()
-    saved = json.loads((quiet_directory.settings.cache_dir / "names-v2.json").read_text())
-    assert saved.get(ANN) == (TAIL if negative else None)
+    assert quiet_directory._store is not None
+    row = quiet_directory._store.get([ANN]).get(ANN, Row("", 0, False))
+    assert row.rank <= DECLARED and row.looked_up == negative  # a declared label at most, never a known name
     quiet_directory.note_name(ANN, "Ann Lee")  # a profile lookup or a roster names them later
     assert await show(_m("1", _at(1), imdisplayname=BOGUS), quiet_directory, tmp_path / "9", monkeypatch) == (
         "Ann Lee"
     )
 
 
-# --- the names cache: declared names are labels, never cached names ---
+# --- the names store: declared names are labels, never known names ---
 
 
 @pytest.mark.parametrize("mri", [ANN, CONTACT])
 @pytest.mark.parametrize("before", [None, "marker", "Ann Lee"])
-def test_a_declared_name_never_enters_the_names_cache(
+def test_a_declared_name_never_becomes_a_known_name(
     directory: Directory, mri: str, before: str | None
 ) -> None:
+    """038-AC7: a declared name is stored at the lowest rank and never over a live one."""
     if before is not None:
-        directory.note_name(ANN, TAIL if before == "marker" else before)
+        _named(directory, before)
     directory.note_declared(mri, BOGUS)
     assert directory.known_name(ANN) == ("Ann Lee" if before == "Ann Lee" else "")
-    assert directory._names.get(ANN) == (
-        None if before is None else TAIL if before == "marker" else "Ann Lee"
-    )
+    assert directory._names.get(ANN) == (("Ann Lee", LIVE) if before == "Ann Lee" else (BOGUS, DECLARED))
 
 
 @pytest.mark.parametrize("negative", [False, True])
 def test_a_declared_name_is_a_last_resort_label(directory: Directory, negative: bool) -> None:
     if negative:
-        directory.note_name(ANN, TAIL)
+        directory._note_missed([ANN])
     assert directory.name_for(ANN) == TAIL
     directory.note_declared(CONTACT, BOGUS)
     directory.note_declared(ANN, "")  # an empty name keeps the last one
@@ -380,13 +394,11 @@ def test_a_declared_name_is_a_last_resort_label(directory: Directory, negative: 
     assert directory.name_for(ANN) == "Ann Lee"
 
 
-def test_declared_labels_are_bounded(directory: Directory, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(D, "_DECLARED_MAX", 2)
-    for n in range(3):
-        directory.note_declared(f"8:orgid:p{n}", f"P {n}")
-    directory.note_declared("8:orgid:p1", "P 1")  # recently seen: kept over p2
-    directory.note_declared("8:orgid:p3", "P 3")
-    assert [directory.name_for(f"8:orgid:p{n}") for n in range(4)] == ["p0", "P 1", "p2", "P 3"]
+def test_a_declared_label_serves_every_process(directory: Directory) -> None:
+    """038: declared names live in names.db, not in one process's memory."""
+    directory.note_declared("8:orgid:p1", "P 1")
+    other = Directory(directory.settings)
+    assert (other.name_for("8:orgid:p1"), other.known_name("8:orgid:p1")) == ("P 1", "")
 
 
 async def test_a_declared_name_does_not_spare_a_profile_lookup(
@@ -437,7 +449,7 @@ def test_a_mention_title_is_never_a_declared_name(directory: Directory) -> None:
 
     directory.note_declared(ANN, BOGUS)
     assert "title=" not in html()
-    directory.note_name(ANN, TAIL)
+    directory._note_missed([ANN])
     assert "title=" not in html()
     directory.note_name(ANN, "Ann Lee")
     assert 'title="Ann Lee"' in html()
@@ -457,7 +469,7 @@ async def test_a_reader_known_by_a_declared_name_only_is_still_looked_up(
         asked.append(member)
 
     if before is not None:
-        directory.note_name(ANN, TAIL)
+        directory._note_missed([ANN])
     directory.note_declared(ANN, BOGUS)
     receipts = R.Receipts(directory, ME, lambda t, f: None, None, None)
     monkeypatch.setattr(receipts, "_name", lookup)
@@ -485,6 +497,155 @@ def test_mcp_archive_reads_name_senders_from_the_names_cache(
     assert read and {m["sender"] for m in read} == {shown}
     found = _call(server, "search_messages", query="there", since="2026-07-01")["messages"]
     assert found and {m["sender"] for m in found} == {shown}
+
+
+def test_mcp_calls_share_one_store_and_see_names_improved_between_them(
+    settings: Settings,
+    data: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One names.db open per MCP process; a name another process improved shows on the next call."""
+    opens: list[Path] = []
+    real = D._open_store
+
+    def counted(path: Path) -> Any:
+        opens.append(path)
+        return real(path)
+
+    monkeypatch.setattr(D, "_open_store", counted)
+    settings.cache_dir.mkdir(parents=True, exist_ok=True)
+    (settings.cache_dir / "names-v2.json").write_text(json.dumps({MCP_OTHER: "Ann Old"}))
+    server = _server(settings, data)
+
+    def senders() -> set[str]:
+        read = _call(server, "read_messages", thread_id=MCP_PRIVATE, since="2026-07-01")["messages"]
+        return {m["sender"] for m in read}
+
+    assert senders() == {"Ann Old"}
+    Directory(settings).note_name(MCP_OTHER, "Ann Lee")  # another process, a live name
+    assert senders() == {"Ann Lee"}
+    assert len(opens) == 2  # this test's other Directory, and the server's one
+
+
+def test_a_failed_store_call_does_not_blank_the_next_mcp_call(
+    settings: Settings,
+    data: Path,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pause after a failure spans no MCP call: each call gives names.db one fresh try."""
+    settings.cache_dir.mkdir(parents=True, exist_ok=True)
+    (settings.cache_dir / "names-v2.json").write_text(json.dumps({MCP_OTHER: "Ann Lee"}))
+    server = _server(settings, data)
+    directory = server.archive.directory()
+    assert directory is not None and directory._store is not None
+    directory._store._db.execute("PRAGMA busy_timeout = 50")
+    roster = tmp_path / "rosters"
+    index = Index(roster)
+    index.upsert_chat("19:r@thread.v2", participants=[{"mri": "8:orgid:dee-test", "name": "Dee Ray"}])
+    index.close()
+
+    class _Stop(Exception):
+        pass
+
+    def stop(seconds: float) -> None:
+        raise _Stop
+
+    holder = sqlite3.connect(settings.config_dir / "names.db", isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(_Stop):
+            directory.import_rosters(roster, stop)  # its write fails: the store pauses
+    finally:
+        holder.close()
+    assert directory._paused()
+    known = server.archive._known_name()
+    assert known is not None and known(MCP_OTHER) == "Ann Lee"
+
+
+def test_mcp_api_calls_share_the_process_store(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The API fallback reuses the server's Directory: no names.db open per call."""
+    opens: list[Path] = []
+    real = D._open_store
+
+    def counted(path: Path) -> Any:
+        opens.append(path)
+        return real(path)
+
+    monkeypatch.setattr(D, "_open_store", counted)
+    convs = [{"id": MCP_PRIVATE, "lastMessage": {"composetime": "2026-07-03T09:00:00Z"}}]
+    _api(monkeypatch, convs, {MCP_PRIVATE: [_mcp_msg("a", "2026-07-02T09:00:00Z")]})
+    server = _gone(settings, tmp_path, monkeypatch)
+    for _ in range(3):
+        assert _call(server, "read_messages", thread_id=MCP_PRIVATE, since="2026-07-01")["source"] == "api"
+        assert _call(server, "find_chats", query="", since="2026-07-01")["source"] == "api"
+    assert len(opens) == 1
+    assert server.api().directory is server.archive.directory()
+
+
+def test_each_mcp_api_call_reads_rosters_afresh(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shared Directory must not pin a roster for the MCP process's life: members join between sends."""
+    server = _gone(settings, tmp_path, monkeypatch)
+    rosters = [
+        {"topic": None, "members": [{"mri": n, "name": n, "role": "User"}], "picture": None} for n in "ab"
+    ]
+    fetched: list[str] = []
+
+    async def fetch(self: Directory, thread_id: str) -> dict[str, Any]:
+        fetched.append(thread_id)
+        return rosters[len(fetched) - 1]
+
+    monkeypatch.setattr(Directory, "_fetch_thread", fetch)
+    assert asyncio.run(server.api().directory.thread(MCP_PRIVATE)) == rosters[0]
+    assert asyncio.run(server.api().directory.thread(MCP_PRIVATE)) == rosters[1]
+    assert fetched == [MCP_PRIVATE] * 2
+
+
+def test_each_mcp_api_call_reads_names_afresh(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A name another process improved after a call is the one the next call shows."""
+    server = _gone(settings, tmp_path, monkeypatch)
+    first = server.api().directory
+    assert first._store is not None
+    first._store.put([(MCP_OTHER, "Ann Old", 2, "test", 0)])
+    assert first.known_name(MCP_OTHER) == "Ann Old"
+    Directory(settings).note_name(MCP_OTHER, "Ann Lee")  # another process, a live name
+    assert server.api().directory.known_name(MCP_OTHER) == "Ann Lee"
+
+
+def test_without_a_store_each_mcp_api_call_asks_again_for_a_missed_person(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With names.db unusable a lookup miss lives in memory only: it must not outlive the call."""
+    (settings.config_dir / "names.db").mkdir(parents=True)  # not a database
+    server = _gone(settings, tmp_path, monkeypatch)
+    profiles = _Profiles({})
+    monkeypatch.setattr(D.httpx, "AsyncClient", profiles.client)
+    asyncio.run(server.api().directory.resolve([MCP_OTHER]))
+    profiles.known[MCP_OTHER] = "Ann Lee"  # the directory has a name for them now
+    directory = server.api().directory
+    asyncio.run(directory.resolve([MCP_OTHER]))
+    assert profiles.batches == [[MCP_OTHER]] * 2 and directory.known_name(MCP_OTHER) == "Ann Lee"
+
+
+def test_serve_imports_the_rosters_on_the_server_s_directory(
+    settings: Settings,
+    data: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """038-AC4 for MCP: the import runs on the Directory the tools read through, at start."""
+    started: list[tuple[Directory, Path]] = []
+    monkeypatch.setattr(
+        Directory, "start_roster_import", lambda self, data_dir: started.append((self, data_dir))
+    )
+    server = M.Server(settings, data, stdin=io.StringIO(""), stdout=io.StringIO())
+    assert server.serve() == 0
+    assert started == [(server.archive.directory(), data.resolve())]
 
 
 @pytest.mark.parametrize("names", [{MCP_OTHER: "Ann Lee"}, {MCP_OTHER: "other"}, {}])
@@ -588,7 +749,7 @@ async def test_a_lookup_that_names_nobody_repaints_no_receipts(
             directory.note_name(ANN, "Ann Lee")
 
     if before is not None:
-        directory.note_name(ANN, TAIL)
+        directory._note_missed([ANN])
     directory.note_declared(ANN, BOGUS)
     monkeypatch.setattr(directory, "resolve", resolve)
     receipts = R.Receipts(directory, ME, lambda t, f: sent.append(f), None, None)
@@ -601,7 +762,7 @@ async def test_a_lookup_that_names_nobody_repaints_no_receipts(
     await receipts.close()
 
 
-# --- the names cache file: v2 only, an older file is ignored ---
+# --- the old names cache files: imported once, left on disk ---
 
 
 def _old_cache(settings: Settings, names: dict[str, str]) -> Path:
@@ -612,22 +773,25 @@ def _old_cache(settings: Settings, names: dict[str, str]) -> Path:
 
 
 @pytest.mark.parametrize("v2", [None, {ANN: "Ann Lee"}])
-def test_the_unversioned_names_file_is_ignored_and_left_alone(
+def test_the_old_names_files_are_imported_and_left_alone(
     settings: Settings, v2: dict[str, str] | None
 ) -> None:
+    """038-AC4: names-v2.json gives archived names, the unversioned names.json declared labels only."""
     old = _old_cache(settings, {ANN: BOGUS, "8:orgid:bob": "Bob Roe"})
     before = old.read_bytes()
+    v2_path = settings.cache_dir / "names-v2.json"
     if v2 is not None:
-        (settings.cache_dir / "names-v2.json").write_text(json.dumps(v2))
+        v2_path.write_text(json.dumps(v2))
+    v2_before = v2_path.read_bytes() if v2 else None
     directory = Directory(settings)
     assert directory.known_name(ANN) == ("Ann Lee" if v2 else "")
     assert directory.known_name("8:orgid:bob") == ""
+    assert directory.name_for("8:orgid:bob") == "Bob Roe"
     assert sender_name(ANN, REAL, directory.known_name) == ("Ann Lee" if v2 else REAL)
     directory.note_name("8:orgid:cy", "Cy Ray")
-    directory._save_names()
-    saved = json.loads((settings.cache_dir / "names-v2.json").read_text())
-    assert saved == {**(v2 or {}), "8:orgid:cy": "Cy Ray"}
-    assert old.read_bytes() == before  # the user's file is never rewritten nor deleted
+    assert old.read_bytes() == before  # the user's files are never rewritten nor deleted
+    assert (v2_path.read_bytes() if v2 else None) == v2_before
+    assert v2_path.exists() == bool(v2)
 
 
 class _Profiles:
