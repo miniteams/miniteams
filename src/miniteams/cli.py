@@ -508,6 +508,40 @@ def cmd_mcp(settings: Settings, args: argparse.Namespace) -> int:
     return Server(settings, Path(args.data_dir), read_only=args.read_only).serve()
 
 
+def cmd_names(settings: Settings, args: argparse.Namespace) -> int:
+    """038-AC5: name everyone the archive names (call records, member events, senders), reading it only."""
+    import sqlite3
+
+    from .archive_store import chat_dirs, name_fields
+    from .directory import Directory, roster_entries
+    from .messages import message_names
+
+    data_dir = Path(args.data_dir)
+    try:
+        folders = chat_dirs(data_dir)
+        rosters = roster_entries(data_dir / "index.db")
+    except (OSError, sqlite3.Error) as exc:
+        log.error("names_sweep_no_archive", data_dir=str(data_dir), error=str(exc))
+        return 1
+    directory = Directory(settings)
+    # Every run, not once like the long-running processes' import: rosters change between sweeps.
+    directory.note_entries(rosters)
+    named = {e[0] for e in rosters}
+    read = 0
+    for folder in folders:
+        try:
+            for page in name_fields(folder):
+                entries = [e for message in page for e in message_names(message)]
+                named.update(e[0] for e in entries)
+                directory.note_entries(entries)
+        except (OSError, sqlite3.Error) as exc:  # missing, locked or corrupt: the others still count
+            log.warning("names_sweep_chat_skipped", chat_dir=str(folder), error=str(exc))
+            continue
+        read += 1
+    print(f"{read}/{len(folders)} chats read, {len(named)} people named")
+    return 0 if directory.flush() else 1
+
+
 def cmd_stream(settings: Settings, args: argparse.Namespace) -> int:
     """Full chain → websocket → authenticate → register → stream, with auto-reconnect (M2-M4)."""
     import asyncio
@@ -837,6 +871,13 @@ def main(argv: list[str] | None = None) -> int:
     p_mcp.add_argument("--data-dir", default="data", help="archive root to read (default: ./data)")
     p_mcp.add_argument("--read-only", action="store_true", help="expose no tool that writes to Teams")
     p_mcp.set_defaults(func=cmd_mcp)
+
+    p_names = sub.add_parser("names", help="people's names in names.db")
+    p_names.add_argument(
+        "--sweep", action="store_true", required=True, help="learn the names the archive holds (read-only)"
+    )
+    p_names.add_argument("--data-dir", default="data", help="archive root to read (default: ./data)")
+    p_names.set_defaults(func=cmd_names)
 
     p_stream = sub.add_parser("stream", help="stream live incoming chat events (M2+)")
     p_stream.add_argument(

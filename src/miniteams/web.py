@@ -85,10 +85,12 @@ from .messages import (
     is_edited,
     is_me,
     mention_kind,
+    message_ms,
     reaction_emoji,
     snippet,
     thread_of,
 )
+from .names_store import now_ms
 from .presence import FORCE, Presence, dm_ids, dm_peer, open_cache, person
 from .receipts import EVENT as RECEIPT_EVENT
 from .receipts import Receipts
@@ -332,7 +334,9 @@ async def sender_of(resource: dict[str, Any], directory: Directory | None) -> st
     name = resource.get("imdisplayname")
     if directory is None:
         return str(name or mri)
-    directory.note_declared(mri, name)
+    # A typing event is current, and may carry no time of its own.
+    seen = message_ms(resource) or (now_ms() if resource.get("messagetype") == "Control/Typing" else 0)
+    directory.note_declared(mri, name, seen)
     if is_me(mri, directory.me):
         return _YOU
     return sender_name(mri, name, directory.known_name) or (await directory.display(mri) if mri else "")

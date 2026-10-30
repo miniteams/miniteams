@@ -114,6 +114,7 @@ def _no_network(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 def _private_dirs(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
     """Settings the code builds itself (`cli.main`) default under XDG: never the user's names.db or caches."""
     home = tmp_path_factory.mktemp("xdg")
+    monkeypatch.setenv("MINITEAMS_TENANT_ID", "t")  # a clean checkout has no .env to read it from
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "config"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(home / "cache"))
 

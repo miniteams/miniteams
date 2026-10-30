@@ -20,7 +20,7 @@ import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import quote
 
 import httpx
@@ -61,6 +61,10 @@ _ROSTER_IMPORT = "import:index-rosters"
 
 # A names.db that could not be opened, or a write that failed, is tried again at most this often (seconds).
 _STORE_RETRY_AFTER = 60.0
+
+# A name noted again within this long of its stored sighting is not written again: a live note per message
+# would be a write per message. Within a rank the newest sighting wins, so the store lags by up to this.
+_RESEEN_MS = 24 * 3600 * 1000
 
 # Lookups run inline in the event loop and a 429 retry can take ~30s: don't repeat that per message.
 _THREAD_RETRY_AFTER = 60.0
@@ -130,15 +134,37 @@ def _cached_names(path: Path) -> list[tuple[str, str]]:
     return [(k, v) for k, v in items if isinstance(k, str) and "/" not in k and isinstance(v, str) and v]
 
 
-def _roster_entries(index: Path) -> list[Entry]:
-    """The names stored rosters give their members, read-only: the archive is never written here."""
-    db = sqlite3.connect(f"file:{index}?mode=ro", uri=True)
+class _Held(NamedTuple):
+    name: str
+    rank: int
+    seen: int  # the newest sighting of this name at this rank this process knows of
+    written: int  # its sighting the store holds, as far as this process knows
+
+
+def _ms(value: object) -> int:
     try:
-        rosters = [r[0] for r in db.execute("SELECT participants FROM chats")]
+        return int(str(value))
+    except ValueError:
+        return 0
+
+
+def roster_entries(index: Path) -> list[Entry]:
+    """The names stored rosters give their members, seen at their conversation's `version` (stored with
+    the roster; `last_fetch_at` moves on passes that keep the roster); read-only: the archive is never
+    written here."""
+    from .archive_store import open_untouched  # archive_store imports messages, which imports this module
+
+    db = open_untouched(index)
+    try:
+        rosters = db.execute(
+            "SELECT participants, CASE WHEN json_valid(raw) THEN json_extract(raw, '$.version') END"
+            " FROM chats"
+        ).fetchall()
     finally:
         db.close()
     entries: list[Entry] = []
-    for text in rosters:
+    for text, version in rosters:
+        seen = _ms(version)  # epoch ms; 0 for a chat stored without its conversation
         try:
             people = json.loads(text or "[]")
         except ValueError:
@@ -148,7 +174,7 @@ def _roster_entries(index: Path) -> list[Entry]:
                 continue
             mri, name = _bare(str(p.get("mri") or "")), str(p.get("name") or "")
             if mri and name and name != _tail(mri):
-                entries.append((mri, name, ARCHIVED, "index-roster", 0))
+                entries.append((mri, name, ARCHIVED, "index-roster", seen))
     return entries
 
 
@@ -164,8 +190,8 @@ class Directory:
         self._thread_fetch: dict[str, asyncio.Task[dict[str, Any] | None]] = {}  # in flight
         # thread_id → monotonic time of a transient failure; capped like _threads.
         self._thread_failed: OrderedDict[str, float] = OrderedDict()
-        # Read cache of the store, bare MRI → (name, rank); a miss reads the store other processes fill.
-        self._names: dict[str, tuple[str, int]] = {}
+        # Read cache of the store, bare MRI → its best name; a miss reads the store other processes fill.
+        self._names: dict[str, _Held] = {}
         self._missed: set[str] = set()  # a successful lookup found no name for them
         # (MRI, rank) → latest entry not written yet: one per person and rank, kept while writes fail.
         self._pending: dict[tuple[str, int], Entry] = {}
@@ -225,25 +251,57 @@ class Directory:
     def _remember(self, rows: dict[str, Row]) -> None:
         for mri, row in rows.items():
             if row.name:
-                self._names[mri] = (row.name, row.rank)
+                held = self._names.get(mri)
+                same = held is not None and (held.name, held.rank) == (row.name, row.rank)
+                seen = max(row.seen_at, held.seen) if same and held is not None else row.seen_at
+                self._names[mri] = _Held(row.name, row.rank, seen, row.seen_at)
             if row.looked_up:
                 self._missed.add(mri)
 
     def _note(self, pairs: list[tuple[str, str]], rank: int, source: str) -> None:
-        """Record (MRI, name) pairs at `rank`; the store keeps the best (038-AC2)."""
-        seen, entries = now_ms(), list[Entry]()
-        for mri, name in pairs:
+        """Record (MRI, name) pairs at `rank`, seen now; the store keeps the best (038-AC2)."""
+        seen = now_ms()
+        self.note_entries((mri, name, rank, source, seen) for mri, name in pairs)
+
+    def note_entries(self, entries: Iterable[Entry]) -> None:
+        """Record names, each at its own rank and sighting time (038-AC8), in one write; the store keeps
+        the best (038-AC2)."""
+        batch: list[Entry] = []
+        for mri, name, rank, source, seen in entries:
             mri = _bare(mri)
             if not mri or not name or name == _tail(mri):
                 continue
             held = self._names.get(mri)
-            if held is not None and held[1] > rank:
-                continue  # ranks only grow: this write could not win
-            if held == (name, rank):
-                continue  # stored, or pending: a retry per message would stall each one on a held lock
-            self._names[mri] = (name, rank)  # kept even when the store is down
-            entries.append((mri, name, rank, source, seen))
-        self._put(entries)
+            if held is not None and (held.rank > rank or held.rank == rank and seen < held.seen):
+                continue  # could not win: ranks only grow, and within one the newest sighting wins
+            if (
+                held is not None
+                and (held.name, held.rank) == (name, rank)
+                and seen <= held.written + _RESEEN_MS
+            ):
+                # Stored or pending: a write per message would stall each on a held lock.
+                self._names[mri] = held._replace(seen=seen)
+                continue
+            self._names[mri] = _Held(name, rank, seen, seen)  # kept even when the store is down
+            batch.append((mri, name, rank, source, seen))
+        self._put(batch)
+
+    def flush(self, tries: int = 3, wait: Callable[[float], object] | None = None) -> bool:
+        """Write what is queued, `tries` times at most, waiting out a failing store between them: a run
+        about to end must not drop it. False, logged, when some stayed unwritten."""
+        for attempt in range(tries):
+            if attempt:
+                (wait or time.sleep)(_STORE_RETRY_AFTER)
+            if attempt == tries - 1:
+                with self._pending_lock:
+                    self._failed_at = -math.inf  # the last chance: no pause skips it
+            self._put([])
+            with self._pending_lock:
+                left = len(self._pending)
+            if not left:
+                return True
+        log.error("names_unwritten", count=left)
+        return False
 
     def _queue(self, entries: Iterable[Entry]) -> None:
         """Keep the latest seen entry per (MRI, rank); the caller holds _pending_lock."""
@@ -319,7 +377,7 @@ class Directory:
             return False
         if done:
             return True
-        entries = _roster_entries(index)
+        entries = roster_entries(index)
         return self._stored(lambda s: s.import_once(key, entries, [], now_ms()), None) is not None
 
     def start_roster_import(self, data_dir: Path) -> None:
@@ -349,27 +407,31 @@ class Directory:
         """A live name, from a profile lookup or a fetched roster: the best rank."""
         self._note([(mri, name or "")], LIVE, source)
 
-    def note_declared(self, mri: str, name: str | None) -> None:
-        """A name a message declares for its sender: a last-resort label, never a known name."""
-        self._note([(mri, name or "")], DECLARED, "declared")
+    def note_declared(self, mri: str, name: str | None, seen: int) -> None:
+        """A name a message sent at `seen` (epoch ms) declares for its sender: a last-resort label, never a
+        known name. The message's time, not now: an old message shown again must not beat a newer name."""
+        self.note_entries([(mri, name or "", DECLARED, "declared", seen)])
 
     def known_name(self, mri: str) -> str:
         """The live or archived name of `mri`; "" when it has none."""
         mri = _bare(mri)
         held = self._names.get(mri)
-        if mri and (held is None or held[1] < ARCHIVED):
+        if mri and (held is None or held.rank < ARCHIVED):
             self._remember(self._stored(lambda s: s.get([mri]), {}))
             held = self._names.get(mri)
-        return held[0] if held is not None and held[1] >= ARCHIVED else ""
+        return held.name if held is not None and held.rank >= ARCHIVED else ""
 
     def name_for(self, mri: str) -> str:
         """A label for `mri`: its known name, else the last name a message declared, else its bare id."""
         mri = _bare(mri)
-        return self.known_name(mri) or self._names.get(mri, ("", 0))[0] or _tail(mri)
+        if known := self.known_name(mri):  # reads the store into _names
+            return known
+        held = self._names.get(mri)
+        return held.name if held else _tail(mri)
 
     def _lookup_due(self, mri: str, refresh: bool) -> bool:
         held = self._names.get(mri)
-        return (held is None or held[1] < LIVE) and (refresh or mri not in self._missed)
+        return (held is None or held.rank < LIVE) and (refresh or mri not in self._missed)
 
     async def resolve(self, mris: list[str], *, refresh: bool = False) -> None:
         """Batched MRI → display-name lookup of those without a live name; an MRI it names nobody for is

@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Iterable
+from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
 
@@ -50,10 +51,19 @@ def now_ms() -> int:
     return time.time_ns() // 1_000_000
 
 
+def iso_ms(value: object) -> int:
+    """An ISO 8601 time as epoch ms; 0 when missing or unparsable."""
+    try:
+        return int(datetime.fromisoformat(str(value)).timestamp() * 1000)
+    except ValueError, OverflowError:
+        return 0
+
+
 class Row(NamedTuple):
     name: str
     rank: int
     looked_up: bool  # a successful lookup found no name for it
+    seen_at: int  # epoch ms the name was seen at
 
 
 class NameStore:
@@ -96,8 +106,9 @@ class NameStore:
     def _get(self, mris: set[str]) -> dict[str, Row]:
         if not mris:
             return {}
-        query = f"SELECT mri, name, rank, looked_up_at FROM names WHERE mri IN ({','.join('?' * len(mris))})"
-        return {m: Row(n, r, at is not None) for m, n, r, at in self._db.execute(query, list(mris))}
+        marks = ",".join("?" * len(mris))
+        query = f"SELECT mri, name, rank, looked_up_at, seen_at FROM names WHERE mri IN ({marks})"
+        return {m: Row(n, r, at is not None, s) for m, n, r, at, s in self._db.execute(query, list(mris))}
 
     def put(self, entries: Iterable[Entry]) -> dict[str, Row]:
         """Upsert named entries in one transaction; the stored rows of their MRIs afterwards."""

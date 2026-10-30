@@ -31,7 +31,7 @@ from .config import Settings, write_private
 from .directory import Directory
 from .drafts import iter_draft_pages
 from .dump import epoch_seconds, iter_history_pages
-from .messages import message_files
+from .messages import message_files, message_names
 from .skype import exchange_skype_token
 
 log = structlog.get_logger()
@@ -190,6 +190,7 @@ def _topup(
     thread_id: str,
     store: ChatStore,
     label: str,
+    directory: Directory,
     floor: str | None = None,
 ) -> int:
     """Fetch messages newer than the top-up bound; stop as soon as a page overlaps it. `floor`
@@ -204,6 +205,7 @@ def _topup(
     for messages in iter_history_pages(settings, skype_token, thread_id, _PAGE_SIZE, 0):
         # Pending until the walk reaches the bound: a reset mid-walk must not lift `newest()`.
         added += store.insert_page(messages, pending=True)
+        directory.note_entries(e for m in messages for e in message_names(m))
         top = top or str(messages[0].get("composetime", ""))
         pages += 1
         oldest_in_page = str(messages[-1].get("composetime", ""))  # newest-first → last is oldest
@@ -225,7 +227,13 @@ def _topup(
 
 
 def _backfill(
-    settings: Settings, skype_token: str, thread_id: str, store: ChatStore, index: Index, label: str
+    settings: Settings,
+    skype_token: str,
+    thread_id: str,
+    store: ChatStore,
+    index: Index,
+    label: str,
+    directory: Directory,
 ) -> int:
     """Walk older than the oldest stored message until history is exhausted, then flag done."""
     oldest = store.oldest()
@@ -234,6 +242,7 @@ def _backfill(
     start = time.monotonic()
     for messages in iter_history_pages(settings, skype_token, thread_id, _PAGE_SIZE, 0, end_before):
         added += store.insert_page(messages)
+        directory.note_entries(e for m in messages for e in message_names(m))
         pages += 1
         oldest_in_page = str(messages[-1].get("composetime", ""))  # newest-first → last is oldest
         log.info(
@@ -516,7 +525,7 @@ async def archive_chat(
         new_top = (
             _refresh_drafts(settings, skype_token, store, label)
             if drafts
-            else _topup(settings, skype_token, thread_id, store, label, floor)
+            else _topup(settings, skype_token, thread_id, store, label, directory, floor)
         )
         new_old = 0
         # Empty store must re-backfill even when flagged done: a meeting chat archived BEFORE its
@@ -525,7 +534,7 @@ async def archive_chat(
         if drafts:
             index.mark_backfill_done(thread_id)
         elif not index.backfill_done(thread_id) or not store.count():
-            new_old = _backfill(settings, skype_token, thread_id, store, index, label)
+            new_old = _backfill(settings, skype_token, thread_id, store, index, label, directory)
         media = (
             await _download_media(
                 store,
@@ -711,6 +720,8 @@ async def run_archive(
             duration_s=round(time.monotonic() - run_start, 1),
             auth_expired=auth_expired,
         )
+        # Names the pass noted while names.db was failing; a live pass must not hold new messages for it.
+        directory.flush(tries=1 if live_pass else 3)
         # A pass that stopped on a dead credential proves nothing about the archiver being alive.
         if not auth_expired:
             note_meta(index, archiver_seen=_now_iso(), archiver_state="idle")

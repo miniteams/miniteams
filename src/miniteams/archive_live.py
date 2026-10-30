@@ -34,7 +34,7 @@ from .auth import AuthExpired
 from .chats import in_archive_scope
 from .config import Settings
 from .directory import Directory
-from .messages import message_files, thread_of
+from .messages import message_files, message_names, thread_of
 from .stream import run_forever
 
 log = structlog.get_logger()
@@ -84,6 +84,7 @@ class LiveArchive:
         self.download_media, self.download_avatars = download_media, download_avatars
         self.media_types = media_types
         self.index = Index(data_dir)
+        self.directory = Directory(settings)  # names of the messages it stores (038-AC8)
         self.stopped = asyncio.Event()  # set when the refresh token is dead
         self._buffering = False
         self._buffer: dict[tuple[str, ...], tuple[str, str, dict[str, Any]]] = {}
@@ -190,6 +191,7 @@ class LiveArchive:
         if outcome == "new":
             self.index.merge_raw(thread_id, {"lastMessage": resource})
         if outcome != "stale":
+            self.directory.note_entries(message_names(resource))
             self._spawn_media(thread_id, resource)
             self._recent[thread_id] = time.monotonic()
             self._recent.move_to_end(thread_id)
@@ -391,6 +393,7 @@ class LiveArchive:
         return counts["media"]
 
     def close(self) -> None:
+        self.directory.flush(tries=1)  # one last try, no wait: a stop must not hang on a failing names.db
         self.index.close()
 
 
@@ -417,7 +420,7 @@ async def run_live(
         download_avatars=download_avatars,
         media_types=media_types,
     )
-    Directory(settings).start_roster_import(live.data_dir)
+    live.directory.start_roster_import(live.data_dir)
     stream = asyncio.create_task(
         run_forever(
             settings,

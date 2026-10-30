@@ -137,6 +137,68 @@ def chat_label(data_dir: Path, thread_id: str) -> str:
     return "" if row is None else str(row[0] or row[1] or "")
 
 
+def open_untouched(path: Path) -> sqlite3.Connection:
+    """`path` read-only, creating nothing beside it: a `mode=ro` open of a WAL database creates its -wal
+    and -shm and, read-only, never removes them.
+
+    Without a -wal every committed row is in the main file, read `immutable` (no sidecar, no lock): a
+    writer checkpointing meanwhile can make the read fail with sqlite3.Error, which callers skip on. With
+    one, its rows are only there: a plain read-only open, beside sidecars that already exist."""
+    if Path(f"{path}-wal").exists():
+        return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    return sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+
+
+def chat_dirs(data_dir: Path) -> list[Path]:
+    """Folder of every indexed chat, read-only and creating nothing; same errors as `read_chats`."""
+    path = data_dir / "index.db"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    db = open_untouched(path)
+    try:
+        rows = db.execute("SELECT id, dir FROM chats").fetchall()
+    finally:
+        db.close()
+    return [data_dir / (d or chat_dir_name(i)) for i, d in rows]
+
+
+# What `messages.message_names` reads; `content` only where it names people. A row that is not JSON
+# reads as NULLs: json_extract would fail the whole page.
+_NAME_FIELDS = """
+SELECT r, json_extract(j, '$.messagetype'), json_extract(j, '$.from'), json_extract(j, '$.imdisplayname'),
+    json_extract(j, '$.composetime'), json_extract(j, '$.originalarrivaltime'),
+    CASE WHEN json_extract(j, '$.messagetype') = 'Event/Call'
+        OR json_extract(j, '$.messagetype') LIKE 'ThreadActivity/%'
+        THEN json_extract(j, '$.content') END
+FROM (SELECT rowid AS r, CASE WHEN json_valid(raw) THEN raw END AS j FROM messages
+    WHERE rowid > ? ORDER BY rowid LIMIT ?)
+ORDER BY r
+"""
+_NAME_KEYS = ("messagetype", "from", "imdisplayname", "composetime", "originalarrivaltime", "content")
+
+
+def name_fields(chat_dir: Path, page: int = 500) -> Iterator[list[dict[str, Any]]]:
+    """The fields of every stored message `message_names` reads, a page at a time, read-only and
+    creating nothing (`open_untouched`).
+
+    Keyset pages by rowid, each its own short read: the archiver writes on, its WAL checkpoints."""
+    path = chat_dir / "messages.db"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    db = open_untouched(path)
+    try:
+        after = 0
+        while True:
+            rows = db.execute(_NAME_FIELDS, (after, page)).fetchall()
+            if rows:
+                yield [{k: v for k, v in zip(_NAME_KEYS, r[1:], strict=True) if v is not None} for r in rows]
+            if len(rows) < page:
+                return
+            after = rows[-1][0]
+    finally:
+        db.close()
+
+
 _COLS = "SELECT id, composetime, raw FROM messages"
 # ponytail: unreachable in practice (the real archive's largest same-composetime group is 1); a bound,
 # not a size.

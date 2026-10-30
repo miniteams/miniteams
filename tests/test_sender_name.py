@@ -207,7 +207,7 @@ REAL = "Real Name"  # what a second message from the same unknown sender declare
 def test_sender_name_rule(directory: Directory) -> None:
     directory.note_name(ANN, "Ann Lee")
     directory._note_missed(["8:orgid:gone"])  # a lookup named nobody
-    directory.note_declared("8:orgid:new", BOGUS)  # a label, not a name
+    directory.note_declared("8:orgid:new", BOGUS, D.now_ms())  # a label, not a name
     known = directory.known_name
     assert sender_name(ANN, BOGUS, known) == "Ann Lee"
     assert sender_name(ANN, "", known) == "Ann Lee"
@@ -341,6 +341,29 @@ async def test_each_site_shows_the_directory_name_first(
         assert quiet_directory.known_name(ANN) == "Ann Lee"  # the declared name did not replace it
 
 
+@pytest.mark.parametrize("site", ["list row", "stream jsonl", "stream text"])
+async def test_an_old_message_shown_again_never_beats_a_newer_declared_name(
+    quiet_directory: Directory,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    site: str,
+) -> None:
+    """038-AC2: each site notes the declared name at the message's time, not when it shows it."""
+    quiet_directory.note_declared(ANN, "Ann 2026", D.now_ms() - 1000)
+    show, _ = SITES[site]
+    assert (
+        await show(
+            _m("1", "2024-02-01T10:00:00.000Z", imdisplayname="Ann 2024"),
+            quiet_directory,
+            tmp_path,
+            monkeypatch,
+        )
+        == "Ann 2024"
+    )
+    assert quiet_directory._store is not None
+    assert quiet_directory._store.get([ANN])[ANN][:2] == ("Ann 2026", DECLARED)
+
+
 @pytest.mark.parametrize("site", list(SITES))
 @pytest.mark.parametrize("negative", [False, True])
 async def test_each_message_of_an_unknown_sender_shows_its_own_name(
@@ -358,7 +381,7 @@ async def test_each_message_of_an_unknown_sender_shows_its_own_name(
         assert await show(message, quiet_directory, tmp_path / str(n), monkeypatch) == declared
     assert quiet_directory.known_name(ANN) == ""
     assert quiet_directory._store is not None
-    row = quiet_directory._store.get([ANN]).get(ANN, Row("", 0, False))
+    row = quiet_directory._store.get([ANN]).get(ANN, Row("", 0, False, 0))
     assert row.rank <= DECLARED and row.looked_up == negative  # a declared label at most, never a known name
     quiet_directory.note_name(ANN, "Ann Lee")  # a profile lookup or a roster names them later
     assert await show(_m("1", _at(1), imdisplayname=BOGUS), quiet_directory, tmp_path / "9", monkeypatch) == (
@@ -377,9 +400,9 @@ def test_a_declared_name_never_becomes_a_known_name(
     """038-AC7: a declared name is stored at the lowest rank and never over a live one."""
     if before is not None:
         _named(directory, before)
-    directory.note_declared(mri, BOGUS)
+    directory.note_declared(mri, BOGUS, D.now_ms())
     assert directory.known_name(ANN) == ("Ann Lee" if before == "Ann Lee" else "")
-    assert directory._names.get(ANN) == (("Ann Lee", LIVE) if before == "Ann Lee" else (BOGUS, DECLARED))
+    assert directory._names[ANN][:2] == (("Ann Lee", LIVE) if before == "Ann Lee" else (BOGUS, DECLARED))
 
 
 @pytest.mark.parametrize("negative", [False, True])
@@ -387,8 +410,8 @@ def test_a_declared_name_is_a_last_resort_label(directory: Directory, negative: 
     if negative:
         directory._note_missed([ANN])
     assert directory.name_for(ANN) == TAIL
-    directory.note_declared(CONTACT, BOGUS)
-    directory.note_declared(ANN, "")  # an empty name keeps the last one
+    directory.note_declared(CONTACT, BOGUS, D.now_ms())
+    directory.note_declared(ANN, "", D.now_ms())  # an empty name keeps the last one
     assert directory.name_for(ANN) == BOGUS  # reaction people, typing: some label beats a guid
     directory.note_name(ANN, "Ann Lee")
     assert directory.name_for(ANN) == "Ann Lee"
@@ -396,7 +419,7 @@ def test_a_declared_name_is_a_last_resort_label(directory: Directory, negative: 
 
 def test_a_declared_label_serves_every_process(directory: Directory) -> None:
     """038: declared names live in names.db, not in one process's memory."""
-    directory.note_declared("8:orgid:p1", "P 1")
+    directory.note_declared("8:orgid:p1", "P 1", D.now_ms())
     other = Directory(directory.settings)
     assert (other.name_for("8:orgid:p1"), other.known_name("8:orgid:p1")) == ("P 1", "")
 
@@ -412,7 +435,7 @@ async def test_a_declared_name_does_not_spare_a_profile_lookup(
 
     directory.set_token("sk", "bearer")
     monkeypatch.setattr(directory, "resolve", resolve)
-    directory.note_declared(ANN, BOGUS)
+    directory.note_declared(ANN, BOGUS, D.now_ms())
     assert await directory.display(CONTACT) == "Ann Lee"
     assert asked == [[ANN]]
 
@@ -432,7 +455,7 @@ async def test_a_roster_member_is_never_named_by_a_declared_name(
         return None
 
     monkeypatch.setattr(directory, "resolve", nothing)
-    directory.note_declared(ANN, BOGUS)
+    directory.note_declared(ANN, BOGUS, D.now_ms())
     info = await directory.thread(T)
     assert info is not None
     assert {m["mri"]: m["name"] for m in info["members"]} == {ANN: TAIL, ME: "Me"}
@@ -447,7 +470,7 @@ def test_a_mention_title_is_never_a_declared_name(directory: Directory) -> None:
         record = CV.chat_record(message, T, ME, name_for=directory.name_for, known_name=directory.known_name)
         return str(record["html"])
 
-    directory.note_declared(ANN, BOGUS)
+    directory.note_declared(ANN, BOGUS, D.now_ms())
     assert "title=" not in html()
     directory._note_missed([ANN])
     assert "title=" not in html()
@@ -470,7 +493,7 @@ async def test_a_reader_known_by_a_declared_name_only_is_still_looked_up(
 
     if before is not None:
         directory._note_missed([ANN])
-    directory.note_declared(ANN, BOGUS)
+    directory.note_declared(ANN, BOGUS, D.now_ms())
     receipts = R.Receipts(directory, ME, lambda t, f: None, None, None)
     monkeypatch.setattr(receipts, "_name", lookup)
     receipts.shown[T] = {}
@@ -750,7 +773,7 @@ async def test_a_lookup_that_names_nobody_repaints_no_receipts(
 
     if before is not None:
         directory._note_missed([ANN])
-    directory.note_declared(ANN, BOGUS)
+    directory.note_declared(ANN, BOGUS, D.now_ms())
     monkeypatch.setattr(directory, "resolve", resolve)
     receipts = R.Receipts(directory, ME, lambda t, f: sent.append(f), None, None)
     receipts.shown[T] = {ANN: 5}

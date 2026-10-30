@@ -48,8 +48,8 @@ def test_a_name_gives_way_only_to_a_rank_as_high(store: NameStore, first: int, s
     """038-AC2: declared < archived < live; a later name of the same rank wins."""
     store.put([(ANN, "First", first, "a", 10)])
     store.put([(ANN, "Second", second, "b", 20)])
-    won = ("Second", second) if second >= first else ("First", first)
-    assert store.get([ANN]) == {ANN: Row(*won, False)}
+    won = ("Second", second, False, 20) if second >= first else ("First", first, False, 10)
+    assert store.get([ANN]) == {ANN: Row(*won)}
 
 
 @pytest.mark.parametrize("rank", RANKS)
@@ -68,7 +68,7 @@ def test_an_empty_name_is_never_written(store: NameStore, directory: Directory) 
     assert store.get([ANN]) == {}
     directory.note_name(BOB, "")
     directory.note_name(BOB, None)
-    directory.note_declared(BOB, None)
+    directory.note_declared(BOB, None, directory_mod.now_ms())
     directory.note_name(BOB, TAIL[BOB])  # the guid is no name
     assert _rows(directory.settings) == []
 
@@ -78,16 +78,16 @@ def test_a_lookup_that_names_nobody_never_erases_a_name(store: NameStore, rank: 
     """038-AC2: the negative is noted beside the name."""
     store.put([(ANN, "Ann Lee", rank, "a", 10)])
     store.missed([ANN], 99)
-    assert store.get([ANN]) == {ANN: Row("Ann Lee", rank, True)}
+    assert store.get([ANN]) == {ANN: Row("Ann Lee", rank, True, 10)}
 
 
 @pytest.mark.parametrize("rank", RANKS)
 def test_a_name_after_a_negative_fills_its_row(store: NameStore, rank: int) -> None:
     """038-AC2: the rank-0 row of a lookup miss takes any real name, and keeps its lookup mark."""
     store.missed([ANN], 99)
-    assert store.get([ANN]) == {ANN: Row("", 0, True)}
+    assert store.get([ANN]) == {ANN: Row("", 0, True, 0)}
     store.put([(ANN, "Ann Lee", rank, "a", 0)])
-    assert store.get([ANN]) == {ANN: Row("Ann Lee", rank, True)}
+    assert store.get([ANN]) == {ANN: Row("Ann Lee", rank, True, 0)}
 
 
 async def test_an_empty_profile_answer_keeps_an_archived_name(
@@ -104,7 +104,7 @@ async def test_an_empty_profile_answer_keeps_an_archived_name(
     await directory.resolve([ANN])
     assert directory.known_name(ANN) == "Ann Lee"
     assert directory._store is not None and directory._store.get([ANN]) == {
-        ANN: Row("Ann Lee", ARCHIVED, True)
+        ANN: Row("Ann Lee", ARCHIVED, True, 0)
     }
 
 
@@ -118,7 +118,7 @@ def _state(directory: Directory, state: str) -> None:
     if state in ("missed", "archived+missed"):
         directory._note_missed([ANN])
     if state == "declared":
-        directory.note_declared(ANN, "Ann Declared")
+        directory.note_declared(ANN, "Ann Declared", directory_mod.now_ms())
     if state == "live":
         directory.note_name(ANN, "Ann Lee")
 
@@ -194,7 +194,7 @@ def test_two_processes_learning_at_once_both_keep_their_names(settings: Settings
     for t in threads:
         t.join(10)
     stale.note_name(CY, "Cy Ray")
-    stale.note_declared(GONE, "Gone Declared")
+    stale.note_declared(GONE, "Gone Declared", directory_mod.now_ms())
     third = Directory(settings)
     for who in ("Ann", "Bob"):
         assert [third.known_name(f"8:orgid:{who}{n}") for n in range(100)] == [
@@ -209,7 +209,7 @@ def test_a_name_another_process_adds_later_is_seen(settings: Settings) -> None:
     """038-AC3: an absence is not cached."""
     reader, writer = Directory(settings), Directory(settings)
     assert reader.known_name(ANN) == "" and reader.name_for(ANN) == TAIL[ANN]
-    writer.note_declared(ANN, "Ann Declared")
+    writer.note_declared(ANN, "Ann Declared", directory_mod.now_ms())
     assert reader.name_for(ANN) == "Ann Declared"
     writer.note_name(ANN, "Ann Lee")
     assert reader.known_name(ANN) == "Ann Lee"
@@ -219,7 +219,7 @@ def test_a_lower_rank_noted_here_never_hides_a_better_name_written_elsewhere(set
     """038-AC2 across processes: the store's answer wins over this process's guess."""
     here, there = Directory(settings), Directory(settings)
     there.note_name(ANN, "Ann Lee")
-    here.note_declared(ANN, "Zorglub")
+    here.note_declared(ANN, "Zorglub", directory_mod.now_ms())
     assert here.known_name(ANN) == "Ann Lee"
     assert here.name_for(ANN) == "Ann Lee"
 
@@ -378,7 +378,7 @@ def test_an_unusable_store_leaves_names_in_memory(settings: Settings) -> None:
     directory = Directory(settings)
     assert directory._store is None
     directory.note_name(ANN, "Ann Lee")
-    directory.note_declared(BOB, "Bob Roe")
+    directory.note_declared(BOB, "Bob Roe", directory_mod.now_ms())
     assert (directory.known_name(ANN), directory.name_for(BOB)) == ("Ann Lee", "Bob Roe")
 
 
@@ -414,7 +414,9 @@ def test_a_locked_store_is_logged_and_the_name_written_later(
     try:
         with structlog.testing.capture_logs() as logs:
             directory.note_name(ANN, "Ann Lee")
-            directory.note_declared(ANN, "Zorglub")  # a lower rank while ANN is queued: never wins
+            directory.note_declared(
+                ANN, "Zorglub", directory_mod.now_ms()
+            )  # a lower rank while ANN is queued: never wins
     finally:
         holder.close()
     assert directory.known_name(ANN) == "Ann Lee"
@@ -422,7 +424,7 @@ def test_a_locked_store_is_logged_and_the_name_written_later(
     directory.note_name(BOB, "Bob Roe")  # inside the window: queued too
     assert _rows(settings) == []
     clock[0] += directory_mod._STORE_RETRY_AFTER
-    directory.note_declared(CY, None)  # any note past the window writes the queue
+    directory.note_declared(CY, None, directory_mod.now_ms())  # any note past the window writes the queue
     fresh = Directory(settings)
     assert (fresh.known_name(ANN), fresh.known_name(BOB)) == ("Ann Lee", "Bob Roe")
     assert [r[:3] for r in _rows(settings)] == [(ANN, "Ann Lee", LIVE), (BOB, "Bob Roe", LIVE)]
@@ -440,7 +442,7 @@ def test_notes_under_a_held_lock_wait_on_it_once(settings: Settings, monkeypatch
             directory._store._db.execute("PRAGMA busy_timeout = 2000")  # a stall per note would show
             started = time.perf_counter()
             for n in range(5):
-                directory.note_declared(f"8:orgid:p{n}-test", f"P {n}")
+                directory.note_declared(f"8:orgid:p{n}-test", f"P {n}", directory_mod.now_ms())
             directory._note_missed([GONE])
             elapsed = time.perf_counter() - started
     finally:
@@ -471,7 +473,7 @@ def test_the_latest_of_two_names_noted_while_the_store_fails_wins(
     directory.note_name(ANN, "Ann Old")
     assert directory._pending[ANN, LIVE][1] == "Ann New"
     clock[0] += directory_mod._STORE_RETRY_AFTER
-    directory.note_declared(CY, None)
+    directory.note_declared(CY, None, directory_mod.now_ms())
     assert [r[:2] for r in _rows(settings)] == [(ANN, "Ann New")]
     assert directory.known_name(ANN) == "Ann New"
 
@@ -501,7 +503,7 @@ def test_a_queued_name_never_beats_a_better_one_written_meanwhile(
     directory, clock = _locked_once(settings, monkeypatch)
     holder = _hold(settings)
     try:
-        directory.note_declared(ANN, "Zorglub")
+        directory.note_declared(ANN, "Zorglub", directory_mod.now_ms())
     finally:
         holder.close()
     Directory(settings).note_name(ANN, "Ann Lee")
@@ -556,13 +558,13 @@ def test_a_store_unavailable_at_start_is_reopened_later(
 
 def _counted_reads(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
     reads: list[Path] = []
-    real_entries = directory_mod._roster_entries
+    real_entries = directory_mod.roster_entries
 
     def read(index: Path) -> list[Any]:
         reads.append(index)
         return real_entries(index)
 
-    monkeypatch.setattr(directory_mod, "_roster_entries", read)
+    monkeypatch.setattr(directory_mod, "roster_entries", read)
     return reads
 
 
@@ -669,7 +671,7 @@ def test_a_store_opened_while_another_creates_it_opens(tmp_path: Path) -> None:
             store = NameStore(path)
         finally:
             timer.join()
-    assert store.get([ANN]) == {ANN: Row("Ann Lee", LIVE, False)}
+    assert store.get([ANN]) == {ANN: Row("Ann Lee", LIVE, False, 0)}
     store.close()
 
 
@@ -738,7 +740,7 @@ def test_a_failed_roster_import_is_retried(
 ) -> None:
     """038-AC4: an unreadable index imports nothing and marks nothing; the next start imports."""
     _index(tmp_path / "data")
-    real = directory_mod._roster_entries
+    real = directory_mod.roster_entries
     calls: list[Path] = []
 
     def flaky(index: Path) -> list[Any]:
@@ -747,7 +749,7 @@ def test_a_failed_roster_import_is_retried(
             raise sqlite3.DatabaseError("database disk image is malformed")
         return real(index)
 
-    monkeypatch.setattr(directory_mod, "_roster_entries", flaky)
+    monkeypatch.setattr(directory_mod, "roster_entries", flaky)
     directory = Directory(settings)
     with structlog.testing.capture_logs() as logs:
         directory.import_rosters(tmp_path / "data")
@@ -780,7 +782,7 @@ def test_a_name_noted_again_is_not_written_again(
 
     monkeypatch.setattr(NameStore, "put", put)
     for _ in range(3):
-        directory.note_declared(ANN, "Ann Declared")
+        directory.note_declared(ANN, "Ann Declared", directory_mod.now_ms())
         directory.note_name(BOB, "Bob Roe")
     assert len(writes) == 2
 
@@ -823,7 +825,7 @@ def test_a_broken_store_is_left_alone_for_the_window(
     with structlog.testing.capture_logs() as logs:
         for n in range(100):
             directory.name_for(f"8:orgid:p{n}-test")
-            directory.note_declared(f"8:orgid:p{n}-test", f"P {n}")
+            directory.note_declared(f"8:orgid:p{n}-test", f"P {n}", directory_mod.now_ms())
     assert [e["event"] for e in logs] == ["names_store_failed"]
     assert directory.name_for("8:orgid:p7-test") == "P 7"  # memory still answers
     clock[0] += directory_mod._STORE_RETRY_AFTER
@@ -845,7 +847,7 @@ def test_a_roster_import_during_a_pause_runs_after_it(
         holder.close()
     directory.import_rosters(data, lambda seconds: clock.__setitem__(0, clock[0] + seconds))
     assert [r[:3] for r in _rows(settings)] == [(ANN, "Ann Lee", ARCHIVED), (BOB, "Bob Roe", ARCHIVED)]
-    directory.note_declared(CY, None)  # the queued live name lands over the roster's
+    directory.note_declared(CY, None, directory_mod.now_ms())  # the queued live name lands over the roster's
     assert [r[:3] for r in _rows(settings)] == [(ANN, "Ann Lee", ARCHIVED), (BOB, "Bob Live", LIVE)]
 
 

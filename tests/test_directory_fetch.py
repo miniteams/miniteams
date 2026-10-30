@@ -115,7 +115,7 @@ async def test_resolve_keys_a_contact_url_on_its_mri(directory: Directory, monke
     )
     await directory.resolve(["https://fr.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:zzz"])
     assert directory._store is not None
-    assert directory._store.get(["8:orgid:zzz"]) == {"8:orgid:zzz": Row("", 0, True)}  # noted, not named
+    assert directory._store.get(["8:orgid:zzz"]) == {"8:orgid:zzz": Row("", 0, True, 0)}  # noted, not named
 
 
 async def test_display_negative_caches_unresolved(directory: Directory, monkeypatch) -> None:

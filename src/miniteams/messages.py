@@ -22,6 +22,7 @@ from . import attachments
 from ._io import emit
 from .directory import Directory, sender_name
 from .emoji_table import SHORTCODES
+from .names_store import ARCHIVED, DECLARED, Entry, iso_ms
 from .teams_emojis import TEAMS_DIVERSE, TEAMS_EMOJIS, TEAMS_PLAIN
 
 log = structlog.get_logger()
@@ -69,6 +70,12 @@ _ACTIVITY_ROOTS = {
 # Meeting chats: JSON, the people in `members`; `initiator` is never one of them.
 _MEMBER_EVENTS = {"ThreadActivity/MemberJoined", "ThreadActivity/MemberLeft"}
 _THREAD_RE = re.compile(r"/conversations/([^/]+)")
+# A call record's participants: `<part identity="MRI">…<displayName>NAME</displayName>…</part>`. Never
+# past the next part (an unclosed one must not take its name) nor far (nor rescan the content per part).
+_CALL_PART_RE = re.compile(
+    r'<part\b[^>]*?\bidentity="([^"<>]*)"[^>]*>((?:(?!<part\b).){0,4096}?)</part>', re.S | re.I
+)
+_DISPLAY_NAME_RE = re.compile(r"<displayName>([^<]*)</displayName>", re.I)
 
 # Teams' names for its default reactions, first name of an emoji first.
 EMOJI = {
@@ -381,6 +388,43 @@ def _parse_member_event(content: str) -> Activity | None:
     return Activity("", tuple(str(m["id"]) for m in people), "", names)
 
 
+def call_names(content: str) -> dict[str, str]:
+    """MRI → display name of an `Event/Call` record's participants, those it names."""
+    if "<part" not in content and "&lt;part" in content:
+        content = html.unescape(content)  # escaped once more in some payloads
+    names: dict[str, str] = {}
+    for part in _CALL_PART_RE.finditer(content):
+        shown = _DISPLAY_NAME_RE.search(part[2])
+        if shown and (name := html.unescape(shown[1]).strip()):
+            names.setdefault(html.unescape(part[1]).strip(), name)
+    return names
+
+
+def message_ms(message: dict[str, Any]) -> int:
+    """When a message was sent, epoch ms: the time its names were seen at, never when it is shown."""
+    return iso_ms(message.get("composetime") or message.get("originalarrivaltime"))
+
+
+def message_names(message: dict[str, Any]) -> list[Entry]:
+    """The names a stored message gives people, at the message's time (038-AC1, 038-AC8): a call
+    record's participants and a member event's `friendlyname` as archived, the sender's
+    `imdisplayname` as declared."""
+    msgtype = str(message.get("messagetype") or "")
+    content = str(message.get("content") or "")
+    found = [(str(message.get("from") or ""), str(message.get("imdisplayname") or ""), DECLARED, "declared")]
+    if msgtype == "Event/Call":
+        found += [(mri, name, ARCHIVED, "call") for mri, name in call_names(content).items()]
+    elif is_activity(msgtype) and (activity := parse_activity(msgtype, content)) is not None:
+        found += [(mri, name, ARCHIVED, "event") for mri, name in activity.names.items()]
+    seen = message_ms(message)
+    entries: list[Entry] = []
+    for mri, name, rank, source in found:
+        mri = mri.rsplit("/", 1)[-1]  # `from` is a contact URL ending in the MRI
+        if mri and name and name != mri.split(":")[-1]:
+            entries.append((mri, name, rank, source, seen))
+    return entries
+
+
 def activity_line(msgtype: str, activity: Activity, me: str, name_for: Callable[[str], str] | None) -> str:
     """The plain-text line a system message shows: "👥 Ann added Bob, Carl", "👥 Bob left"…"""
 
@@ -459,7 +503,8 @@ async def _print_message(resource: dict[str, Any], directory: Directory, tag: st
         return
     sender_mri = resource.get("from", "")
     declared = resource.get("imdisplayname")
-    directory.note_declared(sender_mri, declared)  # stored at the declared rank, never a known name
+    # Stored at the declared rank, never a known name.
+    directory.note_declared(sender_mri, declared, message_ms(resource))
     sender = sender_name(sender_mri, declared, directory.known_name) or await directory.display(sender_mri)
     when = resource.get("composetime") or resource.get("originalarrivaltime") or ""
     label = await directory.label(thread_of(resource))
@@ -544,7 +589,7 @@ async def resource_to_record(resource: dict[str, Any], directory: Directory) -> 
     msgtype = resource.get("messagetype", "")
     sender_mri = resource.get("from", "")
     declared = resource.get("imdisplayname")
-    directory.note_declared(sender_mri, declared)
+    directory.note_declared(sender_mri, declared, message_ms(resource))
     content = resource.get("content", "")
     props = resource.get("properties") or {}
     thread_id = thread_of(resource)
