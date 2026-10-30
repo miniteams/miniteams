@@ -28,10 +28,16 @@ from .archive_store import ChatStore, Index
 from .auth import AuthExpired, TokenSource
 from .chats import DRAFTS_THREAD, fetch_conversations, in_archive_scope, last_activity
 from .config import Settings, write_private
-from .directory import Directory
+from .directory import (
+    _SPECIAL_THREADS,
+    UNKNOWN_USER,
+    Directory,
+    roster_label,
+    unnamed_people,
+)
 from .drafts import iter_draft_pages
 from .dump import epoch_seconds, iter_history_pages
-from .messages import message_files
+from .messages import message_files, message_names
 from .skype import exchange_skype_token
 
 log = structlog.get_logger()
@@ -190,6 +196,7 @@ def _topup(
     thread_id: str,
     store: ChatStore,
     label: str,
+    directory: Directory,
     floor: str | None = None,
 ) -> int:
     """Fetch messages newer than the top-up bound; stop as soon as a page overlaps it. `floor`
@@ -204,6 +211,7 @@ def _topup(
     for messages in iter_history_pages(settings, skype_token, thread_id, _PAGE_SIZE, 0):
         # Pending until the walk reaches the bound: a reset mid-walk must not lift `newest()`.
         added += store.insert_page(messages, pending=True)
+        directory.note_entries(e for m in messages for e in message_names(m))
         top = top or str(messages[0].get("composetime", ""))
         pages += 1
         oldest_in_page = str(messages[-1].get("composetime", ""))  # newest-first → last is oldest
@@ -225,7 +233,13 @@ def _topup(
 
 
 def _backfill(
-    settings: Settings, skype_token: str, thread_id: str, store: ChatStore, index: Index, label: str
+    settings: Settings,
+    skype_token: str,
+    thread_id: str,
+    store: ChatStore,
+    index: Index,
+    label: str,
+    directory: Directory,
 ) -> int:
     """Walk older than the oldest stored message until history is exhausted, then flag done."""
     oldest = store.oldest()
@@ -234,6 +248,7 @@ def _backfill(
     start = time.monotonic()
     for messages in iter_history_pages(settings, skype_token, thread_id, _PAGE_SIZE, 0, end_before):
         added += store.insert_page(messages)
+        directory.note_entries(e for m in messages for e in message_names(m))
         pages += 1
         oldest_in_page = str(messages[-1].get("composetime", ""))  # newest-first → last is oldest
         log.info(
@@ -423,6 +438,28 @@ async def _download_avatars(store: ChatStore, info: dict[str, Any], skype_token:
     return saved
 
 
+def _relabel(index: Index, directory: Directory, thread_id: str) -> None:
+    """038-AC1, 038-AC6: the people a stored roster names by no name get names.db's names, else "Unknown
+    user", and a topic-less chat its label again; local only, written only when a name changed."""
+    members = index.participants(thread_id)
+    if not (unnamed := unnamed_people(members)):
+        return
+    names, todo = directory.known_names(unnamed), set(unnamed)  # one names.db read per chat
+    fixed = [
+        {**m, "name": names.get(mri) or UNKNOWN_USER}
+        if isinstance(m, dict) and (mri := str(m.get("mri") or "")) in todo
+        else m
+        for m in members
+    ]
+    if fixed == members:  # its unknown people are still unknown: nothing to write
+        return
+    label, topic = index.label_topic(thread_id)
+    if not topic and thread_id not in _SPECIAL_THREADS:
+        label = roster_label(None, [m for m in fixed if isinstance(m, dict)], directory.me) or label
+    index.upsert_chat(thread_id, label=label, topic=topic, participants=fixed)
+    log.info("chat_relabelled", thread=thread_id)
+
+
 async def archive_chat(
     settings: Settings,
     skype_token: str,
@@ -487,17 +524,26 @@ async def archive_chat(
         # roster/meeting updates) or no message at all: only an unchanged version proves them idle.
         version = int(conv.get("version") or 0)
         if caught_up or (version and version == index.synced_version(thread_id)):
+            _relabel(index, directory, thread_id)
             by = "activity" if caught_up else "version"
             log.info("chat_unchanged", thread=thread_id, newest=(newest or "")[:19], by=by)
             index.touch(thread_id, _now_iso())
             return counts
 
-    info = await directory.thread(thread_id) or {}  # topic + roster + picture (best-effort)
+    fetched = await directory.thread(thread_id)  # topic + roster + picture (best-effort); None: not fetched
+    info = fetched or {}
     label = await directory.label(thread_id)
     # The directory fetch is itself denied on meeting chats whose access was revoked (403);
     # the enumeration raw still carries the topic — use it so index + logs show a name, not the id.
     topic = str(info.get("topic") or ((conv or {}).get("threadProperties") or {}).get("topic") or "")
-    if label == thread_id and topic:
+    if fetched is None:  # what the index holds stands: a failed fetch must not wipe its label or roster
+        stored_label, stored_topic = index.label_topic(thread_id)
+        if label == thread_id:  # the stored label stands while the topic it was made from does
+            label = (
+                stored_label if stored_label and stored_topic == topic else topic or stored_label or thread_id
+            )
+        topic = topic or stored_topic
+    elif label == thread_id and topic:
         label = topic
     log.info("chat_start", chat=label, thread=thread_id)
     # Store the full conversation object only when we have a real one (enumeration); a bare
@@ -507,7 +553,7 @@ async def archive_chat(
         thread_id,
         label=label,
         topic=topic,
-        participants=info.get("members") or [],
+        participants=None if fetched is None else info.get("members") or [],
         raw=raw,
     )
     store = ChatStore(data_dir, thread_id)
@@ -516,7 +562,7 @@ async def archive_chat(
         new_top = (
             _refresh_drafts(settings, skype_token, store, label)
             if drafts
-            else _topup(settings, skype_token, thread_id, store, label, floor)
+            else _topup(settings, skype_token, thread_id, store, label, directory, floor)
         )
         new_old = 0
         # Empty store must re-backfill even when flagged done: a meeting chat archived BEFORE its
@@ -525,7 +571,7 @@ async def archive_chat(
         if drafts:
             index.mark_backfill_done(thread_id)
         elif not index.backfill_done(thread_id) or not store.count():
-            new_old = _backfill(settings, skype_token, thread_id, store, index, label)
+            new_old = _backfill(settings, skype_token, thread_id, store, index, label, directory)
         media = (
             await _download_media(
                 store,
@@ -592,6 +638,7 @@ async def run_archive(
     data_dir = data_dir.resolve()
     index = Index(data_dir)
     directory = Directory(settings)
+    directory.start_roster_import(data_dir)
     run_start = time.monotonic()
     totals = {"new": 0, "media": 0, "avatars": 0}
     failed = denied = 0
@@ -710,6 +757,8 @@ async def run_archive(
             duration_s=round(time.monotonic() - run_start, 1),
             auth_expired=auth_expired,
         )
+        # Names the pass noted while names.db was failing; a live pass must not hold new messages for it.
+        directory.flush(tries=1 if live_pass else 3)
         # A pass that stopped on a dead credential proves nothing about the archiver being alive.
         if not auth_expired:
             note_meta(index, archiver_seen=_now_iso(), archiver_state="idle")

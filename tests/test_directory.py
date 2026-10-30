@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import sqlite3
+from contextlib import closing
 from typing import Any
 
 import httpx
@@ -20,10 +22,14 @@ def test_reaction_diff_tracks_add_and_remove(directory: Directory) -> None:
     assert removed == {"u1"}
 
 
-def test_name_for_uses_cache_then_strips_prefix(directory: Directory) -> None:
+def test_name_for_uses_cache_then_unknown_user(directory: Directory) -> None:
+    """038-AC6: an unnamed person reads "Unknown user", never its guid; a bot keeps its bare id."""
     directory.note_name("8:orgid:guid", "Alice")
     assert directory.name_for("8:orgid:guid") == "Alice"
-    assert directory.name_for("8:orgid:unknown") == "unknown"
+    assert directory.name_for("8:orgid:unknown") == directory_mod.UNKNOWN_USER
+    assert directory.name_for("8:teamsvisitor:abc") == directory_mod.UNKNOWN_USER
+    assert directory.name_for("28:bot-id") == "bot-id"
+    assert directory.name_for("") == ""
 
 
 def test_contact_url_shares_the_mri_cache(directory: Directory) -> None:
@@ -33,17 +39,19 @@ def test_contact_url_shares_the_mri_cache(directory: Directory) -> None:
     assert directory.name_for(contact.format("apac")) == "Alice"  # another region's host
 
 
-def test_load_drops_contact_url_keys(settings: Settings) -> None:
+def test_import_drops_contact_url_keys(settings: Settings) -> None:
     contact = "https://fr.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:guid"
     settings.cache_dir.mkdir(parents=True)
     (settings.cache_dir / "names-v2.json").write_text(json.dumps({"8:orgid:guid": "Alice", contact: "Alice"}))
-    assert Directory(settings)._names == {"8:orgid:guid": "Alice"}
+    assert Directory(settings).known_name("8:orgid:guid") == "Alice"
+    with closing(sqlite3.connect(settings.config_dir / "names.db")) as db:
+        assert db.execute("SELECT mri FROM names").fetchall() == [("8:orgid:guid",)]
 
 
 def test_note_name_ignores_empty(directory: Directory) -> None:
     directory.note_name("", "x")
     directory.note_name("8:o:u", None)
-    assert directory.name_for("8:o:u") == "u"
+    assert directory.name_for("8:o:u") == directory_mod.UNKNOWN_USER
 
 
 def test_mri_from_userlink() -> None:
@@ -247,5 +255,11 @@ def test_roster_label_is_one_rule_for_live_and_archived_rosters() -> None:
     assert directory_mod.roster_label(None, people, me) == "Ann"
     assert directory_mod.roster_label("", [people[0], people[2]], me) == "Jira"
     assert directory_mod.roster_label(None, [people[0]], me) == "Me"
-    assert directory_mod.roster_label(None, [{"mri": ann, "name": ""}, {"name": "No mri"}], me) == "No mri"
+    # 038-AC6: an unnamed person, stored without a name, as its bare id or as the label, reads "Unknown user".
+    unnamed = [{"mri": ann, "name": ""}, {"name": "No mri"}]
+    assert directory_mod.roster_label(None, unnamed, me) == "Unknown user, No mri"
+    for name in ("", "ann", "Unknown user"):
+        roster = [{"mri": ann, "name": name}, {"mri": "8:orgid:carl", "name": "Carl"}]
+        assert directory_mod.roster_label(None, roster, me) == "Unknown user, Carl"
+    assert directory_mod.roster_label(None, [people[0], {"mri": bot, "name": "bot"}], me) == "bot"
     assert directory_mod.roster_label(None, [], me) == ""

@@ -334,7 +334,8 @@ async def test_a_system_line_shows_who_and_its_time(board: W.Board, chat: Pages)
     await board.on_event(_event("NewMessage", T, **_m("4", _at(4), added, **activity)))
     line = page.locator('[data-id="4"].system')
     await line.wait_for()
-    assert await line.locator(".html").inner_text() == f"👥 You added {ANN.split(':')[-1]}"
+    assert await line.locator(".html").inner_text() == "👥 You added Unknown user"  # 038-AC6: never the guid
+    assert await line.locator(".html span").get_attribute("title") == ANN
     when = line.locator(".when")
     assert await when.is_visible() and await when.get_attribute("title") == _at(4)
     assert await when.inner_text() == await page.locator(".msg:not(.system) .when").first.inner_text()

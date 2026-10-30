@@ -61,7 +61,7 @@ from .compose import (
     who_reader,
 )
 from .decompose import MISREAD, Editable, brace_name, decompose
-from .directory import Directory, is_app, sender_name
+from .directory import UNKNOWN_USER, Directory, is_app, sender_name, unknown
 from .directory import humans as _humans
 from .dump import epoch_seconds, fetch_history
 from .emoji_table import SHORTCODES
@@ -399,7 +399,7 @@ def chat_record(
 ) -> dict[str, Any]:
     """One message as the chat page shows it (spec 011): sanitised body, reactions, mention kind.
     `custom`: the custom emoji object ids `/emoji/<id>` serves; `images`: their reaction key → object id;
-    `saved`: `page_files`; `name_for` labels people, `known_name` gives only names a lookup or roster gave;
+    `saved`: `page_files`; `name_for` labels people, `known_name` gives only live or archived names;
     `cards`: refreshed app cards by cardClientId (spec 037)."""
     props = message.get("properties")
     props = props if isinstance(props, dict) else {}
@@ -412,7 +412,7 @@ def chat_record(
     body = ""
     activity = None if deleted or kind != "system" else parse_activity(msgtype, content)
     if activity:
-        body = html.escape(activity_line(msgtype, activity, me, name_for))
+        body = activity_line(msgtype, activity, me, name_for)
     elif not deleted:
         named: set[str] = set()  # 027-AC6: the reference entries the body already links
         if msgtype == "RichText/Html":
@@ -456,21 +456,24 @@ def chat_record(
             key = str(emotion.get("key") or "")
             # The emoji cache knows a custom key's image id; else its tail mostly is one.
             oid = (images or {}).get(key) or key.partition(";")[2]
+            people = [name_for(u) if name_for else u for u in users]
             reactions.append(
                 {
                     "key": key,
                     "emoji": reaction_emoji(key),
                     "count": len(users),
                     "mine": any(is_me(u, me) for u in users),
-                    "people": [name_for(u) if name_for else u for u in users],
+                    "people": people,
                 }
                 | ({"src": f"/emoji/{oid}"} if oid in custom else {})
+                # The page's tooltip of an "Unknown user" (038-AC6).
+                | ({"mris": users} if UNKNOWN_USER in people else {})
             )
     return {
         "id": str(message.get("id") or ""),
         "at": str(message.get("composetime") or message.get("originalarrivaltime") or ""),
         "from": mri,
-        "name": sender_name(mri, message.get("imdisplayname"), known_name),
+        "name": sender_name(mri, message.get("imdisplayname"), known_name) or unknown(mri),
         "me": is_me(mri, me),
         "type": kind,
         "editable": msgtype in TEXT_TYPES,
@@ -494,7 +497,7 @@ async def name_activity(records: list[dict[str, Any]], directory: Directory | No
     people = [m for _, (_, a) in pending for m in (a.initiator, *a.targets) if m not in a.names]
     await directory.resolve([m for m in people if not is_me(m, me)])
     for record, (msgtype, activity) in pending:
-        record["html"] = html.escape(activity_line(msgtype, activity, me, directory.name_for))
+        record["html"] = activity_line(msgtype, activity, me, directory.name_for)
 
 
 # --- wire parsers: the page's dict → a typed request, or the refusal it is answered ---
@@ -829,7 +832,9 @@ def _member_items(humans: dict[str, str], thread_id: str, me: str, q: str) -> li
         items.append({"name": "everyone", "mri": thread_id, "everyone": True})
     for mri, name in humans.items():
         folded = fold(name)
-        if name and not is_me(mri, me) and any(p.startswith(prefix) for p in (folded, *folded.split())):
+        # forms(): none for "" or "Unknown user", which several unnamed people share (038-AC6).
+        mentionable = forms(name) and not is_me(mri, me)
+        if mentionable and any(p.startswith(prefix) for p in (folded, *folded.split())):
             items.append({"name": name, "mri": mri})
     return items[:_COMPLETE_ITEMS]
 
@@ -1703,7 +1708,8 @@ class ChatVerbs:
             {
                 "id": str(m.get("id") or ""),
                 "at": str(m.get("composetime") or ""),
-                "name": sender_name(str(m.get("from") or ""), m.get("imdisplayname"), known_name),
+                "from": (mri := str(m.get("from") or "").rsplit("/", 1)[-1]),
+                "name": sender_name(mri, m.get("imdisplayname"), known_name) or unknown(mri),
                 "text": message_text(m, known_name),
             }
             for m in found

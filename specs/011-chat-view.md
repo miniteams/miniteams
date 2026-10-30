@@ -97,10 +97,10 @@ click opens Teams web (2026-10-14 decision).
   detached by a jump, then scrolls to the bottom. Live: the page opens
   its own WS (`/ws`, same Origin check) and subscribes with `{"follow": "<thread>"}`; the server
   then forwards `NewMessage`, `MessageUpdate` (edit, delete, reactions) and typing events for that
-  thread as `{"msg": record}`, `{"edit": record}`, `{"typing": name, "on": bool}` to that socket (one
-  frame per person, off on ClearTyping, on that person's next message, or after the board's typing
-  TTL; my own typing is never relayed). The `follow` answer carries `typing`: who already types,
-  so open, split switch and reconnect show what the row shows. New
+  thread as `{"msg": record}`, `{"edit": record}`, `{"typing": name, "on": bool, "mri": mri}` to that
+  socket (one frame per person, keyed by `mri`, off on ClearTyping, on that person's next message, or
+  after the board's typing TTL; my own typing is never relayed). The `follow` answer carries `typing`
+  as `[{name, mri}]`: who already types, so open, split switch and reconnect show what the row shows. New
   messages append when the latest page is loaded (else they only bump the "↓ latest" count); the
   page sticks to the bottom only when already there.
 - **Search and jump.** A search field in the header: verb `{"search": "<thread>", "q": text}` runs

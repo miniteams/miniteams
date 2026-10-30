@@ -17,6 +17,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from .attachments import LIVE_HOST_RE, LIVE_VIEW_RE, Giphy, existing, giphy, object_id
 from .compose import _URL_RE, trim_url
+from .directory import UNKNOWN_USER
 from .messages import file_name, json_list, reaction_emoji
 
 _KEPT = frozenset(
@@ -113,6 +114,8 @@ class _Sanitizer(HTMLParser):
         # Lets an unmatched end tag return in O(1) instead of scanning the stack (CWE-407).
         self.counts: Counter[str] = Counter()
         self.hidden = 0  # depth inside script/style/iframe
+        # (open-stack index, output index, MRI) of a quote's author: "Unknown user" gets the MRI on hover.
+        self.author: tuple[int, int, str] | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in _DROP_CONTENT:
@@ -168,6 +171,8 @@ class _Sanitizer(HTMLParser):
             extra = ' class="reply"' + (_attr("data-msg", mid) if mid.isascii() and mid.isdigit() else "")
         self._push(tag, emitted)
         if emitted:
+            if tag == "strong" and a.get("itemprop") == "mri" and a.get("itemid") and self.author is None:
+                self.author = (len(self.open) - 1, len(self.out), a["itemid"])
             self.out.append(f"<{tag}{extra}>")
 
     def _img(self, a: dict[str, str], emoji: bool) -> None:
@@ -233,6 +238,11 @@ class _Sanitizer(HTMLParser):
         if self.renamed is not None and self.renamed[0] == len(self.open):
             del self.out[self.renamed[1] :]
             self.renamed = None
+        if self.author is not None and self.author[0] == len(self.open):
+            _, at, mri = self.author
+            self.author = None
+            if at < len(self.out) and html.unescape("".join(self.out[at + 1 :])) == UNKNOWN_USER:  # 038-AC6
+                self.out[at] = f"<strong{_attr('title', mri)}>"
         if emitted:
             self.out.append(f"</{tag}>")
 

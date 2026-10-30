@@ -656,12 +656,12 @@ def test_record_mentions_and_me() -> None:
     ],
 )
 def test_a_mention_shows_its_persons_full_name_on_hover(
-    thread: str, mri: str, known: dict[str, str], title: str
+    directory: Directory, thread: str, mri: str, known: dict[str, str], title: str
 ) -> None:
     """033-AC9: a mention span carries its person's full name as `title`, from the directory (which holds the
     chats' roster names); unknown, or everyone, no title."""
-    directory = Directory.__new__(Directory)
-    directory._names = dict(known)
+    for person, name in known.items():
+        directory.note_name(person, name)
     kind = "everyone" if mri == thread else "person"
     content = '<p><span itemtype="http://schema.skype.com/Mention" itemscope itemid="0">Ann</span> look</p>'
     props = {"mentions": json.dumps([{"mentionType": kind, "itemid": 0, "mri": mri}])}
@@ -697,7 +697,7 @@ async def test_history_names_reaction_people(
         quiet_directory,
         data_dir=_archive(tmp_path / "d", T, [_m("1", _at(1), properties={"emotions": emotions})]),
     )
-    quiet_directory._names[ANN] = "Ann Lee"
+    quiet_directory.note_name(ANN, "Ann Lee")
     [message] = (await _history(board, T))["messages"]
     assert message["reactions"][0]["people"] == ["Ann Lee"]
 
@@ -1112,7 +1112,7 @@ async def test_follow_relays_messages_edits_deletes_reactions_and_typing(
 
         emotions = {"emotions": [{"key": "like", "users": [{"mri": ME, "time": 1}]}]}
         assert board.directory is not None
-        board.directory._names[ME] = "Me Self"
+        board.directory.note_name(ME, "Me Self")
         reaction = {"id": "9", "composetime": _at(9), "messagetype": "RichText/Html", "properties": emotions}
         await board.on_event(_event("MessageUpdate", T, **reaction))
         edit = (await _frame(ws))["edit"]
@@ -1122,9 +1122,9 @@ async def test_follow_relays_messages_edits_deletes_reactions_and_typing(
         assert "html" not in edit  # partial update: the page keeps the body it shows
 
         await board.on_event(_event("NewMessage", T, messagetype="Control/Typing"))
-        assert await _frame(ws) == {"typing": "Ann Lee", "on": True, "thread": T}
+        assert await _frame(ws) == {"typing": "Ann Lee", "on": True, "thread": T, "mri": ANN}
         await board.on_event(_event("NewMessage", T, messagetype="Control/ClearTyping"))
-        assert await _frame(ws) == {"typing": "Ann Lee", "on": False, "thread": T}
+        assert await _frame(ws) == {"typing": "Ann Lee", "on": False, "thread": T, "mri": ANN}
 
 
 async def test_follow_relays_only_its_thread_and_skips_noise(board: W.Board, settings: Settings) -> None:
@@ -1299,7 +1299,7 @@ async def test_relay_failure_does_not_cost_the_board_its_update(
         )
         assert board.rows[B]["last_id"] == "9"
         await board.on_event(_event("NewMessage", B, messagetype="Control/Typing"))
-        assert await _frame(ws) == {"typing": "Ann Lee", "on": True, "thread": B}
+        assert await _frame(ws) == {"typing": "Ann Lee", "on": True, "thread": B, "mri": ANN}
 
 
 async def test_typing_relay_names_who_stopped_and_expires(
@@ -1314,21 +1314,22 @@ async def test_typing_relay_names_who_stopped_and_expires(
         await _frame(ws)
         await board.on_event(_event("NewMessage", C, messagetype="Control/Typing"))
         await board.on_event(_event("NewMessage", C, messagetype="Control/Typing", **bob))
-        assert await _frame(ws) == {"typing": "Ann Lee", "on": True, "thread": C}
-        assert await _frame(ws) == {"typing": "Bob Day", "on": True, "thread": C}
+        assert await _frame(ws) == {"typing": "Ann Lee", "on": True, "thread": C, "mri": ANN}
+        assert await _frame(ws) == {"typing": "Bob Day", "on": True, "thread": C, "mri": "8:orgid:bob"}
         await board.on_event(_event("NewMessage", C, messagetype="Control/ClearTyping", **bob))
-        assert await _frame(ws) == {"typing": "Bob Day", "on": False, "thread": C}
+        assert await _frame(ws) == {"typing": "Bob Day", "on": False, "thread": C, "mri": "8:orgid:bob"}
         assert await _frame(ws) == {
             "typing": "Ann Lee",
             "on": False,
             "thread": C,
+            "mri": ANN,
         }  # Ann never cleared: expiry
         await board.on_event(_event("NewMessage", C, messagetype="Control/Typing"))
-        assert await _frame(ws) == {"typing": "Ann Lee", "on": True, "thread": C}
+        assert await _frame(ws) == {"typing": "Ann Lee", "on": True, "thread": C, "mri": ANN}
         await board.on_event(
             _event("NewMessage", C, id="9", composetime=_at(9), messagetype="Text", content="x")
         )
-        assert await _frame(ws) == {"typing": "Ann Lee", "on": False, "thread": C}
+        assert await _frame(ws) == {"typing": "Ann Lee", "on": False, "thread": C, "mri": ANN}
         assert (await _frame(ws))["msg"]["id"] == "9"
         await _silent(ws, 0.4)  # the expiry was cancelled: no second clear
 
@@ -1408,9 +1409,11 @@ async def test_follow_answers_who_already_types(
         await ws.send(json.dumps({"follow": T}))
         assert (await _frame(ws))["typing"] == []  # another chat's typers stay there
         await ws.send(json.dumps({"follow": B}))
-        assert (await _frame(ws))["typing"] == ["Ann Lee"]  # my own typing is not news to the page
-        assert await _frame(ws) == {"typing": "Ann Lee", "on": False, "thread": B}  # TTL, no ClearTyping
-        assert board.rows[B]["typing"] == []
+        # My own typing is not news to the page; the MRI keys each typer (038-AC6).
+        assert (await _frame(ws))["typing"] == [{"name": "Ann Lee", "mri": ANN}]
+        # TTL, no ClearTyping
+        assert await _frame(ws) == {"typing": "Ann Lee", "on": False, "thread": B, "mri": ANN}
+        await wait(lambda: board.rows[B]["typing"] == [], "my own typing expired")  # armed just after Ann's
 
 
 async def test_typing_expiry_off_the_board_does_not_rebroadcast(
@@ -2783,7 +2786,13 @@ async def test_search_folds_case_and_accents_newest_first(searchable: W.Board, n
     answer = await _search(searchable, T, " reunion ")
     assert answer["search"] == T
     assert [h["id"] for h in answer["hits"]] == ["4", "3", "1"]
-    assert answer["hits"][0] == {"id": "4", "at": _at(4), "name": "Ann Lee", "text": "réunion finie"}
+    assert answer["hits"][0] == {
+        "id": "4",
+        "at": _at(4),
+        "from": ANN,
+        "name": "Ann Lee",
+        "text": "réunion finie",
+    }
     assert [h["id"] for h in (await _search(searchable, T, "ANNULÉE"))["hits"]] == ["3"]
     assert (await _search(searchable, T, "absent"))["hits"] == []
 

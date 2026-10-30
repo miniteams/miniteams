@@ -7,6 +7,7 @@ import pytest
 
 from miniteams import directory as directory_mod
 from miniteams.directory import Directory
+from miniteams.names_store import Row
 
 
 class _Resp:
@@ -113,7 +114,8 @@ async def test_resolve_keys_a_contact_url_on_its_mri(directory: Directory, monke
         directory_mod.httpx, "AsyncClient", lambda *a, **k: _AsyncClientPost(lambda url: _Resp({"value": []}))
     )
     await directory.resolve(["https://fr.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:zzz"])
-    assert directory._names == {"8:orgid:zzz": "zzz"}
+    assert directory._store is not None
+    assert directory._store.get(["8:orgid:zzz"]) == {"8:orgid:zzz": Row("", 0, True, 0)}  # noted, not named
 
 
 async def test_display_negative_caches_unresolved(directory: Directory, monkeypatch) -> None:
@@ -125,8 +127,8 @@ async def test_display_negative_caches_unresolved(directory: Directory, monkeypa
         return _Resp({"value": []})  # endpoint returns nothing
 
     monkeypatch.setattr(directory_mod.httpx, "AsyncClient", lambda *a, **k: _AsyncClientPost(handler))
-    assert await directory.display("8:orgid:zzz") == "zzz"  # stripped fallback
-    assert await directory.display("8:orgid:zzz") == "zzz"
+    assert await directory.display("8:orgid:zzz") == "Unknown user"  # 038-AC6: never the bare id
+    assert await directory.display("8:orgid:zzz") == "Unknown user"
     assert calls["n"] == 1  # negative-cached, not re-fetched
 
 
@@ -137,7 +139,7 @@ async def test_resolve_refresh_retries_negatives(
     """A user unknown to an old lookup (not yet visible, a transient partial answer) stays unknown
     forever unless a caller that shows every name asks again."""
     directory.set_token("sk", bearer="id-tok")
-    directory.note_name("8:orgid:zzz", "zzz")  # negative-cache marker
+    directory._note_missed(["8:orgid:zzz"])  # an earlier lookup named nobody
     directory.note_name("8:orgid:bob", "Bob")
     asked: list[Any] = []
 
@@ -149,7 +151,7 @@ async def test_resolve_refresh_retries_negatives(
     monkeypatch.setattr(directory_mod.httpx, "AsyncClient", lambda *a, **k: _Client(None))
     await directory.resolve(["8:orgid:zzz", "8:orgid:bob"], refresh=refresh)
     assert asked == [["8:orgid:zzz"]] * calls  # a known name is never re-asked
-    assert directory.name_for("8:orgid:zzz") == ("Zoe" if refresh else "zzz")
+    assert directory.name_for("8:orgid:zzz") == ("Zoe" if refresh else "Unknown user")
     assert directory.name_for("8:orgid:bob") == "Bob"
 
 
@@ -170,8 +172,8 @@ async def test_names_cache_persists_across_instances(settings, monkeypatch) -> N
 
 
 async def test_display_without_bearer_skips_resolution(directory: Directory) -> None:
-    # no bearer set → no network, just stripped id
-    assert await directory.display("8:orgid:guid") == "guid"
+    # no bearer set → no network, the unknown label (038-AC6)
+    assert await directory.display("8:orgid:guid") == "Unknown user"
 
 
 async def test_thread_result_is_cached(directory: Directory, monkeypatch) -> None:

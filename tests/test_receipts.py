@@ -350,7 +350,7 @@ async def test_a_live_reader_never_named_yet_is_resolved_at_once(
     monkeypatch.setattr(directory, "resolve", resolve)
     receipts.on_event(G, _live(ANN, "5;1;1"))  # named already: no lookup
     receipts.on_event(G, _live(DAN, "6;1;1"))
-    assert sent[-1][1]["receipts"][DAN.lower()]["name"] == DAN.lower().split(":")[-1]  # painted at once
+    assert sent[-1][1]["receipts"][DAN.lower()]["name"] == "Unknown user"  # painted at once (038-AC6)
     await _settle(receipts)
     assert asked == [[DAN.lower()]]
     assert sent[-1][1]["receipts"][DAN.lower()]["name"] == "Dan Fox"
@@ -469,7 +469,7 @@ async def test_board_relays_receipts_to_followers_without_touching_rows_or_seen(
         assert {"receipts": {}, "thread": T} in frames  # the cached paint, empty here
         assert any(f.get("follow") == T for f in frames)
         assert {
-            "receipts": {ANN.lower(): {"id": "3", "name": ANN.lower().split(":")[-1]}},
+            "receipts": {ANN.lower(): {"id": "3", "name": "Unknown user"}},
             "thread": T,
         } in frames
         await board.on_event({"resourceType": "NewMessage", "resource": _live(ANN, "5;1;1", thread_id=T)})

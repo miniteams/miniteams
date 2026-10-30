@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 
 from .chats import chat_kind
 from .config import Settings
-from .directory import humans
+from .directory import UNKNOWN_USER, humans
 from .emoji_table import SHORTCODES
 from .messages import fold, is_me, snippet
 from .send import MAX_HTML_BYTES, NOTES_THREAD, too_long
@@ -477,7 +477,7 @@ def forms(name: str) -> list[str]:
     """The forms a member is mentioned by (spec 033): full name, first word, last word, the last two
     without the punctuation around them (`Doe, John` → `Doe`; `(Sales)` → `Sales`)."""
     words = name.split()
-    if not words:
+    if not words or name == UNKNOWN_USER:  # several unnamed people share it: it mentions none (038-AC6)
         return []
     return list(
         dict.fromkeys((name, *(word for w in (words[0], words[-1]) if (word := _TRIM_RE.sub("", w)))))

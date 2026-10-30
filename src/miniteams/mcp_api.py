@@ -29,11 +29,11 @@ Record = Callable[[dict[str, Any], Callable[[str], str] | None], dict[str, Any]]
 
 
 class ApiReader:
-    def __init__(self, settings: Settings, skype_token: str, bearer: str, *, record: Record):
+    def __init__(self, settings: Settings, skype_token: str, directory: Directory, *, record: Record):
+        """`directory`: the process's, holding these tokens."""
         self.settings, self.skype_token = settings, skype_token
         self.record = record
-        self.directory = Directory(settings)
-        self.directory.set_token(skype_token, bearer)
+        self.directory = directory
 
     def _conversations(self, since: str) -> list[dict[str, Any]]:
         """Listing rows active at or after `since`, newest first, at most `_MAX_CONVERSATIONS`."""

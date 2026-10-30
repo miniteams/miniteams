@@ -455,7 +455,10 @@
   const split = pref("chatnav") === "split";
   const LIVE_MAX = 600;  // messages kept on screen at the bottom (and buffered while detached)
   const EDGE = 150;  // px from the top or bottom that loads the next page
-  const typing = new Set();
+  const typing = new Map();  // MRI (else the name) → name: two "Unknown user" are two typers
+  // 038-AC6: the server's label of a person no source names; its tooltip tells two of them apart.
+  const UNKNOWN = "Unknown user";
+  const tipped = (name, mri) => (name === UNKNOWN && mri ? `${name} (${mri})` : name);
   // The picker's favorites (spec 016): an emoji, or a custom one's `<name>;<id> <image id>`, stored like the ⚙
   // settings. An emoji is sent as its code points: the server turns them into Teams' key for it.
   const FAVS = ["👍", "❤️", "😆", "😮", "😢", "😡", "🙏", "🙃"];
@@ -733,14 +736,16 @@
     av.style.background = avatarBg(r.from || name);
     if (r.from) { av.dataset.pmri = r.from.toLowerCase(); presenceDot(av); authorsSoon(); }
     const head = el("div", "head"), who = Object.assign(el("b", null, name), { dir: "auto" });
+    const tip = name === UNKNOWN && r.from ? r.from : "";
+    if (tip) who.title = tip;
     // Spec 023: someone else's name, in a chat that is not our 1:1, leads to our 1:1.
-    if (!r.me && /^8:orgid:/i.test(r.from) && kind(thread) !== "dm") { Object.assign(who, { className: "who", tabIndex: -1, title: DM_GO }); who.setAttribute("role", "link"); }
+    if (!r.me && /^8:orgid:/i.test(r.from) && kind(thread) !== "dm") { Object.assign(who, { className: "who", tabIndex: -1, title: tip ? `${tip}\n${DM_GO}` : DM_GO }); who.setAttribute("role", "link"); }
     head.append(who, Object.assign(el("span", "when", fmtTime(r.at)), { title: r.at }));
     if (r.edited && !r.deleted) head.append(el("span", "edited", "edited"));
     body.prepend(head);
     if (!r.deleted && r.reactions && r.reactions.length) {
       const line = el("div", "reacts");
-      const people = r.reactions.map((x) => `${x.emoji} — ${(x.people || []).join(", ") || x.count}`).join("\n");
+      const people = r.reactions.map((x) => `${x.emoji} — ${(x.people || []).map((n, i) => tipped(n, (x.mris || [])[i])).join(", ") || x.count}`).join("\n");
       for (const x of r.reactions) {
         // A custom emoji has no character: its image, else its name.
         const face = x.src ? Object.assign(el("img", "emoji"), { src: x.src, alt: x.emoji })
@@ -1121,7 +1126,7 @@
     }
     for (const [node, readers] of at) {
       const box = el("div", "reads"), extra = readers.length > READS_SHOWN ? readers.length - READS_SHOWN : 0;
-      box.title = readers.map((p) => p.name).join("\n");
+      box.title = readers.map((p) => tipped(p.name, p.mri)).join("\n");
       box.setAttribute("role", "img"); box.setAttribute("aria-label", "Read by " + readers.map((p) => p.name).join(", "));
       for (const p of readers.slice(0, readers.length - extra)) {
         const a = el("span", "ra", initials(p.name));
@@ -1397,7 +1402,7 @@
     for (const h of m.hits || []) {
       const b = el("button");
       b.dataset.id = h.id;
-      b.append(Object.assign(el("b", null, h.name || "?"), { dir: "auto" }), el("span", "when", fmtTime(h.at)),
+      b.append(Object.assign(el("b", null, h.name || "?"), { dir: "auto" }, h.name === UNKNOWN && h.from ? { title: h.from } : {}), el("span", "when", fmtTime(h.at)),
         Object.assign(el("div", "truncate", h.text), { dir: "auto" }));
       b.onclick = () => { $hits.hidden = true; jump(h.at, h.id); };
       $hits.append(b);
@@ -1418,7 +1423,11 @@
   };
   document.addEventListener("click", (e) => { if (!$hits.contains(e.target) && e.target !== $find) closeHits(); });
 
-  const renderTyping = () => { $typing.textContent = typing.size ? "✍ " + [...typing].join(", ") + (typing.size > 1 ? " are" : " is") + " typing…" : ""; };
+  const renderTyping = () => {
+    if (!typing.size) { $typing.replaceChildren(); return; }
+    const who = [...typing].flatMap(([mri, n], i) => [...(i ? [", "] : []), n === UNKNOWN && mri !== n ? Object.assign(el("span", null, n), { title: mri }) : n]);
+    $typing.replaceChildren("✍ ", ...who, (typing.size > 1 ? " are" : " is") + " typing…");
+  };
 
   // Spec 022: the members under "N members", on hover (delayed, the popover hoverable too) or focus.
   const $mpop = document.getElementById("mpop"), MEMBERS_SHOWN = 50;
@@ -1431,7 +1440,7 @@
       const name = p.me ? "You" : p.name || "?", av = el("span", "mav", initials(p.name || name));
       av.style.background = avatarBg(p.mri); av.dataset.pmri = p.mri.toLowerCase();
       const li = el("li");
-      li.append(presenceDot(av), Object.assign(el("span", "truncate", name), { dir: "auto" }));
+      li.append(presenceDot(av), Object.assign(el("span", "truncate", name), { dir: "auto" }, name === UNKNOWN ? { title: p.mri } : {}));
       ul.append(li);
     }
     const more = Math.max(rosterTotal, roster.length) - shown.length;
@@ -1482,7 +1491,7 @@
     sends.wake();  // only now: a page about to reload must not resend first
     hist.followFailed = false;
     // Who already types when the follow lands (open, switch, reconnect): frames only carry changes.
-    typing.clear(); for (const n of m.typing || []) typing.add(n); renderTyping();
+    typing.clear(); for (const t of m.typing || []) if (t && typeof t.name === "string") typing.set(t.mri || t.name, t.name); renderTyping();
     retry.reset();  // not on open: a socket whose follow fails must keep backing off
     readOnly = !!m.read_only;
     $reply.disabled = readOnly;
@@ -2044,10 +2053,10 @@
       else if (typeof m.edit === "string" || "react" in m || "delete" in m) onAction(m);
       else if (m.msg) {
         append(m.msg);
-        if (typing.delete(m.msg.name)) renderTyping();
+        if (typing.delete(m.msg.from) || typing.delete(m.msg.name)) renderTyping();
       }
       else if (m.edit) replace(m.edit);
-      else if ("typing" in m) { if (m.on) typing.add(m.typing); else typing.delete(m.typing); renderTyping(); }
+      else if ("typing" in m) { if (m.on) typing.set(m.mri || m.typing, m.typing); else typing.delete(m.mri || m.typing); renderTyping(); }
       else if ("sent" in m) onSent(m);
     };
     ws.onclose = () => {

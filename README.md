@@ -66,6 +66,7 @@ uv run miniteams archive --live                        # catch up, then store ea
 uv run miniteams archive --live --verify-media         # same, plus one background media sweep
 uv run miniteams archive --recheck-since 2026-09-22    # one-shot: re-walk chats active since the
                                                        # date down to it, filling any hole
+uv run miniteams names --sweep    # learn the names the archive holds (--data-dir; below)
 uv run miniteams web              # local live page: conversations newest-first (see below)
 uv run miniteams web --limit 0 --bind 127.0.0.5:8765   # load every chat (with an archive that is
                                                        # every archived chat: a heavier page)
@@ -373,12 +374,21 @@ turns each line into an event in the session; `docs/watch.md` has the call and t
 (`gap`, `suppressed`, `stopped`).
 
 `stream` enriches each line with thread name + participants, resolves MRIs → display names
-(cached in `~/.cache/miniteams/names-v2.json`; the older `names.json` is ignored), downloads
+(kept in `~/.config/miniteams/names.db`, shared by every miniteams process; a person no source names
+reads `Unknown user`, never their guid, with the MRI on hover in the chat page), downloads
 images/files to `~/.cache/miniteams/media/` (full-res + optimized, shown as `file://`), and renders
 reactions (`↳ 👍 Alice reacted`), edits (`✏ …`) and deletes (`🗑 …`). `--typing` adds `✍ is typing /
 stopped` indicators.
 `stream --jsonl` = per-event JSON; `stream --raw` = full firehose NDJSON of every frame (all
 endpoints, presence/calls, named events), decoded.
+
+`names --sweep` reads every chat of the archive (`--data-dir`, default `./data`) for people's names:
+call records and member events (archived), the name each sender's message declares (declared), and
+the rosters of `index.db`. A name only replaces one of a lower rank, or an older one of its rank. It
+opens the archive read-only and creates no file in it (unless the archiver closes a chat at that very
+moment: then SQLite's usual sidecars, which the next writer reuses), so it can run beside `archive
+--live`; a chat it cannot read is skipped. It prints how many chats it read and how many people it
+named. It exits 1 without a readable `index.db`, or when names.db stays unusable and names go unsaved.
 
 `archive` keeps private chats, meeting chats and your own `48:` conversations: Notes, scheduled
 and parked drafts, and the activity feeds (mentions, notifications, saved, …). `--all` adds
