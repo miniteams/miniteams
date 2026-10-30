@@ -1,6 +1,6 @@
 # 038 — Names that outlive their owners
 
-**Status**: in progress
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-10-30
 
@@ -59,22 +59,22 @@ shows the id, so two unknown people stay distinguishable.
 
 ## Acceptance criteria
 
-- [ ] **AC1** Given an MRI whose profile lookup returns no name, when the archive holds a call record
+- [x] **AC1** Given an MRI whose profile lookup returns no name, when the archive holds a call record
       naming it, then every label for it (title, member line, sender) shows that name.
-- [ ] **AC2** A **declared** name never replaces an **archived** or **live** one; an **archived**
+- [x] **AC2** A **declared** name never replaces an **archived** or **live** one; an **archived**
       name never replaces a **live** one; an empty or failed lookup never replaces any name.
-- [ ] **AC3** Two processes learning different names at the same time both keep theirs: neither
+- [x] **AC3** Two processes learning different names at the same time both keep theirs: neither
       write drops the other.
-- [ ] **AC4** First start with an existing `names-v2.json`, `names.json` and `index.db` imports all
+- [x] **AC4** First start with an existing `names-v2.json`, `names.json` and `index.db` imports all
       three; a second start imports nothing more and changes no row.
-- [ ] **AC5** `miniteams names --sweep` on an archive names every MRI that a call record, a member
+- [x] **AC5** `miniteams names --sweep` on an archive names every MRI that a call record, a member
       event or a sent message names; it reads the archive only, never writes it, and can run while
       the archiver runs.
-- [ ] **AC6** Given an MRI no source names, every label for it reads "Unknown user", never its guid;
+- [x] **AC6** Given an MRI no source names, every label for it reads "Unknown user", never its guid;
       in the chat page, hovering it shows the MRI.
-- [ ] **AC7** A message from a sender with a **live** or **archived** name is attributed to that name
+- [x] **AC7** A message from a sender with a **live** or **archived** name is attributed to that name
       even if its `imdisplayname` differs (today's #85 rule kept).
-- [ ] **AC8** The live archiver stores the names of the call records, member events and senders it
+- [x] **AC8** The live archiver stores the names of the call records, member events and senders it
       archives, without a second pass over the message.
 
 ## Phases

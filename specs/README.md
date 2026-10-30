@@ -39,4 +39,4 @@
 | [035](035-click-setting.md) | Choose what each click on a chat row opens | shipped |
 | [036](036-own-presence.md) | Connection banner and own presence | shipped |
 | [037](037-card-refresh.md) | Up-to-date app cards | shipped |
-| [038](038-names-store.md) | Names that outlive their owners | in progress |
+| [038](038-names-store.md) | Names that outlive their owners | shipped |
