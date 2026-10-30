@@ -27,7 +27,7 @@ from .card_refresh import _BUSY_TIMEOUT, CardRefresher, Cards, CardStore
 from .chats import chat_kind, is_system, last_activity, parse_when
 from .compose import render_outgoing
 from .config import Settings
-from .directory import Directory, sender_name
+from .directory import Directory, member_label, sender_name, unknown
 from .drafts import (
     SCHEDULE_MAX_AHEAD,
     SCHEDULE_MIN_AHEAD,
@@ -182,7 +182,7 @@ def message_record(
     record = {
         "id": str(message.get("id") or ""),
         "time": str(message.get("composetime") or ""),
-        "sender": sender_name(mri, message.get("imdisplayname"), known_name),
+        "sender": sender_name(mri, message.get("imdisplayname"), known_name) or unknown(mri),
         "from": mri,
         "text": message_text(message, known_name),
         "edited": is_edited(message),
@@ -307,7 +307,10 @@ class Archive:
                     "label": chat["label"],
                     "kind": chat_kind(thread_id),
                     "last_activity": activity,
-                    "participants": [{"name": n, "mri": str(m.get("mri") or "")} for n, m in roster],
+                    "participants": [
+                        {"name": member_label(str(m.get("mri") or ""), n), "mri": str(m.get("mri") or "")}
+                        for n, m in roster
+                    ],
                     "backfill_done": chat["backfill_done"],
                     "history_denied": chat["history_denied"],
                     "synced_at": chat["synced_at"],

@@ -20,7 +20,7 @@ import structlog
 
 from . import attachments
 from ._io import emit
-from .directory import Directory, sender_name
+from .directory import UNKNOWN_USER, Directory, is_name, sender_name
 from .emoji_table import SHORTCODES
 from .names_store import ARCHIVED, DECLARED, Entry, iso_ms
 from .teams_emojis import TEAMS_DIVERSE, TEAMS_EMOJIS, TEAMS_PLAIN
@@ -360,7 +360,7 @@ def parse_activity(msgtype: str, content: str) -> Activity | None:
         if tag == "value":
             value = text
         elif tag == "friendlyname":
-            if last and text:
+            if last and is_name(last, text):  # a bare guid is no name (038-AC6)
                 names.setdefault(last, text)  # names the MRI just before it, initiator or target
         elif text:
             last = text
@@ -383,7 +383,9 @@ def _parse_member_event(content: str) -> Activity | None:
     people = [m for m in members if isinstance(m, dict) and m.get("id")] if isinstance(members, list) else []
     if not people:
         return None
-    names = {str(m["id"]): str(m["friendlyname"]) for m in people if m.get("friendlyname")}
+    names = {
+        str(m["id"]): name for m in people if is_name(str(m["id"]), name := str(m.get("friendlyname") or ""))
+    }
     # No initiator: the line never shows it, so name_activity must not look it up.
     return Activity("", tuple(str(m["id"]) for m in people), "", names)
 
@@ -420,25 +422,29 @@ def message_names(message: dict[str, Any]) -> list[Entry]:
     entries: list[Entry] = []
     for mri, name, rank, source in found:
         mri = mri.rsplit("/", 1)[-1]  # `from` is a contact URL ending in the MRI
-        if mri and name and name != mri.split(":")[-1]:
+        if mri and is_name(mri, name):
             entries.append((mri, name, rank, source, seen))
     return entries
 
 
 def activity_line(msgtype: str, activity: Activity, me: str, name_for: Callable[[str], str] | None) -> str:
-    """The plain-text line a system message shows: "👥 Ann added Bob, Carl", "👥 Bob left"…"""
+    """The escaped HTML line a system message shows: "👥 Ann added Bob, Carl", "👥 Bob left"…; an
+    "Unknown user" carries its MRI as a tooltip (038-AC6)."""
 
     def who(mri: str) -> str:
         if is_me(mri, me):
             return "You"
-        return activity.names.get(mri) or (name_for(mri) if name_for else "someone")
+        name = activity.names.get(mri) or (name_for(mri) if name_for else "someone")
+        if name == UNKNOWN_USER:
+            return f'<span title="{html.escape(mri)}">{UNKNOWN_USER}</span>'
+        return html.escape(name)
 
     if msgtype in _MEMBER_EVENTS:
         joined = msgtype == "ThreadActivity/MemberJoined"
         return f"👥 {', '.join(map(who, activity.targets))} {'joined' if joined else 'left'}"
     actor = who(activity.initiator)
     if msgtype == "ThreadActivity/TopicUpdate":
-        return f"✎ {actor} renamed the chat to «{activity.value}»"
+        return f"✎ {actor} renamed the chat to «{html.escape(activity.value)}»"
     added = msgtype == "ThreadActivity/AddMember"
     if activity.targets == (activity.initiator,):
         return f"👥 {actor} {'joined' if added else 'left'}"

@@ -7,7 +7,7 @@ present; we read it opportunistically and fall back to the roster otherwise.
 
 Caches live for the process lifetime and survive reconnects; the token pair is renewed by the
 stream while a session lasts (`set_token`). Lookups never raise into the stream — a failed fetch
-degrades to the bare id and is not retried for `_THREAD_RETRY_AFTER`.
+degrades to the thread id and is not retried for `_THREAD_RETRY_AFTER`.
 """
 
 import asyncio
@@ -69,10 +69,43 @@ _RESEEN_MS = 24 * 3600 * 1000
 # Lookups run inline in the event loop and a 429 retry can take ~30s: don't repeat that per message.
 _THREAD_RETRY_AFTER = 60.0
 
+UNKNOWN_USER = "Unknown user"  # the label of a person no source names (038-AC6)
+
 
 def is_app(mri: str) -> bool:
     """`28:<id>` MRIs are bots/apps; people are `8:orgid:<guid>`."""
     return mri.rsplit("/", 1)[-1].startswith("28:")
+
+
+def is_person(mri: str) -> bool:
+    """`8:` MRIs are people (`8:orgid:<guid>`, guests…); bots, apps and threads are not."""
+    return _bare(mri).startswith("8:")
+
+
+def unknown(mri: str) -> str:
+    """The label of an MRI no source names: UNKNOWN_USER for a person, "" else (bots keep their own)."""
+    return UNKNOWN_USER if is_person(mri) else ""
+
+
+def is_name(mri: str, name: str) -> bool:
+    """`name` names `mri`: not empty, not its bare id, not the unknown label a roster stores."""
+    return bool(name) and name != _tail(mri) and name != UNKNOWN_USER
+
+
+def member_label(mri: str, name: str) -> str:
+    """A stored roster member's label: its name, else unknown()'s for a person; a bot's as stored."""
+    return name if is_name(mri, name) else unknown(mri) or name
+
+
+def unnamed_people(members: list[Any]) -> list[str]:
+    """The MRIs of a stored roster's people it names by no name: "", their bare guid or "Unknown user"."""
+    return [
+        mri
+        for m in members
+        if isinstance(m, dict)
+        and is_person(mri := str(m.get("mri") or ""))
+        and not is_name(mri, str(m.get("name") or ""))
+    ]
 
 
 def humans(members: list[dict[str, Any]]) -> dict[str, str]:
@@ -88,16 +121,23 @@ def roster_label(topic: str | None, members: list[dict[str, Any]], me: str) -> s
     if topic:
         return f"{topic} · {len(members)}p"
     named = [m for m in members if m.get("name")]
-    others = [str(m["name"]) for m in named if m.get("mri") != me and not is_app(str(m.get("mri") or ""))]
+    others = [
+        label
+        for m in members
+        if (mri := str(m.get("mri") or "")) != me
+        and not is_app(mri)
+        and (label := member_label(mri, str(m.get("name") or "")))
+    ]
     apps = [str(m["name"]) for m in named if is_app(str(m.get("mri") or ""))]
-    return ", ".join(others or apps or [str(m["name"]) for m in named])
+    return ", ".join(others or apps or [member_label(str(m.get("mri") or ""), str(m["name"])) for m in named])
 
 
 def sender_name(mri: str, declared: object, known_name: Callable[[str], str] | None) -> str:
     """Who sent a message: the directory's name for `mri`, else the name this message declares, else "".
 
     The declared `imdisplayname` is free text the sending client chose; Teams attributes by `from`."""
-    return (known_name(mri) if known_name and mri else "") or str(declared or "")
+    said = str(declared or "")
+    return (known_name(mri) if known_name and mri else "") or (said if is_name(mri, said) else "")
 
 
 def _bare(mri: str) -> str:
@@ -173,7 +213,7 @@ def roster_entries(index: Path) -> list[Entry]:
             if not isinstance(p, dict):
                 continue
             mri, name = _bare(str(p.get("mri") or "")), str(p.get("name") or "")
-            if mri and name and name != _tail(mri):
+            if mri and is_name(mri, name):
                 entries.append((mri, name, ARCHIVED, "index-roster", seen))
     return entries
 
@@ -269,7 +309,7 @@ class Directory:
         batch: list[Entry] = []
         for mri, name, rank, source, seen in entries:
             mri = _bare(mri)
-            if not mri or not name or name == _tail(mri):
+            if not mri or not is_name(mri, name):
                 continue
             held = self._names.get(mri)
             if held is not None and (held.rank > rank or held.rank == rank and seen < held.seen):
@@ -345,7 +385,7 @@ class Directory:
             else:
                 entries.append((mri, name, ARCHIVED, "names-v2", 0))
         old = _cached_names(self.settings.cache_dir / "names.json")
-        entries += [(mri, name, DECLARED, "names-json", 0) for mri, name in old if name != _tail(mri)]
+        entries += [(mri, name, DECLARED, "names-json", 0) for mri, name in old if is_name(mri, name)]
         if self._stored(lambda s: s.import_once(_CACHE_IMPORT, entries, missed, now_ms()), None) is None:
             self._cache_import_due()
 
@@ -421,13 +461,22 @@ class Directory:
             held = self._names.get(mri)
         return held.name if held is not None and held.rank >= ARCHIVED else ""
 
+    def known_names(self, mris: list[str]) -> dict[str, str]:
+        """known_name of each of `mris` that has one, keyed as given; one names.db read for those not held."""
+        held = {m: self._names.get(_bare(m)) for m in mris}
+        if missing := [_bare(m) for m, h in held.items() if h is None or h.rank < ARCHIVED]:
+            self._remember(self._stored(lambda s: s.get(missing), {}))
+        found = {m: self._names.get(_bare(m)) for m in mris}
+        return {m: h.name for m, h in found.items() if h is not None and h.rank >= ARCHIVED}
+
     def name_for(self, mri: str) -> str:
-        """A label for `mri`: its known name, else the last name a message declared, else its bare id."""
+        """A label for `mri`: its known name, else the last name a message declared, else "Unknown user"
+        (038-AC6); a bot's bare id."""
         mri = _bare(mri)
         if known := self.known_name(mri):  # reads the store into _names
             return known
         held = self._names.get(mri)
-        return held.name if held else _tail(mri)
+        return held.name if held else unknown(mri) or _tail(mri)
 
     def _lookup_due(self, mri: str, refresh: bool) -> bool:
         held = self._names.get(mri)
@@ -462,12 +511,12 @@ class Directory:
         pairs = [(_bare(str(u.get("mri") or "")), str(u.get("displayName") or "")) for u in users]
         self._note(pairs, LIVE, "profile")
         # Noted only after a successful lookup: transient failures above return early and stay retryable.
-        named = {mri for mri, name in pairs if name and name != _tail(mri)}
+        named = {mri for mri, name in pairs if is_name(mri, name)}
         if missed := [mri for mri in todo if mri not in named]:
             self._note_missed(missed)
 
     async def display(self, mri: str) -> str:
-        """Resolve an MRI to a display name (cached); falls back to the stripped id."""
+        """Resolve an MRI to a display name (cached); falls back as name_for does."""
         mri = _bare(mri)
         if self.bearer and mri.startswith("8:orgid:") and self._lookup_due(mri, False):
             await self.resolve([mri])
@@ -567,13 +616,15 @@ class Directory:
         for m in data.get("members") or []:
             mri = m.get("linkedMri") or _mri_from_userlink(m.get("userLink")) or m.get("mri") or ""
             name = m.get("friendlyName") or m.get("friendlyname") or ""
-            members.append({"mri": mri, "name": name, "role": m.get("role")})
+            # A bare guid is no name: stored, it would make the archiver relabel the chat every pass.
+            members.append({"mri": mri, "name": name if is_name(mri, name) else "", "role": m.get("role")})
         self._note([(m["mri"], m["name"]) for m in members], LIVE, "roster")
 
         # Resolve roster members the thread didn't name (bare-guid MRIs) in one batched call.
         await self.resolve([m["mri"] for m in members if not m["name"]])
         for m in members:
-            m["name"] = m["name"] or self.known_name(m["mri"]) or _tail(m["mri"])  # never a declared name
+            # Never a declared name; an unnamed person's label is stored as such, its MRI beside it (038-AC6).
+            m["name"] = m["name"] or self.known_name(m["mri"]) or unknown(m["mri"]) or _tail(m["mri"])
 
         props = data.get("properties") or {}
         topic = props.get("topic") or None
@@ -587,7 +638,7 @@ class Directory:
         }
 
     async def label(self, thread_id: str) -> str:
-        """Human-readable thread label: topic · N, else roster names, else bare id."""
+        """Human-readable thread label: topic · N, else roster names, else the thread id."""
         if thread_id in _SPECIAL_THREADS:
             return _SPECIAL_THREADS[thread_id]
         info = await self.thread(thread_id)

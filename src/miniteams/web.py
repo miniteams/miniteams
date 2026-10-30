@@ -891,7 +891,9 @@ class Board:
             "read_only": not in_scope(thread_id),  # `send` refuses channels: no composer for them
             # Live frames only say what changes: who already types is in the timers, board row or not.
             "typing": [
-                n for (tid, _), (_, n) in self._typing_timers.items() if tid == thread_id and n != _YOU
+                {"name": n, "mri": mri}
+                for (tid, mri), (_, n) in self._typing_timers.items()
+                if tid == thread_id and n != _YOU
             ],
         }
         # Spec 022: the members popover opens on the label's count only (none on a 1:1, a channel's would
@@ -932,7 +934,8 @@ class Board:
                 return
             if msgtype == "Control/Typing":
                 name = self._typing_arm(thread_id, _from(resource), await sender_of(resource, self.directory))
-                self._relay_now(thread_id, {"typing": name, "on": True})
+                # The MRI: the page's tooltip of an "Unknown user" (038-AC6).
+                self._relay_now(thread_id, {"typing": name, "on": True, "mri": _from(resource)})
             else:
                 self._typing_stop(thread_id, _from(resource), self._relay_now)
             return
@@ -1314,10 +1317,14 @@ class Board:
             self._typing_stop(thread_id, _from(resource), self._relay_queued)
             self.broadcast()
             return
-        name = self._typing_arm(thread_id, _from(resource), await sender_of(resource, self.directory))
-        if name not in row["typing"]:
-            row["typing"].append(name)
+        self._typing_arm(thread_id, _from(resource), await sender_of(resource, self.directory))
+        row["typing"] = self._typers(thread_id)
         self.broadcast()
+
+    def _typers(self, thread_id: str) -> list[str]:
+        """The names typing in the chat, rebuilt from the per-MRI timers: one "Unknown user" stopping leaves
+        another's name in place (038-AC6)."""
+        return list(dict.fromkeys(n for (tid, _), (_, n) in self._typing_timers.items() if tid == thread_id))
 
     def _typing_arm(self, thread_id: str, mri: str, name: str) -> str:
         """(Re)start the expiry: Teams does not always send ClearTyping. Returns the name announced."""
@@ -1340,10 +1347,10 @@ class Board:
         timer, name = entry
         timer.cancel()
         if name != _YOU:  # my own typing on another device is not news to the page
-            relay(thread_id, {"typing": name, "on": False})
+            relay(thread_id, {"typing": name, "on": False, "mri": mri})
         row = self.rows.get(thread_id)
-        if row and name in row["typing"]:
-            row["typing"].remove(name)
+        if row:
+            row["typing"] = self._typers(thread_id)
 
     def _typing_expired(self, thread_id: str, mri: str) -> None:
         self._typing_stop(thread_id, mri, self._relay_queued)

@@ -28,7 +28,13 @@ from .archive_store import ChatStore, Index
 from .auth import AuthExpired, TokenSource
 from .chats import DRAFTS_THREAD, fetch_conversations, in_archive_scope, last_activity
 from .config import Settings, write_private
-from .directory import Directory
+from .directory import (
+    _SPECIAL_THREADS,
+    UNKNOWN_USER,
+    Directory,
+    roster_label,
+    unnamed_people,
+)
 from .drafts import iter_draft_pages
 from .dump import epoch_seconds, iter_history_pages
 from .messages import message_files, message_names
@@ -432,6 +438,28 @@ async def _download_avatars(store: ChatStore, info: dict[str, Any], skype_token:
     return saved
 
 
+def _relabel(index: Index, directory: Directory, thread_id: str) -> None:
+    """038-AC1, 038-AC6: the people a stored roster names by no name get names.db's names, else "Unknown
+    user", and a topic-less chat its label again; local only, written only when a name changed."""
+    members = index.participants(thread_id)
+    if not (unnamed := unnamed_people(members)):
+        return
+    names, todo = directory.known_names(unnamed), set(unnamed)  # one names.db read per chat
+    fixed = [
+        {**m, "name": names.get(mri) or UNKNOWN_USER}
+        if isinstance(m, dict) and (mri := str(m.get("mri") or "")) in todo
+        else m
+        for m in members
+    ]
+    if fixed == members:  # its unknown people are still unknown: nothing to write
+        return
+    label, topic = index.label_topic(thread_id)
+    if not topic and thread_id not in _SPECIAL_THREADS:
+        label = roster_label(None, [m for m in fixed if isinstance(m, dict)], directory.me) or label
+    index.upsert_chat(thread_id, label=label, topic=topic, participants=fixed)
+    log.info("chat_relabelled", thread=thread_id)
+
+
 async def archive_chat(
     settings: Settings,
     skype_token: str,
@@ -496,17 +524,26 @@ async def archive_chat(
         # roster/meeting updates) or no message at all: only an unchanged version proves them idle.
         version = int(conv.get("version") or 0)
         if caught_up or (version and version == index.synced_version(thread_id)):
+            _relabel(index, directory, thread_id)
             by = "activity" if caught_up else "version"
             log.info("chat_unchanged", thread=thread_id, newest=(newest or "")[:19], by=by)
             index.touch(thread_id, _now_iso())
             return counts
 
-    info = await directory.thread(thread_id) or {}  # topic + roster + picture (best-effort)
+    fetched = await directory.thread(thread_id)  # topic + roster + picture (best-effort); None: not fetched
+    info = fetched or {}
     label = await directory.label(thread_id)
     # The directory fetch is itself denied on meeting chats whose access was revoked (403);
     # the enumeration raw still carries the topic — use it so index + logs show a name, not the id.
     topic = str(info.get("topic") or ((conv or {}).get("threadProperties") or {}).get("topic") or "")
-    if label == thread_id and topic:
+    if fetched is None:  # what the index holds stands: a failed fetch must not wipe its label or roster
+        stored_label, stored_topic = index.label_topic(thread_id)
+        if label == thread_id:  # the stored label stands while the topic it was made from does
+            label = (
+                stored_label if stored_label and stored_topic == topic else topic or stored_label or thread_id
+            )
+        topic = topic or stored_topic
+    elif label == thread_id and topic:
         label = topic
     log.info("chat_start", chat=label, thread=thread_id)
     # Store the full conversation object only when we have a real one (enumeration); a bare
@@ -516,7 +553,7 @@ async def archive_chat(
         thread_id,
         label=label,
         topic=topic,
-        participants=info.get("members") or [],
+        participants=None if fetched is None else info.get("members") or [],
         raw=raw,
     )
     store = ChatStore(data_dir, thread_id)

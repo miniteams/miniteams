@@ -4,8 +4,10 @@ against the real board. Synthetic data, no network, no Teams.
 Run: `uv run --with playwright pytest tests/test_browser_members.py`.
 """
 
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import browser_helpers
@@ -14,8 +16,9 @@ import test_browser_split_ux as ux
 import test_web_chat
 from browser_helpers import Page, Pages, past, until  # skips without playwright
 from test_browser_split_ux import _board, _id
-from test_web_chat import ANN, ME, T, _at, _served
+from test_web_chat import ANN, ME, T, _at, _m, _served
 
+from miniteams import compose
 from miniteams import web as W
 from miniteams.config import Settings
 from miniteams.directory import Directory
@@ -298,3 +301,101 @@ async def test_a_click_toggles_and_leaving_closes(chat: ux.Split) -> None:
     assert await page.evaluate(OPEN)
     await page.click("#members")
     await _closed_for_good(page)
+
+
+GONE = "8:orgid:0000c0de-0000-4000-8000-00000000dead"  # nobody ever named them
+OTHER = "8:orgid:0000c0de-0000-4000-8000-00000000beef"  # another one
+LIVE = "8:live:unknown-person-test"  # a consumer account: no private-chat link
+GUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+
+
+async def test_an_unnamed_member_reads_unknown_user_with_the_mri_on_hover(
+    directory: Directory, settings: Settings, pages: Pages, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """038-AC6: the sender, the member line, a reaction, a receipt, a quote, typing, a search hit and the
+    members list say "Unknown user", never the guid; each shows the MRI on hover. Two unknown typers stay
+    two when one stops."""
+    contact = {"from": f"https://h/v1/users/ME/contacts/{GONE}", "imdisplayname": ""}
+    other = {"from": f"https://h/v1/users/ME/contacts/{OTHER}", "imdisplayname": ""}
+    first = _m("1", _at(1), **contact)
+    left = f"<deletemember><eventtime>1</eventtime><initiator>{GONE}</initiator><target>{GONE}</target>"
+    left += "</deletemember>"
+    data = test_web_chat._archive(
+        tmp_path / "data",
+        T,
+        [
+            first,
+            _m("2", _at(2), properties={"emotions": [{"key": "like", "users": [{"mri": GONE}]}]}),
+            _m("3", _at(3), left, messagetype="ThreadActivity/DeleteMember", **{"from": T}),
+            _m(
+                "4",
+                _at(4),
+                "<p>hello</p>",
+                **{"from": f"https://h/v1/users/ME/contacts/{LIVE}", "imdisplayname": ""},
+            ),
+            _m("5", _at(5), compose.reply_quote(first, "Unknown user") + "<p>agreed</p>"),
+        ],
+    )
+    directory.note_name(ANN, "Ann Lee")
+    roster = [
+        {"mri": ME, "name": "Me Self"},
+        {"mri": ANN, "name": "Ann Lee"},
+        {"mri": GONE, "name": "Unknown user"},
+    ]
+
+    async def fetch(self: Directory, thread_id: str) -> dict[str, Any]:
+        return {"topic": None, "members": [dict(m) for m in roster]}  # as _fetch_thread labels them
+
+    monkeypatch.setattr(Directory, "_fetch_thread", fetch)
+    board = W.Board({}, directory, me=ME, data_dir=data)
+    board.link = "up"
+    board.rows[T] = {"id": T, "label": "Team · 3p", "last_activity": _at(5), "last_id": "5", "typing": []}
+    board.rows[T].update(seen_at=None, muted=False, mention=None)
+    async with _served(board, settings) as host:
+        pages.serve(host, board)
+        page = await pages.open(f"/chat/{T}")
+        await page.wait_for_selector('[data-id="3"] .html span[title]')
+        for who in (contact, other):
+            await board.on_event(test_web_chat._event("NewMessage", T, messagetype="Control/Typing", **who))
+        await until(page, "document.querySelectorAll('#typing span').length === 2")
+        await board.on_event(
+            test_web_chat._event("NewMessage", T, messagetype="Control/ClearTyping", **contact)
+        )
+        await until(page, "document.querySelectorAll('#typing span').length === 1")
+        board._receipts_frame(T, {"receipts": {GONE: {"id": "2", "name": directory.name_for(GONE)}}})
+        await until(page, "document.querySelector('[data-id=\"2\"] .reads') !== null")
+        await page.hover("#members")
+        await until(page, OPEN)
+        await until(page, f"{ROWS}.length === 3")
+        shown = await page.evaluate("document.body.innerText")
+        assert "Unknown user" in shown
+        assert not re.search(GUID, shown), shown
+        title = "(s) => [s.textContent, s.title]"
+        sender = await page.locator('[data-id="1"] .head b').evaluate(title)
+        assert sender[0] == "Unknown user" and sender[1].split("\n")[0] == GONE
+        assert await page.locator('[data-id="3"] .html span[title]').evaluate(title) == ["Unknown user", GONE]
+        assert await page.locator("#typing span").evaluate(title) == [
+            "Unknown user",
+            OTHER,
+        ]  # the other still types
+        assert await page.locator("#typing").inner_text() == "✍ Unknown user is typing…"
+        # Not an orgid MRI: no private-chat link, the plain tooltip.
+        assert await page.locator('[data-id="4"] .head b').evaluate(title) == ["Unknown user", LIVE]
+        assert await page.locator('[data-id="5"] .html strong').evaluate(title) == ["Unknown user", GONE]
+        assert f"Unknown user ({GONE})" in await page.locator(
+            '[data-id="2"] .reacts > *'
+        ).first.get_attribute("title")
+        assert await page.locator('[data-id="2"] .reads').get_attribute("title") == f"Unknown user ({GONE})"
+        member = page.locator("#mpop li > .truncate", has_text="Unknown user")
+        assert await member.evaluate(title) == ["Unknown user", GONE]
+        named = page.locator("#mpop li > .truncate", has_text="Ann Lee")
+        assert await named.get_attribute("title") is None  # named people: no tooltip
+        await page.mouse.move(900, 600)
+        await page.fill("#find", "m1")
+        await page.press("#find", "Enter")
+        await page.wait_for_selector("#hits button b")
+        assert await page.locator('#hits button[data-id="1"] b').evaluate(title) == ["Unknown user", GONE]
+        assert await page.locator('#hits button[data-id="5"] b').evaluate(title) == ["Ann Lee", ""]
+        assert not re.search(GUID, await page.evaluate("document.body.innerText"))
+        await pages.close()
+    assert pages.external == []

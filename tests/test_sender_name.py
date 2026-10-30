@@ -190,7 +190,7 @@ async def test_the_web_stamps_the_name_it_starts_with(
 
 # --- display side: the directory's name for `from`, else this message's declared name ---
 
-TAIL = ANN.split(":")[-1]  # an unresolved MRI's label
+UNKNOWN = "Unknown user"  # an unresolved person's label (038-AC6)
 
 
 def _named(directory: Directory, name: str) -> None:
@@ -295,13 +295,13 @@ async def _relayed(
     return str(frame["msg"]["name"])
 
 
-# The name each site shows when neither the directory nor the message names the sender.
+# The name each site shows when neither the directory nor the message names the sender (038-AC6).
 SITES: dict[str, tuple[Site, str]] = {
-    "chat record": (_record, ""),  # the page shows "?"
-    "live relay": (_relayed, ""),
-    "live relay, media": (functools.partial(_relayed, media=True), ""),
-    "reply quote": (_quote, TAIL),
-    "search hit": (_hit, ""),
+    "chat record": (_record, UNKNOWN),
+    "live relay": (_relayed, UNKNOWN),
+    "live relay, media": (functools.partial(_relayed, media=True), UNKNOWN),
+    "reply quote": (_quote, UNKNOWN),
+    "search hit": (_hit, UNKNOWN),
     "list row": (_row, f"name:{CONTACT}"),
     "watch line": (_watch_line, f"name:{CONTACT}"),
     "stream jsonl": (_jsonl, f"name:{CONTACT}"),
@@ -409,7 +409,7 @@ def test_a_declared_name_never_becomes_a_known_name(
 def test_a_declared_name_is_a_last_resort_label(directory: Directory, negative: bool) -> None:
     if negative:
         directory._note_missed([ANN])
-    assert directory.name_for(ANN) == TAIL
+    assert directory.name_for(ANN) == UNKNOWN
     directory.note_declared(CONTACT, BOGUS, D.now_ms())
     directory.note_declared(ANN, "", D.now_ms())  # an empty name keeps the last one
     assert directory.name_for(ANN) == BOGUS  # reaction people, typing: some label beats a guid
@@ -458,7 +458,7 @@ async def test_a_roster_member_is_never_named_by_a_declared_name(
     directory.note_declared(ANN, BOGUS, D.now_ms())
     info = await directory.thread(T)
     assert info is not None
-    assert {m["mri"]: m["name"] for m in info["members"]} == {ANN: TAIL, ME: "Me"}
+    assert {m["mri"]: m["name"] for m in info["members"]} == {ANN: UNKNOWN, ME: "Me"}
 
 
 def test_a_mention_title_is_never_a_declared_name(directory: Directory) -> None:
@@ -754,7 +754,7 @@ async def test_typing_ends_after_the_typist_got_a_name(
     assert row["typing"] == []
     assert board._typing_timers == {}
     typing = [f for f in frames if "typing" in f]
-    assert typing[-1] == {"typing": shown, "on": False}
+    assert typing[-1] == {"typing": shown, "on": False, "mri": ANN}
     assert {f["typing"] for f in typing} == {shown}
     board.close()
 
@@ -862,7 +862,7 @@ async def test_after_the_upgrade_a_roster_is_resolved_in_one_batch(
     info = await directory.thread(T)
     assert info is not None
     assert profiles.batches == [sorted([ANN, "8:orgid:bob", "8:orgid:cy"])]  # one lookup, not one per member
-    assert [m["name"] for m in info["members"]] == ["Ann Lee", "Bob Roe", "cy"]
+    assert [m["name"] for m in info["members"]] == ["Ann Lee", "Bob Roe", UNKNOWN]
 
 
 @pytest.mark.parametrize("followed", [False, True])  # the board alone, and board plus relay

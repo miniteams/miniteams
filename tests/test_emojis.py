@@ -103,7 +103,7 @@ async def test_list_emojis_resolves_creators_and_downloads(
         assert out == [
             "2020-09-13  bare  ()",
             f"2024-08-02  ah-denis  (Alice)  {image}",
-            "2026-09-21  newer  (c0ffee)",  # unresolved: stripped id, and its image failed
+            "2026-09-21  newer  (Unknown user)",  # unresolved (038-AC6), and its image failed
         ]
 
 

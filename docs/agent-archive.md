@@ -108,10 +108,10 @@ def messages(thread_id, data_dir="data", since=None, until=None):
     """Yield (composetime, author, plain_text) oldest-first."""
     idx = sqlite3.connect(f"file:{data_dir}/index.db?mode=ro", uri=True)
     row = idx.execute("select participants from chats where id = ?", (thread_id,)).fetchone()
-    names = {  # an unresolved member is named by the bare id at the end of its MRI: skip it
+    names = {  # an unresolved member is named "Unknown user", or the bare id in older rosters: skip it
         m["mri"]: m["name"]
         for m in json.loads(row[0] if row else "[]")
-        if m.get("name") and m["name"] != m["mri"].split(":")[-1]
+        if m.get("name") and m["name"] not in ("Unknown user", m["mri"].split(":")[-1])
     }
     con = sqlite3.connect(f"file:{data_dir}/{thread_id}/messages.db?mode=ro", uri=True)
     sql, args = "select composetime, raw from messages where 1=1", []

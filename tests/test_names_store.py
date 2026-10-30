@@ -19,11 +19,11 @@ from miniteams import directory as directory_mod
 from miniteams import names_store as NS
 from miniteams.archive_store import Index
 from miniteams.config import Settings
-from miniteams.directory import Directory, sender_name
+from miniteams.directory import UNKNOWN_USER, Directory, sender_name
 from miniteams.names_store import ARCHIVED, DECLARED, LIVE, NameStore, Row
 
 ANN, BOB, CY, DEE, GONE = (f"8:orgid:{p}-0000-test" for p in ("ann", "bob", "cy", "dee", "gone"))
-TAIL = {mri: mri.split(":")[-1] for mri in (ANN, BOB, CY, GONE)}  # what an unresolved MRI shows
+TAIL = {mri: mri.split(":")[-1] for mri in (ANN, BOB, CY, GONE)}  # old caches and rosters: an unnamed MRI
 RANKS = [LIVE, ARCHIVED, DECLARED]
 
 
@@ -208,7 +208,7 @@ def test_two_processes_learning_at_once_both_keep_their_names(settings: Settings
 def test_a_name_another_process_adds_later_is_seen(settings: Settings) -> None:
     """038-AC3: an absence is not cached."""
     reader, writer = Directory(settings), Directory(settings)
-    assert reader.known_name(ANN) == "" and reader.name_for(ANN) == TAIL[ANN]
+    assert reader.known_name(ANN) == "" and reader.name_for(ANN) == UNKNOWN_USER
     writer.note_declared(ANN, "Ann Declared", directory_mod.now_ms())
     assert reader.name_for(ANN) == "Ann Declared"
     writer.note_name(ANN, "Ann Lee")
@@ -259,7 +259,7 @@ def test_a_corrupt_old_cache_is_skipped(settings: Settings, corrupt: str) -> Non
     (settings.cache_dir / corrupt).write_text("{not json")
     directory = Directory(settings)
     assert directory.known_name(ANN) == ("" if corrupt == "names-v2.json" else "Ann Lee")
-    assert directory.name_for(BOB) == (TAIL[BOB] if corrupt == "names.json" else "Bob Roe")
+    assert directory.name_for(BOB) == (UNKNOWN_USER if corrupt == "names.json" else "Bob Roe")
 
 
 def test_two_processes_starting_together_import_once(
@@ -314,6 +314,7 @@ def _index(data_dir: Path) -> Path:
         participants=[
             {"mri": ANN, "name": "Ann Lee", "role": "Admin"},
             {"mri": GONE, "name": TAIL[GONE], "role": "User"},  # an unresolved member
+            {"mri": "8:orgid:nobody-0000-test", "name": UNKNOWN_USER},  # one stored since 038-AC6
             {"mri": f"https://h/v1/users/ME/contacts/{BOB}", "name": "Bob Roe"},
             "not a member",
         ],

@@ -524,6 +524,218 @@ async def test_resume_skips_unchanged_chat(settings: Settings, tmp_path, monkeyp
     assert thread_fetched == []  # thread metadata not even fetched
 
 
+def _stored_chat(
+    data: Path,
+    participants: list[dict[str, Any]],
+    label: str,
+    backfilled: bool = True,
+    topic: str = "",
+    thread: str = C1,
+) -> None:
+    pre = ChatStore(data, thread)
+    pre.insert_page([_msg("a1", "2026-07-01T09:00:00Z")])
+    pre.close()
+    index = Index(data)
+    index.upsert_chat(thread, label=label, topic=topic, participants=participants)
+    if backfilled:
+        index.mark_backfill_done(thread)
+    index.close()
+
+
+def _idle(monkeypatch, thread: str = C1, **extra: Any) -> None:
+    conv = {"id": thread, "lastMessage": {"composetime": "2026-07-01T09:00:00Z"}, **extra}  # == stored newest
+    monkeypatch.setattr(AR, "fetch_conversations", lambda s, tok: iter([[conv]]))
+
+
+def _chat(data: Path) -> dict[str, Any]:
+    index = Index(data)
+    (chat,) = index.chats()
+    index.close()
+    return chat
+
+
+def _relabels(events: list[tuple[str, str, dict[str, Any]]]) -> list[str]:
+    return [event for _, event, _ in events if event in ("chat_relabelled", "chat_unchanged")]
+
+
+def _roster_denied(monkeypatch) -> list[str]:
+    """Every thread fetch fails, as a revoked meeting chat's does; returns the URLs asked."""
+    from test_directory_fetch import _patch
+
+    asked: list[str] = []
+
+    def denied(url: str) -> Any:
+        asked.append(url)
+        raise RuntimeError("403")
+
+    _patch(monkeypatch, denied)
+    return asked
+
+
+async def test_an_idle_chat_stored_with_guid_names_is_relabelled_locally(
+    settings: Settings, tmp_path, monkeypatch
+) -> None:
+    """038-AC6: an idle chat whose stored roster names people by their bare guid gets names.db's name, else
+    "Unknown user", and its label again, in one pass with no request; the next pass writes nothing."""
+    from miniteams.directory import Directory
+    from miniteams.names_store import ARCHIVED
+
+    gone, known = "0000c0de-0000-4000-8000-00000000dead", "0000c0de-0000-4000-8000-00000000beef"
+    bot = "28:00000000-0000-4000-8000-0000000000ee"
+    old = [
+        {"mri": f"8:orgid:{gone}", "name": gone, "role": "User"},
+        {"mri": f"8:orgid:{known}", "name": known},
+        {"mri": "8:orgid:ann", "name": "Ann Lee"},
+        {"mri": bot, "name": bot.split(":")[-1]},  # a bot keeps its bare id
+    ]
+    Directory(settings).note_entries([(f"8:orgid:{known}", "Kay Known", ARCHIVED, "call", 1)])
+    data = tmp_path / "data"
+    _stored_chat(data, old, f"{gone}, {known}, Ann Lee")
+    history, asked = _count_history(monkeypatch), _roster_denied(monkeypatch)
+    _idle(monkeypatch)
+    events = _spy_log(monkeypatch)
+    await _run(settings, data)
+    assert (history, asked) == ([], [])  # no top-up, no thread fetch
+    assert _relabels(events) == ["chat_relabelled", "chat_unchanged"]
+    chat = _chat(data)
+    assert chat["label"] == "Unknown user, Kay Known, Ann Lee"
+    assert chat["participants"] == [
+        {"mri": f"8:orgid:{gone}", "name": "Unknown user", "role": "User"},
+        {"mri": f"8:orgid:{known}", "name": "Kay Known"},
+        old[2],
+        old[3],
+    ]
+    events.clear()
+    await _run(settings, data)
+    assert _relabels(events) == ["chat_unchanged"]
+    assert (history, asked) == ([], [])
+
+
+async def test_a_topic_label_survives_the_local_relabel(settings: Settings, tmp_path, monkeypatch) -> None:
+    gone = "0000c0de-0000-4000-8000-00000000dead"
+    data = tmp_path / "data"
+    _stored_chat(data, [{"mri": f"8:orgid:{gone}", "name": gone}], "Plan · 2p", topic="Plan")
+    _count_history(monkeypatch)
+    _idle(monkeypatch)
+    _roster_denied(monkeypatch)
+    await _run(settings, data)
+    chat = _chat(data)
+    assert (chat["label"], chat["topic"]) == ("Plan · 2p", "Plan")
+    assert chat["participants"] == [{"mri": f"8:orgid:{gone}", "name": "Unknown user"}]
+
+
+async def test_a_declared_name_never_relabels_a_stored_roster(
+    settings: Settings, tmp_path, monkeypatch
+) -> None:
+    """038-AC2: names.db's declared name (free text a message chose) never names a roster member."""
+    from miniteams.directory import Directory
+
+    tail = "0000c0de-0000-4000-8000-00000000dead"
+    gone = f"8:orgid:{tail}"
+    Directory(settings).note_declared(gone, "Said Name", 1790000000000)
+    data = tmp_path / "data"
+    _stored_chat(
+        data, [{"mri": gone, "name": tail}, {"mri": "8:orgid:ann", "name": "Ann Lee"}], f"{tail}, Ann Lee"
+    )
+    _count_history(monkeypatch)
+    _roster_denied(monkeypatch)
+    _idle(monkeypatch)
+    await _run(settings, data)
+    chat = _chat(data)
+    assert (chat["label"], chat["participants"][0]) == (
+        "Unknown user, Ann Lee",
+        {"mri": gone, "name": "Unknown user"},
+    )
+    assert "Said Name" not in str(chat)
+
+
+async def test_an_unknown_user_is_named_once_names_db_learns_the_name(
+    settings: Settings, tmp_path, monkeypatch
+) -> None:
+    """038-AC1: a stored "Unknown user" stays as written while names.db has no name (no write on any pass),
+    and gets the name, with the label, on the pass after names.db learns it."""
+    from miniteams.directory import Directory
+    from miniteams.names_store import ARCHIVED
+
+    gone = "8:orgid:0000c0de-0000-4000-8000-00000000dead"
+    old = [{"mri": gone, "name": "Unknown user"}, {"mri": "8:orgid:ann", "name": "Ann Lee"}]
+    data = tmp_path / "data"
+    _stored_chat(data, old, "Unknown user, Ann Lee")
+    history, asked = _count_history(monkeypatch), _roster_denied(monkeypatch)
+    _idle(monkeypatch)
+    events = _spy_log(monkeypatch)
+    for _ in range(2):
+        await _run(settings, data)
+    assert _relabels(events) == ["chat_unchanged"] * 2  # nothing learned: nothing written
+    assert (_chat(data)["label"], _chat(data)["participants"]) == ("Unknown user, Ann Lee", old)
+    Directory(settings).note_entries([(gone, "Gil Gone", ARCHIVED, "call", 1)])
+    events.clear()
+    await _run(settings, data)
+    assert _relabels(events) == ["chat_relabelled", "chat_unchanged"]
+    assert _chat(data)["label"] == "Gil Gone, Ann Lee"
+    assert _chat(data)["participants"][0] == {"mri": gone, "name": "Gil Gone"}
+    assert (history, asked) == ([], [])
+
+
+async def test_a_special_thread_keeps_its_label_when_its_roster_is_fixed(
+    settings: Settings, tmp_path, monkeypatch
+) -> None:
+    notes, tail = "48:notes", "0000c0de-0000-4000-8000-00000000dead"
+    data = tmp_path / "data"
+    _stored_chat(data, [{"mri": f"8:orgid:{tail}", "name": tail}], "Notes to self", thread=notes)
+    _count_history(monkeypatch)
+    _roster_denied(monkeypatch)
+    _idle(monkeypatch, notes)
+    await _run(settings, data)
+    chat = _chat(data)
+    assert (chat["label"], chat["participants"]) == (
+        "Notes to self",
+        [{"mri": f"8:orgid:{tail}", "name": "Unknown user"}],
+    )
+
+
+@pytest.mark.parametrize(
+    ("listed", "label", "topic"),
+    [
+        ({"threadProperties": {"topic": "Plan"}}, "Plan · 2p", "Plan"),  # the topic it was made from: kept
+        ({}, "Plan · 2p", "Plan"),  # no topic listed: the stored one stands
+        ({"threadProperties": {"topic": "Retro"}}, "Retro", "Retro"),  # renamed: the new topic
+    ],
+)
+async def test_a_failed_fetch_keeps_the_stored_label_and_topic(
+    settings: Settings, tmp_path, monkeypatch, listed: dict[str, Any], label: str, topic: str
+) -> None:
+    roster = [{"mri": "8:orgid:ann", "name": "Ann Lee"}, {"mri": "8:orgid:bob", "name": "Bob Roe"}]
+    data = tmp_path / "data"
+    _stored_chat(data, roster, "Plan · 2p", backfilled=False, topic="Plan")
+    _count_history(monkeypatch)
+    conv = {"id": C1, "lastMessage": {"composetime": "2026-07-02T09:00:00Z"}, **listed}
+    monkeypatch.setattr(AR, "fetch_conversations", lambda s, tok: iter([[conv]]))
+    _roster_denied(monkeypatch)
+    await _run(settings, data)
+    chat = _chat(data)
+    assert (chat["label"], chat["topic"], chat["participants"]) == (label, topic, roster)
+
+
+async def test_a_failed_roster_fetch_keeps_the_stored_roster_and_label(
+    settings: Settings, tmp_path, monkeypatch
+) -> None:
+    """A chat that is archived (not skipped) while its roster cannot be fetched keeps what the index holds."""
+    old = [{"mri": "8:orgid:ann", "name": "Ann Lee"}, {"mri": "8:orgid:bob", "name": "Bob Roe"}]
+    data = tmp_path / "data"
+    _stored_chat(data, old, "Ann Lee, Bob Roe", backfilled=False)
+    history = _count_history(monkeypatch)
+    conv = {"id": C1, "lastMessage": {"composetime": "2026-07-02T09:00:00Z"}}
+    monkeypatch.setattr(AR, "fetch_conversations", lambda s, tok: iter([[conv]]))
+    _roster_denied(monkeypatch)
+    await _run(settings, data)
+    assert history  # archived, not skipped
+    index = Index(data)
+    (chat,) = index.chats()
+    index.close()
+    assert (chat["label"], chat["participants"]) == ("Ann Lee, Bob Roe", old)
+
+
 def _seed_synced(data: Path, msgs: list[dict[str, Any]], version: int) -> None:
     pre = ChatStore(data, C1)
     pre.insert_page(msgs)

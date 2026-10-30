@@ -320,7 +320,7 @@ def test_activity_lines_name_who_did_what() -> None:
     assert _line(_DEL, _deleted(_ANN, _BOB)) == "👥 Ann Lee removed Bob Roe"
     assert _line(_DEL, _deleted(_BOB, _BOB)) == "👥 Bob Roe left"
     assert _line(_DEL, _deleted(_ANN, _ME)) == "👥 Ann Lee removed You"
-    assert _line(_TOPIC, _topic(_ANN, "Q&amp;A")) == "✎ Ann Lee renamed the chat to «Q&A»"
+    assert _line(_TOPIC, _topic(_ANN, "Q&amp;A")) == "✎ Ann Lee renamed the chat to «Q&amp;A»"  # escaped HTML
 
 
 def test_meeting_member_events_name_the_members() -> None:

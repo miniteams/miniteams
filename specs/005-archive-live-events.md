@@ -23,7 +23,8 @@ follows the stream:
    arrives.
 4. On any gap signal (reconnect, `trouter.message_loss`) go back to step 1's buffering and run a
    new catch-up pass. The fast-skip on unchanged chats keeps that pass cheap: it only touches chats
-   whose last activity moved.
+   whose last activity moved (a skipped chat's roster stored with guid names is relabelled locally, once,
+   with no request: spec 038).
 
 Media referenced by a live message downloads right away. The process runs until the refresh token
 dies, then stops cleanly with exit code 1, like `--loop`.

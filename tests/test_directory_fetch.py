@@ -127,8 +127,8 @@ async def test_display_negative_caches_unresolved(directory: Directory, monkeypa
         return _Resp({"value": []})  # endpoint returns nothing
 
     monkeypatch.setattr(directory_mod.httpx, "AsyncClient", lambda *a, **k: _AsyncClientPost(handler))
-    assert await directory.display("8:orgid:zzz") == "zzz"  # stripped fallback
-    assert await directory.display("8:orgid:zzz") == "zzz"
+    assert await directory.display("8:orgid:zzz") == "Unknown user"  # 038-AC6: never the bare id
+    assert await directory.display("8:orgid:zzz") == "Unknown user"
     assert calls["n"] == 1  # negative-cached, not re-fetched
 
 
@@ -151,7 +151,7 @@ async def test_resolve_refresh_retries_negatives(
     monkeypatch.setattr(directory_mod.httpx, "AsyncClient", lambda *a, **k: _Client(None))
     await directory.resolve(["8:orgid:zzz", "8:orgid:bob"], refresh=refresh)
     assert asked == [["8:orgid:zzz"]] * calls  # a known name is never re-asked
-    assert directory.name_for("8:orgid:zzz") == ("Zoe" if refresh else "zzz")
+    assert directory.name_for("8:orgid:zzz") == ("Zoe" if refresh else "Unknown user")
     assert directory.name_for("8:orgid:bob") == "Bob"
 
 
@@ -172,8 +172,8 @@ async def test_names_cache_persists_across_instances(settings, monkeypatch) -> N
 
 
 async def test_display_without_bearer_skips_resolution(directory: Directory) -> None:
-    # no bearer set → no network, just stripped id
-    assert await directory.display("8:orgid:guid") == "guid"
+    # no bearer set → no network, the unknown label (038-AC6)
+    assert await directory.display("8:orgid:guid") == "Unknown user"
 
 
 async def test_thread_result_is_cached(directory: Directory, monkeypatch) -> None:

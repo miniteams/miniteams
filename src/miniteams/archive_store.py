@@ -508,6 +508,18 @@ class Index:
         with self._db:
             self._db.execute("UPDATE chats SET last_fetch_at = ? WHERE id = ?", (when_iso, thread_id))
 
+    def label_topic(self, thread_id: str) -> tuple[str, str]:
+        row = self._db.execute("SELECT label, topic FROM chats WHERE id = ?", (thread_id,)).fetchone()
+        return (str(row[0] or ""), str(row[1] or "")) if row else ("", "")
+
+    def participants(self, thread_id: str) -> list[Any]:
+        row = self._db.execute("SELECT participants FROM chats WHERE id = ?", (thread_id,)).fetchone()
+        try:
+            found = json.loads(row[0]) if row else []
+        except ValueError:
+            return []
+        return found if isinstance(found, list) else []
+
     def synced_version(self, thread_id: str) -> int:
         row = self._db.execute("SELECT synced_version FROM chats WHERE id = ?", (thread_id,)).fetchone()
         return int(row[0]) if row else 0
