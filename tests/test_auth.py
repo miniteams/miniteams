@@ -386,6 +386,45 @@ def test_persist_does_not_claim_a_stamp_it_never_read(settings: Settings, monkey
     assert _rt(src) == "rt-rotated"
 
 
+def test_auth_expired_names_the_cache_version_it_failed_on(settings: Settings, monkeypatch) -> None:
+    # The stream's renewals wait on this after a dead refresh. Compared with what the source last read
+    # instead, a presence call loading the sibling's write first would hide it, and the session would
+    # 401 on its stale skype token; a missing file must not count as a write either.
+    dead = {"error": "invalid_grant"}
+    monkeypatch.setattr(A, "_app", lambda cid, s, cache: _CacheBackedApp(cache))
+    src = A.TokenSource(settings)
+    _sibling_write(src._cache_path, "rt-dead")
+    src._teams._silent = dead  # type: ignore[attr-defined]
+    with pytest.raises(A.AuthExpired) as failed:
+        src.refresh()
+    since = failed.value.stamp
+    assert since == A._stamp(src._cache_path) and not src.written_since(since)
+
+    _sibling_write(src._cache_path, "rt-rotated")
+    assert src.presence_token() == "tok-https://presence.teams.microsoft.com/.default"  # loads it
+    assert _rt(src) == "rt-rotated" and src.written_since(since)
+
+    src._cache_path.unlink()
+    assert not src.written_since(since)  # deleted under us: nothing new to load
+    assert A.AuthExpired("raised elsewhere").stamp == (0, 0, 0)
+
+
+def test_a_write_during_the_failed_refresh_counts(settings: Settings, monkeypatch) -> None:
+    # The sibling's rotation that made ours dead often lands while our AAD call is in flight.
+    monkeypatch.setattr(A, "_app", lambda cid, s, cache: _CacheBackedApp(cache))
+    src = A.TokenSource(settings)
+    _sibling_write(src._cache_path, "rt-dead")
+
+    def rotated_meanwhile(scopes: Any, account: Any) -> dict:
+        _sibling_write(src._cache_path, "rt-rotated")
+        return {"error": "invalid_grant"}
+
+    src._teams.acquire_token_silent_with_error = rotated_meanwhile  # type: ignore[attr-defined]
+    with pytest.raises(A.AuthExpired) as failed:
+        src.refresh()
+    assert src.written_since(failed.value.stamp)
+
+
 def test_interactive_seed_survives_a_sibling_write(settings: Settings, monkeypatch, capsys) -> None:
     # The browser leg seeds the family refresh token in memory only. Reloading the file over it
     # costs the user a second, pointless device-code prompt.

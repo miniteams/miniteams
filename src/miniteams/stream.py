@@ -22,7 +22,7 @@ import structlog
 import websockets
 
 from ._io import force_blocking_stdout
-from .auth import AuthExpired, TokenSource, cache_stamp, token_source
+from .auth import AuthExpired, TokenSource, token_source
 from .config import Settings
 from .directory import Directory
 from .messages import _decode_body, decode_event, emit_raw_delivery, emit_raw_named, handle_delivery
@@ -343,9 +343,12 @@ async def _refresh_directory_token(
             aad = await asyncio.to_thread(tokens.refresh)
             skype = await asyncio.to_thread(exchange_skype_token, settings, aad["access_token"])
         except AuthExpired as exc:
-            # Retrying can't revive a dead refresh token; the session loop stops at its next reconnect.
-            log.error("directory_token_refresh_stopped", error=str(exc))
-            return
+            # Ours may only be stale: a sibling (archive, login) rotates the token on disk, and the
+            # session can outlive this by hours, every call 401ing on the token we stopped renewing.
+            log.error("directory_token_refresh_waiting", error=str(exc))
+            await _wait_for_login(tokens, exc.stamp, sleep)
+            delay = 0.0
+            continue
         except Exception as exc:  # noqa: BLE001 — transient (network, authz 5xx): retry after the floor
             log.warning("directory_token_refresh_failed", error=str(exc), error_type=type(exc).__name__)
             delay = _TOKEN_REFRESH_MIN
@@ -356,11 +359,15 @@ async def _refresh_directory_token(
         log.info("directory_token_refreshed", expires_in=lifetime)
 
 
-async def _wait_for_login(settings: Settings) -> None:
-    """Return once another process (`miniteams login`) has rewritten the token cache."""
-    before = cache_stamp(settings)
-    while cache_stamp(settings) == before:
-        await asyncio.sleep(_LOGIN_POLL)
+async def _wait_for_login(
+    tokens: TokenSource,
+    since: tuple[int, int, int],
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """Return once another process (`miniteams login`, a sibling's refresh) has written the token cache
+    since the version `since` names, including a write that landed during the failed refresh."""
+    while not tokens.written_since(since):
+        await sleep(_LOGIN_POLL)
 
 
 async def run_forever(
@@ -458,7 +465,8 @@ async def run_forever(
             if not wait_for_login:
                 return
             link("login")
-            await _wait_for_login(settings)  # the next refresh rereads the rewritten cache (_sync_cache)
+            # The next refresh rereads the rewritten cache (_sync_cache).
+            await _wait_for_login(tokens, exc.stamp)
             log.info("login_detected")
             backoff = 1.0
             continue

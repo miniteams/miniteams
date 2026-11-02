@@ -74,14 +74,23 @@ async def test_hook_exception_is_logged_not_raised(settings: Settings, directory
 class _Tokens:
     """TokenSource stand-in: scripted refresh results (an exception instance is raised)."""
 
-    def __init__(self, *results: Any) -> None:
+    def __init__(self, *results: Any, changed: list[bool] | None = None) -> None:
         self._results = list(results)
+        self._changed = changed or [True]  # written_since() answers, the last one repeats
+        self.since: list[Any] = []  # the stamps written_since() was asked about
 
     def refresh(self) -> dict[str, Any]:
         out = self._results.pop(0) if len(self._results) > 1 else self._results[0]
         if isinstance(out, Exception):
             raise out
         return out
+
+    def acquire(self) -> None:
+        return None
+
+    def written_since(self, stamp: Any) -> bool:
+        self.since.append(stamp)
+        return self._changed.pop(0) if len(self._changed) > 1 else self._changed[0]
 
 
 def _scripted_exchange(monkeypatch, *results: Any) -> None:
@@ -120,26 +129,47 @@ async def test_directory_token_is_renewed_before_expiry(
     assert (directory.skype_token, directory.bearer) == ("ST2", "A2")  # not the id_token beside it
 
 
-async def test_dead_refresh_token_stops_the_refresher(
+async def test_dead_refresh_token_waits_for_a_sibling_write_then_renews(
     settings: Settings, directory: Directory, monkeypatch
 ) -> None:
+    """A refresh token dead in memory but rotated on disk by another process (archive, login) must not
+    stop the renewals: the session would 401 on the stale skype token until restarted."""
     from miniteams.auth import AuthExpired
 
+    def dead() -> AuthExpired:
+        exc = AuthExpired("dead")
+        exc.stamp = (7, 7, 7)
+        return exc
+
+    _scripted_exchange(monkeypatch, {"skype_token": "ST2", "expires_in": 3600})
+    cases = [
+        # The sibling's write already landed during the failed refresh: no poll, renewed at the floor.
+        (_Tokens(dead(), {"access_token": "A2"}), [3600.0 * 0.8, 60.0]),
+        # Not yet: poll the cache until it does, never calling AAD meanwhile.
+        (
+            _Tokens(dead(), {"access_token": "A2"}, changed=[False, False, True]),
+            [3600.0 * 0.8, S._LOGIN_POLL, S._LOGIN_POLL, 60.0],
+        ),
+        # Still dead after the write (a login elsewhere is pending): waits again, no hot loop.
+        (
+            _Tokens(dead(), dead(), {"access_token": "A2"}),
+            [3600.0 * 0.8, 60.0, 60.0],
+        ),
+    ]
     sleeps: list[float] = []
 
     async def fake_sleep(delay: float) -> None:
         sleeps.append(delay)
-        if len(sleeps) > 3:
-            raise asyncio.CancelledError  # still looping: the guard is broken
+        if directory.skype_token == "ST2":
+            raise asyncio.CancelledError  # renewed: the next wait is the regular one
 
-    cases = [
-        (_Tokens(AuthExpired("dead")), [3600.0 * 0.8]),
-        (_Tokens(RuntimeError("blip"), AuthExpired("dead")), [3600.0 * 0.8, S._TOKEN_REFRESH_MIN]),
-    ]
-    for dead, expected in cases:
+    for tokens, expected in cases:
+        directory.set_token("ST1", "A1")
         sleeps.clear()
-        await S._refresh_directory_token(settings, dead, directory, 3600.0, sleep=fake_sleep)  # type: ignore[arg-type]
-        assert sleeps == expected  # returned right after AuthExpired: no further AAD calls
+        with pytest.raises(asyncio.CancelledError):
+            await S._refresh_directory_token(settings, tokens, directory, 3600.0, sleep=fake_sleep)  # type: ignore[arg-type]
+        assert sleeps[:-1] == expected and (directory.skype_token, directory.bearer) == ("ST2", "A2")
+        assert set(tokens.since) == {(7, 7, 7)}  # waits on the version the refresh failed on
 
 
 async def test_missing_expires_in_does_not_refresh_every_minute(
@@ -300,18 +330,30 @@ async def test_run_forever_waits_for_a_login_when_asked(
     refreshes again (it rereads the rewritten cache); without the flag the loop returns (see above)."""
     from miniteams.auth import AuthExpired
 
-    tokens = _Tokens(AuthExpired("dead"), {"access_token": "A", "id_token": "I"})
+    expired = AuthExpired("dead")
+    expired.stamp = (7, 7, 7)
+    tokens = _Tokens(expired, {"access_token": "A", "id_token": "I"})
     calls: list[int] = []
+    since: list[Any] = []
 
     def refresh(_self: Any) -> Any:
         calls.append(1)
         return tokens.refresh()
 
+    changed = iter([False] * 2 + [True] * 10)
     monkeypatch.setattr(
-        S, "token_source", lambda _s: type("T", (), {"acquire": lambda self: None, "refresh": refresh})()
+        S,
+        "token_source",
+        lambda _s: type(
+            "T",
+            (),
+            {
+                "acquire": lambda self: None,
+                "refresh": refresh,
+                "written_since": lambda self, st: since.append(st) or next(changed),
+            },
+        )(),
     )
-    stamps = iter([(1, 1, 1)] * 3 + [(2, 2, 2)] * 10)
-    monkeypatch.setattr(S, "cache_stamp", lambda _s: next(stamps))
     monkeypatch.setattr(S, "_LOGIN_POLL", 0.0)
     monkeypatch.setattr(S, "force_blocking_stdout", lambda: None)
 
@@ -321,17 +363,14 @@ async def test_run_forever_waits_for_a_login_when_asked(
     monkeypatch.setattr(S, "exchange_skype_token", exchange)
     with pytest.raises(asyncio.CancelledError):
         await S.run_forever(settings, directory=directory, wait_for_login=True)
-    assert len(calls) == 2 and next(stamps) == (2, 2, 2)  # one refresh before the wait, one after it
+    assert len(calls) == 2 and next(changed)  # one refresh before the wait, one after the write
+    assert set(since) == {(7, 7, 7)}  # the version the refresh failed on
 
 
 def _link_loop(monkeypatch, *refreshes: Any, exchanges: list[Any]) -> list[int]:
     """run_forever on scripted tokens and exchanges, sessions that report alive twice, no backoff wait."""
     tokens = _Tokens(*refreshes)
-    monkeypatch.setattr(
-        S,
-        "token_source",
-        lambda _s: type("T", (), {"acquire": lambda self: None, "refresh": lambda self: tokens.refresh()})(),
-    )
+    monkeypatch.setattr(S, "token_source", lambda _s: tokens)
 
     def exchange(*_a: Any) -> Any:
         out = exchanges.pop(0)
@@ -344,8 +383,6 @@ def _link_loop(monkeypatch, *refreshes: Any, exchanges: list[Any]) -> list[int]:
     monkeypatch.setattr(S, "get_or_create_epid", lambda *_a: "epid")
     monkeypatch.setattr(S, "trouter_info", lambda *_a: {})
     monkeypatch.setattr(S, "handshake", lambda *_a: "sid")
-    stamps = iter([(1,), (2,), (2,), (2,)])
-    monkeypatch.setattr(S, "cache_stamp", lambda _s: next(stamps))
     monkeypatch.setattr(S, "_LOGIN_POLL", 0.0)
     real_sleep = asyncio.sleep
 

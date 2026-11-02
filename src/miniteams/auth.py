@@ -67,11 +67,6 @@ def _cache_file(settings: Settings) -> Path:
     return settings.config_dir / "msal_cache.json"
 
 
-def cache_stamp(settings: Settings) -> tuple[int, int, int]:
-    """The token cache file's identity: it changes when any process (`miniteams login`) writes it."""
-    return _stamp(_cache_file(settings))
-
-
 def _build_cache(settings: Settings) -> tuple[msal.SerializableTokenCache, Path]:
     settings.config_dir.mkdir(parents=True, exist_ok=True)
     settings.config_dir.chmod(0o700)
@@ -163,6 +158,9 @@ def token_tenant(access_token: str) -> str:
 class AuthExpired(RuntimeError):
     """Silent refresh failed with no cached/refreshable token — re-auth needed, don't retry."""
 
+    # The cache file version the refresh failed on: any later write may hold a live token.
+    stamp: tuple[int, int, int] = _NO_FILE
+
 
 class AuthUnavailable(RuntimeError):
     """Silent refresh failed on AAD's side — the credential may still be good, so retry."""
@@ -197,6 +195,14 @@ class TokenSource:
             # a sibling's rotated token as already loaded, and we would never read it.
             if wrote:
                 self._cache_stamp = _stamp(self._cache_path)
+
+    def written_since(self, stamp: tuple[int, int, int]) -> bool:
+        """True once the cache file is no longer the version `stamp` (an `AuthExpired.stamp`) names.
+
+        Not compared with what this source last read: another of its callers (presence every few
+        minutes) may already have loaded the new file, and the stale skype token would stay."""
+        now = _stamp(self._cache_path)
+        return now != _NO_FILE and now != stamp
 
     def _sync_cache(self) -> None:
         """Re-read the cache file when another miniteams process has written it.
@@ -295,10 +301,12 @@ class TokenSource:
                 code = str(err.get("error") or "")
                 # No account at all (result is None) is a dead cache too, not an AAD hiccup.
                 if result is None or code in _DEAD_CREDENTIAL:
-                    raise AuthExpired(
+                    expired = AuthExpired(
                         f"silent token refresh failed ({code or 'no cached account'}) — "
                         "refresh token expired or revoked"
                     )
+                    expired.stamp = self._cache_stamp
+                    raise expired
                 raise AuthUnavailable(f"silent token refresh failed ({code}) — AAD-side, retryable")
             return result
 
