@@ -42,7 +42,16 @@ from .archive_store import (
     saved_files,
     search_chat,
 )
-from .attachments import LIVE_HOST_RE, LIVE_VIEW_RE, existing, giphy, giphy_image, live_image, remote_gif
+from .attachments import (
+    FULL_VIEW,
+    LIVE_HOST_RE,
+    LIVE_VIEW_RE,
+    existing,
+    giphy,
+    giphy_image,
+    live_image,
+    remote_gif,
+)
 from .card_refresh import CardRefresher, Cards, Row
 from .chats import chat_kind
 from .compose import (
@@ -1724,7 +1733,8 @@ class ChatVerbs:
         """`media_file` on the media pool, else, with the `host` or Giphy `via` (`<host><path>`) that
         `media_url` or `giphy_media_url` gave, the image fetched from Teams or Giphy; ArchiveUnavailable past
         the pool's deadline."""
-        found = await io("media", self.media_file, path)
+        # The full view's archived copy is `<id>.full.*`: `<id>` alone finds the bounded one first.
+        found = await io("media", self.media_file, f"{path}.full" if view == FULL_VIEW else path)
         if found is not None:
             return found
         thread_id, _, name = (unquote(part) for part in path.removeprefix("/media/").partition("/"))
