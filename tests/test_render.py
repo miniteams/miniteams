@@ -336,16 +336,32 @@ def test_unarchived_asyncgw_image_goes_through_media(media: Path) -> None:
     """011-AC6: an image the archiver has not written yet still points at /media, which fetches it."""
     new = "0-frc-d1-fedcba9876543210"
     raw = f'<img itemtype="http://schema.skype.com/AMSImage" src="https://{GW}/v1/objects/{new}/views/imgo">'
-    expected = f'<img src="/media/19%3Aaaaa%40thread.v2/{new}?host={GW}">'
+    full = f' data-full="/media/19%3Aaaaa%40thread.v2/{new}?host={GW}&amp;view=imgpsh_fullsize"'
+    expected = f'<img src="/media/19%3Aaaaa%40thread.v2/{new}?host={GW}"{full}>'
     assert sanitize(raw, T, media) == expected
     assert sanitize(raw, T, None) == expected  # a chat the archive does not hold
+
+
+def test_an_image_names_its_full_view_for_the_zoom(media: Path) -> None:
+    """`data-full`, for the zoom: the archive's `.full` copy, else the live full view; no GIF, no emoji."""
+    gw = f"https://{GW}/v1/objects/{OBJ}/views"
+    img = '<img itemtype="http://schema.skype.com/AMSImage" src="{}">'
+    live = f"/media/19%3Aaaaa%40thread.v2/{OBJ}?host={GW}&amp;view=imgpsh_fullsize"
+    assert f'data-full="{live}"' in sanitize(img.format(f"{gw}/imgo"), T, media)
+    (media / f"{OBJ}.full.jpg").write_bytes(b"jpg")
+    assert f'data-full="/media/19%3Aaaaa%40thread.v2/{OBJ}.full.jpg"' in sanitize(img.format(SRC), T, media)
+    assert "data-full" not in sanitize(
+        img.format(f"{gw}/imgpsh_mobile_save_anim"), T, media
+    )  # a GIF's is a still
+    emoji = f'<img itemtype="http://schema.skype.com/CustomEmoji" src="{gw}/imgo">'
+    assert "data-full" not in sanitize(emoji, T, media)
 
 
 @pytest.mark.parametrize(
     ("view", "query"),
     [
         ("imgpsh_mobile_save_anim", "&amp;view=imgpsh_mobile_save_anim"),  # a GIF's animated view (031-AC6)
-        ("imgo", ""),  # the default needs no parameter
+        ("imgo", ""),  # the default needs no parameter (`data-full` aside)
         ("IMGO", ""),  # off the view pattern: the server's default
         ("a" * 41, ""),
     ],
@@ -356,7 +372,8 @@ def test_live_image_keeps_the_view_the_message_names(view: str, query: str) -> N
     raw = (
         f'<img itemtype="http://schema.skype.com/AMSImage" src="https://{GW}/v1/objects/{new}/views/{view}">'
     )
-    assert sanitize(raw, T, None) == f'<img src="/media/19%3Aaaaa%40thread.v2/{new}?host={GW}{query}">'
+    out = re.sub(r' data-full="[^"]*"', "", sanitize(raw, T, None))
+    assert out == f'<img src="/media/19%3Aaaaa%40thread.v2/{new}?host={GW}{query}">'
 
 
 @pytest.mark.parametrize(

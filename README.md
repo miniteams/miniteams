@@ -274,6 +274,8 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   without alt; the text alone inside a link): the page loads no other external image.
   A click opens an image full size: the wheel (or a pinch) zooms at the pointer, +/− at the centre, 0 resets, a drag
   pans the zoomed image; Escape, a click outside it, or a click on it unzoomed closes it.
+  A Teams image shown as Teams' bounded view loads its full-resolution one on its first open (the archive's `.full`
+  copy, else fetched live) and swaps it in, a zoomed view kept in place; without one the shown copy stays.
 - **Mark read in Teams when shown** (⚙, on by default): a chat opened, and each message from someone else landing in
   it, marks it read in Teams once the window is visible, focused and at the latest message, and the archive has caught
   up (no "loading latest messages…"); one `read` a second per chat, the last one sent only if all that still holds.
