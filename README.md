@@ -272,6 +272,8 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   (`giphy-<id>.<ext>`), else fetched from Giphy by `web` (no token), else loaded by the page from Giphy itself at once
   (no referrer), else the link below. Any other external image is a link to it, `[image: <alt>]` (`[image not archived]`
   without alt; the text alone inside a link): the page loads no other external image.
+  A click opens an image full size: the wheel (or a pinch) zooms at the pointer, +/− at the centre, 0 resets, a drag
+  pans the zoomed image; Escape, a click outside it, or a click on it unzoomed closes it.
 - **Mark read in Teams when shown** (⚙, on by default): a chat opened, and each message from someone else landing in
   it, marks it read in Teams once the window is visible, focused and at the latest message, and the archive has caught
   up (no "loading latest messages…"); one `read` a second per chat, the last one sent only if all that still holds.

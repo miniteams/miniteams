@@ -387,6 +387,51 @@ async def test_a_message_image_opens_full_size(board: W.Board, chat: Pages) -> N
 
 
 @pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
+async def test_an_open_image_zooms_at_the_pointer_and_pans(board: W.Board, chat: Pages) -> None:
+    """The wheel zooms at the pointer, a drag pans, a zoomed click stays, 0 resets, then a click closes."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    await page.evaluate(
+        """async () => {
+          const c = Object.assign(document.createElement("canvas"), { width: 400, height: 300 });
+          const img = document.querySelector('[data-id="2"] .html img');
+          img.src = URL.createObjectURL(await new Promise((r) => c.toBlob(r)));
+          await img.decode();
+        }"""
+    )
+    await page.locator('[data-id="2"] .html img').click()
+    zoom, big = page.locator("#zoom"), page.locator("#zoom img")
+    await zoom.wait_for()
+
+    async def box() -> list[float]:
+        return await big.evaluate(
+            "i => { const r = i.getBoundingClientRect(); return [r.left, r.top, r.width] }"
+        )  # type: ignore[no-any-return]
+
+    x0, y0, w0 = await box()
+    px, py = x0 + w0 / 4, y0 + 5
+    await page.mouse.move(px, py)
+    await page.mouse.wheel(0, -400)
+    await until(page, f"document.querySelector('#zoom img').getBoundingClientRect().width > {w0 * 1.5}")
+    x1, y1, w1 = await box()
+    k = w1 / w0
+    assert (
+        abs((px - x1) - (px - x0) * k) < 1.5 and abs((py - y1) - (py - y0) * k) < 1.5
+    )  # the point under the pointer stays
+    await page.mouse.down()
+    await page.mouse.move(px + 40, py + 30, steps=4)
+    await page.mouse.up()
+    x2, y2, _ = await box()
+    assert abs(x2 - x1 - 40) < 1.5 and abs(y2 - y1 - 30) < 1.5
+    await page.mouse.click(px + 40, py + 30)
+    assert await zoom.is_visible()
+    await page.keyboard.press("0")
+    assert await box() == [x0, y0, w0]
+    await big.click()
+    await zoom.wait_for(state="hidden")
+
+
+@pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
 async def test_an_image_the_archive_lacks_is_retried_then_said(
     board: W.Board, chat: Pages, data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
