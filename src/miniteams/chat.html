@@ -184,9 +184,11 @@
   .html blockquote.reply strong { display: block; color: var(--text); font-size: 12.5px; }
   .html img { max-width: min(100%, 420px); max-height: 360px; width: auto; height: auto; border-radius: 6px; display: block; margin: 4px 0; }
   #msgs .html img:not(.emoji) { cursor: zoom-in; }
-  #zoom { padding: 0; border: 0; background: transparent; max-width: 96vw; max-height: 96vh; cursor: zoom-out; }
+  #zoom { padding: 0; border: 0; background: transparent; max-width: 96vw; max-height: 96vh; overflow: visible; cursor: zoom-out; }
   #zoom::backdrop { background: rgb(0 0 0 / .8); }
-  #zoom img { display: block; max-width: 96vw; max-height: 96vh; object-fit: contain; }
+  #zoom img { display: block; max-width: 96vw; max-height: 96vh; object-fit: contain; transform-origin: 0 0; touch-action: none; }
+  #zoom.zoomed img { cursor: grab; }
+  #zoom.drag img { cursor: grabbing; }
   .html img.emoji { display: inline; height: 1.4em; width: auto; margin: 0; vertical-align: -.3em; border-radius: 0; }
   .html a { color: var(--accent); }
   .html table { border-collapse: collapse; }
@@ -355,7 +357,7 @@
   <div id="lag" role="status" hidden>loading latest messages…</div>
   <div id="toast" role="status"></div>
 </div>
-<dialog id="zoom" aria-label="image"><img alt=""></dialog>
+<dialog id="zoom" aria-label="image"><img alt="" draggable="false" title="wheel or +/- to zoom, drag to pan, 0 to reset"></dialog>
 <div id="typing" aria-live="polite"></div>
 <footer>
   <div id="view" class="view html" hidden aria-label="preview"></div>
@@ -610,9 +612,41 @@
   keepBottom.observe($list);
   keepBottom.observe($msgs);
   keepBottom.observe($outq);
-  // A message image opens full size; Escape (native to <dialog>) or a click closes it.
-  const $zoom = document.getElementById("zoom");
-  const zoom = (img) => { Object.assign($zoom.firstElementChild, { src: img.src, alt: img.alt }); $zoom.showModal(); };
+  // A message image opens full size; Escape (native to <dialog>) or a click closes it. Wheel/pinch zooms at the pointer, drag pans.
+  const $zoom = document.getElementById("zoom"), $zimg = $zoom.firstElementChild;
+  const zv = { s: 1, x: 0, y: 0, drag: null };
+  const zset = (s, x, y) => {
+    Object.assign(zv, s <= 1 ? { s: 1, x: 0, y: 0 } : { s, x, y });
+    $zimg.style.transform = zv.s === 1 ? "" : `translate(${zv.x}px, ${zv.y}px) scale(${zv.s})`;
+    $zoom.classList.toggle("zoomed", zv.s > 1);
+  };
+  // With origin 0 0 the box's top-left is the translation: scaling by k keeps the point under (px, py) in place.
+  const zby = (k, px, py) => {
+    const r = $zimg.getBoundingClientRect(), s = Math.min(Math.max(zv.s * k, 1), 20);
+    k = s / zv.s;
+    zset(s, zv.x + (px - r.left) * (1 - k), zv.y + (py - r.top) * (1 - k));
+  };
+  const zoom = (img) => { Object.assign($zimg, { src: img.src, alt: img.alt }); zset(1); $zoom.showModal(); };
+  $zoom.addEventListener("wheel", (e) => { e.preventDefault(); zby(Math.exp(-e.deltaY * (e.deltaMode ? 16 : 1) * (e.ctrlKey ? 0.01 : 0.002)), e.clientX, e.clientY); }, { passive: false });  // a trackpad pinch is a Ctrl wheel; Firefox counts lines
+  $zimg.addEventListener("pointerdown", (e) => {
+    if (zv.s === 1 || e.button !== 0) return;
+    zv.drag = { px: e.clientX - zv.x, py: e.clientY - zv.y };
+    $zimg.setPointerCapture(e.pointerId);
+    $zoom.classList.add("drag");
+  });
+  $zimg.addEventListener("pointermove", (e) => {
+    const d = zv.drag;
+    if (!d) return;
+    zset(zv.s, e.clientX - d.px, e.clientY - d.py);
+  });
+  $zimg.addEventListener("lostpointercapture", () => { zv.drag = null; $zoom.classList.remove("drag"); });  // after pointerup, pointercancel, or Escape mid-drag
+  $zoom.addEventListener("keydown", (e) => {
+    const k = { "+": 1.25, "=": 1.25, "-": 0.8 }[e.key];
+    if (k) zby(k, innerWidth / 2, innerHeight / 2);  // the screen's centre, wherever the pointer is
+    else if (e.key === "0") zset(1);
+    else return;
+    e.preventDefault();
+  });
   $msgs.addEventListener("click", (e) => {
     const img = e.target.closest(".html img:not(.emoji)");
     if (img && !img.closest("a")) zoom(img);  // a linked image keeps its link
@@ -670,7 +704,7 @@
     else if (split) switchTo(m.chat, true);
     else location.assign(chatPath(m.chat) + location.search);
   };
-  $zoom.onclick = () => $zoom.close();
+  $zoom.onclick = (e) => { if (e.target !== $zimg || zv.s === 1) $zoom.close(); };  // a zoomed image keeps its clicks: the end of a pan
   const toBottom = () => { $list.scrollTop = $list.scrollHeight; lastTop = $list.scrollTop; hist.stick = !hist.newer; if (hist.stick) hist.unseen = 0; showLatest(); };
   const byId = (id) => $msgs.querySelector(`[data-id="${CSS.escape(id)}"]`);
   // The reader's place as a message and its offset, not pixels: pages above it change the pixels.
