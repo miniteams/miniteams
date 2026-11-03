@@ -626,7 +626,30 @@
     k = s / zv.s;
     zset(s, zv.x + (px - r.left) * (1 - k), zv.y + (py - r.top) * (1 - k));
   };
-  const zoom = (img) => { Object.assign($zimg, { src: img.src, alt: img.alt }); zset(1); $zoom.showModal(); };
+  // The first open of a Teams image loads its full view (data-full) behind the shown copy, then swaps it in.
+  const zoom = (img) => {
+    Object.assign($zimg, { src: img.src, alt: img.alt });
+    zset(1);
+    $zoom.showModal();
+    const full = img.dataset.full, shown = $zimg.src;
+    if (!full) return;
+    const hd = new Image();
+    delete img.dataset.full;  // one try: a failed full view is not asked again
+    hd.src = full;
+    hd.decode().then(() => {
+      img.src = hd.src;  // the message keeps it: the next open shows it at once
+      if (!$zoom.open || $zimg.src !== shown) return;  // closed, or another image opened meanwhile
+      const r = $zimg.getBoundingClientRect();
+      $zimg.src = hd.src;  // a decoded image applies at once (HTML's list of available images): the box below is the new one
+      if (zv.s === 1) return;  // unzoomed: the new fit
+      const s = (r.width * zv.s) / $zimg.getBoundingClientRect().width;  // a zoomed view keeps its place (offsetWidth rounds)
+      const { x, y } = zv;
+      zset(s, x, y);
+      const n = $zimg.getBoundingClientRect();
+      zset(zv.s, x + r.left - n.left, y + r.top - n.top);
+      if (zv.drag) Object.assign(zv.drag, { px: zv.drag.px - zv.x + x, py: zv.drag.py - zv.y + y });  // a pan under way follows on
+    }, () => {});  // no full view: the shown copy stays
+  };
   $zoom.addEventListener("wheel", (e) => { e.preventDefault(); zby(Math.exp(-e.deltaY * (e.deltaMode ? 16 : 1) * (e.ctrlKey ? 0.01 : 0.002)), e.clientX, e.clientY); }, { passive: false });  // a trackpad pinch is a Ctrl wheel; Firefox counts lines
   $zimg.addEventListener("pointerdown", (e) => {
     if (zv.s === 1 || e.button !== 0) return;

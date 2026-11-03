@@ -4,6 +4,7 @@ Run: `uv run --with playwright pytest tests/test_browser.py` (playwright stays o
 """
 
 import asyncio
+import base64
 import json
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -429,6 +430,63 @@ async def test_an_open_image_zooms_at_the_pointer_and_pans(board: W.Board, chat:
     assert await box() == [x0, y0, w0]
     await big.click()
     await zoom.wait_for(state="hidden")
+
+
+@pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)
+async def test_the_first_open_swaps_in_the_full_view_and_keeps_the_zoomed_view(
+    board: W.Board, chat: Pages
+) -> None:
+    """`data-full` loads on the first open only; it lands under a zoomed view without moving it, then
+    an unzoomed open fits the bigger image."""
+    page = await chat.open(_chat(T))
+    await _handled(page, "history")
+    hd = await page.evaluate(
+        """async () => {
+          const canvas = (width, height) =>
+             Object.assign(document.createElement("canvas"), { width, height });
+          const blob = (w, h) => new Promise((r) => canvas(w, h).toBlob(r));
+          const img = document.querySelector('[data-id="2"] .html img');
+          img.src = URL.createObjectURL(await blob(400, 300));
+          img.dataset.full = "/media/hd/full.png";
+          await img.decode();
+          const b = new Uint8Array(await (await blob(1600, 1200)).arrayBuffer());
+          return btoa(String.fromCharCode(...b));
+        }"""
+    )
+    asked, release = [], asyncio.get_running_loop().create_future()
+
+    async def held(route: Route) -> None:
+        asked.append(route.request.url)
+        await release
+        await route.fulfill(body=base64.b64decode(hd), content_type="image/png")
+
+    await page.route("**/media/hd/**", held)
+    msg, zoom, big = page.locator('[data-id="2"] .html img'), page.locator("#zoom"), page.locator("#zoom img")
+    box = "i => { const r = i.getBoundingClientRect(); return [r.left, r.top, r.width, r.height] }"
+    await msg.click()
+    await zoom.wait_for()
+    _, _, w0, _ = await big.evaluate(box)
+    await page.mouse.move(640, 360)
+    await page.mouse.wheel(0, -1200)  # past the full view's fit, else it lands unzoomed at that fit
+    await until(page, f"document.querySelector('#zoom img').getBoundingClientRect().width > {w0 * 4}")
+    await page.mouse.down()  # the full view lands during a pan: the pan goes on from where it is
+    await page.mouse.move(650, 360)
+    before = await big.evaluate(box)
+    release.set_result(None)
+    await until(page, "document.querySelector('#zoom img').naturalWidth === 1600")
+    after = await big.evaluate(box)
+    assert all(abs(a - b) < 1.5 for a, b in zip(after, before, strict=True)), (before, after)
+    await page.mouse.move(670, 360)
+    await page.mouse.up()
+    moved = await big.evaluate(box)
+    assert abs(moved[0] - after[0] - 20) < 1.5 and abs(moved[1] - after[1]) < 1.5, (after, moved)
+    await page.keyboard.press("0")
+    assert (await big.evaluate(box))[2] > w0 * 1.5  # the full view's own fit
+    await page.keyboard.press("Escape")
+    await msg.click()
+    await zoom.wait_for()
+    assert await msg.evaluate("i => [i.naturalWidth, 'full' in i.dataset]") == [1600, False]
+    assert len(asked) == 1
 
 
 @pytest.mark.parametrize("pages", ["chromium", "firefox"], indirect=True)

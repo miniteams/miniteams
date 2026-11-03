@@ -76,7 +76,7 @@ _CTYPE_EXT = {
     "video/webm": ".webm",
 }
 _VIEW_RE = re.compile(r"/views/[^/?#]+")
-_FULL_VIEW = "imgpsh_fullsize"  # full-resolution view (vs the bounded `imgo` Teams references)
+FULL_VIEW = "imgpsh_fullsize"  # full-resolution view (vs the bounded `imgo` Teams references)
 
 
 def _attrs(tag: str) -> dict[str, str]:
@@ -955,7 +955,7 @@ async def _download_image(
 ) -> tuple[str, str | None]:
     """Fetch the optimized view (as referenced) and the full-resolution view; return (optim, full)."""
     optim = await fetch_image(client, token, src, media_dir, suffix="")
-    full_url = _VIEW_RE.sub(f"/views/{_FULL_VIEW}", src)
+    full_url = _VIEW_RE.sub(f"/views/{FULL_VIEW}", src)
     # The full view has its own URL: a denied one must be skipped/recorded on that URL, or a
     # message whose optimized view is fine would re-poll a 403 full view on every run.
     if full_url == src or (skip_url and skip_url(full_url)):

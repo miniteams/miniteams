@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
-from .attachments import LIVE_HOST_RE, LIVE_VIEW_RE, Giphy, existing, giphy, object_id
+from .attachments import FULL_VIEW, LIVE_HOST_RE, LIVE_VIEW_RE, Giphy, existing, giphy, object_id
 from .compose import _URL_RE, trim_url
 from .directory import UNKNOWN_USER
 from .messages import file_name, json_list, reaction_emoji
@@ -74,6 +74,25 @@ def media_url(thread_id: str, media_dir: Path | None, src: str, live: bool = Tru
     view = parts.path.rpartition("/views/")[2]
     named = f"&view={view}" if view != "imgo" and LIVE_VIEW_RE.fullmatch(view) else ""
     return f"/media/{thread}/{quote(stem, safe='')}?host={parts.netloc}{named}"
+
+
+def full_media_url(thread_id: str, media_dir: Path | None, src: str) -> str | None:
+    """`/media/<thread>/<file>` of the archive's full-resolution copy of an `imgo` image, else its full view
+    fetched live (`media_url`'s form); None for any other view: a GIF's full view is a still."""
+    try:
+        parts = urlsplit(src)
+    except ValueError:
+        return None
+    stem = object_id(src)
+    if parts.path.rpartition("/views/")[2] != "imgo" or not STEM_RE.fullmatch(stem):
+        return None
+    thread = quote(thread_id, safe="")
+    found = existing(media_dir, f"{stem}.full") if media_dir is not None else None
+    if found is not None:
+        return f"/media/{thread}/{quote(Path(found).name, safe='')}"
+    if parts.scheme != "https" or not LIVE_HOST_RE.fullmatch(parts.netloc):
+        return None
+    return f"/media/{thread}/{quote(stem, safe='')}?host={parts.netloc}&view={FULL_VIEW}"
 
 
 def giphy_media_url(thread_id: str, media_dir: Path | None, gif: Giphy) -> str:
@@ -207,6 +226,8 @@ class _Sanitizer(HTMLParser):
             return
         attrs = _attr("src", local) + (' class="emoji"' if emoji else "")
         attrs += _attr("data-giphy", gif.url) if gif is not None else ""  # the page's last source (031-AC4)
+        full = None if emoji or gif else full_media_url(self.thread_id, self.media_dir, src)
+        attrs += _attr("data-full", full) if full and full != local else ""  # loaded by the page on zoom
         attrs += "".join(_attr(k, a[k]) for k in _IMG_ATTRS if k in a)
         attrs += "".join(_attr(k, a[k]) for k in ("width", "height") if a.get(k, "").isdigit())
         self.out.append(f"<img{attrs}>")
