@@ -1684,6 +1684,23 @@ async def test_media_route_live_fetch_asks_the_view_the_message_names(
     ]
 
 
+async def test_media_route_full_view_is_the_archived_full_copy_else_live(
+    board: W.Board, data_dir: Path, live: list[Any]
+) -> None:
+    """The zoom's `view=imgpsh_fullsize` gets the archive's `.full` copy, never its bounded one: without
+    a `.full`, Teams is asked."""
+    _archive(data_dir, T, [_m("1", _at(1))])
+    store = ChatStore(data_dir, T)
+    (store.media_dir / "fresh.jpg").write_bytes(b"bounded")
+    path = f"/media/{quote(T, safe='')}/fresh"
+    assert await board.chat.media(path, GW, view="imgpsh_fullsize") == (b"\x89PNG-live", "image/png")
+    assert await board.chat.media(path, GW) == (b"bounded", "image/jpeg")
+    (store.media_dir / "fresh.full.png").write_bytes(b"full")
+    store.close()
+    assert await board.chat.media(path, GW, view="imgpsh_fullsize") == (b"full", "image/png")
+    assert len(live) == 1
+
+
 GIPHY_ID = "l0MYt5jPR6QX5pnqM"
 GIPHY_PATH = f"media2.giphy.com/media/v1.Y2lk/{GIPHY_ID}/giphy.gif"
 
