@@ -1,6 +1,6 @@
 # 039 — Notifications and sounds per interaction
 
-**Status**: in progress
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-11-05
 
@@ -65,25 +65,25 @@ mention. Nobody hears a sound they did not pick.
 
 ## Acceptance criteria
 
-- [ ] **AC1** ⚙ → Notify shows the six rows of Scope, in order, each with a switch, a picker and ▶; the
+- [x] **AC1** ⚙ → Notify shows the six rows of Scope, in order, each with a switch, a picker and ▶; the
   @ / Messages / None segment and the Meeting start switch are gone.
-- [ ] **AC2** With no stored pref, the defaults of Scope apply and no row has a sound.
-- [ ] **AC3** Stored `notify` / `meetings` prefs migrate as listed in Scope, once; a reload keeps the
+- [x] **AC2** With no stored pref, the defaults of Scope apply and no row has a sound.
+- [x] **AC3** Stored `notify` / `meetings` prefs migrate as listed in Scope, once; a reload keeps the
   migrated values and the old keys are gone.
-- [ ] **AC4** Each row notifies exactly on its interaction under its mute rule, and only when its
+- [x] **AC4** Each row notifies exactly on its interaction under its mute rule, and only when its
   switch is on (one test per row, plus my own message / my own mention never notifying).
-- [ ] **AC5** A row with a sound plays it on its interaction, with or without its notification; a row
+- [x] **AC5** A row with a sound plays it on its interaction, with or without its notification; a row
   with None plays nothing.
-- [ ] **AC6** No sound while the window is active, nor in Do Not Disturb.
-- [ ] **AC7** Two interactions with sounds within 3 s play one sound.
-- [ ] **AC8** ▶ plays the row's current sound right away, window in front or not, DND or not.
-- [ ] **AC9** The picker lists only the system sounds present on the machine; Custom file… stores the
+- [x] **AC6** No sound while the window is active, nor in Do Not Disturb.
+- [x] **AC7** Two interactions with sounds within 3 s play one sound.
+- [x] **AC8** ▶ plays the row's current sound right away, window in front or not, DND or not.
+- [x] **AC9** The picker lists only the system sounds present on the machine; Custom file… stores the
   path in `sounds.json`, the page shows its file name; a missing file plays nothing and shows
   "(missing)".
-- [ ] **AC10** The page never passes a file path to the native window: it asks for a sound by name or
+- [x] **AC10** The page never passes a file path to the native window: it asks for a sound by name or
   by row (`custom`), the window resolves it.
-- [ ] **AC11** Every choice survives a reload and a widget restart.
-- [ ] **AC12** At 200 × 700 and 267 × 450 no control is clipped; screenshots in both themes reviewed
+- [x] **AC11** Every choice survives a reload and a widget restart.
+- [x] **AC12** At 200 × 700 and 267 × 450 no control is clipped; screenshots in both themes reviewed
   before commit.
 
 ## Phases
