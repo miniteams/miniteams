@@ -167,10 +167,24 @@
   // A tab's rule without the filter box: the badge counts what the tab shows once the box is empty.
   // Disconnected: no count, whatever the choice; a stale one would read as live.
   const publish = () => tray?.badge(...(live && badge !== "none" ? [badge, rows.filter(filters[badge]).length] : ["none", 0]));
-  // Desktop notifications: what changed between two live frames, so never the snapshot of a (re)connection.
-  const ALERTS = [["mention", "@"], ["all", "Messages"], ["none", "None"]], YOU = "You";  // web.py's _YOU
-  let alert = ALERTS.some(([k]) => k === pref("notify")) ? pref("notify") : "mention";
-  let meetings = pref("meetings") !== "0";
+  // Desktop notifications and sounds (spec 039), per interaction: what changed between two live frames, so
+  // never the snapshot of a (re)connection.
+  const YOU = "You";  // web.py's _YOU
+  const ALERTS = [["me", "@ you"], ["all", "@ everyone"], ["dm", "Direct message"], ["group", "Group message"],
+    ["meeting", "Meeting chat"], ["start", "Meeting start"]], CUSTOM = "custom", CHOOSE = "+";
+  // The coarse prefs before 039, one digit per message row: me all dm group meeting.
+  const MIGRATE = { mention: "11000", all: "11111", none: "00000" }, was = store("notify"), met = store("meetings");
+  if (ALERTS.every(([k]) => store("notify." + k) == null)) {  // a row already chosen: the old keys are stale
+    if (Object.hasOwn(MIGRATE, was ?? "")) [...MIGRATE[was]].forEach((v, i) => keep("notify." + ALERTS[i][0], v));
+    if (met != null) keep("notify.start", met === "0" ? "0" : "1");
+  }
+  keep("notify", null); keep("meetings", null);
+  const alerts = {}, sounds = {};  // row → notifies; row → sound name, `custom` or null
+  for (const [k] of ALERTS) {
+    alerts[k] = (pref("notify." + k) ?? (["me", "all", "start"].includes(k) ? "1" : "0")) === "1";
+    sounds[k] = pref("sound." + k) || null;
+  }
+  let soundList = [], customs = {}, fetched = false;  // the tray's: system sound names; row → { name, missing }
   const STARTED = "📞 call started";  // messages.py's Event/Call marker
   let before = null;  // id → row of the previous live frame
   const heard = new Set();  // "chat message" keys notified: one message, one notification
@@ -180,22 +194,58 @@
     before = live ? new Map(rows.map((r) => [r.id, r])) : null;
     if (!prev || !before || !tray) return;
     for (const r of rows) {
-      const old = prev.get(r.id), m = r.mention, fresh = r.last_id && r.last_id !== old?.last_id;
-      // A mention surfaces even in a muted chat, as on the @ tab; a meeting starting follows its own switch,
-      // muted chat or not; other messages follow the Inbox's rule.
-      const [id, by, text] = alert !== "none" && m?.msg_id && m.msg_id !== old?.mention?.msg_id && m.by !== YOU
-        ? [m.msg_id, m.by, m.text]
-        : meetings && fresh && kind(r.id) === "meeting" && r.text === STARTED && r.sender !== YOU
-          ? [r.last_id, r.sender, "📅 meeting started"]
-        : alert === "all" && fresh && r.sender && r.sender !== YOU && !r.muted && !isSeen(r)
-          ? [r.last_id, r.sender, r.text] : [];
+      const old = prev.get(r.id), m = r.mention, fresh = r.last_id && r.last_id !== old?.last_id, k = kind(r.id);
+      // A mention surfaces even in a muted chat, as on the @ tab, and wins; a meeting start too, muted or not;
+      // other messages follow the Inbox's rule. The notification and the sound each go to the first row that has one.
+      const rules = [
+        m?.msg_id && m.msg_id !== old?.mention?.msg_id && m.by !== YOU && [m.kind === "all" ? "all" : "me", m.msg_id, m.by, m.text],
+        fresh && k === "meeting" && r.text === STARTED && r.sender !== YOU && ["start", r.last_id, r.sender, "📅 meeting started"],
+        fresh && r.sender && r.sender !== YOU && !r.muted && !isSeen(r) && [k, r.last_id, r.sender, r.text],
+      ].filter(Boolean);
+      const say = rules.find(([row]) => alerts[row]), ring = rules.find(([row]) => sounds[row]), id = (say || ring)?.[1];
       if (!id || heard.has(r.id + " " + id)) continue;
       heard.add(r.id + " " + id);
       if (heard.size > 500) heard.delete(heard.values().next().value);  // the page runs for days
       const chat = rowTitle(r);
-      tray.notify(r.id, clip(by && by !== chat ? by + " · " + chat : chat, 120), clip(text || "", 200));
+      if (say) { const [, , by, text] = say; tray.notify(r.id, clip(by && by !== chat ? by + " · " + chat : chat, 120), clip(text || "", 200)); }
+      if (ring) tray.play(ring[0], sounds[ring[0]]);
     }
   };
+  // Each row's sound picker: None, the system's sounds, the row's own file if any, then the dialog.
+  const soundPicker = (k, lbl) => {
+    const s = sounds[k], c = customs[k], box = el("select"), play = el("button", "play", "▶");
+    const opts = [["", "None"], ...soundList.map((n) => [n, n.replaceAll("-", " ")])];
+    const gone = fetched && s && s !== CUSTOM && !soundList.includes(s);  // before the first fetch it may well be there
+    if (s && s !== CUSTOM && !soundList.includes(s)) opts.push([s, s.replaceAll("-", " ") + (gone ? " (missing)" : "")]);
+    if (c || s === CUSTOM) opts.push([CUSTOM, c ? c.name + (c.missing ? " (missing)" : "") : "custom file (missing)"]);
+    opts.push([CHOOSE, "Custom file…"]);
+    for (const [v, t] of opts) box.append(Object.assign(el("option", null, t), { value: v }));
+    box.value = s || ""; box.title = box.selectedOptions[0]?.textContent || ""; box.dataset.k = "sound." + k; box.setAttribute("aria-label", lbl + " sound");
+    box.setAttribute("aria-describedby", "notify-hint");
+    // Custom file… is an action: a cancelled dialog sends nothing back, the choice stays as it was. Keys
+    // (arrows, type-ahead) change a closed select too: landing on it only selects it, Enter or Space opens it.
+    let keyed = false;
+    const ask = () => { box.value = s || ""; tray.choose(k); };
+    box.onpointerdown = () => { keyed = false; };
+    box.onkeydown = (e) => {
+      const go = e.key === "Enter" || e.key === " ";
+      // Alt+↑/↓ and F4 open the list: a pick in it is as deliberate as a pointer one.
+      keyed = !(go || e.key === "F4" || (e.altKey && (e.key === "ArrowDown" || e.key === "ArrowUp")));
+      if (go && box.value === CHOOSE) { e.preventDefault(); ask(); }
+    };
+    box.onblur = () => { if (box.value === CHOOSE) box.value = s || ""; };  // left on it: nothing was chosen
+    box.onchange = () => {
+      if (box.value === CHOOSE) { if (!keyed) ask(); return; }
+      sounds[k] = box.value || null; keep("sound." + k, sounds[k]); renderHeader(true);
+    };
+    play.disabled = !s || gone || (s === CUSTOM && (!c || c.missing)); play.title = "Play this sound"; play.dataset.k = "play." + k;
+    play.setAttribute("aria-label", "play the " + lbl + " sound");
+    play.onclick = () => tray.preview(k, s);
+    return [box, play];
+  };
+  // A failed fetch (the bridge gone) keeps the lists of the last one.
+  const fetchSounds = () => Promise.all([tray.sounds(), tray.customs()])
+    .then(([s, c]) => { soundList = s || []; customs = c || {}; fetched = true; renderHeader(true); }, () => {});
 
   // The header wraps with the width and the banner comes and goes: rows scroll in under both.
   const measure = new ResizeObserver(() => {
@@ -206,7 +256,7 @@
   measure.observe($header, { box: "border-box" });
   measure.observe($banner, { box: "border-box" });
   const banner = linkBanner($banner), own = ownStatus(document.getElementById("own"), send);
-  const renderHeader = () => {
+  const renderHeader = (force) => {
     const c = counts();
     $tabs.replaceChildren(...Object.entries(TABS).map(([k, lbl]) => {
       const b = el("button", (tab === k ? "on " : "") + (k === "mention" ? "mention" : ""), lbl);
@@ -215,6 +265,9 @@
     secs.paint($mode);
     $cog.classList.toggle("open", menuOpen);
     const old = $cog.querySelector(".menu"), scrolled = old?.scrollTop ?? 0;  // every render rebuilds it
+    const f = old?.contains(document.activeElement) ? document.activeElement : null;
+    // A live frame would close a picker's open list: the menu shows nothing a frame changes.
+    if (menuOpen && f?.tagName === "SELECT" && !force) return;
     old?.remove();
     if (!menuOpen) return;
     const menu = el("div", "menu"); menu.onclick = (e) => e.stopPropagation();
@@ -247,18 +300,20 @@
       for (const [k, lbl] of BADGES) {
         const b = el("button", badge === k ? "on" : "", lbl); b.onclick = () => { badge = k; keep("badge", k); publish(); render(); }; yseg.append(b);
       }
-      const abox = el("div"), aseg = el("div", "seg");
+      const abox = el("div"), table = el("div", "alerts");
       abox.id = "notify";
       for (const [k, lbl] of ALERTS) {
-        const b = el("button", alert === k ? "on" : "", lbl); b.onclick = () => { alert = k; keep("notify", k); render(); }; aseg.append(b);
+        const line = el("div", "alert"), lab = el("label", null, lbl), sw = el("input", "switch");
+        line.dataset.row = k; sw.type = "checkbox"; sw.id = lab.htmlFor = "notify-" + k; sw.dataset.k = "notify." + k;
+        sw.setAttribute("aria-describedby", "notify-hint");
+        sw.checked = alerts[k]; sw.onchange = () => { alerts[k] = sw.checked; keep("notify." + k, sw.checked ? "1" : "0"); render(); };
+        line.append(lab, sw, ...soundPicker(k, lbl)); table.append(line);
       }
-      const mlab = el("label", null, "Meeting start"), msw = el("input", "switch");
-      msw.type = "checkbox"; msw.checked = meetings; msw.onchange = () => { meetings = msw.checked; keep("meetings", meetings ? "1" : "0"); render(); };
-      mlab.append(msw);
-      ybox.append(el("h3", null, "Tray"), yseg); abox.append(el("h3", null, "Notify"), aseg, mlab); menu.append(ybox, abox);
+      ybox.append(el("h3", null, "Tray"), yseg); abox.append(el("h3", null, "Notify"), Object.assign(el("div", "hint", "Switch: desktop notification. List: sound."), { id: "notify-hint" }), table); menu.append(ybox, abox);
     }
     $cog.append(menu);
     menu.scrollTop = scrolled;
+    if (f?.dataset.k) menu.querySelector(`[data-k="${f.dataset.k}"]`)?.focus();  // keyboard users keep their place
   };
 
   // Where a click on a row goes: `?nav=chat` keeps its own (plain = this tab, middle = the chat page).
@@ -461,7 +516,8 @@
     else if (e.key === "Tab" && !e.shiftKey && sel && pick().some((r) => r.id === sel)) { e.preventDefault(); openReply(sel); }
     else if (e.key === "Escape" && (query || sel)) { $q.value = ""; query = ""; sel = ""; render(); }
   };
-  $gear.onclick = (e) => { e.stopPropagation(); menuOpen = !menuOpen; renderHeader(); };
+  // The custom files may have gone missing since: the window checks them on each opening.
+  $gear.onclick = (e) => { e.stopPropagation(); menuOpen = !menuOpen; renderHeader(); if (menuOpen && tray) fetchSounds(); };
   addEventListener("click", () => { if (menuOpen) { menuOpen = false; renderHeader(); } });
   addEventListener("keydown", (e) => { if (e.key === "Escape" && menuOpen) { menuOpen = false; renderHeader(); } });
   addEventListener("keydown", (e) => {
@@ -499,13 +555,14 @@
   render();
   window.miniteamsTray?.then((t) => {
     tray = t;
-    t.settings.connect(() => { menuOpen = true; renderHeader(); });
+    t.settings.connect(() => { menuOpen = true; renderHeader(); fetchSounds(); });
+    t.chosen.connect((row) => { if (Object.hasOwn(sounds, row)) { sounds[row] = CUSTOM; keep("sound." + row, CUSTOM); fetchSounds(); } });
     // A notification clicked: the window is shown, the chat opens as a click on its row does.
     t.opened.connect((id) => {
       const r = rows.find((x) => x.id === id), go = r && route(r, aim(false));
       if (!(go && go() !== false) && r?.link) window.open(r.link, "_blank", "noopener");
     });
-    publish(); renderHeader();
+    publish(); renderHeader(); fetchSounds();
   });
   signIn.then(connect);
   setInterval(render, CLOCK_TICK_MS);

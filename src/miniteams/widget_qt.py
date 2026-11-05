@@ -6,11 +6,16 @@ and listens to `settings` and `opened`. A browser has no such promise, so the pa
 there.
 """
 
+import contextlib
 import hashlib
 import html
+import json
 import os
 import re
 import signal
+import tempfile
+import time
+from collections.abc import Callable
 from importlib.resources import files
 from pathlib import Path
 
@@ -26,6 +31,7 @@ from PySide6.QtCore import (
     QObject,
     QProcess,
     QRectF,
+    QStandardPaths,
     Qt,
     QTimer,
     QUrl,
@@ -34,6 +40,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtDBus import QDBusConnection, QDBusServiceWatcher
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWebChannel import QWebChannel
@@ -44,7 +51,7 @@ from PySide6.QtWebEngineCore import (
     QWebEngineScript,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
+from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon, QWidget
 
 from .widget import badge_text, chat_link, is_board, is_external, token, tooltip
 
@@ -62,6 +69,25 @@ NOTIFICATIONS = "org.freedesktop.Notifications"
 NOTIFICATIONS_PATH = "/org/freedesktop/Notifications"
 GDBUS = "gdbus"
 KEPT = 100  # notifications whose click is still awaited; the daemon's closing signal can be missed
+
+# Spec 039: the Notify rows, and the freedesktop theme's sounds fit for a notification, in picker order.
+ROWS = ("me", "all", "dm", "group", "meeting", "start")
+SOUNDS = (
+    "bell",
+    "complete",
+    "message",
+    "message-new-instant",
+    "phone-incoming-call",
+    "window-attention",
+    "dialog-information",
+    "dialog-warning",
+    "alarm-clock-elapsed",
+)
+CUSTOM = "custom"
+AUDIO = "Audio files (*.oga *.ogg *.wav *.mp3 *.flac *.opus)"
+XFCONF = "xfconf-query"
+BURST = 3.0  # seconds after a played sound during which the next ones stay silent
+DND_TIMEOUT = 1000  # ms an xfconf-query read may take before it is killed and read as not DND
 
 log = structlog.get_logger()
 
@@ -110,6 +136,18 @@ def _channel_js() -> str:
     if not f.open(QIODevice.OpenModeFlag.ReadOnly):
         raise RuntimeError("qwebchannel.js missing from the Qt install")
     return bytes(f.readAll().data()).decode()
+
+
+def system_sounds() -> dict[str, str]:
+    """The allowlisted theme sounds present in the XDG data dirs: name → file, in `SOUNDS` order."""
+    found = {}
+    for name in SOUNDS:
+        path = QStandardPaths.locate(
+            QStandardPaths.StandardLocation.GenericDataLocation, f"sounds/freedesktop/stereo/{name}.oga"
+        )
+        if path:
+            found[name] = path
+    return found
 
 
 def gvariant(text: str) -> str:
@@ -216,22 +254,196 @@ class Notifier(QObject):
 
 class Tray(QObject):
     """The page's side of the tray: `badge(pref, count)` and `notify(chat, title, body)` from the page,
-    `settings` and `opened(chat)` to it."""
+    `settings` and `opened(chat)` to it. Sounds (spec 039): the page asks by name or by row (`custom`),
+    never by path; custom paths stay in `sounds.json`, the page sees file names (`customs`, `chosen`)."""
 
     settings = Signal()
     opened = Signal(str)
+    chosen = Signal(str, str)
 
-    def __init__(self, icon: QIcon, tray: QSystemTrayIcon, window: QWidget, notifier: Notifier) -> None:
+    def __init__(
+        self, icon: QIcon, tray: QSystemTrayIcon, window: QWidget, notifier: Notifier, config_dir: Path
+    ) -> None:
         super().__init__()
         self.icon, self.tray, self.shown = icon, tray, ("", "miniteams")
         self.window, self.notifier = window, notifier
+        self.sounds_path = config_dir / "widget" / "sounds.json"
+        self.clock: Callable[[], float] = time.monotonic
+        self.last: float | None = None  # when `play` last started a sound
+        self.reading: QProcess | None = None  # the DND read a `play` waits on
+        self.warned: set[tuple[str, str]] = set()  # (event, path) already logged: once per file
+        self.unreadable: int | None = -1  # mtime of the unreadable sounds.json already logged; None = no stat
+        self.player: QMediaPlayer | None = None
+        self.dialog: QFileDialog | None = None
+
+    def _in_front(self) -> bool:
+        return bool(self.window.isVisible() and self.window.isActiveWindow())
 
     @Slot(str, str, str)
     def notify(self, chat: str, title: str, body: str) -> None:
         # The window in front shows the board already: the user is looking at what changed.
-        if self.window.isVisible() and self.window.isActiveWindow():
+        if self._in_front():
             return
         self.notifier.show(chat, title, body)
+
+    @Slot(result="QStringList")
+    def sounds(self) -> list[str]:
+        return list(system_sounds())
+
+    @Slot(result="QVariantMap")
+    def customs(self) -> dict[str, dict[str, str | bool]]:
+        return {
+            row: {"name": os.path.basename(path), "missing": not os.path.isfile(path)}
+            for row, path in self._customs().items()
+        }
+
+    @Slot(str)
+    def choose(self, row: str) -> None:
+        if row not in ROWS:
+            log.warning("widget_sound_refused", row=row[:64])
+            return
+        if self.dialog is not None and shiboken6.isValid(self.dialog) and self.dialog.isVisible():
+            self.dialog.raise_()
+            self.dialog.activateWindow()
+            return
+        dialog = self.dialog = QFileDialog(self.window, "Sound", "", AUDIO)
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.fileSelected.connect(lambda path: self._store(row, os.path.abspath(path)))
+        dialog.finished.connect(lambda _: setattr(self, "dialog", None))
+        dialog.open()
+
+    @Slot(str, str)
+    def play(self, row: str, sound: str) -> None:
+        if self._in_front():
+            return
+        # A play while DND is read is part of the same burst.
+        if self.reading is not None or (self.last is not None and self.clock() - self.last < BURST):
+            return
+        if (path := self._resolve(row, sound)) is None:
+            return
+        proc = self.reading = QProcess(self)
+        proc.setProgram(XFCONF)
+        proc.setArguments(["-c", "xfce4-notifyd", "-p", "/do-not-disturb"])
+        proc.finished.connect(lambda code, _: self._dnd_read(proc, path, code))
+        proc.errorOccurred.connect(lambda err: self._dnd_failed(proc, path, err))
+        proc.start()
+        QTimer.singleShot(DND_TIMEOUT, proc, lambda: self._dnd_late(proc, path))
+
+    @Slot(str, str)
+    def preview(self, row: str, sound: str) -> None:
+        if (path := self._resolve(row, sound)) is not None:
+            self.output(path)
+
+    def output(self, path: str) -> None:
+        """Plays `path`, replacing any sound still playing; tests stub it."""
+        if self.player is None:
+            self.player = QMediaPlayer(self)
+            self.player.setAudioOutput(QAudioOutput(self.player))
+            self.player.errorOccurred.connect(self._unplayable)
+        self.player.setSource(QUrl.fromLocalFile(path))
+        self.player.play()
+
+    def _unplayable(self, error: QMediaPlayer.Error, _: str = "") -> None:
+        if self.player is not None:
+            path = self.player.source().toLocalFile()
+            self._warn_once("widget_sound_unplayable", path, name=os.path.basename(path), error=error.name)
+
+    def _warn_once(self, event: str, key: str, **fields: str) -> None:
+        """Logs `event` once per `key`: it would repeat on every interaction until the setup changes."""
+        if (event, key) not in self.warned:
+            self.warned.add((event, key))
+            log.warning(event, **fields)
+
+    def _sound(self, path: str) -> None:
+        self.last = self.clock()
+        self.output(path)
+
+    def _resolve(self, row: str, sound: str) -> str | None:
+        if row not in ROWS or (sound != CUSTOM and sound not in SOUNDS):
+            log.warning("widget_sound_refused", row=row[:64], sound=sound[:64])
+            return None
+        if sound != CUSTOM:
+            if (path := system_sounds().get(sound)) is None:
+                self._warn_once("widget_sound_absent", sound, sound=sound)
+            return path
+        if (path := self._customs().get(row)) is None:
+            self._warn_once("widget_sound_unset", row, row=row)
+            return None
+        if not os.path.isfile(path):
+            self._warn_once("widget_sound_missing", path, row=row, name=os.path.basename(path))
+            return None
+        return path
+
+    def _dnd_read(self, proc: QProcess, path: str, code: int) -> None:
+        if not shiboken6.isValid(proc):  # destroyed while running (the app quitting)
+            return
+        out = bytes(proc.readAllStandardOutput().data()).decode(errors="replace").strip()
+        proc.deleteLater()
+        if proc is not self.reading:  # killed by `_dnd_late`, whose sound already played
+            return
+        self.reading = None
+        if not (code == 0 and out == "true"):
+            self._sound(path)
+
+    def _dnd_failed(self, proc: QProcess, path: str, err: QProcess.ProcessError) -> None:
+        if err == QProcess.ProcessError.FailedToStart:  # no xfconf: no DND to honour, and no `finished`
+            proc.deleteLater()
+            if proc is not self.reading:  # the 1 s timeout already played it
+                return
+            self.reading = None
+            self._sound(path)
+
+    def _dnd_late(self, proc: QProcess, path: str) -> None:
+        if self.reading is None or proc is not self.reading:
+            return
+        self.reading = None
+        proc.kill()  # its `finished` follows and only deletes it
+        self._warn_once("widget_dnd_timeout", XFCONF, program=XFCONF)
+        self._sound(path)
+
+    def _customs(self) -> dict[str, str]:
+        return self._load() or {}
+
+    def _load(self) -> dict[str, str] | None:
+        """sounds.json's rows, {} when absent, None when malformed (logged once per mtime)."""
+        try:
+            data = json.loads(self.sounds_path.read_text())
+            if not isinstance(data, dict):
+                raise ValueError("not an object")
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as e:
+            mtime = None
+            with contextlib.suppress(OSError):
+                mtime = self.sounds_path.stat().st_mtime_ns
+            if mtime != self.unreadable:
+                self.unreadable = mtime
+                log.warning("widget_sounds_unreadable", error=str(e)[:200])
+            return None
+        return {row: path for row, path in data.items() if row in ROWS and isinstance(path, str)}
+
+    def _store(self, row: str, path: str) -> None:
+        old = self._load()
+        if old is None:
+            log.warning("widget_sounds_reset")
+        kept = (old or {}) | {row: path}
+        folder = self.sounds_path.parent
+        folder.mkdir(parents=True, mode=0o700, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=folder, prefix=".sounds.", suffix=".tmp")  # 0600
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(kept, f)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.sounds_path)
+        except OSError as e:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            log.warning("widget_sounds_unwritable", error=str(e))
+            return
+        self.chosen.emit(row, os.path.basename(path))
 
     @Slot(str, int)
     def badge(self, pref: str, count: int) -> None:
@@ -309,7 +521,7 @@ class Window(QWebEngineView):
         self.tray.setToolTip(APP)
         self.notifier = Notifier(QDBusConnection.sessionBus())
         self.notifier.clicked.connect(self.open_chat)
-        self.bridge = Tray(icon, self.tray, self, self.notifier)
+        self.bridge = Tray(icon, self.tray, self, self.notifier, config_dir)
         channel = QWebChannel(page)
         channel.registerObject("tray", self.bridge)
         page.setWebChannel(channel)

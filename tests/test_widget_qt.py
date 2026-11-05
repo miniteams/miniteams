@@ -5,6 +5,7 @@ Run: `uv run --extra widget pytest tests/test_widget_qt.py`; skipped without the
 
 import asyncio
 import contextlib
+import json
 import os
 import resource
 import signal
@@ -26,7 +27,7 @@ import test_web_chat  # noqa: E402
 from PySide6.QtCore import QEvent, QLockFile, QProcess, QSize, QTimer, QUrl  # noqa: E402
 from PySide6.QtGui import QCloseEvent, QColor, QDesktopServices  # noqa: E402
 from PySide6.QtWebEngineCore import QWebEnginePage  # noqa: E402
-from PySide6.QtWidgets import QApplication, QSystemTrayIcon  # noqa: E402
+from PySide6.QtWidgets import QApplication, QFileDialog, QSystemTrayIcon  # noqa: E402
 from test_web_chat import ME, _archive, _at, _m, _served  # noqa: E402
 
 from miniteams import web as W  # noqa: E402
@@ -794,3 +795,432 @@ async def test_a_gdbus_failure_logs_its_error(
         await until(lambda: any(e["event"] == "widget_notify_failed" for e in logs), "the failure logged")
     event = next(e for e in logs if e["event"] == "widget_notify_failed")
     assert event["stderr"].startswith("Error: no service") and len(event["stderr"]) == 200
+
+
+# --- sounds (spec 039) ---
+
+
+@pytest.fixture
+def xfconf(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A stand-in `xfconf-query` printing the returned file's content (`false` until a test writes it)."""
+    fake, answer = tmp_path / "xfconf-query", tmp_path / "dnd"
+    answer.write_text("false")
+    fake.write_text(f"#!/bin/sh\ncat {answer}\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(widget_qt, "XFCONF", str(fake))
+    return answer
+
+
+@pytest.fixture
+def sounding(
+    app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, xfconf: Path
+) -> Iterator[tuple[widget_qt.Tray, list[str], list[bool]]]:
+    """A bridge on a hidden-able window; the theme holds bell, message, window-attention and dialog-error
+    (not allowlisted); audio output stubbed into the returned list; the front flag drives isActiveWindow."""
+    stereo = tmp_path / "data" / "sounds" / "freedesktop" / "stereo"
+    stereo.mkdir(parents=True)
+    for name in ("window-attention", "dialog-error", "message", "bell"):
+        (stereo / f"{name}.oga").write_bytes(b"")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "home-data"))
+    monkeypatch.setenv("XDG_DATA_DIRS", str(tmp_path / "data"))
+    window = widget_qt.QWidget()
+    window.show()
+    front = [False]
+    monkeypatch.setattr(window, "isActiveWindow", lambda: front[0])
+    notifier = widget_qt.Notifier(widget_qt.QDBusConnection.sessionBus())
+    tray = QSystemTrayIcon()
+    bridge = widget_qt.Tray(widget_qt.app_icon(), tray, window, notifier, tmp_path / "cfg")
+    played: list[str] = []
+    monkeypatch.setattr(bridge, "output", played.append)
+    bridge.clock = lambda: 100.0
+    yield bridge, played, front
+    window.deleteLater()
+    QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+async def settled(bridge: widget_qt.Tray) -> None:
+    """Every DND read answered and gone."""
+
+    def done() -> bool:
+        QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        return not bridge.findChildren(QProcess)
+
+    await until(done, "DND reads answered")
+
+
+def _stem(path: str) -> str:
+    return Path(path).stem
+
+
+def test_sounds_lists_the_allowlisted_ones_present_in_order(
+    sounding: tuple[widget_qt.Tray, list[str], list[bool]],
+) -> None:
+    """039-AC9: only allowlisted theme sounds that exist, in picker order; dialog-error, present, is not."""
+    bridge, _, _ = sounding
+    assert bridge.sounds() == ["bell", "message", "window-attention"]
+
+
+async def test_play_is_silent_in_front_and_in_dnd(
+    sounding: tuple[widget_qt.Tray, list[str], list[bool]], xfconf: Path
+) -> None:
+    """039-AC6: the window active → nothing; DND true → nothing, no burst taken; DND false → plays."""
+    bridge, played, front = sounding
+    front[0] = True
+    bridge.play("dm", "bell")
+    await settled(bridge)
+    assert played == []
+    front[0] = False
+    xfconf.write_text("true\n")
+    bridge.play("dm", "bell")
+    await settled(bridge)
+    assert played == []
+    xfconf.write_text("false\n")
+    bridge.play("dm", "message")
+    await until(lambda: played, "a sound out of DND")
+    assert [_stem(p) for p in played] == ["message"]
+
+
+@pytest.mark.parametrize("broken", ["absent", "failing"])
+async def test_play_without_a_dnd_answer_plays(
+    sounding: tuple[widget_qt.Tray, list[str], list[bool]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    broken: str,
+) -> None:
+    """039-AC6: no xfconf-query, or no such property (it fails): not DND, the sound plays."""
+    bridge, played, _ = sounding
+    failing = tmp_path / "xfconf-failing"
+    failing.write_text("#!/bin/sh\necho 'Property does not exist' >&2\nexit 1\n")
+    failing.chmod(0o755)
+    monkeypatch.setattr(widget_qt, "XFCONF", str(tmp_path / "absent" if broken == "absent" else failing))
+    bridge.play("me", "bell")
+    await until(lambda: played, broken)
+    await settled(bridge)
+    assert [_stem(p) for p in played] == ["bell"]
+
+
+async def test_a_burst_plays_one_sound(sounding: tuple[widget_qt.Tray, list[str], list[bool]]) -> None:
+    """039-AC7: plays within 3 s of a played one stay silent, also while its DND read is out; past 3 s,
+    the next plays."""
+    bridge, played, _ = sounding
+    now = [100.0]
+    bridge.clock = lambda: now[0]
+    bridge.play("me", "bell")
+    bridge.play("dm", "message")  # its DND read still out
+    await settled(bridge)
+    assert [_stem(p) for p in played] == ["bell"]
+    now[0] = 102.9
+    bridge.play("dm", "message")
+    await settled(bridge)
+    assert len(played) == 1
+    now[0] = 103.1
+    bridge.play("dm", "message")
+    await until(lambda: len(played) == 2, "the next burst")
+    assert [_stem(p) for p in played] == ["bell", "message"]
+
+
+async def test_preview_ignores_front_dnd_and_burst_and_starts_no_burst(
+    sounding: tuple[widget_qt.Tray, list[str], list[bool]], xfconf: Path
+) -> None:
+    """039-AC8 (native side): ▶ plays at once in front, in DND, in a burst; a later play is not held by it."""
+    bridge, played, front = sounding
+    bridge.preview("me", "bell")
+    bridge.play("dm", "message")
+    await until(lambda: len(played) == 2, "a play after a preview")
+    await settled(bridge)
+    bridge.preview("me", "bell")  # within the play's burst
+    front[0] = True
+    bridge.preview("me", "bell")
+    front[0] = False
+    xfconf.write_text("true")
+    bridge.preview("me", "window-attention")
+    assert [_stem(p) for p in played] == ["bell", "message", "bell", "bell", "window-attention"]
+    assert bridge.findChildren(QProcess) == []  # preview reads no DND
+
+
+@pytest.mark.parametrize(
+    ("row", "sound"),
+    [
+        ("dm", "/etc/passwd"),
+        ("dm", "../x"),
+        ("dm", "sounds/freedesktop/stereo/bell.oga"),
+        ("dm", "dialog-error"),  # present in the theme, not allowlisted
+        ("nope", "bell"),
+        ("../dm", "bell"),
+    ],
+)
+async def test_the_page_cannot_name_a_path(
+    sounding: tuple[widget_qt.Tray, list[str], list[bool]], row: str, sound: str
+) -> None:
+    """039-AC10: a path-like or unlisted sound, an unknown row: nothing played by play or preview, a warning
+    logged each time (a page bug)."""
+    bridge, played, _ = sounding
+    with structlog.testing.capture_logs() as logs:
+        bridge.play(row, sound)
+        bridge.preview(row, sound)
+        await settled(bridge)
+    assert played == []
+    assert [e["event"] for e in logs] == ["widget_sound_refused"] * 2
+
+
+def _dialog(bridge: widget_qt.Tray) -> QFileDialog:
+    QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)  # a closed one goes (WA_DeleteOnClose)
+    dialog = bridge.window.findChild(QFileDialog)
+    assert dialog is not None and dialog.isVisible()  # open(), not exec(): the loop goes on
+    return dialog
+
+
+async def test_a_chosen_file_is_kept_native_side_and_shown_by_name(
+    sounding: tuple[widget_qt.Tray, list[str], list[bool]], tmp_path: Path
+) -> None:
+    """039-AC9, 039-AC10: Custom file… stores the absolute path in sounds.json (0600), the page gets the file
+    name only; cancel stores nothing; a deleted file shows missing, plays nothing, logs once."""
+    bridge, played, _ = sounding
+    tune = tmp_path / "My tune.ogg"
+    tune.write_bytes(b"")
+    got: list[tuple[str, str]] = []
+    bridge.chosen.connect(lambda row, name: got.append((row, name)))
+    bridge.choose("me")
+    _dialog(bridge).reject()
+    bridge.choose("dm")
+    dialog = _dialog(bridge)
+    dialog.selectFile(str(tune))
+    dialog.accept()
+    await until(lambda: got, "chosen")
+    assert got == [("dm", "My tune.ogg")]
+    stored = tmp_path / "cfg" / "widget" / "sounds.json"
+    assert json.loads(stored.read_text()) == {"dm": str(tune)}
+    assert stored.stat().st_mode & 0o777 == 0o600
+    assert bridge.customs() == {"dm": {"name": "My tune.ogg", "missing": False}}
+    assert str(tmp_path) not in json.dumps(bridge.customs())
+    bridge.preview("dm", "custom")
+    assert played == [str(tune)]
+    tune.unlink()
+    assert bridge.customs() == {"dm": {"name": "My tune.ogg", "missing": True}}
+    now = [100.0]
+    bridge.clock = lambda: now[0]
+    with structlog.testing.capture_logs() as logs:
+        for t in (100.0, 110.0):
+            now[0] = t
+            bridge.play("dm", "custom")
+        bridge.preview("dm", "custom")
+        await settled(bridge)
+    assert played == [str(tune)]
+    assert [e["event"] for e in logs] == ["widget_sound_missing"]
+    assert "My tune.ogg" == logs[0]["name"] and str(tmp_path) not in json.dumps(logs)
+
+
+def _slow_xfconf(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str) -> None:
+    fake = tmp_path / "xfconf-slow"
+    fake.write_text(f"#!/bin/sh\n{body}\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(widget_qt, "XFCONF", str(fake))
+
+
+async def test_a_hung_dnd_read_is_killed_and_the_sound_plays(
+    sounding: tuple[widget_qt.Tray, list[str], list[bool]], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """039-AC6: an xfconf-query that never answers is killed after 1 s, read as not DND: the sound plays once,
+    no child is left, the killed read's late end plays nothing more."""
+    bridge, played, _ = sounding
+    _slow_xfconf(tmp_path, monkeypatch, "exec sleep 20")
+    start = time.monotonic()
+    with structlog.testing.capture_logs() as logs:
+        bridge.play("dm", "bell")
+        await until(lambda: played, "the sound after the timeout")
+    assert time.monotonic() - start >= 0.9
+    await settled(bridge)  # the killed process reaped
+    for _ in range(30):
+        QApplication.processEvents()
+        await asyncio.sleep(0.01)
+    assert [_stem(p) for p in played] == ["bell"]
+    assert [e["event"] for e in logs] == ["widget_dnd_timeout"]
+
+
+async def test_plays_during_a_dnd_read_are_silent(
+    sounding: tuple[widget_qt.Tray, list[str], list[bool]], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """039-AC7: while a DND read is out, other plays (other rows, other sounds) stay silent."""
+    bridge, played, _ = sounding
+    _slow_xfconf(tmp_path, monkeypatch, "sleep 0.3; echo false")
+    bridge.play("me", "bell")
+    bridge.play("dm", "message")
+    bridge.play("start", "window-attention")
+    await settled(bridge)
+    assert [_stem(p) for p in played] == ["bell"]
+
+
+async def test_a_dnd_silenced_play_holds_no_burst(
+    sounding: tuple[widget_qt.Tray, list[str], list[bool]], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """039-AC6, 039-AC7: a play silenced by a slow DND answer starts no burst: the next one plays; two sounds
+    are still never within 3 s of each other."""
+    bridge, played, _ = sounding
+    now = [100.0]
+    bridge.clock = lambda: now[0]
+    answer = tmp_path / "slow-dnd"
+    answer.write_text("true")
+    _slow_xfconf(tmp_path, monkeypatch, f"sleep 0.3; cat {answer}")
+    bridge.play("me", "bell")
+    await settled(bridge)
+    assert played == []
+    answer.write_text("false")
+    now[0] = 100.5
+    bridge.play("dm", "message")
+    await settled(bridge)
+    now[0] = 103.4
+    bridge.play("dm", "bell")
+    await settled(bridge)
+    assert [_stem(p) for p in played] == ["message"]
+    now[0] = 103.6
+    bridge.play("dm", "bell")
+    await settled(bridge)
+    assert [_stem(p) for p in played] == ["message", "bell"]
+
+
+async def test_an_undecodable_file_is_logged_once(
+    sounding: tuple[widget_qt.Tray, list[str], list[bool]], tmp_path: Path
+) -> None:
+    """A custom file the player cannot decode logs its name and the error once per file, through the real
+    output."""
+    bridge, _, _ = sounding
+    noise, other = tmp_path / "noise.ogg", tmp_path / "other.ogg"
+    # Plain text, not random bytes: random data can hold a decodable audio frame and play noise.
+    noise.write_text("not audio\n" * 400)
+    other.write_text("still not audio\n" * 300)
+    with structlog.testing.capture_logs() as logs:
+
+        def unplayable() -> list[dict[str, Any]]:
+            return [e for e in logs if e["event"] == "widget_sound_unplayable"]
+
+        for path, n in ((noise, 1), (other, 2), (noise, 2)):
+            widget_qt.Tray.output(bridge, str(path))  # the real one, not the fixture's stub
+            await until(lambda n=n: len(unplayable()) >= n, f"{path.name} refused")
+            for _ in range(30):
+                QApplication.processEvents()
+                await asyncio.sleep(0.01)
+    assert [e["name"] for e in unplayable()] == ["noise.ogg", "other.ogg"]
+    assert all(e["error"] for e in unplayable()) and str(tmp_path) not in json.dumps(logs)
+
+
+async def test_a_malformed_sounds_json_logs_once_and_a_choice_resets_it(
+    sounding: tuple[widget_qt.Tray, list[str], list[bool]], tmp_path: Path
+) -> None:
+    """A malformed sounds.json (bad JSON, not an object) reads as empty, logged once per change of the file;
+    a new choice replaces it, saying so."""
+    bridge, _, _ = sounding
+    stored = tmp_path / "cfg" / "widget" / "sounds.json"
+    stored.parent.mkdir(parents=True)
+    tune = tmp_path / "tune.ogg"
+    tune.write_bytes(b"")
+    with structlog.testing.capture_logs() as logs:
+        for i, content in enumerate(("{not json", "[]")):
+            stored.write_text(content)
+            os.utime(stored, ns=(i * 10**9, i * 10**9))
+            assert bridge.customs() == {} and bridge.customs() == {}
+            bridge.play("dm", "custom")
+        assert [e["event"] for e in logs].count("widget_sounds_unreadable") == 2
+        bridge.choose("dm")
+        dialog = _dialog(bridge)
+        dialog.selectFile(str(tune))
+        dialog.accept()
+    assert "widget_sounds_reset" in [e["event"] for e in logs]
+    assert json.loads(stored.read_text()) == {"dm": str(tune)}
+
+
+def test_an_unreadable_sounds_dir_logs_once(
+    sounding: tuple[widget_qt.Tray, list[str], list[bool]], tmp_path: Path
+) -> None:
+    """sounds.json that cannot even be stat'ed (its directory unreadable) reads as empty, logged once."""
+    bridge, _, _ = sounding
+    folder = tmp_path / "cfg" / "widget"
+    folder.mkdir(parents=True)
+    (folder / "sounds.json").write_text("{}")
+    folder.chmod(0)
+    try:
+        with structlog.testing.capture_logs() as logs:
+            for _ in range(4):
+                assert bridge.customs() == {}
+    finally:
+        folder.chmod(0o700)
+    assert [e["event"] for e in logs].count("widget_sounds_unreadable") == 1
+
+
+def test_a_second_choose_raises_the_open_dialog(
+    sounding: tuple[widget_qt.Tray, list[str], list[bool]],
+) -> None:
+    """Custom file… twice: one dialog; once it is closed, the next opens a new one."""
+    bridge, _, _ = sounding
+    bridge.choose("dm")
+    first = _dialog(bridge)
+    bridge.choose("me")
+    assert [d for d in bridge.window.findChildren(QFileDialog) if d.isVisible()] == [first]
+    first.reject()
+    bridge.choose("me")
+    assert _dialog(bridge) is not first
+
+
+async def test_setup_warnings_are_logged_once_and_never_in_front(
+    sounding: tuple[widget_qt.Tray, list[str], list[bool]],
+) -> None:
+    """039-AC10: `custom` for a row with no file, or an allowlisted sound absent from the theme, plays
+    nothing; its warning is logged once, not per interaction, and not at all while the window is in front."""
+    bridge, played, front = sounding
+    now = [100.0]
+    bridge.clock = lambda: now[0]
+    with structlog.testing.capture_logs() as logs:
+        front[0] = True
+        for _ in range(5):
+            bridge.play("dm", "custom")
+            bridge.play("dm", "complete")
+        await settled(bridge)
+        assert logs == []
+        front[0] = False
+        for i in range(5):
+            now[0] = 100.0 + 4 * i
+            bridge.play("dm", "custom")
+            bridge.play("me", "complete")
+            bridge.preview("dm", "custom")
+            await settled(bridge)
+    assert played == []
+    assert [(e["event"], e.get("row", e.get("sound"))) for e in logs] == [
+        ("widget_sound_unset", "dm"),
+        ("widget_sound_absent", "complete"),
+    ]
+
+
+async def test_the_page_plays_a_rows_sound_through_the_channel(
+    opened: tuple[widget_qt.Window, list[str]],
+    board: W.Board,
+    gdbus: Path,
+    xfconf: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """039-AC5: end to end, a row's switch and sound set in the page's prefs, the window hidden: a new group
+    message on the board reaches the real `Tray.play` with that row and sound, and plays it once."""
+    window, _ = opened
+    stereo = tmp_path / "theme" / "sounds" / "freedesktop" / "stereo"
+    stereo.mkdir(parents=True)
+    (stereo / "bell.oga").write_bytes(b"")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "home-data"))
+    monkeypatch.setenv("XDG_DATA_DIRS", str(tmp_path / "theme"))
+    played: list[str] = []
+    monkeypatch.setattr(window.bridge, "output", played.append)
+    asked: list[tuple[str, str]] = []  # what the page asked for: `play` is a slot, `_resolve` its Python side
+    resolve = window.bridge._resolve
+    monkeypatch.setattr(
+        window.bridge, "_resolve", lambda row, sound: asked.append((row, sound)) or resolve(row, sound)
+    )
+    await js(window, "localStorage.setItem('notify.group', '0'); localStorage.setItem('sound.group', 'bell')")
+    window.tray.setToolTip("")  # the reloaded page's count, published once its tray is there
+    window.reload()
+    await until(lambda: window.tray.toolTip() == "miniteams — 2 unread", "the reloaded page's tray")
+    window.hide()
+    board.rows[A].update(last_id="99", last_activity=_at(50), sender="Bob Roe", text="new")
+    board.broadcast()
+    await until(lambda: played, "the group sound")
+    await settled(window.bridge)
+    assert asked == [("group", "bell")]
+    assert [Path(p).name for p in played] == ["bell.oga"]
+    assert window.notifier.chats == {}  # the row's switch is off
