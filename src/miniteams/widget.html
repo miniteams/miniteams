@@ -170,18 +170,24 @@
   // Desktop notifications: what changed between two live frames, so never the snapshot of a (re)connection.
   const ALERTS = [["mention", "@"], ["all", "Messages"], ["none", "None"]], YOU = "You";  // web.py's _YOU
   let alert = ALERTS.some(([k]) => k === pref("notify")) ? pref("notify") : "mention";
+  let meetings = pref("meetings") !== "0";
+  const STARTED = "📞 call started";  // messages.py's Event/Call marker
   let before = null;  // id → row of the previous live frame
   const heard = new Set();  // "chat message" keys notified: one message, one notification
   const clip = (t, n) => t.length > n ? t.slice(0, n - 1) + "…" : t;
   const news = () => {
     const prev = before;
     before = live ? new Map(rows.map((r) => [r.id, r])) : null;
-    if (!prev || !before || !tray || alert === "none") return;
+    if (!prev || !before || !tray) return;
     for (const r of rows) {
-      const old = prev.get(r.id), m = r.mention;
-      // A mention surfaces even in a muted chat, as on the @ tab; other messages follow the Inbox's rule.
-      const [id, by, text] = m?.msg_id && m.msg_id !== old?.mention?.msg_id && m.by !== YOU ? [m.msg_id, m.by, m.text]
-        : alert === "all" && r.last_id && r.last_id !== old?.last_id && r.sender && r.sender !== YOU && !r.muted && !isSeen(r)
+      const old = prev.get(r.id), m = r.mention, fresh = r.last_id && r.last_id !== old?.last_id;
+      // A mention surfaces even in a muted chat, as on the @ tab; a meeting starting follows its own switch,
+      // muted chat or not; other messages follow the Inbox's rule.
+      const [id, by, text] = alert !== "none" && m?.msg_id && m.msg_id !== old?.mention?.msg_id && m.by !== YOU
+        ? [m.msg_id, m.by, m.text]
+        : meetings && fresh && kind(r.id) === "meeting" && r.text === STARTED && r.sender !== YOU
+          ? [r.last_id, r.sender, "📅 meeting started"]
+        : alert === "all" && fresh && r.sender && r.sender !== YOU && !r.muted && !isSeen(r)
           ? [r.last_id, r.sender, r.text] : [];
       if (!id || heard.has(r.id + " " + id)) continue;
       heard.add(r.id + " " + id);
@@ -246,7 +252,10 @@
       for (const [k, lbl] of ALERTS) {
         const b = el("button", alert === k ? "on" : "", lbl); b.onclick = () => { alert = k; keep("notify", k); render(); }; aseg.append(b);
       }
-      ybox.append(el("h3", null, "Tray"), yseg); abox.append(el("h3", null, "Notify"), aseg); menu.append(ybox, abox);
+      const mlab = el("label", null, "Meeting start"), msw = el("input", "switch");
+      msw.type = "checkbox"; msw.checked = meetings; msw.onchange = () => { meetings = msw.checked; keep("meetings", meetings ? "1" : "0"); render(); };
+      mlab.append(msw);
+      ybox.append(el("h3", null, "Tray"), yseg); abox.append(el("h3", null, "Notify"), aseg, mlab); menu.append(ybox, abox);
     }
     $cog.append(menu);
     menu.scrollTop = scrolled;
