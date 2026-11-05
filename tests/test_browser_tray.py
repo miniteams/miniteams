@@ -311,6 +311,44 @@ async def test_none_notifies_nothing(native: Fake) -> None:
     assert await _notes(native, b.said(A, "2"), b.change(B, mention=_at_me("m1"))) == []
 
 
+async def test_meeting_start_notifies_on_its_own_switch(native: Fake) -> None:
+    """A call starting in a meeting chat notifies, muted or not, even on None; not in a group chat, not my
+    own call, not an ended one; switched off it raises nothing, and the choice is kept."""
+    page = native.page
+    assert page is not None
+    await _choose(page, "None")
+    b, meet = Board(), "19:meeting_fictional@thread.v2"
+    b.rows[meet] = row(meet, "Fictional standup", muted=True, last_id="1")
+    assert await _notes(native, list(b.rows.values())) == []
+    start = {"text": "📞 call started", "sender": ""}
+    assert await _notes(native, b.said(meet, "2", **start)) == [
+        [meet, "Fictional standup", "📅 meeting started"]
+    ]
+    others = (
+        b.said(A, "3", **start),
+        b.said(meet, "4", text="📞 call ended", sender=""),
+        b.said(meet, "5", text="📞 call started", sender="You"),
+    )
+    assert len(await _notes(native, *others)) == 1
+    await page.locator("#gear").click()
+    await page.locator("#notify label", has_text="Meeting start").locator("input").uncheck()
+    await page.keyboard.press("Escape")
+    assert len(await _notes(native, b.said(meet, "6", **start))) == 1
+    await page.reload()
+    await page.wait_for_selector("a.name")
+    await page.locator("#gear").click()
+    assert not await page.locator("#notify label", has_text="Meeting start").locator("input").is_checked()
+
+
+async def test_a_mention_wins_over_a_meeting_start_in_one_frame(native: Fake) -> None:
+    """A frame carrying both a meeting start and a new mention in one chat raises the mention."""
+    b, meet = Board(), "19:meeting_fictional@thread.v2"
+    b.rows[meet] = row(meet, "Fictional standup", last_id="1")
+    await _notes(native, list(b.rows.values()))
+    both = b.said(meet, "2", text="📞 call started", sender="", mention=_at_me("m1"))
+    assert await _notes(native, both) == [[meet, "Bob Roe · Fictional standup", "hey m1"]]
+
+
 async def test_no_notification_for_a_snapshot_or_a_resync(native: Fake) -> None:
     """024-AC10: the first board of a connection only sets what the next one is compared with: a
     reconnection's board, newer messages and mentions in it, raises nothing; the change after it does."""

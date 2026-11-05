@@ -202,6 +202,9 @@ watches the token cache file).
   or the seeding loads; none while the window is in front. Title: sender · chat; body: the mentioning message's text
   for a mention, else the chat's last message, cut to 200 characters. One notification per chat: a newer one
   replaces it. Sent with `gdbus` (`libglib2.0-bin`) to the desktop's notification service.
+- ⚙ → Notify → **Meeting start** (on by default): a call starting in a meeting chat notifies ("📅 meeting started"),
+  muted chat or not, whatever the choice above, also when you are the first one in (Teams names nobody for a
+  scheduled meeting's start); not for an ad-hoc call you start from it. Calls in other chats are not this switch's.
 - A notification's **Open** button shows the window and opens the chat as clicking its row does. Dismissing it (or
   "clear all") opens nothing; xfce4-notifyd reports a body click only as a dismissal, so there a body click opens
   nothing either.
