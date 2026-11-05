@@ -196,15 +196,24 @@ watches the token cache file).
   pill instead of red), **Inbox** or **None**; "99+" past 99, the tooltip says how many. Counts follow the tabs'
   rules, ignore the filter box, and keep updating while the window is hidden; disconnected from `web`, or while
   `web` is still seeding its list, the icon shows no count.
-- ⚙ → **Notify** (native window only) picks what raises a desktop notification: **@** (a new mention, the default,
-  also in a muted chat as on the @ tab), **Messages** (that, plus any new message in a chat the Inbox shows: not
-  muted, not older than its Seen mark) or **None**. Never for your own messages, nor for the board a (re)connection
-  or the seeding loads; none while the window is in front. Title: sender · chat; body: the mentioning message's text
-  for a mention, else the chat's last message, cut to 200 characters. One notification per chat: a newer one
-  replaces it. Sent with `gdbus` (`libglib2.0-bin`) to the desktop's notification service.
-- ⚙ → Notify → **Meeting start** (on by default): a call starting in a meeting chat notifies ("📅 meeting started"),
-  muted chat or not, whatever the choice above, also when you are the first one in (Teams names nobody for a
-  scheduled meeting's start); not for an ad-hoc call you start from it. Calls in other chats are not this switch's.
+- ⚙ → **Notify** (native window only): one row per interaction, each with a notification switch, a sound and ▶ to
+  hear it. Rows: **@ you** and **@ everyone** (a new mention, also in a muted chat as on the @ tab; on by default),
+  **Direct message**, **Group message**, **Meeting chat** (a new message in a chat the Inbox shows: not muted, not
+  older than its Seen mark; off by default) and **Meeting start** (a call starting in a meeting chat, muted or not,
+  "📅 meeting started"; on by default; also when you are the first one in, not for an ad-hoc call you start). For
+  one message the rows are asked in order, its mention first, then a meeting start, then its chat's row: the
+  notification comes from the first one switched on, the sound from the first one with a sound; at most one of each.
+- Never for your own messages, nor for the board a (re)connection or the seeding loads; none while the window is in
+  front. Title: sender · chat; body: the mentioning message's text for a mention, else the chat's last message, cut
+  to 200 characters. One notification per chat: a newer one replaces it. Sent with `gdbus` (`libglib2.0-bin`) to
+  the desktop's notification service.
+- Sound: **None** (default), the freedesktop theme's notification sounds found on the machine, or **Custom file…**
+  (an audio file; its path stays in `~/.config/miniteams/widget/sounds.json`, the row shows its name, "(missing)"
+  once it is gone, checked each time ⚙ opens; from the keyboard, arrow onto it then Enter). A sound plays with or
+  without the row's notification. Silent while the window is in front, in xfce4-notifyd's Do Not Disturb, and for
+  3 s after a sound (a burst plays one); ▶ always plays.
+- The pre-039 choice (@ / Messages / None, the Meeting start switch) carries over once to the rows, unless a row
+  was already set.
 - A notification's **Open** button shows the window and opens the chat as clicking its row does. Dismissing it (or
   "clear all") opens nothing; xfce4-notifyd reports a body click only as a dismissal, so there a body click opens
   nothing either.

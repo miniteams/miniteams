@@ -973,7 +973,7 @@ def _dialog(bridge: widget_qt.Tray) -> QFileDialog:
 async def test_a_chosen_file_is_kept_native_side_and_shown_by_name(
     sounding: tuple[widget_qt.Tray, list[str], list[bool]], tmp_path: Path
 ) -> None:
-    """039-AC9, AC10: Custom file… stores the absolute path in sounds.json (0600), the page gets the file
+    """039-AC9, 039-AC10: Custom file… stores the absolute path in sounds.json (0600), the page gets the file
     name only; cancel stores nothing; a deleted file shows missing, plays nothing, logs once."""
     bridge, played, _ = sounding
     tune = tmp_path / "My tune.ogg"
@@ -1053,7 +1053,7 @@ async def test_plays_during_a_dnd_read_are_silent(
 async def test_a_dnd_silenced_play_holds_no_burst(
     sounding: tuple[widget_qt.Tray, list[str], list[bool]], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """039-AC6, AC7: a play silenced by a slow DND answer starts no burst: the next one plays; two sounds
+    """039-AC6, 039-AC7: a play silenced by a slow DND answer starts no burst: the next one plays; two sounds
     are still never within 3 s of each other."""
     bridge, played, _ = sounding
     now = [100.0]
@@ -1187,3 +1187,40 @@ async def test_setup_warnings_are_logged_once_and_never_in_front(
         ("widget_sound_unset", "dm"),
         ("widget_sound_absent", "complete"),
     ]
+
+
+async def test_the_page_plays_a_rows_sound_through_the_channel(
+    opened: tuple[widget_qt.Window, list[str]],
+    board: W.Board,
+    gdbus: Path,
+    xfconf: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """039-AC5: end to end, a row's switch and sound set in the page's prefs, the window hidden: a new group
+    message on the board reaches the real `Tray.play` with that row and sound, and plays it once."""
+    window, _ = opened
+    stereo = tmp_path / "theme" / "sounds" / "freedesktop" / "stereo"
+    stereo.mkdir(parents=True)
+    (stereo / "bell.oga").write_bytes(b"")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "home-data"))
+    monkeypatch.setenv("XDG_DATA_DIRS", str(tmp_path / "theme"))
+    played: list[str] = []
+    monkeypatch.setattr(window.bridge, "output", played.append)
+    asked: list[tuple[str, str]] = []  # what the page asked for: `play` is a slot, `_resolve` its Python side
+    resolve = window.bridge._resolve
+    monkeypatch.setattr(
+        window.bridge, "_resolve", lambda row, sound: asked.append((row, sound)) or resolve(row, sound)
+    )
+    await js(window, "localStorage.setItem('notify.group', '0'); localStorage.setItem('sound.group', 'bell')")
+    window.tray.setToolTip("")  # the reloaded page's count, published once its tray is there
+    window.reload()
+    await until(lambda: window.tray.toolTip() == "miniteams — 2 unread", "the reloaded page's tray")
+    window.hide()
+    board.rows[A].update(last_id="99", last_activity=_at(50), sender="Bob Roe", text="new")
+    board.broadcast()
+    await until(lambda: played, "the group sound")
+    await settled(window.bridge)
+    assert asked == [("group", "bell")]
+    assert [Path(p).name for p in played] == ["bell.oga"]
+    assert window.notifier.chats == {}  # the row's switch is off
