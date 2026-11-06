@@ -253,6 +253,9 @@ ALERTS = ["me", "all", "dm", "group", "meeting", "start"]
 LABELS = ["@ you", "@ everyone", "Direct message", "Group message", "Meeting chat", "Meeting start"]
 STORED = """Object.fromEntries(Object.keys(localStorage).filter(k => /^(notify|meetings|sound)/.test(k))
   .sort().map(k => [k, localStorage.getItem(k)]))"""
+# A switched-off row's sound picker is dimmed: its sound never plays (039-AC5).
+DIMMED = """[...document.querySelectorAll('#notify .alert')]
+  .filter(l => getComputedStyle(l.querySelector('select')).opacity < 1).map(l => l.dataset.row)"""
 SWITCHES = "Object.fromEntries([...document.querySelectorAll('#notify .switch')].map(s => [s.id, s.checked]))"
 
 
@@ -262,9 +265,10 @@ def _prefs(**prefs: str) -> str:
 
 
 def _only(row_name: str, mode: str) -> str:
-    """Every row's switch off but `row_name`'s with `mode` notify; with `mode` sound its sound, switch off."""
-    prefs = {f"notify_{k}": "1" if k == row_name and mode == "notify" else "0" for k in ALERTS}
-    return _prefs(**prefs, **({f"sound_{row_name}": "bell"} if mode == "sound" else {}))
+    """Every row's switch off but `row_name`'s with `mode` notify or both; `row_name` has a sound with both,
+    and with silent (its switch off)."""
+    prefs = {f"notify_{k}": "1" if k == row_name and mode != "silent" else "0" for k in ALERTS}
+    return _prefs(**prefs, **({f"sound_{row_name}": "bell"} if mode != "notify" else {}))
 
 
 async def _toggle(page: Page, *rows: str, on: bool = True) -> None:
@@ -297,7 +301,9 @@ async def test_notify_table_rows_defaults_and_kept(native: Fake) -> None:
     defaults = {f"notify-{r}": r in ("me", "all", "start") for r in ALERTS}
     assert await page.evaluate(SWITCHES) == defaults
     assert await page.evaluate(STORED) == {}
+    assert await page.evaluate(DIMMED) == [r for r in ALERTS if not defaults[f"notify-{r}"]]
     await page.locator("#notify-dm").check()
+    assert "dm" not in await page.evaluate(DIMMED)
     await page.locator("[data-k='sound.group']").select_option("message-new-instant")
     assert await page.evaluate(STORED) == {"notify.dm": "1", "sound.group": "message-new-instant"}
     await page.reload()
@@ -593,12 +599,13 @@ EXPECTED = {
 }
 
 
-@pytest.mark.parametrize("mode", ["notify", "sound"])
+@pytest.mark.parametrize("mode", ["notify", "both", "silent"])
 @pytest.mark.parametrize("alert", ALERTS)
 async def test_each_row_takes_only_its_interaction(pages: Pages, alert: str, mode: str) -> None:
-    """039-AC4, 039-AC5: with only one row on (its switch, or its sound with the switch off) a frame bringing
-    every interaction raises that row's alone, under its mute rule (mentions and meeting starts in muted
-    chats, messages not); my own message and mention never; the row switched off raises nothing more."""
+    """039-AC4, 039-AC5: with only one row on (its switch, with or without its sound) a frame bringing every
+    interaction raises that row's alone, under its mute rule (mentions and meeting starts in muted chats,
+    messages not); my own message and mention never; a sound with its switch off plays nothing, and the row
+    switched off raises nothing more."""
     fake = Fake()
     b = Board()
     for t, label, muted in (
@@ -614,11 +621,13 @@ async def test_each_row_takes_only_its_interaction(pages: Pages, alert: str, mod
     await until(page, "typeof window.__opened === 'function'")
     notes = await _notes(fake, _everything(b, 1))
     plays = await _plays(page)
-    assert (notes, plays) == (([EXPECTED[alert]], []) if mode == "notify" else ([], [[alert, "bell"]]))
-    await page.locator("#gear").click()
-    await page.locator(f"#notify-{alert}").set_checked(False)
-    await page.locator(f"[data-k='sound.{alert}']").select_option("")
-    await page.keyboard.press("Escape")
+    expected = {
+        "notify": ([EXPECTED[alert]], []),
+        "both": ([EXPECTED[alert]], [[alert, "bell"]]),
+        "silent": ([], []),
+    }
+    assert (notes, plays) == expected[mode]
+    await _toggle(page, alert, on=False)
     assert await _notes(fake, _everything(b, 2)) == notes
     assert await _plays(page) == plays
     await pages.close()
@@ -640,7 +649,7 @@ async def test_a_row_with_a_sound_notifies_and_plays_once(pages: Pages) -> None:
 
 async def test_a_mention_takes_precedence_over_its_message(pages: Pages) -> None:
     """039-AC4, 039-AC5: a message mentioning me in a group chat is the mention's (its sound), not the group
-    message's; with the @ row silent and off, the group row takes it."""
+    message's; with the @ row off, the group row takes it, with its own sound."""
     init = _prefs(notify_group="1", sound_me="bell", sound_group="message-new-instant")
     page = await _open(pages, fake := Fake(), BRIDGE + init)
     await until(page, "typeof window.__opened === 'function'")
@@ -649,7 +658,6 @@ async def test_a_mention_takes_precedence_over_its_message(pages: Pages) -> None
     assert await _plays(page) == [["me", "bell"]]
     await page.locator("#gear").click()
     await page.locator("#notify-me").set_checked(False)
-    await page.locator("[data-k='sound.me']").select_option("")
     await page.keyboard.press("Escape")
     notes = await _notes(fake, b.said(A, "3", mention=_at_me("3")))
     assert notes[1:] == [[A, "Bob Roe · Fictional A", "text 3"]]
@@ -657,28 +665,27 @@ async def test_a_mention_takes_precedence_over_its_message(pages: Pages) -> None
     await pages.close()
 
 
-async def test_the_notification_and_the_sound_take_their_own_first_row(pages: Pages) -> None:
-    """039-AC4, 039-AC5: one message, the rows in order (mention, meeting start, its chat's): the notification
-    goes to the first row switched on, the sound to the first row with a sound, once each."""
+async def test_the_sound_is_the_notifying_rows(pages: Pages) -> None:
+    """039-AC4, 039-AC5: one message, the rows in order (mention, meeting start, its chat's): the first row
+    switched on notifies, once, with its own sound; a later row's sound stays silent."""
     page = await _open(pages, fake := Fake(), BRIDGE + _prefs(notify_group="1", sound_group="bell"))
     await until(page, "typeof window.__opened === 'function'")
     b = Board()
     frame = b.said(A, "2", mention=_at_me("2"))
     assert await _notes(fake, frame, frame) == [[A, "Bob Roe · Fictional A", "hey 2"]]  # @ you: on by default
-    assert await _plays(page) == [["group", "bell"]]
+    assert await _plays(page) == []
     await pages.close()
 
 
-async def test_a_silent_mention_row_rings_while_the_chat_row_notifies(pages: Pages) -> None:
-    """039-AC4, 039-AC5.
-    @ rows off but @ you with a sound, Group message on: a mention in a group chat notifies
-    as the group message and plays @ you's sound."""
+async def test_a_mention_row_switched_off_keeps_its_sound_silent(pages: Pages) -> None:
+    """039-AC4, 039-AC5: @ rows off but @ you with a sound, Group message on without one: a mention in a group
+    chat notifies as the group message, and nothing plays."""
     init = _prefs(notify_me="0", notify_all="0", sound_me="bell", notify_group="1")
     page = await _open(pages, fake := Fake(), BRIDGE + init)
     await until(page, "typeof window.__opened === 'function'")
     b = Board()
     assert await _notes(fake, b.said(A, "2", mention=_at_me("2"))) == [[A, "Bob Roe · Fictional A", "text 2"]]
-    assert await _plays(page) == [["me", "bell"]]
+    assert await _plays(page) == []
     await pages.close()
 
 

@@ -34,8 +34,8 @@ mention. Nobody hears a sound they did not pick.
   "Inbox rule" = today's Messages rule: not muted, not older than the Seen mark, not mine, has a
   sender. Mentions and meeting starts keep #101's rules: never my own, a mention wins over a meeting
   start in the same frame.
-- Each row: label, notify switch, sound picker, ▶ preview. Notify and sound are independent: a sound
-  with no notification is allowed.
+- Each row: label, notify switch, sound picker, ▶ preview. A sound plays only with its row's
+  notification (no notification, no sound).
 - Sound picker: **None** (default), the freedesktop theme's sounds that fit a notification (bell,
   complete, message, message-new-instant, phone-incoming-call, window-attention, dialog-information,
   dialog-warning, alarm-clock-elapsed) when present, then **Custom file…**. Names shown without the
@@ -72,8 +72,8 @@ mention. Nobody hears a sound they did not pick.
   migrated values and the old keys are gone.
 - [x] **AC4** Each row notifies exactly on its interaction under its mute rule, and only when its
   switch is on (one test per row, plus my own message / my own mention never notifying).
-- [x] **AC5** A row with a sound plays it on its interaction, with or without its notification; a row
-  with None plays nothing.
+- [x] **AC5** A row with a sound plays it with its notification, never without; a row with None plays
+  nothing.
 - [x] **AC6** No sound while the window is active, nor in Do Not Disturb.
 - [x] **AC7** Two interactions with sounds within 3 s play one sound.
 - [x] **AC8** ▶ plays the row's current sound right away, window in front or not, DND or not.
@@ -121,6 +121,7 @@ mention. Nobody hears a sound they did not pick.
   decode `.oga`; QtMultimedia ships with PySide6 and needs no player on colleagues' machines.
 - Custom paths stay on the native side — a page that cannot hand over a path cannot make the window
   read an arbitrary file.
-- Sound and notification independent per row — the point of the table (option A).
+- The sound follows the notification: a sound with no notification was hard to trace back to its row
+  (changed after shipping, was option A: independent).
 - First sound of a burst wins, not the "most important" — no priority order to explain.
 - DND read at play time — no watcher to keep in sync; one `xfconf-query` call per played sound at most.

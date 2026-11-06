@@ -99,6 +99,7 @@
     font-size: 10px; color: var(--dim); cursor: pointer; }
   .menu .alert .play:hover:enabled { color: var(--accent); border-color: var(--accent); }
   .menu .alert .play:disabled { opacity: .4; cursor: default; }
+  .menu .alert:has(.switch:not(:checked)) select { opacity: .55; }  /* switched off: its sound never plays */
   /* Pasted images waiting for their send (spec 012 phase 5); the widget shrinks --thumb. */
   .imgs { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 4px 0; --thumb: 64px; }
   .imgs[hidden] { display: none; }

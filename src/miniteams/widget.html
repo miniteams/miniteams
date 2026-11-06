@@ -196,19 +196,21 @@
     for (const r of rows) {
       const old = prev.get(r.id), m = r.mention, fresh = r.last_id && r.last_id !== old?.last_id, k = kind(r.id);
       // A mention surfaces even in a muted chat, as on the @ tab, and wins; a meeting start too, muted or not;
-      // other messages follow the Inbox's rule. The notification and the sound each go to the first row that has one.
+      // other messages follow the Inbox's rule. The first row switched on notifies, with its own sound if any:
+      // no notification, no sound.
       const rules = [
         m?.msg_id && m.msg_id !== old?.mention?.msg_id && m.by !== YOU && [m.kind === "all" ? "all" : "me", m.msg_id, m.by, m.text],
         fresh && k === "meeting" && r.text === STARTED && r.sender !== YOU && ["start", r.last_id, r.sender, "📅 meeting started"],
         fresh && r.sender && r.sender !== YOU && !r.muted && !isSeen(r) && [k, r.last_id, r.sender, r.text],
       ].filter(Boolean);
-      const say = rules.find(([row]) => alerts[row]), ring = rules.find(([row]) => sounds[row]), id = (say || ring)?.[1];
+      const say = rules.find(([row]) => alerts[row]), id = say?.[1];
       if (!id || heard.has(r.id + " " + id)) continue;
       heard.add(r.id + " " + id);
       if (heard.size > 500) heard.delete(heard.values().next().value);  // the page runs for days
       const chat = rowTitle(r);
-      if (say) { const [, , by, text] = say; tray.notify(r.id, clip(by && by !== chat ? by + " · " + chat : chat, 120), clip(text || "", 200)); }
-      if (ring) tray.play(ring[0], sounds[ring[0]]);
+      const [row, , by, text] = say;
+      tray.notify(r.id, clip(by && by !== chat ? by + " · " + chat : chat, 120), clip(text || "", 200));
+      if (sounds[row]) tray.play(row, sounds[row]);
     }
   };
   // Each row's sound picker: None, the system's sounds, the row's own file if any, then the dialog.
