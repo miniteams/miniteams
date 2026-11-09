@@ -505,3 +505,7 @@ uv run --with playwright pytest tests/test_browser*.py   # opt-in headless Chrom
 uv run --with playwright playwright install firefox     # scroll and typing tests also run in Firefox; skipped without it
 pre-commit run --all-files
 ```
+
+## License
+
+[Apache-2.0](LICENSE)
