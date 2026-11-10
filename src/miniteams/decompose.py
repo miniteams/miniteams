@@ -18,6 +18,7 @@ from .compose import (
     _URL_TRAIL,
     EMOJI_NAME_RE,
     ESCAPABLE,
+    _indent,
     _literal,
     _word,
     compose_html,
@@ -461,7 +462,11 @@ def _escape(seg: str, wide: bool, line_start: bool, following: str, after_url: b
             k = j - i
             if (seg[j : j + 1] or following) in ESCAPABLE:
                 out.append("\\" * 2 * k)
-            elif line_start and not i and _literal(rest := "\\" + seg[j:] + following) != rest:
+            elif (
+                line_start
+                and _indent(seg) >= i
+                and _literal(rest := seg[:i] + "\\" + seg[j:] + following) != rest
+            ):
                 # Before a line-start marker compose strips a lone backslash, and collapses each pair
                 # followed by another backslash: two read as one, m >= 3 as m - (m - 1) // 2.
                 out.append("\\" * max(2 * k - 1, 2))
@@ -558,7 +563,9 @@ def _markdown(blocks: list[Block], wide: bool, italic: str) -> str:
         if kind == "line":
             line = _inline_md(body, wide, italic, line_start=True)
             # A leading `- `, `> `, `1. ` would start a block: the backslash keeps the line text.
-            out.append("\\" + line if _literal("\\" + line) != "\\" + line else line)
+            cut = _indent(line)
+            escaped = line[:cut] + "\\" + line[cut:]
+            out.append(escaped if _literal(escaped) != escaped else line)
         elif kind == "blockquote":
             out += (f"> {_inline_md(item, wide, italic)}" for item in body)
         elif kind == "ul":

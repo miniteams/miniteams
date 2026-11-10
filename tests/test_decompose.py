@@ -262,6 +262,10 @@ TYPED = [
     r"\- x",
     r"\\\\- x",
     r"\\\\\\> deep",
+    r"  \- x",
+    r"  \\- x",
+    "\t\\\\\\- x",
+    "x\n   \\1. z",
     r"\>http://#",
     r"\\>http://#",
     "http://`",
@@ -325,6 +329,30 @@ def test_random_backslash_and_marker_mixes_round_trip(seed: int) -> None:
             continue
         for full in (False, True):
             _typed_round_trips(text, full)
+
+
+@pytest.mark.parametrize(
+    ("msgtype", "content", "text"),
+    [
+        ("Text", "a\n  - b", "a\n  \\- b"),
+        ("Text", "  1. y", "  \\1. y"),
+        ("Text", "x\n\t* y", "x\n\t\\* y"),
+        ("RichText/Html", "<p>a<br>  - b</p>", "a\n  \\- b"),
+        ("Text", "- y", "\\- y"),
+        ("RichText/Html", "<p>\t&gt; </p>", "\t> "),
+        ("RichText/Html", "<p>a<br>  &gt; x</p>", "a\n  > x"),
+        ("Text", "  > x", "  > x"),
+        ("Text", "1. y", "\\1. y"),
+    ],
+)
+def test_an_indented_marker_line_stays_a_line(msgtype: str, content: str, text: str) -> None:
+    """040 review: a plain line holding an indented marker edits as an escaped one, not a list."""
+    form = decompose(_msg(content, msgtype), {})
+    assert isinstance(form, Editable) and form.text == text
+    composed = compose_html(form.text, [], {}, full=True)[0]
+    assert "<li>" not in composed
+    again = decompose(_msg(composed), {})
+    assert isinstance(again, Editable) and again.text == text
 
 
 def test_a_text_message_is_its_own_lines() -> None:

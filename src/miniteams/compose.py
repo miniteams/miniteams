@@ -37,6 +37,7 @@ _URL_TRAIL = frozenset(".,:;!?*_~…–—«»‹›“”‘’")
 _URL_CLOSERS = {")": "(", "]": "[", "}": "{"}
 _URL_HOST_RE = re.compile(r"https?://[^/?#']*")
 _ORDERED_RE = re.compile(r"\d{1,9}\. ")
+_INDENT_RE = re.compile(r"[ \t]*")  # a line's indent: a no-break space is text
 # The trailing `:` is a lookahead so an unknown name gives it back: `:nope::fire:` still finds `:fire:`;
 # never a URL's `:` (`URL:https://…`), nor one glued to a word (`a:b:c`, `fe80::1:a:b`, `10:30:x:`).
 _EMOJI = rf"(?<![A-Za-z0-9]):(?P<emoji>{EMOJI_NAME_RE.pattern})(?=:(?!//))"
@@ -228,7 +229,7 @@ def _escape_len(line: str, i: int, after: str, lead: bool) -> int:
     nxt = line[i + 1 : i + 2]
     if nxt == "\\":
         escapes = (line[i + 2 : i + 3] or after) in ESCAPABLE or (
-            lead and not i and _literal(line[1:]) != line[1:]
+            lead and _indent(line) >= i and _literal(rest := line[:i] + line[i + 1 :]) != rest
         )
         return 2 if escapes else 0
     return 2 if nxt in ESCAPABLE else 0
@@ -254,30 +255,45 @@ def _atom(line: str, i: int, hi: int, lo: int, after: str) -> tuple[int, int, in
     return i + 1, -1, -1
 
 
+def _indent(line: str) -> int:
+    return m.end() if (m := _INDENT_RE.match(line)) else 0
+
+
 def _literal(line: str) -> str:
-    """`line` without the `\\` that keeps its leading block marker (`- `, `* `, `> `, `1. `) literal."""
-    rest = line[1:]
-    if line.startswith("\\") and (
-        rest.startswith(("- ", "* ", "> ")) or rest == ">" or _ORDERED_RE.match(rest)
+    """`line` without the `\\` that keeps its leading block marker literal: `- `, `* `, `1. ` after any
+    indent, `> ` (or a bare `>`) at column 0, where quotes start."""
+    cut = _indent(line)
+    rest = line[cut + 1 :]
+    if line.startswith("\\", cut) and (
+        rest.startswith(("- ", "* "))
+        or _ORDERED_RE.match(rest)
+        or (not cut and (rest.startswith("> ") or rest == ">"))
     ):
-        return rest
+        return line[:cut] + rest
     return line
 
 
+def _list_item(line: str) -> tuple[str, int, int]:
+    """(tag, indent, text start) of a `- `/`* `/`1. ` line after its spaces and tabs; tag "" if none."""
+    indent = _indent(line)
+    rest = line[indent:]
+    if rest.startswith(("- ", "* ")):
+        return "ul", indent, indent + 2
+    if m := _ORDERED_RE.match(rest):
+        return "ol", indent, indent + m.end()
+    return "", indent, 0
+
+
 def _blocks(text: str, on_text: OnText) -> str:
-    """Full mode: fenced code, `> ` quotes, `- `/`* `/`1. ` lists; other lines inline, joined by <br>."""
+    """Full mode: fenced code, `> ` quotes, `- `/`* `/`1. ` lists nested by indent; other lines inline,
+    joined by <br>."""
     lines = text.split("\n")
     starts = list(itertools.accumulate((len(line) + 1 for line in lines[:-1]), initial=0))
     fences = [n for n, line in enumerate(lines) if line.startswith("```")]
     fence_end = dict(zip(fences, fences[1:], strict=False))
-    kinds: list[tuple[str, Callable[[str], int]]] = [
-        ("blockquote", lambda s: 2 if s.startswith("> ") else 1 if s == ">" else 0),
-        ("ul", lambda s: 2 if s.startswith(("- ", "* ")) else 0),
-        ("ol", lambda s: m.end() if (m := _ORDERED_RE.match(s)) else 0),
-    ]
     out: list[str] = []
     after_text = False
-    i = 0
+    i = plain_to = 0
     while i < len(lines):
         line = lines[i]
         if (close := fence_end.get(i)) is not None:
@@ -285,23 +301,34 @@ def _blocks(text: str, on_text: OnText) -> str:
             out.append(f"<pre><code>{code}</code></pre>")
             i, after_text = close + 1, False
             continue
-        for tag, marker in kinds:
-            if marker(line):
-                run: list[tuple[int, int]] = []
-                end = i
-                while end < len(lines) and (cut := marker(lines[end])):
-                    run.append((end, cut))
-                    end += 1
-                if tag == "blockquote" and all(len(lines[n]) == cut for n, cut in run):
-                    continue  # `>` alone is what was typed, not an empty quote
-                items = [_inline(lines[n][cut:], on_text, base=starts[n] + cut) for n, cut in run]
-                i = end
-                if tag == "blockquote":
-                    out.append(f"<blockquote>{'<br>'.join(items)}</blockquote>")
+        if _list_item(line)[0]:
+            levels: list[tuple[int, str]] = []  # open lists, (indent, tag), each with its last <li> open
+            while i < len(lines) and (item := _list_item(lines[i]))[0]:
+                tag, indent, cut = item
+                if not levels or indent > levels[-1][0]:
+                    levels.append((indent, tag))
+                    out.append(f"<{tag}>")
                 else:
-                    out.append(f"<{tag}>{''.join(f'<li>{it}</li>' for it in items)}</{tag}>")
-                after_text = False
-                break
+                    while len(levels) > 1 and levels[-1][0] > indent:
+                        out.append(f"</li></{levels.pop()[1]}>")
+                    shut, kind = levels[-1]
+                    out.append("</li>" if kind == tag else f"</li></{kind}><{tag}>")
+                    # The level now lines up with this item: a line deeper than it nests under it.
+                    levels[-1] = (min(shut, indent), tag)
+                out.append(f"<li>{_inline(lines[i][cut:], on_text, base=starts[i] + cut)}")
+                i += 1
+            out.extend(f"</li></{tag}>" for _, tag in reversed(levels))
+            after_text = False
+            continue
+        end = i
+        while i >= plain_to and end < len(lines) and (lines[end].startswith("> ") or lines[end] == ">"):
+            end += 1
+        # `>` or `> ` alone is what was typed, not an empty quote; such a run is not scanned again (linear).
+        plain_to = max(plain_to, end)
+        if any(len(lines[n]) > 2 for n in range(i, end)):
+            items = [_inline(lines[n][2:], on_text, base=starts[n] + 2) for n in range(i, end)]
+            out.append(f"<blockquote>{'<br>'.join(items)}</blockquote>")
+            i, after_text = end, False
         else:
             lit = _literal(line)
             out.append(

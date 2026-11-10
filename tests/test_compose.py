@@ -247,6 +247,112 @@ def test_full_quotes_and_lists() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("text", "html_"),
+    [
+        # 040-AC1
+        ("- a\n  - b\n- c", "<ul><li>a<ul><li>b</li></ul></li><li>c</li></ul>"),
+        # 040-AC2
+        ("1. a\n   - b\n2. c", "<ol><li>a<ul><li>b</li></ul></li><li>c</li></ol>"),
+        # 040-AC3: three levels, back to the top in one step
+        (
+            "- a\n  1. b\n    * c\n- d",
+            "<ul><li>a<ol><li>b<ul><li>c</li></ul></li></ol></li><li>d</li></ul>",
+        ),
+        # 040-AC3: a jump of several levels nests one; a shallower line joins the nearest shallower level
+        ("- a\n      - b\n      - c", "<ul><li>a<ul><li>b</li><li>c</li></ul></li></ul>"),
+        ("- a\n    - b\n  - c", "<ul><li>a<ul><li>b</li></ul></li><li>c</li></ul>"),
+        # 040-AC3: a level lines up with its last item, so a line deeper than that item nests under it
+        ("  - a\n- b\n  - c", "<ul><li>a</li><li>b<ul><li>c</li></ul></li></ul>"),
+        ("   - a\n - b\n  - c", "<ul><li>a</li><li>b<ul><li>c</li></ul></li></ul>"),
+        (
+            "- a\n    - b\n  - c\n    - d",
+            "<ul><li>a<ul><li>b</li></ul></li><li>c<ul><li>d</li></ul></li></ul>",
+        ),
+        (
+            "- a\n    - b\n  1. c\n   - d",
+            "<ul><li>a<ul><li>b</li></ul></li></ul><ol><li>c<ul><li>d</li></ul></li></ol>",
+        ),
+        # 040-AC3: a tab counts as one, a different kind at a level starts a new list there
+        ("- a\n\t- b\n\t1. c\n- d", "<ul><li>a<ul><li>b</li></ul><ol><li>c</li></ol></li><li>d</li></ul>"),
+        ("- a\n1. b", "<ul><li>a</li></ul><ol><li>b</li></ol>"),
+        # 040-AC4: an indented list line with no item above starts a top-level list
+        ("  - a", "<ul><li>a</li></ul>"),
+        ("x\n  - a\n- b", "x<ul><li>a</li><li>b</li></ul>"),
+        ("> q\n   1. a", "<blockquote>q</blockquote><ol><li>a</li></ol>"),
+        # 040-AC5: an indented non-list line stays a plain line; a no-break space is no indent
+        ("- a\n  b", "<ul><li>a</li></ul>  b"),
+        ("- a\n\u00a0- b", "<ul><li>a</li></ul>\u00a0- b"),
+        # blank line, escape and fence end the whole run
+        ("- a\n  - b\n\n  - c", "<ul><li>a<ul><li>b</li></ul></li></ul><ul><li>c</li></ul>"),
+        ("- a\n  - b\n\\- c", "<ul><li>a<ul><li>b</li></ul></li></ul>- c"),
+        # 040 review: an escape after the indent keeps an indented marker literal, as at column 0
+        ("- a\n  \\- b", "<ul><li>a</li></ul>  - b"),
+        ("x\n\t\\1. y", "x<br>\t1. y"),
+        ("  \\\\- y", "  \\- y"),
+        # 040 review: quotes start at column 0 only, so an indented `\> ` keeps its backslash
+        ("  \\> x", "  \\&gt; x"),
+        ("\t\\>", "\t\\&gt;"),
+        ("- a\n  - b\n```\nx\n```", "<ul><li>a<ul><li>b</li></ul></li></ul><pre><code>x</code></pre>"),
+    ],
+)
+def test_indented_list_lines_nest(text: str, html_: str) -> None:
+    """040-AC1..AC5: relative indentation builds the list tree, in Teams' shape."""
+    assert _md(text, True) == html_
+
+
+def test_a_nested_item_keeps_its_mention_offset() -> None:
+    """040-AC1 (spec 033 anchors): a mention inside a nested item is read at its offset in the message."""
+    text = "- a\n  - @Ann b"
+    assert compose.mention_ats(text) == [8]
+    picks = [{"at": 8, "mri": "8:orgid:moore", "forms": compose.forms("Ann Moore")}]
+    found = compose.resolve_mentions(text, [*ROSTER, MOORE], GROUP, ME, picks=picks)
+    assert found[0]["mri"] == "8:orgid:moore"
+    html_, props = compose_html(text, [{"name": "Ann", "mri": "8:orgid:moore"}], {}, full=True)
+    assert html_ == f"<ul><li>a<ul><li>{_span(0, 'Ann')} b</li></ul></li></ul>" and props is not None
+
+
+@pytest.mark.parametrize(
+    ("text", "at"),
+    [
+        ("x\n  \\- @Ann b", 7),
+        ("\t\\\\- @Ann", 5),
+        ("\\- @Ann", 3),
+        ("> @Ann", 2),
+        (">\n> @Ann", 4),
+        ("> a\n>\n> @Ann", 8),
+    ],
+)
+def test_a_mention_after_an_escaped_marker_keeps_its_offset(text: str, at: int) -> None:
+    """040 review (spec 033 anchors): neither the escape removed after an indent nor a quote marker shifts a
+    mention."""
+    assert compose.mention_ats(text) == [at]
+    picks = [{"at": at, "mri": "8:orgid:moore", "forms": compose.forms("Ann Moore")}]
+    found = compose.resolve_mentions(text, [*ROSTER, MOORE], GROUP, ME, picks=picks)
+    assert found[0]["mri"] == "8:orgid:moore"
+
+
+def test_hostile_lists_stay_linear() -> None:
+    """040-AC3: 10 000 items and a 5000-level staircase render quickly, no recursion; a staircase as
+    deep as MAX_TEXT allows still fits Teams' HTML limit."""
+    flat = "\n".join(f"{'  ' * (n % 3)}- x" for n in range(10_000))
+    began = time.monotonic()
+    assert compose._blocks(flat, lambda seg, _at: seg).count("<li>") == 10_000
+    tree = compose._blocks("\n".join(f"{chr(9) * n}- x" for n in range(5000)), lambda seg, _at: seg)
+    assert tree.endswith("</li></ul>" * 5000)
+    deep = "\n".join(f"{' ' * n}- x" for n in range(230))
+    assert len(deep) <= compose.MAX_TEXT and not send.too_long(_md(deep, True), is_html=True)
+    assert _md(deep, True).count("<ul>") == 230
+    assert time.monotonic() - began < 5
+
+
+def test_a_run_of_bare_quote_marks_is_scanned_once() -> None:
+    """040 review: a bare `>` run is plain text, read once (each line rescanning the run was quadratic)."""
+    began = time.monotonic()
+    assert _md("\n".join([">"] * 14_000), True) == "<br>".join(["&gt;"] * 14_000)
+    assert time.monotonic() - began < 0.5
+
+
 def test_unclosed_fence_stays_text() -> None:
     assert _md("```\ncode", True) == "```<br>code"
 

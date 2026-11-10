@@ -314,9 +314,9 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   the chat's members.
   Messages are limited to 28 KB and 50 mentions.
   - A backslash keeps markup literal: `\*` `\_` `\~` `` \` `` `\[` `\@`, and on the chat page a line starting `\- ` `\* `
-    `\> ` `\1. ` (or a line that is only `\>`); `\\` is one backslash before another backslash or one of those, or
-    (chat page) before a line-start marker; any other backslash stays as typed (`\\srv\share`), and backslashes
-    inside `code`, link labels and URLs stay as typed.
+    `\1. `, after any leading spaces or tabs, or `\> ` (or a line that is only `\>`) at its very start; `\\` is one
+    backslash before another backslash or one of those, or (chat page) before a line-start marker; any other
+    backslash stays as typed (`\\srv\share`), and backslashes inside `code`, link labels and URLs stay as typed.
   - A bare `http(s)://` URL is sent as a link (spec 028), without the punctuation that ends the sentence
     (`. , : ; ! ? * _ ~ ' "`, `… – — « » ‹ › “ ” ‘ ’`, and a closing `) ] } >` unless it closes a bracket opened
     inside the URL). A `'` is kept only before a letter or digit, and a `'` inside the host ends the URL
@@ -345,6 +345,7 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
     streams them to the local server, which spools them to unnamed temp files under `~/.cache/miniteams/uploads/`.
   - Widget: inline formatting.
   - Chat page: bold, italic, strike, code, lists, quotes through a toolbar or Ctrl+B / Ctrl+I, plus a preview of the message as posted.
+  - Chat page: a `- ` or `1. ` line indented further than the list item above it nests under that item (spec 040).
 - **Messages**: hover for actions: reply with a quote, react, edit and delete your own. Right-click a message (or
   the Menu key / Shift+F10 on a focused one) for the same actions in a menu, plus Copy text when it has text (without
   reply quotes, secure context only like 🔗); a link, an image or selected text keeps the browser's own menu (spec 034). A mention shows its
