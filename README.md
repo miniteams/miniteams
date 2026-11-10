@@ -92,7 +92,8 @@ first three read from the API instead, with `source: "api"`. Message records car
 plain-text line per app or bot card (`[]` when none). From the archive that is the latest refreshed
 version kept in `cards.db` (spec 037), and `read_messages` first asks the apps again for their stale
 cards, its requests stopping at 5 s per call (saving to a busy `cards.db` can take up to 4 s more),
-returning the stored cards past that. `send_message` and `update_message`
+returning the stored cards past that. `react` adds your reaction to a message, or removes it with
+`remove: true`, as `miniteams react` does. `send_message` and `update_message`
 write to Teams as you; with `send_at` (ISO 8601 with an offset, 5 seconds to 125 days ahead)
 `send_message` schedules instead, and `list_scheduled`, `update_scheduled` and `cancel_scheduled`
 manage what Teams is holding (`docs/scheduled-send-wire.md`). Their text, like `miniteams send`'s

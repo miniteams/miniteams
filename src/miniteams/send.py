@@ -316,6 +316,11 @@ def delete_message(settings: Settings, skype_token: str, thread_id: str, message
     return result
 
 
+def valid_reaction_key(key: str) -> bool:
+    # Keys are opaque (`yes-tone1`, `starMSER`, `name;0-frc-d4-<hash>`); only blanks are surely wrong.
+    return bool(key) and not any(c.isspace() for c in key)
+
+
 def react(
     settings: Settings,
     skype_token: str,

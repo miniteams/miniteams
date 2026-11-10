@@ -145,11 +145,18 @@ def test_initialize_negotiates_the_version(settings: Settings, data: Path, asked
 def test_tools_list_and_read_only(settings: Settings, data: Path) -> None:
     tools = _rpc(_server(settings, data), "tools/list")["result"]["tools"]
     reads = ["find_chats", "read_messages", "search_messages", "read_transcript", "login"]
-    writes = ["send_message", "list_scheduled", "cancel_scheduled", "update_scheduled", "update_message"]
+    writes = [
+        "send_message",
+        "list_scheduled",
+        "cancel_scheduled",
+        "update_scheduled",
+        "update_message",
+        "react",
+    ]
     assert [t["name"] for t in tools] == reads[:4] + writes + reads[4:]
     assert all(t["inputSchema"]["type"] == "object" for t in tools)
     assert [t["name"] for t in tools if not t["annotations"]["readOnlyHint"]] == writes
-    destructive = ["cancel_scheduled", "update_scheduled", "update_message"]
+    destructive = ["cancel_scheduled", "update_scheduled", "update_message", "react"]
     assert [t["name"] for t in tools if t["annotations"]["destructiveHint"]] == destructive
     listed = _rpc(_server(settings, data, read_only=True), "tools/list")["result"]["tools"]
     assert [t["name"] for t in listed] == reads
@@ -880,8 +887,13 @@ def _writes(monkeypatch) -> list[tuple[Any, ...]]:
         calls.append(("edit", thread, mid, text, is_html, properties))
         return {"status": 200}
 
+    def fake_react(settings, token, thread, mid, key, *, remove=False):  # noqa: ANN001
+        calls.append(("react", thread, mid, key, remove))
+        return {"status": 200}
+
     monkeypatch.setattr(M, "send_message", fake_send)
     monkeypatch.setattr(M, "edit_message", fake_edit)
+    monkeypatch.setattr(M, "react", fake_react)
     return calls
 
 
@@ -897,6 +909,65 @@ def test_send_and_update_go_out_once_with_the_exact_text(settings: Settings, dat
         ("send", PRIVATE, "héllo &lt;there&gt;<br>line", "", True, None),
         ("edit", "48:notes", "m9", "fixed", True, None),
     ]
+
+
+def test_react_adds_and_removes_the_exact_key(settings: Settings, data: Path, monkeypatch) -> None:
+    server = _server(settings, data)
+    _dead_session(server, monkeypatch, state="live")
+    calls = _writes(monkeypatch)
+    out = _call(server, "react", thread_id=PRIVATE, message_id="m9", key="1f525_fire")
+    assert out == {
+        "error": False,
+        "thread_id": PRIVATE,
+        "message_id": "m9",
+        "key": "1f525_fire",
+        "removed": False,
+    }
+    out = _call(server, "react", thread_id=PRIVATE, message_id="m9", key="Like", remove=True)
+    assert out["removed"] is True
+    assert calls == [("react", PRIVATE, "m9", "1f525_fire", False), ("react", PRIVATE, "m9", "Like", True)]
+
+
+@pytest.mark.parametrize("key", ["", "thumbs up", "like\n", "\tlike"])
+def test_react_refuses_a_blank_or_spaced_key_before_any_call(
+    settings: Settings, data: Path, monkeypatch, key: str
+) -> None:
+    server = _server(settings, data)
+    _dead_session(server, monkeypatch, state="live")
+    calls = _writes(monkeypatch)
+    out = _call(server, "react", thread_id=PRIVATE, message_id="m9", key=key)
+    assert out["error"] and "without spaces" in out["text"]
+    assert calls == []
+
+
+def test_react_refuses_an_unknown_chat_before_any_token_is_minted(
+    settings: Settings, data: Path, monkeypatch
+) -> None:
+    server = _server(settings, data)
+    source = _dead_session(server, monkeypatch)  # a refresh here would start a device flow
+    calls = _writes(monkeypatch)
+    out = _call(server, "react", thread_id="19:invented@thread.v2", message_id="m9", key="like")
+    assert out["error"] and "unknown chat" in out["text"]
+    assert source.flows == [] and calls == []
+
+
+@pytest.mark.parametrize(("remove", "action"), [(False, "react failed"), (True, "unreact failed")])
+def test_react_teams_errors_become_tool_errors_without_the_token(
+    settings: Settings, data: Path, monkeypatch, remove: bool, action: str
+) -> None:
+    import httpx
+
+    server = _server(settings, data)
+    _dead_session(server, monkeypatch, state="live")
+
+    def refused(*a, **k):  # noqa: ANN002, ANN003
+        req = httpx.Request("PUT", "https://msg.example/x")
+        raise httpx.HTTPStatusError("403", request=req, response=httpx.Response(403, request=req))
+
+    monkeypatch.setattr(M, "react", refused)
+    out = _call(server, "react", thread_id=PRIVATE, message_id="m9", key="like", remove=remove)
+    assert out["error"] and out["text"].startswith(action) and "403" in out["text"]
+    assert "sk" not in out["text"].split()
 
 
 @pytest.mark.parametrize(
@@ -984,6 +1055,7 @@ def test_read_only_refuses_the_write_tools_before_any_call(
     for name, args in (
         ("send_message", {"thread_id": "48:notes", "text": "hi"}),
         ("update_message", {"thread_id": "48:notes", "message_id": "1", "text": "x"}),
+        ("react", {"thread_id": "48:notes", "message_id": "1", "key": "like"}),
     ):
         response = _rpc(server, "tools/call", {"name": name, "arguments": args})
         assert response["error"]["code"] == -32602
@@ -1212,6 +1284,7 @@ def test_scheduling_tools_leave_the_list_under_read_only(settings: Settings, dat
         "cancel_scheduled",
         "update_scheduled",
         "update_message",
+        "react",
     } & set(listed)
 
 

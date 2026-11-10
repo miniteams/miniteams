@@ -51,7 +51,7 @@ from .messages import (
     quote_names,
 )
 from .render import card_entries, cards_text
-from .send import NOTES_THREAD, edit_message, send_message
+from .send import NOTES_THREAD, edit_message, react, send_message, valid_reaction_key
 from .watch import note_sent
 
 log = structlog.get_logger()
@@ -915,6 +915,20 @@ def _update_message(server: Server, args: dict[str, Any]) -> dict[str, Any]:
     return {"thread_id": thread_id, "message_id": message_id, "status": done.get("status")}
 
 
+def _react(server: Server, args: dict[str, Any]) -> dict[str, Any]:
+    thread_id, message_id, key = args["thread_id"], args["message_id"], args["key"]
+    if not valid_reaction_key(key):
+        raise ToolError("key must be a Teams reaction key, without spaces")
+    remove = args.get("remove", False)
+    _known_thread(server, thread_id)
+    skype_token, _ = server.session.tokens()
+    _write(
+        lambda: react(server.settings, skype_token, thread_id, message_id, key, remove=remove),
+        "unreact" if remove else "react",
+    )
+    return {"thread_id": thread_id, "message_id": message_id, "key": key, "removed": remove}
+
+
 def _login(server: Server, args: dict[str, Any]) -> dict[str, Any]:
     state = server.session.login()
     if state.get("state") == "signed_out":
@@ -1036,6 +1050,21 @@ TOOLS: tuple[Tool, ...] = (
         read_only=False,
         destructive=True,
         required=("thread_id", "message_id", "text"),
+    ),
+    Tool(
+        "react",
+        "Add or remove your reaction on a message, by chat id and message id. `key` is case-sensitive: "
+        "like, heart, laugh, surprised, sad, angry, 1f525_fire, yes-tone1, or an organisation emoji's key.",
+        {
+            "thread_id": {"type": "string"},
+            "message_id": {"type": "string"},
+            "key": {"type": "string"},
+            "remove": {"type": "boolean", "description": "remove your reaction instead"},
+        },
+        _react,
+        read_only=False,
+        destructive=True,
+        required=("thread_id", "message_id", "key"),
     ),
     Tool(
         "login",
