@@ -30,7 +30,7 @@ from .images import OBJECT_ID_RE
 from .messages import TEXT_TYPES, fold, json_list
 from .send import MAX_HTML_BYTES
 
-_DEPTH = 32  # open elements: compose nests a few spans, never more
+_DEPTH = 32  # open elements: two per list level, so 16 nested levels open; compose writes deeper ones
 _REPLY = "schema.skype.com/Reply"
 _IGNORED = " \t\n\r\f"  # HTML layout whitespace; a no-break space is text
 _MARKS = {"b": "b", "strong": "b", "i": "i", "em": "i", "s": "s", "strike": "s", "del": "s"}
@@ -57,11 +57,15 @@ _BLOCKED = {
 OTHER = "formatting miniteams cannot write"
 MISREAD = "a mention the edit would read as someone else"
 IMAGE_IN_TEXT = "an image inside the text"
+_NESTED = "a nested list"  # what compose cannot write around a sublist: text after it, a list in a list
 
 # ("text", s) | ("b" | "i" | "s", tokens) | ("code", s) | ("a", href, label) | ("url", href)
 # | ("mention", everyone, mri, typed) | ("emoji", name, object id); typed: what follows the `@`
 type Token = tuple[Any, ...]
-type Block = tuple[str, Any]  # ("line", tokens) | ("blockquote" | "ul" | "ol", lines) | ("pre", code)
+# ("line", tokens) | ("blockquote", lines) | ("ul" | "ol", items) | ("pre", code)
+type Block = tuple[str, Any]
+# A list item: (tokens, sublists), each sublist ("ul" | "ol", items), after the item's text (spec 040).
+type Item = tuple[tuple[Token, ...], tuple[tuple[str, tuple[Any, ...]], ...]]
 
 
 class Quote(NamedTuple):
@@ -97,6 +101,7 @@ class _Frame:
     items: list[Any] = field(default_factory=list)  # lines: blocks; mark: tokens; list: items
     cur: list[Token] | None = None  # lines: the open text line
     attrs: dict[str, str] = field(default_factory=dict)
+    subs: list[tuple[str, tuple[Item, ...]]] = field(default_factory=list)  # li: its sublists
 
 
 def _only(attrs: dict[str, str], allowed: frozenset[str]) -> None:
@@ -145,6 +150,8 @@ class _Reader(HTMLParser):
             return
         if target.kind != "lines":
             raise _Refused(OTHER)
+        if target.subs:
+            raise _Refused(_NESTED)  # compose writes no text after an item's sublist
         if target.cur is None:
             target.cur = []
         _add(target.cur, token)
@@ -162,8 +169,17 @@ class _Reader(HTMLParser):
     def _block(self, tag: str, kind: str) -> None:
         """A block opens only between lines of the message itself: not in a quote, a list or a span."""
         self._no_images_yet()
+        if kind == "list" and (li := self.stack[-1]).tag == "li":
+            if li.cur and li.cur[-1][0] == "text":
+                # The layout whitespace before a sublist renders nothing: no trailing space in the item.
+                li.cur[-1] = ("text", li.cur[-1][1].rstrip(_IGNORED))
+                if not li.cur[-1][1]:
+                    li.cur.pop()
+            self._flush(li)
+            self._push(tag, kind)
+            return
         if any(f.kind != "container" for f in self.stack[1:]):
-            raise _Refused("a nested list" if tag in ("ul", "ol") and self._in("li") else OTHER)
+            raise _Refused(_NESTED if tag in ("ul", "ol") and self._in("li") else OTHER)
         self._flush(self.root)
         self._push(tag, kind)
 
@@ -189,7 +205,7 @@ class _Reader(HTMLParser):
         ):
             raise _Refused(OTHER)
         if top.kind == "list" and tag != "li":
-            raise _Refused("a nested list" if tag in ("ul", "ol") else OTHER)
+            raise _Refused(_NESTED if tag in ("ul", "ol") else OTHER)
         if tag in _BLOCKED:
             raise _Refused(_BLOCKED[tag])
         if (
@@ -235,6 +251,8 @@ class _Reader(HTMLParser):
             self._no_images_yet()
             if (lines := self._target()).kind != "lines":
                 raise _Refused(OTHER)
+            if lines.subs:
+                raise _Refused(_NESTED)
             lines.items.append(("line", tuple(lines.cur or ())))
             lines.cur = []
         elif tag in ("p", "div"):
@@ -337,9 +355,10 @@ class _Reader(HTMLParser):
             self._flush(frame)
             if len(frame.items) > 1:
                 raise _Refused(OTHER)
-            self.stack[-1].items.append(frame.items[0][1] if frame.items else ())
+            self.stack[-1].items.append((frame.items[0][1] if frame.items else (), tuple(frame.subs)))
         elif tag in ("ul", "ol"):
-            self.root.items.append((tag, tuple(frame.items)))
+            parent = self.stack[-1]
+            (parent.subs if parent.tag == "li" else self.root.items).append((tag, tuple(frame.items)))
 
     def _mention(self, itemid: str, label: str) -> None:
         entry = self.mentions.get(itemid)
@@ -381,10 +400,13 @@ class _Reader(HTMLParser):
         if len(self.stack) > 1:
             raise _Refused(OTHER)
         self._flush(self.root)
-        return [
-            (kind, body if kind == "pre" else _urls(body) if kind == "line" else tuple(map(_urls, body)))
-            for kind, body in self.root.items
-        ]
+        urls = {"pre": lambda b: b, "line": _urls, "blockquote": lambda b: tuple(map(_urls, b))}
+        return [(kind, urls.get(kind, _item_urls)(body)) for kind, body in self.root.items]
+
+
+def _item_urls(items: tuple[Item, ...]) -> tuple[Item, ...]:
+    """Recursion bounded by the reader's `_DEPTH`: each level is two open elements."""
+    return tuple((_urls(tokens), tuple((k, _item_urls(sub)) for k, sub in subs)) for tokens, subs in items)
 
 
 def _urls(tokens: tuple[Token, ...]) -> tuple[Token, ...]:
@@ -568,14 +590,20 @@ def _markdown(blocks: list[Block], wide: bool, italic: str) -> str:
             out.append(escaped if _literal(escaped) != escaped else line)
         elif kind == "blockquote":
             out += (f"> {_inline_md(item, wide, italic)}" for item in body)
-        elif kind == "ul":
-            out += (f"- {_inline_md(item, wide, italic)}" for item in body)
-        elif kind == "ol":
-            out += (f"{n}. {_inline_md(item, wide, italic)}" for n, item in enumerate(body, 1))
+        elif kind in ("ul", "ol"):
+            _list_md(kind, body, wide, italic, "", out)
         else:
             out.append(f"```\n{body}\n```")
         prev = kind
     return "\n".join(out)
+
+
+def _list_md(kind: str, items: tuple[Item, ...], wide: bool, italic: str, pad: str, out: list[str]) -> None:
+    """Sublists two spaces deeper per level (spec 040); depth bounded by the reader's `_DEPTH`."""
+    for n, (tokens, subs) in enumerate(items, 1):
+        out.append(f"{pad}{'- ' if kind == 'ul' else f'{n}. '}{_inline_md(tokens, wide, italic)}")
+        for sub_kind, sub in subs:
+            _list_md(sub_kind, sub, wide, italic, pad + "  ", out)
 
 
 def brace_name(name: str) -> str:
@@ -599,12 +627,20 @@ def _picks(blocks: list[Block]) -> list[dict[str, Any]]:
             elif token[0] in _MARKERS:
                 walk(token[1])
 
+    def items(body: tuple[Item, ...]) -> None:
+        for tokens, subs in body:
+            walk(tokens)
+            for _, sub in subs:
+                items(sub)
+
     for kind, body in blocks:
         if kind == "line":
             walk(body)
+        elif kind == "blockquote":
+            for line in body:
+                walk(line)
         elif kind != "pre":
-            for item in body:
-                walk(item)
+            items(body)
     return picks
 
 
