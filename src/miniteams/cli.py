@@ -3,7 +3,6 @@
 import argparse
 import contextlib
 import os
-import re
 import stat
 import sys
 from collections.abc import Callable
@@ -17,7 +16,7 @@ from ._io import force_blocking_stdout
 from .auth import AuthUnavailable, acquire_aad_token
 from .config import Settings
 from .logging import setup_logging
-from .send import NOTES_THREAD
+from .send import NOTES_THREAD, valid_reaction_key
 from .skype import exchange_skype_token, persist_skype_token
 from .trouter import get_or_create_epid, handshake, trouter_info
 
@@ -603,8 +602,7 @@ _MEDIA_HELP = (
 
 
 def _reaction_key(value: str) -> str:
-    # Keys are opaque (`yes-tone1`, `starMSER`, `name;0-frc-d4-<hash>`); only blanks are surely wrong.
-    if not value or re.search(r"\s", value):
+    if not valid_reaction_key(value):
         raise argparse.ArgumentTypeError("a Teams reaction key, without spaces")
     return value
 
