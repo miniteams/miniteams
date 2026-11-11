@@ -64,8 +64,9 @@ _NESTED = "a nested list"  # what compose cannot write around a sublist: text af
 type Token = tuple[Any, ...]
 # ("line", tokens) | ("blockquote", lines) | ("ul" | "ol", items) | ("pre", code)
 type Block = tuple[str, Any]
-# A list item: (tokens, sublists), each sublist ("ul" | "ol", items), after the item's text (spec 040).
-type Item = tuple[tuple[Token, ...], tuple[tuple[str, tuple[Any, ...]], ...]]
+# A list item: (parts, sublists): its text's lines split at each <br>, each sublist ("ul" | "ol", items),
+# after the item's text (spec 040).
+type Item = tuple[tuple[tuple[Token, ...], ...], tuple[tuple[str, tuple[Any, ...]], ...]]
 
 
 class Quote(NamedTuple):
@@ -162,8 +163,8 @@ class _Reader(HTMLParser):
             lines.cur = None
 
     def _push(self, tag: str, kind: str, attrs: dict[str, str] | None = None) -> None:
-        if len(self.stack) > _DEPTH:
-            raise _Refused(OTHER)
+        if len(self.stack) > _DEPTH:  # the list's depth is the reason only when no wrapper holds the list
+            raise _Refused(_NESTED if self._in("li") and self.stack[1].tag in ("ul", "ol") else OTHER)
         self.stack.append(_Frame(tag, kind, attrs=attrs or {}))
 
     def _block(self, tag: str, kind: str) -> None:
@@ -353,9 +354,10 @@ class _Reader(HTMLParser):
             self.root.items.append((tag, tuple(line for _, line in frame.items)))
         elif tag == "li":
             self._flush(frame)
-            if len(frame.items) > 1:
-                raise _Refused(OTHER)
-            self.stack[-1].items.append((frame.items[0][1] if frame.items else (), tuple(frame.subs)))
+            parts = tuple(line for _, line in frame.items) or ((),)
+            if len(parts) > 1 and not parts[-1]:
+                raise _Refused(OTHER)  # a <br> ending the item's text: compose writes no empty last line
+            self.stack[-1].items.append((parts, tuple(frame.subs)))
         elif tag in ("ul", "ol"):
             parent = self.stack[-1]
             (parent.subs if parent.tag == "li" else self.root.items).append((tag, tuple(frame.items)))
@@ -388,6 +390,8 @@ class _Reader(HTMLParser):
             raw.items.append(data if raw.tag == "pre" else data.replace("\n", " "))
             return
         target = self._target()
+        if target.tag == "li" and target.items and not target.cur:
+            data = data.lstrip(_IGNORED)  # a line's start after a <br>: Teams' `\r\n` layout renders nothing
         # Layout whitespace: between blocks, or leading a line (where HTML renders none).
         if not data.strip(_IGNORED) and (
             target.kind == "list" or self.images or target.kind == "lines" and not target.cur
@@ -406,7 +410,9 @@ class _Reader(HTMLParser):
 
 def _item_urls(items: tuple[Item, ...]) -> tuple[Item, ...]:
     """Recursion bounded by the reader's `_DEPTH`: each level is two open elements."""
-    return tuple((_urls(tokens), tuple((k, _item_urls(sub)) for k, sub in subs)) for tokens, subs in items)
+    return tuple(
+        (tuple(map(_urls, parts)), tuple((k, _item_urls(sub)) for k, sub in subs)) for parts, subs in items
+    )
 
 
 def _urls(tokens: tuple[Token, ...]) -> tuple[Token, ...]:
@@ -600,8 +606,16 @@ def _markdown(blocks: list[Block], wide: bool, italic: str) -> str:
 
 def _list_md(kind: str, items: tuple[Item, ...], wide: bool, italic: str, pad: str, out: list[str]) -> None:
     """Sublists two spaces deeper per level (spec 040); depth bounded by the reader's `_DEPTH`."""
-    for n, (tokens, subs) in enumerate(items, 1):
-        out.append(f"{pad}{'- ' if kind == 'ul' else f'{n}. '}{_inline_md(tokens, wide, italic)}")
+    for n, (parts, subs) in enumerate(items, 1):
+        marker = "- " if kind == "ul" else f"{n}. "
+        # A line break: `\` ends the line, the next one starts at the item's text.
+        text = pad + " " * len(marker)
+        lines = [_inline_md(parts[0], wide, italic)]
+        for part in parts[1:]:
+            line = text + _inline_md(part, wide, italic, line_start=True)
+            escaped = text + "\\" + line[len(text) :]  # read as a text line: an item marker stays text
+            lines.append(escaped if _literal(escaped) != escaped else line)
+        out.append(pad + marker + "\\\n".join(lines))
         for sub_kind, sub in subs:
             _list_md(sub_kind, sub, wide, italic, pad + "  ", out)
 
@@ -628,8 +642,9 @@ def _picks(blocks: list[Block]) -> list[dict[str, Any]]:
                 walk(token[1])
 
     def items(body: tuple[Item, ...]) -> None:
-        for tokens, subs in body:
-            walk(tokens)
+        for parts, subs in body:
+            for tokens in parts:
+                walk(tokens)
             for _, sub in subs:
                 items(sub)
 

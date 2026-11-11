@@ -578,3 +578,27 @@ async def test_a_body_only_edit_frame_keeps_the_rest_of_the_row(fake: Fake) -> N
     await until(page, "document.querySelector('[data-id=\"1\"] .html').textContent.includes('card DONE')")
     assert await page.locator('[data-id="1"] .edited').count() == 1
     assert "👍" in await page.locator('[data-id="1"]').inner_text()
+
+
+@BOTH
+async def test_enter_continues_a_list_in_the_editor_and_saves_outside_it(fake: Fake) -> None:
+    """040-AC11 / AC12 / AC14 / AC15: in the editor Enter continues an item, steps an empty one up, ends the
+    list, then saves; Shift+Enter breaks an item's line."""
+    page = fake.page
+    assert page is not None
+    box = await _edit(fake)
+    await _select(page, "- a\n  - b", 9, 9)
+    for key, want in (
+        ("Shift+Enter", "- a\n  - b\\\n    "),
+        ("Enter", "- a\n  - b\n  - "),
+        ("Enter", "- a\n  - b\n- "),
+        ("Enter", "- a\n  - b\n"),
+    ):
+        await box.press(key)
+        assert await box.input_value() == want, key
+    await fake.settled()
+    assert fake.of("edit") == []
+    await box.press_sequentially("c")
+    await box.press("Enter")
+    await wait(lambda: len(fake.of("edit")) == 1)
+    assert fake.of("edit")[0]["text"] == "- a\n  - b\nc"

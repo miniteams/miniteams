@@ -104,6 +104,7 @@ def test_every_element_round_trips(text: str) -> None:
         "\\\\srv\\share and grep \\*\\.py and ^\\d+$",
         "runs \\\\\\x \\\\\\\\ end \\",
         "a\\\\**b** `c`\\\\_d_",
+        "\u0661. a non-ASCII number is text",
     ],
 )
 def test_literal_text_round_trips(text: str) -> None:
@@ -119,6 +120,7 @@ def test_only_what_would_be_read_as_markdown_is_escaped() -> None:
     readable = "2*3*4 snake_case [draft] a * b"
     assert _round_trip(readable).text == readable
     assert _round_trip("\\- a\n\\1. b\n\\> c").text == "\\- a\n\\1. b\n\\> c"
+    assert _round_trip("\u0661. a").text == "\u0661. a"  # only ASCII digits number an item
     assert _form("<p>*a* [x](https://y.test)</p>").text == "\\*a\\* \\[x](https://y.test)"
 
 
@@ -423,6 +425,49 @@ def test_composed_nested_lists_round_trip(text: str) -> None:
     _round_trip(text)
 
 
+@pytest.mark.parametrize(
+    ("content", "text"),
+    [
+        ("<ul><li>a<br>b</li><li>c</li></ul>", "- a\\\n  b\n- c"),
+        ("<ul>\r\n<li>a<br>\r\nb<br>\r\nc</li>\r\n</ul>", "- a\\\n  b\\\n  c"),  # Teams' layout
+        ("<ul><li>a<ul><li>b<br>c</li></ul></li></ul>", "- a\n  - b\\\n    c"),
+        ("<ol><li>a</li><li>b<br>c</li></ol>", "1. a\n2. b\\\n   c"),
+        ("<ul><li>a<br>- b<br>1. c<br>&gt; d</li></ul>", "- a\\\n  \\- b\\\n  \\1. c\\\n  > d"),
+        ("<ul><li>a<br><br>b</li></ul>", "- a\\\n  \\\n  b"),
+        ("<ul><li><br>b</li></ul>", "- \\\n  b"),
+        ("<ul><li>a\\<br>b</li></ul>", "- a\\\\\n  b"),  # a literal trailing backslash, then the break
+        ("<ul><li>a\\</li><li>b</li></ul>", "- a\\\n- b"),  # no break line after it: stays literal
+        ("<ul><li>a <b>b</b><br><b>c</b> x</li></ul>", "- a **b**\\\n  **c** x"),
+    ],
+)
+def test_a_line_broken_item_opens_and_saves_unchanged(content: str, text: str) -> None:
+    """040-AC17: `<br>` in an item opens as `\\` and a line indented to the item's text, nested items alike;
+    saving the text unchanged posts the same HTML (Teams' layout whitespace aside)."""
+    assert _form(content).text == text
+    assert D._read(compose_html(text, [], EMOJIS, full=True)[0], {}, EMOJIS) == D._read(content, {}, EMOJIS)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "<ul><li>a<br></li></ul>",  # nothing after the break
+        "<ul><li>a<br>\r\n</li></ul>",
+        "<ul><li>a<br><ul><li>b</li></ul></li></ul>",  # a break before a sublist
+    ],
+)
+def test_a_break_compose_cannot_write_is_still_refused(content: str) -> None:
+    """040-AC17: an item's text cannot end with an empty line."""
+    assert decompose(_msg(content), EMOJIS) == D.OTHER
+
+
+@pytest.mark.parametrize(
+    "text", ["- a\\\n  b\n- c", "- a\n  - b\\\n    c\\\n    d\n- e", "1. a\\\n   @Ann Lee", "- \\\n  b"]
+)
+def test_composed_line_breaks_round_trip(text: str) -> None:
+    """040-AC16 / AC17: what compose writes from a line-broken item, the edit flow reads back."""
+    _round_trip(text, [ANN] if "@" in text else None)
+
+
 def test_a_large_nested_list_converts_in_linear_time() -> None:
     """040: 4x the items must not take ~16x the time; the deepest accepted nesting still opens."""
 
@@ -486,7 +531,21 @@ def test_reply_quotes_and_trailing_images_are_split_off_verbatim() -> None:
         ("<ul><li>a<blockquote>q</blockquote></li></ul>", {}, D.OTHER),
         ("<ul><li>a<pre>q</pre></li></ul>", {}, D.OTHER),
         ("<ul><li>a<ul><li>b</li></ul><ul><li>c</li></ul></li></ul>", {}, D.OTHER),  # one list on save
-        ("<ul>" + "<li>x<ul>" * 16 + "<li>y</li>" + "</ul></li>" * 16 + "</ul>", {}, D.OTHER),
+        ("<ul>" + "<li>x<ul>" * 16 + "<li>y</li>" + "</ul></li>" * 16 + "</ul>", {}, "a nested list"),
+        # 16 levels open, but not one more element in the deepest item: the depth is still what refuses it.
+        ("<ul>" + "<li>x<ul>" * 15 + "<li><b>y</b></li>" + "</ul></li>" * 15 + "</ul>", {}, "a nested list"),
+        # Formatting in the deepest item counts toward the cap: 15 levels plus three marks are past it.
+        (
+            "<ul>" + "<li>x<ul>" * 14 + "<li><b><i><s>y</s></i></b></li>" + "</ul></li>" * 14 + "</ul>",
+            {},
+            "a nested list",
+        ),
+        # A wrapper blocks the list at any depth: the wrapper is the reason, not the depth.
+        (
+            "<div>" + "<ul>" + "<li>x<ul>" * 16 + "<li>y</li>" + "</ul></li>" * 16 + "</ul>" + "</div>",
+            {},
+            D.OTHER,
+        ),
         ("<p><u>x</u></p>", {}, "underline"),
         ('<p><span style="color:red">x</span></p>', {}, "coloured or styled text"),
         ('<p><font color="red">x</font></p>', {}, "coloured or styled text"),

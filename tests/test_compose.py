@@ -273,6 +273,26 @@ def test_full_quotes_and_lists() -> None:
             "- a\n    - b\n  1. c\n   - d",
             "<ul><li>a<ul><li>b</li></ul></li></ul><ol><li>c<ul><li>d</li></ul></li></ol>",
         ),
+        # 040 review: a line at a joined item's indent, or less but deeper than the level, is its sibling
+        ("- a\n    - b\n  - c\n  - d", "<ul><li>a<ul><li>b</li></ul></li><li>c</li><li>d</li></ul>"),
+        ("- a\n  - b\n - c\n - d", "<ul><li>a<ul><li>b</li></ul></li><li>c</li><li>d</li></ul>"),
+        # 040 review: only ASCII digits number an item, as the page's list continuation reads them
+        ("\u0661. a", "\u0661. a"),
+        # 040-AC16: a trailing `\` before a line indented to the item's text, not an item, breaks the line
+        ("- a\\\n  b\n- c", "<ul><li>a<br>b</li><li>c</li></ul>"),
+        ("- a\\\n  b\\\n      c", "<ul><li>a<br>b<br>c</li></ul>"),
+        ("- a\n  - b\\\n    c\n- d", "<ul><li>a<ul><li>b<br>c</li></ul></li><li>d</li></ul>"),
+        ("10. a\\\n    b", "<ol><li>a<br>b</li></ol>"),
+        ("- a\\\n  \\- b\\\n  > c", "<ul><li>a<br>- b<br>&gt; c</li></ul>"),  # read as text lines
+        ("- \\\n  b", "<ul><li><br>b</li></ul>"),
+        ("- a\\\\\n  b", "<ul><li>a\\<br>b</li></ul>"),  # the last `\` breaks, the one before stays
+        # 040-AC16: otherwise a trailing `\` stays as typed
+        ("- a\\", "<ul><li>a\\</li></ul>"),
+        ("- a\\\n b", "<ul><li>a\\</li></ul> b"),  # short of the item's text
+        ("10. a\\\n   b", "<ol><li>a\\</li></ol>   b"),
+        ("- a\\\n  ", "<ul><li>a\\</li></ul>  "),  # a blank line ends the item
+        ("- a\\\n  - b", "<ul><li>a\\<ul><li>b</li></ul></li></ul>"),
+        ("- a\\\n```\nx\n```", "<ul><li>a\\</li></ul><pre><code>x</code></pre>"),
         # 040-AC3: a tab counts as one, a different kind at a level starts a new list there
         ("- a\n\t- b\n\t1. c\n- d", "<ul><li>a<ul><li>b</li></ul><ol><li>c</li></ol></li><li>d</li></ul>"),
         ("- a\n1. b", "<ul><li>a</li></ul><ol><li>b</li></ol>"),
@@ -299,6 +319,14 @@ def test_full_quotes_and_lists() -> None:
 def test_indented_list_lines_nest(text: str, html_: str) -> None:
     """040-AC1..AC5: relative indentation builds the list tree, in Teams' shape."""
     assert _md(text, True) == html_
+
+
+def test_a_mention_after_a_line_break_keeps_its_offset() -> None:
+    """040-AC16 (spec 033 anchors): a mention on an item's break line is read at its offset in the message."""
+    text = "- a\\\n    @Ann b\\\n  \\- @Ann"
+    assert compose.mention_ats(text) == [9, 22]
+    html_, _ = compose_html(text, [{"name": "Ann", "mri": "8:orgid:moore"}], {}, full=True)
+    assert html_ == f"<ul><li>a<br>{_span(0, 'Ann')} b<br>- {_span(1, 'Ann')}</li></ul>"
 
 
 def test_a_nested_item_keeps_its_mention_offset() -> None:
@@ -1736,3 +1764,19 @@ def test_mention_ats_reads_a_brace_whole_as_resolve_mentions(text: str, ats: lis
     """033 review r7 L1: the `@`s anchors may sit on are those resolve_mentions reads, an `@` inside a
     `{Who|label}` not among them."""
     assert compose.mention_ats(text) == ats
+
+
+def test_the_pages_list_keys_read_markers_and_escapes_as_compose_does() -> None:
+    """040: ui.js copies compose's escapable characters and ordered marker by hand: they must not drift."""
+    from pathlib import Path
+
+    ui = (Path(compose.__file__).parent / "ui.js").read_text()
+    esc = re.search(r'const ESC = ("(?:[^"\\]|\\.)*");', ui)
+    assert esc and frozenset(json.loads(esc.group(1))) == compose.ESCAPABLE
+    ordered = compose._ORDERED_RE.pattern
+    assert ordered == r"[0-9]{1,9}\. "
+    item = re.search(r"const ITEM = /(.*)/;", ui)
+    marker = re.search(r"const MARKER = /(.*)/;", ui)
+    assert item and item.group(1) == r"^([ \t]*)(?:([-*]) |([0-9]{1,9})\. )"
+    assert marker and marker.group(1) == r"^(?:[-*] |" + ordered + ")"
+    assert "< 999999999 ?" in ui  # the largest number whose next one is still an item: 9 digits

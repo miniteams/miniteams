@@ -36,7 +36,7 @@ _URL_RE = re.compile(r"https?://(?:[^\s<>\"`']|'(?=\w))+")
 _URL_TRAIL = frozenset(".,:;!?*_~…–—«»‹›“”‘’")
 _URL_CLOSERS = {")": "(", "]": "[", "}": "{"}
 _URL_HOST_RE = re.compile(r"https?://[^/?#']*")
-_ORDERED_RE = re.compile(r"\d{1,9}\. ")
+_ORDERED_RE = re.compile(r"[0-9]{1,9}\. ")  # ASCII, as the page's list continuation reads it
 _INDENT_RE = re.compile(r"[ \t]*")  # a line's indent: a no-break space is text
 # The trailing `:` is a lookahead so an unknown name gives it back: `:nope::fire:` still finds `:fire:`;
 # never a URL's `:` (`URL:https://…`), nor one glued to a word (`a:b:c`, `fe80::1:a:b`, `10:30:x:`).
@@ -284,6 +284,13 @@ def _list_item(line: str) -> tuple[str, int, int]:
     return "", indent, 0
 
 
+def _continues(lines: list[str], i: int, cut: int) -> str | None:
+    """`lines[i]` when it continues an item whose text starts at column `cut`: indented that far, not blank,
+    not an item."""
+    line = lines[i] if i < len(lines) else ""
+    return line if _indent(line) >= cut and line.strip(" \t") and not _list_item(line)[0] else None
+
+
 def _blocks(text: str, on_text: OnText) -> str:
     """Full mode: fenced code, `> ` quotes, `- `/`* `/`1. ` lists nested by indent; other lines inline,
     joined by <br>."""
@@ -311,11 +318,21 @@ def _blocks(text: str, on_text: OnText) -> str:
                 else:
                     while len(levels) > 1 and levels[-1][0] > indent:
                         out.append(f"</li></{levels.pop()[1]}>")
-                    shut, kind = levels[-1]
+                    kind = levels[-1][1]
                     out.append("</li>" if kind == tag else f"</li></{kind}><{tag}>")
-                    # The level now lines up with this item: a line deeper than it nests under it.
-                    levels[-1] = (min(shut, indent), tag)
-                out.append(f"<li>{_inline(lines[i][cut:], on_text, base=starts[i] + cut)}")
+                    # The level now lines up with this item: only a line deeper than it nests under it.
+                    levels[-1] = (indent, tag)
+                text, base, lead, parts = lines[i][cut:], starts[i] + cut, False, []
+                # A trailing `\` before a line indented to the item's text, not an item, continues it: <br>.
+                # That line reads like a text line (an escaped marker is text), from its own indent.
+                while text.endswith("\\") and (nxt := _continues(lines, i + 1, cut)) is not None:
+                    parts.append(_inline(text[:-1], on_text, lead=lead, base=base))
+                    i += 1
+                    lit = _literal(nxt)
+                    at = _indent(lit)
+                    text, base, lead = lit[at:], starts[i] + len(nxt) - len(lit) + at, True
+                parts.append(_inline(text, on_text, lead=lead, base=base))
+                out.append(f"<li>{'<br>'.join(parts)}")
                 i += 1
             out.extend(f"</li></{tag}>" for _, tag in reversed(levels))
             after_text = False

@@ -1565,7 +1565,8 @@
   };
   const PLACEHOLDER = $reply.placeholder;
 
-  // Teams' keys (spec 006): Enter sends, Shift+Enter breaks the line, Ctrl+Enter sends too.
+  // Teams' keys (spec 006): Enter sends, Shift+Enter breaks the line, Ctrl+Enter sends too; in a list (spec 040)
+  // Enter opens the next item and Shift+Enter breaks the item's line (formatBar.key).
   // Measuring at height auto lays the list out taller for a moment: Firefox clamps its scroll then.
   const grow = () => {
     const top = $list.scrollTop;
