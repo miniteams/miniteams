@@ -354,7 +354,8 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
     another item or plain text, a plain newline.
     Enter sends only outside a list (Ctrl+Enter sends anywhere). Shift+Enter on an item breaks its line: `\` and
     a new line at the line's indent (the item's text on an item line, its own indent on a break line), which
-    posts as a line break inside the item.
+    posts as a line break inside the item. Tab on an item nests it in the item before it at its level (nothing on a
+    list's first item), Shift+Tab moves it up a level, each with its sublists and line breaks (spec 041).
 - **Messages**: hover for actions: reply with a quote, react, edit and delete your own. Right-click a message (or
   the Menu key / Shift+F10 on a focused one) for the same actions in a menu, plus Copy text when it has text (without
   reply quotes, secure context only like 🔗); a link, an image or selected text keeps the browser's own menu (spec 034). A mention shows its
