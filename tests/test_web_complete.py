@@ -420,6 +420,14 @@ async def test_preview_renders_without_sending(board: W.Board, sent: list[Any]) 
     assert sent == []
 
 
+async def test_preview_shows_a_nested_list(board: W.Board, sent: list[Any]) -> None:
+    """040-AC9: the chat page preview shows the nested tree before sending."""
+    assert board.chat.preview_answer({"preview": "- a\n  1. b\n- c", "format": "full"}) == {
+        "preview": "<ul><li>a<ol><li>b</li></ol></li><li>c</li></ul>"
+    }
+    assert sent == []
+
+
 # --- /emoji/<id> (012-AC9) ---
 
 

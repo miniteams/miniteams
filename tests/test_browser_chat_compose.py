@@ -1623,7 +1623,7 @@ async def test_a_list_made_of_a_line_with_a_pick_keeps_it(fake: Fake) -> None:
     await page.locator("#tools [data-fmt=list]").click()
     assert await box.input_value() == "- hi @Ann "
     await box.press("End")
-    await box.press("Enter")
+    await box.press("Control+Enter")  # 040-AC14: Enter in a list opens an item
     await wait(lambda: len(fake.of("send")) == 1)
     assert fake.of("send")[0]["mentions"] == [{**ANN, "at": 5}]
     assert server_reads(fake.of("send")[0], fake.members) == [ANN["mri"]]
@@ -1676,7 +1676,7 @@ async def test_the_toolbar_moves_anchors_by_what_it_adds(
         await page.locator("#tools [data-fmt=list]").click()
     assert await box.input_value() == text
     await box.press("End")
-    await box.press("Enter")
+    await box.press("Control+Enter")  # 040-AC14: Enter in a list opens an item
     await wait(lambda: len(fake.of("send")) == 1)
     assert [m["at"] for m in fake.of("send")[0]["mentions"]] == ats
 

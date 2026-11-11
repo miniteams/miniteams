@@ -714,7 +714,7 @@
       let a = 0;
       for (const end = Math.min(c, b, from ?? Infinity); a < end && was[a] === now[a];) a++;
       const ok = (own || from !== null) && !type.startsWith("history") && b >= 0 && b <= was.length && was.slice(b) === now.slice(c);
-      s.picks = !ok ? [] : own?.shift ? s.picks.map((p) => ({ ...p, at: own.shift(p.at) }))
+      s.picks = !ok ? [] : own?.shift ? s.picks.flatMap((p) => (Number.isNaN(own.shift(p.at)) ? [] : [{ ...p, at: own.shift(p.at) }]))
         : s.picks.flatMap((p) => (p.at < a ? [p] : p.at >= b ? [{ ...p, at: p.at + d }] : []));
       s.text = now;
     };
@@ -826,11 +826,12 @@
   // execCommand keeps the edit in the textarea's undo history (Ctrl+Z); setRangeText would not.
   // Its `input` event runs the completion's lookup: an insert settles what it dismisses before calling.
   // `adds`: the [offset, length] spans `text` adds to `[a, b)` without changing it (markers, prefixes), which
-  // move a mention's anchor with its `@` (spec 033). The input event it causes is marked as the page's own.
+  // move a mention's anchor with its `@` (spec 033); a negative length removes that many characters there, and an
+  // anchor on them goes. The input event it causes is marked as the page's own.
   const insertText = (input, text, a, b, selA, selB, adds = null) => {
     input.focus();
     input.setSelectionRange(a, b);
-    input.own = { shift: adds && ((at) => at + adds.reduce((n, [pos, len]) => n + (pos <= at ? len : 0), 0)) };
+    input.own = { shift: adds && ((at) => adds.reduce((n, [pos, len]) => (pos > at ? n : len < 0 && at < pos - len ? NaN : n + len), at)) };
     try {
       if (!document.execCommand("insertText", false, text)) {
         input.setRangeText(text, a, b);
@@ -921,8 +922,199 @@
       });
     };
     input.addEventListener("input", hide);  // a shown preview is of the text before the change
-    // Ctrl+B / Ctrl+I; true when the key was the bar's.
+    // Spec 040, lists as compose._blocks reads them: per line, [its item's match, the item's line] or null. A line
+    // ending in `\` continues its item on a next line indented to the item's text (not blank, but the caret's line
+    // and the one after it may be: Enter and Shift+Enter still treat them as the item's).
+    const ITEM = /^([ \t]*)(?:([-*]) |([0-9]{1,9})\. )/;
+    const next = (match) => match[2] ? match[2] + " " : +match[3] < 999999999 ? `${+match[3] + 1}. ` : null;  // 10 digits: no longer an item
+    const lead = (line) => /^[ \t]*/.exec(line)[0];
+    const owners = (lines, near) => {
+      const own = [];
+      const fences = lines.flatMap((line, i) => (line.startsWith("```") ? [i] : []));
+      const shut = new Map(fences.map((open, n) => [open, fences[n + 1]]));
+      for (let i = 0; i < lines.length;) {
+        const close = shut.get(i);
+        if (close !== undefined) { while (i <= close) own[i++] = null; continue; }
+        const match = ITEM.exec(lines[i]);
+        if (!match) { own[i++] = null; continue; }
+        const item = [match, i];
+        own[i++] = item;
+        while (i < lines.length && lines[i - 1].endsWith("\\") && !ITEM.test(lines[i]) && lead(lines[i]).length >= match[0].length
+          && (/[^ \t]/.test(lines[i]) || i === near || i === near + 1)) own[i++] = item;
+      }
+      return own;
+    };
+    // An item as parts of item text: part 0 after the marker, each further one on a break line. compose reads a break
+    // line as a text line: a `\` before a leading marker drops (`_literal`), and so does one of a leading `\\` that
+    // only a line start collapses (`_escape_len`'s lead rule); item text has neither.
+    const MARKER = /^(?:[-*] |[0-9]{1,9}\. )/;
+    const ESC = "\\*_~`[@";  // compose.ESCAPABLE
+    const escapable = (ch) => !!ch && ESC.includes(ch);
+    const slashes = (text) => /^\\*/.exec(text)[0].length;
+    // Whether `count` backslashes before `rest` show one fewer on a break line than in item text (`inItem`: counted
+    // in item text): before a marker by `_literal` and the lead rule, before a quote by the lead rule alone.
+    const markerCase = (count, rest, inItem) =>
+      MARKER.test(rest) && (rest[0] === "*" ? count === (inItem ? 0 : 1) : count <= 2 && count >= (inItem ? 0 : 1));
+    const quoteCase = (count, rest) => (rest === ">" || rest.startsWith("> ")) && count === 2;
+    const oneMoreOnBreak = (text, inItem) => {
+      const count = slashes(text);
+      const rest = text.slice(count);
+      return markerCase(count, rest, inItem) || quoteCase(count, rest);
+    };
+    const breakEscape = (line) => +oneMoreOnBreak(line, false);  // the escape a break line's text drops
+    const toBreak = (text) => +oneMoreOnBreak(text, true);  // the escape a break line adds before `text`
+    // A `\` escaping the next character is one token with it: a caret inside goes before it.
+    // ponytail: URLs and code spans read as text here: in `https://x.y/a\`c``, a caret after the URL's `\` snaps before it; mirror `_atom` if that matters.
+    const escapes = (text, i) => text[i] === "\\" && escapable(text[i + 1] === "\\" ? text[i + 2] : text[i + 1]);
+    const tokenStart = (text, offset) => {
+      let i = 0;
+      for (let size; i < offset && i + (size = escapes(text, i) ? 2 : 1) <= offset;) i += size;
+      return i;
+    };
+    const tokens = (text, from, to) => {
+      let count = 0;
+      while (from < to) { from += escapes(text, from) ? 2 : 1; count++; }
+      return from === to ? count : NaN;  // NaN: a token crosses `to`
+    };
+    // `text` cut at `cut`: its trailing backslashes recounted to show as many at the end, since `\\` collapses only
+    // before what it escapes.
+    const cutKeepingSlashes = (text, cut) => {
+      const kept = text.slice(0, cut);
+      const run = /\\*$/.exec(kept)[0].length;
+      const shown = tokens(text, cut - run, cut);
+      if (tokens(kept, cut - run, cut) === shown) return kept;
+      return kept.slice(0, cut - run) + "\\".repeat(2 * shown - 1);
+    };
+    const none = (length) => Array(Math.max(length, 0)).fill(-1);
+    // Parts back as lines after `head`, with each character's offset in the old text (-1: written here). A further
+    // part sits at its line's indent (at least `textCol`) after a `\` ending the line before, its leading blanks gone
+    // (the indent would take them); blank parts past the caret's go.
+    const write = (head, parts, textCol, caretPart) => {
+      while (parts.length > 1 && parts.length - 1 > caretPart && !/[^ \t]/.test(parts.at(-1).text)) parts = parts.slice(0, -1);
+      let text = head + parts[0].text;
+      let from = none(head.length).concat(parts[0].from);
+      let caret = head.length;
+      parts.slice(1).forEach((part, i) => {
+        const indent = "\\\n" + (part.lead.length >= textCol.length ? part.lead : textCol);
+        const blanks = lead(part.text).length;
+        const body = part.text.slice(blanks);
+        const added = toBreak(body);
+        text += indent;
+        if (i + 1 === caretPart) caret = text.length;
+        text += "\\".repeat(added) + body;
+        from = from.concat(none(indent.length + added), part.from.slice(blanks));
+      });
+      return { text, from, caret };
+    };
+    // Enter: the next item (an empty one goes up a level, or at the top ends the list), never a send in a list;
+    // Shift+Enter: a `\` line break inside the item. False: not the bar's, the page's Enter or the browser's.
+    const listKey = (shift) => {
+      if (input.disabled || input.readOnly) return false;
+      const value = input.value;
+      const selStart = input.selectionStart;
+      const selEnd = input.selectionEnd;
+      const lines = value.split("\n");
+      const lineStarts = [0];
+      for (const line of lines) lineStarts.push(lineStarts.at(-1) + line.length + 1);
+      const lineOf = (offset) => { let line = 0; while (lineStarts[line + 1] <= offset) line++; return line; };
+      const owner = owners(lines, lineOf(selStart));
+      const item = owner[lineOf(selStart)] ?? owner[lineOf(selEnd)];
+      if (!item) return false;
+      if (owner[lineOf(selStart)] !== owner[lineOf(selEnd)]) {  // a selection reaching out of the item: no split
+        if (shift) return false;
+        put("\n", selStart, selEnd, selStart + 1, selStart + 1);
+        close(); edited();
+        return true;
+      }
+      const [match, top] = item;
+      const indent = match[1];
+      const textCol = indent + " ".repeat(match[0].length - indent.length);
+      const parts = [];
+      for (let j = top; owner[j] === item; j++) {
+        const line = lines[j];
+        const width = j === top ? match[0].length : lead(line).length;
+        const start = lineStarts[j] + width + (j === top ? 0 : breakEscape(line.slice(width)));
+        const end = lineStarts[j] + line.length;
+        const text = value.slice(start, owner[j + 1] === item ? end - 1 : end);  // without its separator
+        parts.push({ text, from: Array.from({ length: text.length }, (_, i) => start + i), lead: j === top ? textCol : line.slice(0, width), start, end });
+      }
+      // An offset as [part, offset in its text]: in an indent, a marker, a separator or a break's escape, the part's start.
+      const place = (offset) => {
+        const i = parts.findIndex((part) => offset <= part.end);
+        if (i < parts.length - 1 && offset === parts[i].end) return [i + 1, 0];
+        return [i, tokenStart(parts[i].text, Math.min(Math.max(offset - parts[i].start, 0), parts[i].text.length))];
+      };
+      const [startPart, startAt] = place(selStart);
+      const [endPart, endAt] = place(selEnd);
+      const current = parts[startPart];
+      const kept = cutKeepingSlashes(current.text, startAt);
+      const left = { ...current, text: kept, from: current.from.slice(0, Math.min(kept.length, startAt)).concat(none(kept.length - startAt)) };
+      const right = { ...current, text: parts[endPart].text.slice(endAt), from: parts[endPart].from.slice(endAt) };
+      const before = [...parts.slice(0, startPart), left];
+      const after = [right, ...parts.slice(endPart + 1)];
+      let out;
+      if (shift) out = write(match[0], [...before, ...after], textCol, before.length);
+      else if (startPart === endPart && startAt === endAt && parts.length === 1 && !/[^ \t]/.test(current.text)) {  // a no-break space is text, as in compose
+        // compose's level stack over this run's items: [indent, the level's last item]; one level up is the
+        // parent level's indent and next marker, none at the top.
+        let first = top;
+        while (first && owner[first - 1]) first--;
+        const levels = [];
+        for (const line of lines.slice(first, top + 1)) {
+          const it = ITEM.exec(line);
+          if (!it) continue;  // a line break's line
+          const depth = it[1].length;
+          if (!levels.length || depth > levels.at(-1)[0].length) { levels.push([it[1], it]); continue; }
+          while (levels.length > 1 && levels.at(-1)[0].length > depth) levels.pop();
+          levels[levels.length - 1] = [it[1], it];
+        }
+        const up = levels.at(-2);
+        const upMark = up && next(up[1]);
+        if (up && !upMark) return true;  // the parent's next number is no item: nothing to open, never a send
+        const text = up ? up[0] + upMark : "";  // blank text after the marker goes with it
+        out = { text, from: none(text.length), caret: text.length };
+      } else {
+        const mark = next(match);
+        if (!mark) return true;  // the next number is no item: nothing to open, never a send
+        const first = write(match[0], before, textCol, -1);
+        const second = write(indent + mark, after, indent + " ".repeat(mark.length), 0);
+        out = { text: first.text + "\n" + second.text, from: first.from.concat(none(1), second.from), caret: first.text.length + 1 + second.caret };
+      }
+      // What the rewrite removes and inserts, as insertText's spans: every kept character keeps its mention anchor.
+      const spanStart = lineStarts[top];
+      const spanEnd = parts.at(-1).end;
+      const spans = [];
+      let expected = spanStart;
+      let inserted = 0;
+      const keep = (offset) => {
+        if (offset > expected) spans.push([expected, expected - offset]);
+        if (inserted) spans.push([offset, inserted]);
+        inserted = 0;
+      };
+      for (const origin of out.from) {
+        if (origin < 0) inserted++;
+        else { keep(origin); expected = origin + 1; }
+      }
+      keep(spanEnd);
+      // One change (one undo step), only what differs typed over.
+      const result = value.slice(0, spanStart) + out.text + value.slice(spanEnd);
+      let same = 0;
+      while (same < result.length && same < value.length && result[same] === value[same]) same++;
+      let tail = 0;
+      while (tail < value.length - same && tail < result.length - same && value[value.length - 1 - tail] === result[result.length - 1 - tail]) tail++;
+      const caret = spanStart + out.caret;
+      put(result.slice(same, result.length - tail), same, value.length - tail, caret, caret, spans);
+      close();
+      edited();
+      return true;
+    };
+    // Ctrl+B / Ctrl+I, Enter and Shift+Enter in a list; true when the key was the bar's.
     const key = (e) => {
+      if (e.key === "Enter" && !e.ctrlKey && !e.altKey && !e.metaKey && !e.isComposing && e.keyCode !== 229) {
+        if (!listKey(e.shiftKey)) return false;
+        e.preventDefault();
+        return true;
+      }
       const k = e.key.toLowerCase();
       if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || e.isComposing || e.keyCode === 229 || (k !== "b" && k !== "i")) return false;
       e.preventDefault(); format(k === "b" ? "bold" : "italic");

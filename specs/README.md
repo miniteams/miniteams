@@ -41,3 +41,4 @@
 | [037](037-card-refresh.md) | Up-to-date app cards | shipped |
 | [038](038-names-store.md) | Names that outlive their owners | shipped |
 | [039](039-notify-sounds.md) | Notifications and sounds per interaction | shipped |
+| [040](040-nested-lists.md) | Nested lists in the composer | shipped |

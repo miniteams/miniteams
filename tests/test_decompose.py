@@ -104,6 +104,7 @@ def test_every_element_round_trips(text: str) -> None:
         "\\\\srv\\share and grep \\*\\.py and ^\\d+$",
         "runs \\\\\\x \\\\\\\\ end \\",
         "a\\\\**b** `c`\\\\_d_",
+        "\u0661. a non-ASCII number is text",
     ],
 )
 def test_literal_text_round_trips(text: str) -> None:
@@ -119,6 +120,7 @@ def test_only_what_would_be_read_as_markdown_is_escaped() -> None:
     readable = "2*3*4 snake_case [draft] a * b"
     assert _round_trip(readable).text == readable
     assert _round_trip("\\- a\n\\1. b\n\\> c").text == "\\- a\n\\1. b\n\\> c"
+    assert _round_trip("\u0661. a").text == "\u0661. a"  # only ASCII digits number an item
     assert _form("<p>*a* [x](https://y.test)</p>").text == "\\*a\\* \\[x](https://y.test)"
 
 
@@ -262,6 +264,10 @@ TYPED = [
     r"\- x",
     r"\\\\- x",
     r"\\\\\\> deep",
+    r"  \- x",
+    r"  \\- x",
+    "\t\\\\\\- x",
+    "x\n   \\1. z",
     r"\>http://#",
     r"\\>http://#",
     "http://`",
@@ -327,6 +333,152 @@ def test_random_backslash_and_marker_mixes_round_trip(seed: int) -> None:
             _typed_round_trips(text, full)
 
 
+@pytest.mark.parametrize(
+    ("msgtype", "content", "text"),
+    [
+        ("Text", "a\n  - b", "a\n  \\- b"),
+        ("Text", "  1. y", "  \\1. y"),
+        ("Text", "x\n\t* y", "x\n\t\\* y"),
+        ("RichText/Html", "<p>a<br>  - b</p>", "a\n  \\- b"),
+        ("Text", "- y", "\\- y"),
+        ("RichText/Html", "<p>\t&gt; </p>", "\t> "),
+        ("RichText/Html", "<p>a<br>  &gt; x</p>", "a\n  > x"),
+        ("Text", "  > x", "  > x"),
+        ("Text", "1. y", "\\1. y"),
+    ],
+)
+def test_an_indented_marker_line_stays_a_line(msgtype: str, content: str, text: str) -> None:
+    """040 review: a plain line holding an indented marker edits as an escaped one, not a list."""
+    form = decompose(_msg(content, msgtype), {})
+    assert isinstance(form, Editable) and form.text == text
+    composed = compose_html(form.text, [], {}, full=True)[0]
+    assert "<li>" not in composed
+    again = decompose(_msg(composed), {})
+    assert isinstance(again, Editable) and again.text == text
+
+
+# --- nested lists (spec 040) ---
+
+
+@pytest.mark.parametrize(
+    ("content", "text"),
+    [
+        ("<ul><li>a<ul><li>b</li></ul></li><li>c</li></ul>", "- a\n  - b\n- c"),
+        ("<ol><li>a<ul><li>b</li></ul></li><li>c</li></ol>", "1. a\n  - b\n2. c"),
+        ("<ul><li>a<ul><li>b</li></ul><ol><li>c</li></ol></li><li>d</li></ul>", "- a\n  - b\n  1. c\n- d"),
+        (
+            "<ol><li>a<ul><li>b<ol><li>c</li><li>d</li></ol></li></ul></li><li>e</li></ol>",
+            "1. a\n  - b\n    1. c\n    2. d\n2. e",
+        ),
+        ("<ul><li><ul><li>b</li></ul></li></ul>", "- \n  - b"),
+        (
+            "<ul><li>a<ul><li>- b</li><li>1. c</li><li>\\- d</li></ul></li></ul>",
+            "- a\n  - - b\n  - 1. c\n  - \\- d",
+        ),
+        ("<ul><li>a<ul><li>b</li></ul></li></ul><ul><li>c</li></ul>", "- a\n  - b\n\n- c"),
+    ],
+)
+def test_a_nested_list_opens_indented_and_saves_unchanged(content: str, text: str) -> None:
+    """040-AC6: sublists come back two spaces deeper per level, under bullets and numbers, kinds mixed;
+    saving the text unchanged posts the same HTML."""
+    assert _form(content).text == text
+    assert compose_html(text, [], EMOJIS, full=True)[0] == content
+
+
+@pytest.mark.parametrize(
+    ("content", "text"),
+    [
+        (
+            "<ul>\r\n<li>Alpha\r\n<ul>\r\n<li>One / TB</li><li>Two</li></ul>\r\n</li>"
+            "<li>&nbsp; Beta\r\n<ul>\r\n<li>Three</li></ul>\r\n</li></ul>",
+            "- Alpha\n  - One / TB\n  - Two\n- \xa0 Beta\n  - Three",
+        ),
+        (
+            "<ul>\r\n\r\n\r\n<li>Gamma\r\n\r\n<ul>\r\n<li>Four</li></ul>\r\n\r\n</li><li>Delta</li></ul>",
+            "- Gamma\n  - Four\n- Delta",
+        ),
+        ("<ul><li><b>Bold</b> \r\n<ul><li>x</li></ul></li></ul>", "- **Bold**\n  - x"),
+    ],
+)
+def test_teams_nested_list_layout_round_trips(content: str, text: str) -> None:
+    """040-AC7: Teams' `\\r\\n` layout around a sublist is no text (no trailing space in the item); its
+    `&nbsp;` is, as in a flat item; the text composes back to the same blocks."""
+    form = _form(content)
+    assert form.text == text
+    assert D._read(compose_html(text, [], EMOJIS, full=True)[0], {}, EMOJIS) == D._read(content, {}, EMOJIS)
+
+
+def test_mentions_in_nested_items_come_back_in_text_order() -> None:
+    """040-AC6 + spec 033: picks follow the text through sublists, each anchored at its own `@`."""
+    form = _round_trip(
+        "- @Ann Lee\n  - @everyone\n    - @Ann Lee again\n- @everyone", [ANN, EVERYONE, ANN, EVERYONE]
+    )
+    assert form.text == ("- @{Ann Lee|Ann Lee}\n  - @everyone\n    - @{Ann Lee|Ann Lee} again\n- @everyone")
+    ats = [m.start() for m in re.finditer("@", form.text)]
+    assert [p["at"] for p in form.picks] == ats
+    assert [p.get("everyone", False) for p in form.picks] == [False, True, False, True]
+
+
+@pytest.mark.parametrize("text", ["- a\n  - b\n- c", "1. a\n   - b\n2. c", "- a\n  - b\n    - c\n- d"])
+def test_composed_nested_lists_round_trip(text: str) -> None:
+    """040-AC6: what compose writes from an indented list, the edit flow reads back."""
+    _round_trip(text)
+
+
+@pytest.mark.parametrize(
+    ("content", "text"),
+    [
+        ("<ul><li>a<br>b</li><li>c</li></ul>", "- a\\\n  b\n- c"),
+        ("<ul>\r\n<li>a<br>\r\nb<br>\r\nc</li>\r\n</ul>", "- a\\\n  b\\\n  c"),  # Teams' layout
+        ("<ul><li>a<ul><li>b<br>c</li></ul></li></ul>", "- a\n  - b\\\n    c"),
+        ("<ol><li>a</li><li>b<br>c</li></ol>", "1. a\n2. b\\\n   c"),
+        ("<ul><li>a<br>- b<br>1. c<br>&gt; d</li></ul>", "- a\\\n  \\- b\\\n  \\1. c\\\n  > d"),
+        ("<ul><li>a<br><br>b</li></ul>", "- a\\\n  \\\n  b"),
+        ("<ul><li><br>b</li></ul>", "- \\\n  b"),
+        ("<ul><li>a\\<br>b</li></ul>", "- a\\\\\n  b"),  # a literal trailing backslash, then the break
+        ("<ul><li>a\\</li><li>b</li></ul>", "- a\\\n- b"),  # no break line after it: stays literal
+        ("<ul><li>a <b>b</b><br><b>c</b> x</li></ul>", "- a **b**\\\n  **c** x"),
+    ],
+)
+def test_a_line_broken_item_opens_and_saves_unchanged(content: str, text: str) -> None:
+    """040-AC17: `<br>` in an item opens as `\\` and a line indented to the item's text, nested items alike;
+    saving the text unchanged posts the same HTML (Teams' layout whitespace aside)."""
+    assert _form(content).text == text
+    assert D._read(compose_html(text, [], EMOJIS, full=True)[0], {}, EMOJIS) == D._read(content, {}, EMOJIS)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "<ul><li>a<br></li></ul>",  # nothing after the break
+        "<ul><li>a<br>\r\n</li></ul>",
+        "<ul><li>a<br><ul><li>b</li></ul></li></ul>",  # a break before a sublist
+    ],
+)
+def test_a_break_compose_cannot_write_is_still_refused(content: str) -> None:
+    """040-AC17: an item's text cannot end with an empty line."""
+    assert decompose(_msg(content), EMOJIS) == D.OTHER
+
+
+@pytest.mark.parametrize(
+    "text", ["- a\\\n  b\n- c", "- a\n  - b\\\n    c\\\n    d\n- e", "1. a\\\n   @Ann Lee", "- \\\n  b"]
+)
+def test_composed_line_breaks_round_trip(text: str) -> None:
+    """040-AC16 / AC17: what compose writes from a line-broken item, the edit flow reads back."""
+    _round_trip(text, [ANN] if "@" in text else None)
+
+
+def test_a_large_nested_list_converts_in_linear_time() -> None:
+    """040: 4x the items must not take ~16x the time; the deepest accepted nesting still opens."""
+
+    def run(n: int) -> None:
+        assert isinstance(_form("<ul>" + "<li>x<ul><li>y</li></ul></li>" * n + "</ul>"), Editable)
+
+    assert _best_ms(lambda: run(800)) / max(_best_ms(lambda: run(200)), 0.05) < 8
+    deep = "<ul>" + "<li>x<ul>" * 14 + "<li>y</li>" + "</ul></li>" * 14 + "</ul>"
+    assert _form(deep).text.endswith("\n" + "  " * 14 + "- y")
+
+
 def test_a_text_message_is_its_own_lines() -> None:
     """019-AC4: a `Text` message (no HTML) converts its lines, markup characters escaped."""
     form = decompose({"messagetype": "Text", "content": "a <b> *x*\n- y"}, {})
@@ -369,8 +521,31 @@ def test_reply_quotes_and_trailing_images_are_split_off_verbatim() -> None:
     [
         ("<table><tr><td>x</td></tr></table>", {}, "a table"),
         ("<h2>title</h2>", {}, "a heading"),
-        ("<ul><li>a<ul><li>b</li></ul></li></ul>", {}, "a nested list"),
+        # 040-AC8: what compose cannot write around a sublist.
+        ("<ul><li>a<ul><li>b</li></ul>tail</li></ul>", {}, "a nested list"),
+        ("<ul><li>a<ul><li>b</li></ul><br></li></ul>", {}, "a nested list"),
+        ("<ul><li>a<ul><li>b</li></ul><p>x</p></li></ul>", {}, "a nested list"),
+        ("<ul><li>a<ul><li>b</li></ul>\r\n<b>x</b></li></ul>", {}, "a nested list"),
         ("<ul><ul><li>b</li></ul></ul>", {}, "a nested list"),
+        ("<ul><li><b>a<ul><li>b</li></ul></b></li></ul>", {}, "a nested list"),
+        ("<ul><li>a<blockquote>q</blockquote></li></ul>", {}, D.OTHER),
+        ("<ul><li>a<pre>q</pre></li></ul>", {}, D.OTHER),
+        ("<ul><li>a<ul><li>b</li></ul><ul><li>c</li></ul></li></ul>", {}, D.OTHER),  # one list on save
+        ("<ul>" + "<li>x<ul>" * 16 + "<li>y</li>" + "</ul></li>" * 16 + "</ul>", {}, "a nested list"),
+        # 16 levels open, but not one more element in the deepest item: the depth is still what refuses it.
+        ("<ul>" + "<li>x<ul>" * 15 + "<li><b>y</b></li>" + "</ul></li>" * 15 + "</ul>", {}, "a nested list"),
+        # Formatting in the deepest item counts toward the cap: 15 levels plus three marks are past it.
+        (
+            "<ul>" + "<li>x<ul>" * 14 + "<li><b><i><s>y</s></i></b></li>" + "</ul></li>" * 14 + "</ul>",
+            {},
+            "a nested list",
+        ),
+        # A wrapper blocks the list at any depth: the wrapper is the reason, not the depth.
+        (
+            "<div>" + "<ul>" + "<li>x<ul>" * 16 + "<li>y</li>" + "</ul></li>" * 16 + "</ul>" + "</div>",
+            {},
+            D.OTHER,
+        ),
         ("<p><u>x</u></p>", {}, "underline"),
         ('<p><span style="color:red">x</span></p>', {}, "coloured or styled text"),
         ('<p><font color="red">x</font></p>', {}, "coloured or styled text"),

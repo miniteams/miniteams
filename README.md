@@ -314,9 +314,11 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   the chat's members.
   Messages are limited to 28 KB and 50 mentions.
   - A backslash keeps markup literal: `\*` `\_` `\~` `` \` `` `\[` `\@`, and on the chat page a line starting `\- ` `\* `
-    `\> ` `\1. ` (or a line that is only `\>`); `\\` is one backslash before another backslash or one of those, or
-    (chat page) before a line-start marker; any other backslash stays as typed (`\\srv\share`), and backslashes
-    inside `code`, link labels and URLs stay as typed.
+    `\1. `, after any leading spaces or tabs, or `\> ` (or a line that is only `\>`) at its very start; `\\` is one
+    backslash before another backslash or one of those, or (chat page) before a line-start marker; any other
+    backslash stays as typed (`\\srv\share`), and backslashes inside `code`, link labels and URLs stay as typed.
+    A list item's line ending in `\` breaks the item's line when the next line is indented at least to the item's
+    text, is not blank and is not itself a list item; otherwise the `\` stays as typed.
   - A bare `http(s)://` URL is sent as a link (spec 028), without the punctuation that ends the sentence
     (`. , : ; ! ? * _ ~ ' "`, `… – — « » ‹ › “ ” ‘ ’`, and a closing `) ] } >` unless it closes a bracket opened
     inside the URL). A `'` is kept only before a letter or digit, and a `'` inside the host ends the URL
@@ -345,6 +347,14 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
     streams them to the local server, which spools them to unnamed temp files under `~/.cache/miniteams/uploads/`.
   - Widget: inline formatting.
   - Chat page: bold, italic, strike, code, lists, quotes through a toolbar or Ctrl+B / Ctrl+I, plus a preview of the message as posted.
+  - Chat page: a `- ` or `1. ` line indented further than the list item above it nests under that item (spec 040).
+    Enter on a list item opens the next one (same indent, next number), the text after the caret moving into it;
+    with the caret in the marker or indent it opens an empty item above; on an empty item it goes up a level or
+    ends the list. A selection within one item, its line breaks included, is replaced by the split; reaching
+    another item or plain text, a plain newline.
+    Enter sends only outside a list (Ctrl+Enter sends anywhere). Shift+Enter on an item breaks its line: `\` and
+    a new line at the line's indent (the item's text on an item line, its own indent on a break line), which
+    posts as a line break inside the item.
 - **Messages**: hover for actions: reply with a quote, react, edit and delete your own. Right-click a message (or
   the Menu key / Shift+F10 on a focused one) for the same actions in a menu, plus Copy text when it has text (without
   reply quotes, secure context only like 🔗); a link, an image or selected text keeps the browser's own menu (spec 034). A mention shows its
@@ -362,11 +372,15 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   kept in `data/cards.db` and shown first next time, after a restart too; the archived message is unchanged.
 - **Editing** (✎, spec 019): the message turns into an editor like the composer: `:emoji` / `@member` completion,
   Ctrl+B / Ctrl+I and a mini toolbar with a 👁 preview. It opens on the message's own markdown (formatting, links,
-  emojis, mentions kept as picked), its reply quotes above and its pasted images under it, each removable (✕ / ×),
-  none addable. Enter saves the message composed as a send, Shift+Enter breaks the line, Escape cancels; Enter with
-  nothing changed closes it without an edit (Teams would mark it edited). A message miniteams cannot write back
-  (table, heading, nested list, underline, card, image inside the text, tag mention…) opens no editor: it says why,
-  with Open in Teams. Edited in Teams meanwhile: "edited elsewhere at HH:MM", and "take that version" reloads it;
+  emojis, mentions kept as picked, sublists indented two spaces per level), its reply quotes above and its pasted
+  images under it, each removable (✕ / ×), none addable. Enter saves the message composed as a send, only
+  outside a list (there Enter and Shift+Enter work as in the composer), Shift+Enter breaks the line, Escape
+  cancels; Enter with nothing changed closes it without an edit (Teams would mark it edited).
+  A message miniteams cannot write back (table, heading, text after a sublist,
+  a list directly in a list, nested about 16 levels deep (less with formatting in the deepest item),
+  underline, card, image inside the text, tag mention…)
+  opens no editor: it says why, with Open in Teams.
+  Edited in Teams meanwhile: "edited elsewhere at HH:MM", and "take that version" reloads it;
   saving still replaces it. A message changed so that a kept quote or image is gone is refused: "reopen" loads it again, keeping a text typed meanwhile; a reopen answered "not editable here" keeps that text read-only, to copy, with the reason and Open in Teams (Escape closes it).
 - **Read receipts** (spec 011): each member's small avatar sits under the newest message they read, whoever wrote it.
   More than 3 readers on one message show 3 avatars and `+N`; hover lists every reader. Your own reads and an author's

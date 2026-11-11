@@ -37,7 +37,7 @@ miniteams cannot reproduce is not editable here, and says why.
 - **Mentions.** A mention already in the message is kept as is, even if that person has left the
   chat (the server checks it against its copy of the message); a new mention is checked against the
   roster like in a send.
-- **Not editable here.** A message holding anything else (a table, a heading, a nested list,
+- **Not editable here.** A message holding anything else (a table, a heading,
   underline, colour, a card, an image inside the text, a tag or team mention) keeps ✎ but opening it
   says what blocks it and offers "Open in Teams".
 - **Edited elsewhere.** When the message changes in Teams while it is being edited, a note under the
@@ -55,7 +55,7 @@ miniteams cannot reproduce is not editable here, and says why.
 
 - Editing from the widget (its quick reply only sends).
 - Adding quotes or images while editing.
-- Editing what miniteams cannot reproduce (tables, headings, nested lists, cards, …): Teams does it.
+- Editing what miniteams cannot reproduce (tables, headings, cards, …): Teams does it.
 - Keyboard navigation to reach a message (spec 018).
 
 ## Acceptance criteria
@@ -77,9 +77,10 @@ miniteams cannot reproduce is not editable here, and says why.
 - [x] **AC8** A mention of someone who has left the chat, already in the message, survives an edit; a
   new mention of a non-member is refused like in a send; a mention not in the original copy but
   presented as kept is refused.
-- [x] **AC9** A message holding a table, a heading, a nested list, underline, a card, an image inside
+- [x] **AC9** A message holding a table, a heading, underline, a card, an image inside
   the text or a tag mention cannot be edited here: ✎ says which and offers "Open in Teams", and the
-  server refuses such an edit on its own.
+  server refuses such an edit on its own. Nested lists: editable since spec 040, except text after a sublist
+  or a list directly in a list.
 - [x] **AC10** A change of the message from elsewhere while it is edited shows "edited elsewhere at
   HH:MM" with "take that version", which reloads text, quotes and images; saving still replaces it.
 - [x] **AC11** Enter with nothing changed closes the editor and sends nothing.
