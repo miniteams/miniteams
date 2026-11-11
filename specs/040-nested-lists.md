@@ -1,6 +1,6 @@
 # 040 — Nested lists in the composer
 
-**Status**: in progress
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-11-10
 
@@ -51,37 +51,37 @@ nothing was touched.
 
 ## Acceptance criteria
 
-- [ ] **AC1** `- a\n  - b\n- c` posts `<ul><li>a<ul><li>b</li></ul></li><li>c</li></ul>`.
-- [ ] **AC2** Mixed kinds: `1. a\n   - b\n2. c` posts an `ol` whose first item holds a `ul`.
-- [ ] **AC3** Three levels deep, then back to the top in one step, nest and close correctly.
-- [ ] **AC4** An indented list line with no list item above it (first line, after text, after a
+- [x] **AC1** `- a\n  - b\n- c` posts `<ul><li>a<ul><li>b</li></ul></li><li>c</li></ul>`.
+- [x] **AC2** Mixed kinds: `1. a\n   - b\n2. c` posts an `ol` whose first item holds a `ul`.
+- [x] **AC3** Three levels deep, then back to the top in one step, nest and close correctly.
+- [x] **AC4** An indented list line with no list item above it (first line, after text, after a
   quote) starts a top-level list.
-- [ ] **AC5** An indented line that is not a list item keeps today's behaviour (plain line).
-- [ ] **AC6** The edit flow opens the message in AC1's shape as `- a\n  - b\n- c` and saving it
+- [x] **AC5** An indented line that is not a list item keeps today's behaviour (plain line).
+- [x] **AC6** The edit flow opens the message in AC1's shape as `- a\n  - b\n- c` and saving it
   unchanged posts the same HTML.
-- [ ] **AC7** The edit flow opens Teams' archived shape, with its `\r\n` layout whitespace and
+- [x] **AC7** The edit flow opens Teams' archived shape, with its `\r\n` layout whitespace and
   `&nbsp;` text, and round-trips it.
-- [ ] **AC8** A `<li>` with text after its sublist, or a list directly inside a list, is still
+- [x] **AC8** A `<li>` with text after its sublist, or a list directly inside a list, is still
   refused with "a nested list".
-- [ ] **AC9** The chat page preview shows the nested tree before sending.
-- [ ] **AC10** Live: a nested list sent to the test chat "miniteams" shows nested in Teams web.
-- [ ] **AC11** Enter at the end of `  - b` gives `  - b\n  - `; at the end of `2. c`, `2. c\n3. `.
-- [ ] **AC12** Enter on an empty `  - ` turns it into `- ` (one level up); on an empty top-level
+- [x] **AC9** The chat page preview shows the nested tree before sending.
+- [x] **AC10** Live: a nested list sent to the test chat "miniteams" shows nested in Teams web.
+- [x] **AC11** Enter at the end of `  - b` gives `  - b\n  - `; at the end of `2. c`, `2. c\n3. `.
+- [x] **AC12** Enter on an empty `  - ` turns it into `- ` (one level up); on an empty top-level
   `- `, the line is emptied and the list ends. Undo (Ctrl+Z) takes back each step.
-- [ ] **AC13** Enter mid-item splits it: the text after the caret moves to the new item; a selection
+- [x] **AC13** Enter mid-item splits it: the text after the caret moves to the new item; a selection
   within one line's text is replaced by the split; a caret in the marker or indent counts as at the
   item's text (an empty item opens above).
-- [ ] **AC14** Enter on a list item or a continuation line never sends nor saves; outside a list Enter
+- [x] **AC14** Enter on a list item or a continuation line never sends nor saves; outside a list Enter
   sends (saves) as before; after an empty top-level item ends the list, the next Enter sends. A selection
   reaching another item or plain text, or a next number past 9 digits, gives a plain newline or
   nothing, never a send; one within the item (break lines included) is removed and the item split.
-- [ ] **AC15** Shift+Enter at the end of `  - b` gives `  - b\\\n    `; on a continuation line, another
+- [x] **AC15** Shift+Enter at the end of `  - b` gives `  - b\\\n    `; on a continuation line, another
   break at that line's indent; at a break (right after its `\`), an empty break line between the two.
-- [ ] **AC16** `- a\\\n  b\n- c` posts `<ul><li>a<br>b</li><li>c</li></ul>`, nested items alike; a
+- [x] **AC16** `- a\\\n  b\n- c` posts `<ul><li>a<br>b</li><li>c</li></ul>`, nested items alike; a
   trailing `\` not followed by a continuation line stays as today.
-- [ ] **AC17** The edit flow opens `<li>a<br>b</li>` as `- a\\\n  b` (nested: the item's text column)
+- [x] **AC17** The edit flow opens `<li>a<br>b</li>` as `- a\\\n  b` (nested: the item's text column)
   and saves it unchanged; Teams' archived list items holding a `<br>` open.
-- [ ] **AC18** Enter on a continuation line opens the next item at its item's level; on an empty one,
+- [x] **AC18** Enter on a continuation line opens the next item at its item's level; on an empty one,
   the empty line and its `\` give way to that next item.
 
 ## Phases
