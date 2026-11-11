@@ -1006,6 +1006,24 @@
       });
       return { text, from, caret };
     };
+    // compose's level stack over each run of items: per owned line, its item's depth, and the stack after line
+    // `until` ([indent, the level's last item]).
+    const depths = (lines, owner, until = lines.length - 1) => {
+      const depth = [];
+      let levels = [];
+      for (let i = 0; i <= until; i++) {
+        if (!owner[i]) { levels = []; continue; }
+        if (owner[i][1] !== i) { depth[i] = depth[owner[i][1]]; continue; }  // a line break's line
+        const indent = owner[i][0][1];
+        if (!levels.length || indent.length > levels.at(-1)[0].length) levels.push([indent, owner[i][0]]);
+        else {
+          while (levels.length > 1 && levels.at(-1)[0].length > indent.length) levels.pop();
+          levels[levels.length - 1] = [indent, owner[i][0]];
+        }
+        depth[i] = levels.length - 1;
+      }
+      return { depth, levels };
+    };
     // Enter: the next item (an empty one goes up a level, or at the top ends the list), never a send in a list;
     // Shift+Enter: a `\` line break inside the item. False: not the bar's, the page's Enter or the browser's.
     const listKey = (shift) => {
@@ -1055,20 +1073,8 @@
       let out;
       if (shift) out = write(match[0], [...before, ...after], textCol, before.length);
       else if (startPart === endPart && startAt === endAt && parts.length === 1 && !/[^ \t]/.test(current.text)) {  // a no-break space is text, as in compose
-        // compose's level stack over this run's items: [indent, the level's last item]; one level up is the
-        // parent level's indent and next marker, none at the top.
-        let first = top;
-        while (first && owner[first - 1]) first--;
-        const levels = [];
-        for (const line of lines.slice(first, top + 1)) {
-          const it = ITEM.exec(line);
-          if (!it) continue;  // a line break's line
-          const depth = it[1].length;
-          if (!levels.length || depth > levels.at(-1)[0].length) { levels.push([it[1], it]); continue; }
-          while (levels.length > 1 && levels.at(-1)[0].length > depth) levels.pop();
-          levels[levels.length - 1] = [it[1], it];
-        }
-        const up = levels.at(-2);
+        // One level up is the parent level's indent and next marker, none at the top.
+        const up = depths(lines, owner, top).levels.at(-2);
         const upMark = up && next(up[1]);
         if (up && !upMark) return true;  // the parent's next number is no item: nothing to open, never a send
         const text = up ? up[0] + upMark : "";  // blank text after the marker goes with it
@@ -1108,10 +1114,63 @@
       edited();
       return true;
     };
-    // Ctrl+B / Ctrl+I, Enter and Shift+Enter in a list; true when the key was the bar's.
+    // Tab: the selected items with their subtrees one level deeper, nested in the first one's previous sibling;
+    // Shift+Tab: one level up. Kept only when compose reads exactly that (no other item's level or line break
+    // changed), else the key does nothing. False: no list line selected, the browser's focus move.
+    const listIndent = (shift) => {
+      if (input.disabled || input.readOnly) return false;
+      const value = input.value, a = input.selectionStart, b = input.selectionEnd;
+      const end = b > a && value[b - 1] === "\n" ? b - 1 : b;  // a trailing newline ends the selection
+      const lines = value.split("\n");
+      const lineStarts = [0];
+      for (const line of lines) lineStarts.push(lineStarts.at(-1) + line.length + 1);
+      const lineOf = (offset) => { let line = 0; while (lineStarts[line + 1] <= offset) line++; return line; };
+      const near = lineOf(a), owner = owners(lines, near);
+      let first = near, last = lineOf(end);
+      while (first <= last && !owner[first]) first++;
+      if (first > last) return false;
+      while (!owner[last]) last--;
+      const { depth } = depths(lines, owner), top = owner[first][1], indent = owner[first][0][1].length;
+      let stop = last;
+      for (let t = top; t <= last; t++) {
+        if (owner[t]?.[1] !== t) continue;
+        let k = t;
+        while (owner[k + 1] && (owner[k + 1] === owner[t] || depth[k + 1] > depth[t])) k++;
+        stop = Math.max(stop, k);
+      }
+      let tries;
+      if (shift) {
+        const up = depths(lines, owner, top).levels.at(-2);
+        tries = up ? [up[0].length - indent] : [];
+      } else {
+        // The sibling's sublist indent first (past it the item nests in its last child), then two past the sibling's own, then two past its own.
+        const levels = depths(lines, owner, top - 1).levels, under = levels[depth[top] + 1], sibling = levels[depth[top]];
+        tries = [under && under[0].length - indent, sibling && sibling[0].length + 2 - indent, 2].filter((by) => by > 0);
+      }
+      const step = (i) => (i >= top && i <= stop ? (shift ? -1 : 1) : 0);
+      for (const by of tries) {
+        const spans = [];
+        const moved = lines.map((line, i) => {
+          if (i < top || i > stop || !owner[i]) return line;
+          const n = Math.max(by, -lead(line).length);
+          if (n) spans.push([lineStarts[i], n]);
+          return n > 0 ? " ".repeat(n) + line : line.slice(-n);
+        });
+        const own = owners(moved, near), now = depths(moved, own).depth;
+        if (!lines.every((_, i) => !owner[i] === !own[i] && (!owner[i] || (own[i][1] === owner[i][1] && now[i] === depth[i] + step(i))))) continue;
+        // The selection on the same characters; one in removed indent at its line's start.
+        const move = (at) => spans.reduce((n, [pos, len]) => (pos > at ? n : n + Math.max(len, pos - at)), at);
+        put(moved.slice(top, stop + 1).join("\n"), lineStarts[top], lineStarts[stop] + lines[stop].length, move(a), move(b), spans);
+        close();
+        edited();
+        break;
+      }
+      return true;
+    };
+    // Ctrl+B / Ctrl+I, Enter, Shift+Enter, Tab and Shift+Tab in a list; true when the key was the bar's.
     const key = (e) => {
-      if (e.key === "Enter" && !e.ctrlKey && !e.altKey && !e.metaKey && !e.isComposing && e.keyCode !== 229) {
-        if (!listKey(e.shiftKey)) return false;
+      if ((e.key === "Enter" || e.key === "Tab") && !e.ctrlKey && !e.altKey && !e.metaKey && !e.isComposing && e.keyCode !== 229) {
+        if (!(e.key === "Enter" ? listKey : listIndent)(e.shiftKey)) return false;
         e.preventDefault();
         return true;
       }
