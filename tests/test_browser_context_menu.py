@@ -196,6 +196,44 @@ async def test_any_emoji_opens_the_search_and_reacts_with_the_pick(chat: tuple[P
 
 
 @BOTH
+async def test_the_emoji_search_list_stays_on_screen_and_adds_no_scrollbar(chat: tuple[Page, Fake]) -> None:
+    """The `…` search on the pane's last message: its list lies inside the window, the pane does not grow."""
+    page, _ = chat
+    size = "(m => [m.scrollWidth, m.scrollHeight])(document.getElementById('list'))"
+    before = await page.evaluate(size)
+    await _menu(page, "4")
+    await page.locator(f"{MENU} .favs button", has_text="…").click()
+    search = page.locator(f"{_msg('4')} .esearch input")
+
+    async def on_screen(items: list[str]) -> dict[str, float]:
+        await shows(page, items, pop="#epop")
+        pop = await page.locator("#epop").bounding_box()
+        width, height = await page.evaluate("[innerWidth, innerHeight]")
+        assert pop is not None
+        assert pop["x"] >= 0 and pop["y"] >= 0
+        assert pop["x"] + pop["width"] <= width and pop["y"] + pop["height"] <= height
+        assert await page.evaluate(size) == before
+        return pop
+
+    await search.press_sequentially("fi")
+    await on_screen(["🔥:fire:", "🐟:fish:"])
+    await search.fill(":zz")  # the tallest list: no room under the last message
+    await on_screen([f"z:zz{i:02d}:" for i in range(12)])
+    # A scroll of the pane moves the input: the list follows it.
+    top = "(s => document.querySelector(s).getBoundingClientRect().top)"
+    gap = f"{top}('#epop') - {top}('.esearch input')"
+    was = await page.evaluate(gap)
+    await page.evaluate("document.getElementById('list').scrollBy(0, -40)")
+    await rendered(page)
+    assert await page.evaluate(gap) == pytest.approx(was, abs=1)
+    await page.set_viewport_size({"width": 700, "height": 720})  # a resize moves it too
+    await rendered(page)
+    assert await page.evaluate(gap) == pytest.approx(was, abs=1)
+    box = await page.locator("#epop").bounding_box()
+    assert box is not None and box["x"] + box["width"] <= 700
+
+
+@BOTH
 async def test_reply_edit_delete_and_teams_run_the_bar_actions(chat: tuple[Page, Fake]) -> None:
     """034-AC4: Reply quotes the message in the composer, Edit opens its editor, Delete asks then deletes,
     Open in Teams opens its link; each closes the menu."""
