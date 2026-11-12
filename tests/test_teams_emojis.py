@@ -89,3 +89,29 @@ def test_diverse_lists_the_ids_teams_tones() -> None:
         {"id": "rock", "unicode": "🤘"},
     ]
     assert gen.diverse({"categories": [{"emoticons": emoticons}]}) == ["bartlett"]
+
+
+def test_themed_ids_are_the_variants_of_a_shared_character() -> None:
+    """042-AC1: an id whose character another id also shows, bar the one sent for it, gets Teams' art."""
+    from miniteams.messages import THEMED, themed_art
+
+    assert len(THEMED) == 102
+    assert {"rock", "laughcat", "coolkoala", "sadrobot", "hungover", "yes"} <= THEMED
+    assert not {"1f918_signofthehorns", "like", "sad", "heart", "smile"} & THEMED
+    assert all(re.fullmatch(r"[\w-]{1,64}", i, re.ASCII) for i in THEMED)  # safe as a file name
+    # 042-AC6: a toned themed id is its base only when another id shows its toned character too.
+    keys = ("gran-tone3", "dropthemic-tone3", "rock-tone3", "yes-tone3", "crossedfingers-tone3", "gran-tone9")
+    assert [themed_art(k) for k in keys] == ["gran", "dropthemic", "rock", None, None, None]
+
+
+def test_no_two_ids_share_a_chip_face() -> None:
+    """042-AC1, 042-AC6: every Teams id and toned key shows art or a character no other id shows."""
+    from miniteams.messages import _TONE_RE, reaction_emoji, themed_art
+    from miniteams.teams_emojis import TEAMS_DIVERSE
+
+    faces: dict[str, set[str]] = {}
+    for key in [*TEAMS_EMOJIS, *(f"{n}-tone{t}" for n in TEAMS_DIVERSE for t in "12345")]:
+        art = themed_art(key)
+        face = f"art:{art}" if art else reaction_emoji(key).replace("\ufe0f", "")
+        faces.setdefault(face, set()).add(_TONE_RE.sub("", key))
+    assert {face: ids for face, ids in faces.items() if len(ids) > 1} == {}

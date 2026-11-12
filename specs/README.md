@@ -43,3 +43,4 @@
 | [039](039-notify-sounds.md) | Notifications and sounds per interaction | shipped |
 | [040](040-nested-lists.md) | Nested lists in the composer | shipped |
 | [041](041-list-tab-indent.md) | Tab and Shift+Tab indent list items | shipped |
+| [042](042-themed-reaction-art.md) | Teams art for themed reactions | shipped |

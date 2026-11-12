@@ -76,7 +76,7 @@ from .chats import fetch_conversations, is_meeting, is_private, last_activity
 from .config import Settings, write_private
 from .directory import Directory, roster_label, sender_name
 from .dump import fetch_history
-from .emojis import EmojiCache
+from .emojis import EmojiCache, TeamsArt
 from .http import failure
 from .images import MAX_IMAGE_BYTES
 from .messages import (
@@ -702,6 +702,7 @@ class Board:
         self._authors: dict[ServerConnection, list[str]] = {}  # chat socket → authors it shows
         self._forcing = False  # a status pick in flight (spec 036), board-wide: no older one lands last
         self.emojis = EmojiCache(directory)
+        self.teams_art = TeamsArt(directory.settings.cache_dir / "teams-emojis" if directory else None)
         self.chat = ChatVerbs(
             directory,
             self.emojis,
@@ -1839,6 +1840,11 @@ async def _route(board: Board, ws: ServerConnection, path: str, authorized: bool
             body, ctype = found
             headers = {"Content-Type": ctype, "Cache-Control": "private, max-age=86400"}
             return _respond(ws, body, headers | _FILE_HEADERS)
+    if path.startswith("/teams-emoji/"):
+        art = await board.teams_art.image(path.removeprefix("/teams-emoji/"))
+        if art is not None:
+            headers = {"Content-Type": "image/png", "Cache-Control": "private, max-age=86400"}
+            return _respond(ws, art, headers | _FILE_HEADERS)
     return ws.respond(HTTPStatus.NOT_FOUND, "not found\n")
 
 

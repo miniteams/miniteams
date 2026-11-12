@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from miniteams import emojis
@@ -188,3 +189,94 @@ async def test_cached_image_downloads_once_into_the_cache(settings: Settings, mo
     assert dest.is_dir()
     assert await emojis.cached_image(settings, "SK", "bad") is None
     assert seen == [("SK", "ok", dest), ("SK", "bad", dest)]
+
+
+# --- Teams' art for themed emoticons (spec 042), CDN mocked at the transport ---
+
+_PNG = b"\x89PNG-rock"
+
+
+class _Cdn:
+    def __init__(self) -> None:
+        self.asked: list[httpx.Request] = []
+        self.reply = httpx.Response(200, content=_PNG, headers={"content-type": "image/png"})
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.asked.append(request)
+        return self.reply
+
+
+@pytest.fixture
+def cdn(monkeypatch: pytest.MonkeyPatch) -> _Cdn:
+    fake, real = _Cdn(), httpx.AsyncClient
+    monkeypatch.setattr(
+        emojis.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(fake.handler), **kw)
+    )
+    return fake
+
+
+async def test_teams_art_is_fetched_once_then_read_from_disk(tmp_path: Path, cdn: _Cdn) -> None:
+    """042-AC3: one tokenless CDN request, then the cache, also for a new instance (a restart)."""
+    cache = tmp_path / "teams-emojis"
+    art = emojis.TeamsArt(cache)
+    assert await art.image("rock") == _PNG
+    assert await art.image("rock") == _PNG
+    assert [str(r.url) for r in cdn.asked] == [emojis._ART_URL.format("rock")]
+    assert not {"authorization", "authentication", "cookie"} & set(cdn.asked[0].headers)
+    assert sorted(p.name for p in cache.iterdir()) == ["rock.png"]  # no .part left behind
+    assert await emojis.TeamsArt(cache).image("rock") == _PNG
+    assert len(cdn.asked) == 1
+
+
+@pytest.mark.parametrize(
+    "emoticon", ["like", "1f918_signofthehorns", "../cfg", "rock/x", "rock%2f", "x" * 300, ""]
+)
+async def test_teams_art_serves_themed_ids_only(tmp_path: Path, cdn: _Cdn, emoticon: str) -> None:
+    """042-AC2: any other id is None before the disk or the network."""
+    assert await emojis.TeamsArt(tmp_path / "teams-emojis").image(emoticon) is None
+    assert cdn.asked == [] and not (tmp_path / "teams-emojis").exists()
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        httpx.Response(404),
+        httpx.Response(200, content=b"<svg/>", headers={"content-type": "image/svg+xml"}),
+        httpx.Response(200, content=b"x" * (emojis._ART_MAX + 1), headers={"content-type": "image/png"}),
+    ],
+)
+async def test_failed_teams_art_is_not_refetched_before_the_ttl(
+    tmp_path: Path, cdn: _Cdn, monkeypatch: pytest.MonkeyPatch, reply: httpx.Response
+) -> None:
+    """042-AC4: a failure (status, type, size) is None, nothing is cached, no new request until the TTL."""
+    cdn.reply = reply
+    cache = tmp_path / "teams-emojis"
+    art = emojis.TeamsArt(cache)
+    assert await art.image("rock") is None
+    assert await art.image("rock") is None
+    assert len(cdn.asked) == 1 and not cache.exists()
+    monkeypatch.setattr(art._downloads, "ttl", 0.0)  # the TTL over
+    assert await art.image("rock") is None
+    assert len(cdn.asked) == 2
+
+
+async def test_teams_art_not_stored_is_still_served(
+    tmp_path: Path, cdn: _Cdn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """042-AC3: a cache write that fails (disk full) still serves the art and leaves no `.part` behind."""
+    cache = tmp_path / "teams-emojis"
+    real_replace = Path.replace
+
+    def full(self: Path, target: Path) -> Path:
+        if self.suffix == ".part":
+            raise OSError(28, "No space left on device")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", full)
+    assert await emojis.TeamsArt(cache).image("rock") == _PNG
+    assert list(cache.iterdir()) == []
+
+
+async def test_no_cache_dir_serves_no_art(cdn: _Cdn) -> None:
+    assert await emojis.TeamsArt(None).image("rock") is None
+    assert cdn.asked == []
