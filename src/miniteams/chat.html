@@ -804,7 +804,7 @@
       const line = el("div", "reacts");
       const people = r.reactions.map((x) => `${x.emoji} — ${(x.people || []).map((n, i) => tipped(n, (x.mris || [])[i])).join(", ") || x.count}`).join("\n");
       for (const x of r.reactions) {
-        // A custom emoji has no character: its image, else its name.
+        // A custom or themed emoji shows its image; a custom one without it, its name.
         const face = x.src ? Object.assign(el("img", "emoji"), { src: x.src, alt: x.emoji })
           : x.key.includes(";") ? el("span", "custom-emoji", x.key.split(";")[0]) : null;
         const chip = el(readOnly ? "span" : "button", x.mine ? "mine" : null, face ? ` ${x.count}` : `${x.emoji} ${x.count}`);
@@ -858,9 +858,13 @@
   const plainOf = (node) => {
     const h = node.querySelector(".html");
     if (!h) return "";
+    // innerText skips images: Teams' art (spec 042) reads as the character it stands for.
+    const arts = [...h.querySelectorAll('img.emoji[src^="/teams-emoji/"]')].map((img) => [img, document.createTextNode(img.alt)]);
+    for (const [img, t] of arts) img.replaceWith(t);
     h.classList.add("plain");
     const text = h.innerText;
     h.classList.remove("plain");
+    for (const [img, t] of arts) t.replaceWith(img);
     return text.trim();
   };
 

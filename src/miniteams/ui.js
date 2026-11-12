@@ -34,6 +34,7 @@
     if (!(img instanceof HTMLImageElement)) return;
     const src = img.getAttribute("src") || "", giphy = img.dataset.giphy;
     if (giphy && src === giphy) { img.replaceWith(giphyLink(img)); return; }
+    if (src.startsWith("/teams-emoji/")) { img.replaceWith(img.alt); return; }  // 042-AC4: the character Teams' art stood for
     if (!src.startsWith("/media/")) return;
     const n = Number(img.dataset.retry || 0);
     if (n >= MEDIA_RETRY_MS.length || (giphy && src.includes("?giphy="))) {

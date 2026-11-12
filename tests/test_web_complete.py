@@ -478,6 +478,41 @@ async def test_emoji_route_serves_a_known_custom_image(
     assert emoji_cache == [OID]
 
 
+async def test_teams_emoji_route_serves_themed_art_only(
+    board: W.Board, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """042-AC2, 042-AC3: Teams' art of a themed id, typed and sandboxed; anything else 404s with no fetch."""
+    fetched: list[str] = []
+
+    async def fake_download(emoticon: str) -> bytes:
+        fetched.append(emoticon)
+        return b"\x89PNG-rock"
+
+    monkeypatch.setattr(emojis, "_download_art", fake_download)
+    async with _served(board, settings) as host, httpx.AsyncClient(headers=_cookie(board)) as client:
+        got = await client.get(f"http://{host}/teams-emoji/rock")
+        assert got.status_code == 200 and got.content == b"\x89PNG-rock"
+        assert got.headers["content-type"] == "image/png"
+        assert got.headers["x-content-type-options"] == "nosniff"
+        assert got.headers["content-security-policy"] == "sandbox"
+        assert got.headers["cross-origin-resource-policy"] == "same-origin"
+        assert (settings.cache_dir / "teams-emojis" / "rock.png").read_bytes() == b"\x89PNG-rock"
+        for path in (
+            "/teams-emoji/like",
+            "/teams-emoji/1f918_signofthehorns",
+            "/teams-emoji/rock-tone3",
+            "/teams-emoji/..%2F..%2Fcfg%2Fweb.json",
+            "/teams-emoji/../names-v2.json",
+            "/teams-emoji/rock/x",
+            "/teams-emoji/rock.png",
+            "/teams-emoji/" + "r" * 300,
+            "/teams-emoji/",
+        ):
+            assert (await client.get(f"http://{host}{path}")).status_code == 404, path
+        assert (await client.get(f"http://{host}/teams-emoji/rock")).status_code == 200  # from disk
+        assert fetched == ["rock"]
+
+
 async def test_emoji_file_stays_in_the_cache_dir(
     board: W.Board, settings: Settings, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -18,7 +18,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from .attachments import FULL_VIEW, LIVE_HOST_RE, LIVE_VIEW_RE, Giphy, existing, giphy, object_id
 from .compose import _URL_RE, trim_url
 from .directory import UNKNOWN_USER
-from .messages import file_name, json_list, reaction_emoji
+from .messages import file_name, json_list, reaction_emoji, themed_art
 
 _KEPT = frozenset(
     (
@@ -153,7 +153,14 @@ class _Sanitizer(HTMLParser):
             elif tag in ("img", "emoji"):
                 # A few come without `alt`: the id names the emoticon.
                 emoticon = a.get("itemid") or a.get("id", "")
-                self.out.append(html.escape(a.get("alt") or (reaction_emoji(emoticon) if emoticon else "")))
+                char = a.get("alt") or (reaction_emoji(emoticon) if emoticon else "")
+                art = themed_art(emoticon)
+                # 042-AC5: Teams' art tells a themed id from the plain one sharing its character.
+                self.out.append(
+                    f'<img class="emoji"{_attr("src", f"/teams-emoji/{art}")}{_attr("alt", char)}>'
+                    if art
+                    else html.escape(char)
+                )
             return
         if tag == "img":
             self._img(a, emoji=itemtype.endswith("/CustomEmoji"))

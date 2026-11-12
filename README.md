@@ -367,6 +367,8 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   chip's key, mine first. Every reaction chip toggles yours.
   Hover any reaction chip to see all the message's reactions, grouped by emoji with their participants.
   Native skin tones (`yes-tone1` → 👍🏻 through `yes-tone5` → 👍🏿) are preserved on supported emoji.
+  A themed id sharing its character with another (`rock` vs 🤘) shows Teams' own art (spec 042), fetched once from
+  its public CDN without a token and cached under `~/.cache/miniteams/teams-emojis/`; the character if it fails.
   Cards from bots and apps are rendered; runs of deleted messages are folded.
 - **Up-to-date app cards** (spec 037): an app card that declares a refresh (a Jira link card, …) is asked again
   from its bot when shown, as Teams does, at most every 10 minutes; the row updates in place. The latest card is

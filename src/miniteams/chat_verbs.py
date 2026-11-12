@@ -101,6 +101,7 @@ from .messages import (
     reaction_emoji,
     reaction_key,
     snippet,
+    themed_art,
 )
 from .render import STEM_RE, card_entries, cards_html, file_links, file_urls, files_html, media_url, sanitize
 from .send import (
@@ -475,6 +476,7 @@ def chat_record(
                     "people": people,
                 }
                 | ({"src": f"/emoji/{oid}"} if oid in custom else {})
+                | ({"src": f"/teams-emoji/{art}"} if (art := themed_art(key)) else {})  # 042-AC1
                 # The page's tooltip of an "Unknown user" (038-AC6).
                 | ({"mris": users} if UNKNOWN_USER in people else {})
             )

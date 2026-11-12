@@ -556,7 +556,26 @@ def test_record_deleted_message_has_no_body() -> None:
 def test_record_decodes_unicode_reaction_keys(key: str, emoji: str) -> None:
     emotions = [{"key": key, "users": [{"mri": ME}]}]
     record = CV.chat_record(_m("7", _at(7), properties={"emotions": emotions}), T, ME)
-    assert record["reactions"] == [{"key": key, "emoji": emoji, "count": 1, "mine": True, "people": [ME]}]
+    (reaction,) = record["reactions"]
+    themed = {"rock", "cry", "crossedfingers", "yes", "bartlett-tone2"}  # the base of a toned one has the art
+    src = f"/teams-emoji/{key.removesuffix('-tone2')}" if key in themed else None
+    assert reaction.pop("src", None) == src  # 042-AC1
+    assert reaction == {"key": key, "emoji": emoji, "count": 1, "mine": True, "people": [ME]}
+
+
+def test_record_points_a_themed_reaction_at_teams_art() -> None:
+    """042-AC1, 042-AC6: `rock` gets Teams' art, `gran-tone3` its base's; the plain 🤘, `like` and the
+    toned `yes` keep their characters."""
+    keys = ["rock", "1f918_signofthehorns", "like", "gran-tone3", "yes-tone3"]
+    emotions = [{"key": k, "users": [{"mri": ME}]} for k in keys]
+    record = CV.chat_record(_m("7", _at(7), properties={"emotions": emotions}), T, ME)
+    assert [(r["key"], r["emoji"], r.get("src")) for r in record["reactions"]] == [
+        ("rock", "🤘", "/teams-emoji/rock"),
+        ("1f918_signofthehorns", "🤘", None),
+        ("like", "👍", None),
+        ("gran-tone3", "👵🏽", "/teams-emoji/gran"),
+        ("yes-tone3", "👍🏽", None),
+    ]
 
 
 def test_record_points_a_known_custom_reaction_at_its_image() -> None:

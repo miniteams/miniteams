@@ -186,6 +186,39 @@ _TONE_RE = re.compile(r"-tone[1-5]\Z")
 _CUSTOM_KEY_RE = re.compile(r"[A-Za-z0-9_+-]{1,64};[\w-]{1,128}", re.ASCII)  # compose.EMOJI_NAME_RE;<AMS id>
 
 
+def _themed() -> frozenset[str]:
+    """Teams ids whose character the page also shows for another id, bar the name sent for it (spec 042):
+    `rock` 🤘, not `1f918_signofthehorns`. Teams tells them apart only by its own art."""
+    chars = {name: _reaction_base(name).replace("\ufe0f", "") for name in TEAMS_EMOJIS}
+    shared = Counter(chars.values())
+    return frozenset(n for n, char in chars.items() if shared[char] > 1 and _TEAMS_NAMES.get(char) != n)
+
+
+THEMED = _themed()
+
+
+def _faces() -> dict[str, frozenset[str]]:
+    """Character a chip shows (no U+FE0F) → the ids showing it, plain or toned (`dropthemic-tone3` 🎤)."""
+    faces: dict[str, set[str]] = {}
+    keys = [*TEAMS_EMOJIS, *(f"{n}-tone{t}" for n in TEAMS_DIVERSE for t in "12345")]
+    for key in keys:
+        faces.setdefault(reaction_emoji(key).replace("\ufe0f", ""), set()).add(_TONE_RE.sub("", key))
+    return {char: frozenset(ids) for char, ids in faces.items()}
+
+
+_FACES = _faces()
+
+
+def themed_art(key: str) -> str | None:
+    """The themed id whose Teams art shows `key`; a toned one's base only when another id shows its toned
+    character too (042-AC6: `gran-tone3`, not `yes-tone3` 👍🏽). None for any other key."""
+    base = _TONE_RE.sub("", key)
+    if base not in THEMED:
+        return None
+    shared = _FACES.get(reaction_emoji(key).replace("\ufe0f", ""), frozenset()) - {base}
+    return base if base == key or shared else None
+
+
 def reaction_key(key: str) -> str | None:
     """The key to send for `key` (spec 016): a Teams name, a Unicode key or a custom `<name>;<id>` as
     given; bare code points (`1f64f`) become Teams' name for them (`praying`) or `<hex>_<unicode name>`

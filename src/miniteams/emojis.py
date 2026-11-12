@@ -10,6 +10,7 @@ import asyncio
 import functools
 import json
 import mimetypes
+import os
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,6 +27,7 @@ from .compose import EMOJI_NAME_RE
 from .config import Settings
 from .directory import Directory
 from .http import Downloads, failure
+from .messages import THEMED
 
 log = structlog.get_logger()
 
@@ -37,6 +39,11 @@ _FAILED_TTL = 900.0  # seconds a failed image download is not retried: the page 
 _FAILED_MAX = 512
 _IMAGE_MAX = 50 * 1024 * 1024
 _ID_RE = re.compile(r"[\w-]{1,128}", re.ASCII)
+_ART_URL = (
+    "https://statics.teams.cdn.office.net/evergreen-assets/personal-expressions/v2/assets/emoticons/"
+    "{}/default/30_f.png"
+)
+_ART_MAX = 1024 * 1024  # a 30 px PNG is ~2 KB
 
 
 def fetch_metadata(settings: Settings, skype_token: str, csa_token: str) -> dict[str, Any]:
@@ -223,3 +230,69 @@ def _cached_body(cache: Path, path: Path) -> tuple[bytes, str] | None:
         return target.read_bytes(), mimetypes.guess_type(target.name)[0] or "application/octet-stream"
     except OSError:
         return None
+
+
+class TeamsArt:
+    """Teams' own picture of each themed emoticon (spec 042): fetched once from its public CDN, with no
+    token, and kept under `cache` (None: none served)."""
+
+    def __init__(self, cache: Path | None) -> None:
+        self.cache = cache
+        self._downloads: Downloads[bytes] = Downloads(_FAILED_TTL, _FAILED_MAX)
+
+    async def image(self, emoticon: str) -> bytes | None:
+        """The PNG of a themed id; None for any other id, which never reaches the disk or the network
+        (042-AC2)."""
+        if emoticon not in THEMED or self.cache is None:
+            return None
+        return await self._downloads.get(emoticon, functools.partial(self._fetch, self.cache, emoticon))
+
+    async def _fetch(self, cache: Path, emoticon: str) -> bytes | None:
+        path = cache / f"{emoticon}.png"
+        body = await asyncio.to_thread(_read_art, path)
+        if body is not None:
+            return body  # 042-AC3: once fetched, never again, restarts included
+        try:
+            body = await _download_art(emoticon)
+        except Exception as exc:  # noqa: BLE001 — the page falls back on the character (042-AC4)
+            log.warning("teams_emoji_art_failed", emoticon=emoticon, error=failure(exc))
+            return None
+        try:
+            await asyncio.to_thread(_store_art, path, body)
+        except OSError as exc:  # a full or read-only cache still shows the art, fetched again next time
+            log.warning("teams_emoji_art_not_cached", emoticon=emoticon, error=failure(exc))
+        return body
+
+
+async def _download_art(emoticon: str) -> bytes:
+    async with (
+        httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client,
+        client.stream("GET", _ART_URL.format(emoticon)) as resp,
+    ):
+        resp.raise_for_status()
+        ctype = (resp.headers.get("content-type") or "").split(";")[0].strip()
+        if ctype != "image/png":  # served from our origin: never anything but the PNG asked for
+            raise ValueError(f"unexpected content-type {ctype!r}")
+        body = bytearray()
+        async for chunk in resp.aiter_bytes():
+            body += chunk
+            if len(body) > _ART_MAX:
+                raise ValueError("image over the size cap")
+    return bytes(body)
+
+
+def _read_art(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes() if path.stat().st_size <= _ART_MAX else None
+    except OSError:
+        return None
+
+
+def _store_art(path: Path, body: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.part")  # per process: two servers may share the cache
+    try:
+        tmp.write_bytes(body)
+        tmp.replace(path)  # a reader never sees half a file
+    finally:
+        tmp.unlink(missing_ok=True)

@@ -220,14 +220,32 @@ def test_unicode_emoji_becomes_its_character() -> None:
         'src="https://statics.teams.cdn.office.net/smile.png" alt="🙂" title="Smile"></span>'
     )
     assert sanitize(f"<p>hi {teams}</p>", T) == "<p>hi 🙂</p>"
-    assert sanitize('<emoji id="cool" alt="😎" title="Cool"></emoji>!', T) == "😎!"
+    assert sanitize('<emoji id="smile" alt="🙂" title="Smile"></emoji>!', T) == "🙂!"
     span = '<span itemtype="http://schema.skype.com/Emoji">👍</span>'
     assert sanitize(span, T) == "👍"
     # Without `alt`, the emoticon id names it.
     img = '<img itemscope itemtype="http://schema.skype.com/Emoji" itemid="{}" src="https://x/y.png">'
     assert sanitize(img.format("meltingface") + img.format("1f389_partypopper"), T) == "🫠🎉"
-    assert sanitize('<emoji id="rock"></emoji>', T) == "🤘"
+    assert sanitize('<emoji id="1f918_signofthehorns"></emoji>', T) == "🤘"
     assert sanitize('<emoji alt=""></emoji>', T) == ""
+
+
+def test_themed_emoji_shows_teams_art() -> None:
+    """042-AC5: a themed id is Teams' art with its character as alt; a plain id stays text."""
+    art = '<img class="emoji" src="/teams-emoji/rock" alt="🤘">'
+    assert sanitize('<p><emoji id="rock" alt="🤘" title="Rock"></emoji></p>', T) == f"<p>{art}</p>"
+    assert sanitize('<emoji id="rock"></emoji>', T) == art
+    teams = '<img itemtype="http://schema.skype.com/Emoji" itemid="rock" src="https://x/y.png" alt="🤘">'
+    assert sanitize(teams, T) == art  # Teams' src is never kept: the CSP allows only our own
+    assert sanitize('<emoji id="like" alt="👍"></emoji>', T) == "👍"
+    assert sanitize('<emoji id="yes-tone3"></emoji>', T) == "👍🏽"  # 042-AC6: its toned character
+    assert (
+        sanitize('<emoji id="gran-tone3"></emoji>', T)
+        == '<img class="emoji" src="/teams-emoji/gran" alt="👵🏽">'
+    )
+    assert sanitize('<emoji id="rock" alt="&quot;&gt;x"></emoji>', T) == (
+        '<img class="emoji" src="/teams-emoji/rock" alt="&quot;&gt;x">'
+    )
 
 
 def test_custom_emoji_points_at_the_archived_file(media: Path) -> None:
