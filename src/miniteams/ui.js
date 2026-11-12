@@ -654,9 +654,23 @@
       if (brace && /[|}]/.test(m[1])) return null;
       return { kind: e ? "emoji" : "member", q: brace ? m[1].slice(1) : m[1], start: at - m[1].length - 1, brace };
     };
+    // Viewport coordinates (the list is fixed), on the preferred side, else the one with room. The caret
+    // offsets come from the last render: a scroll moves the input, not the text inside it.
+    let spot = [0, 0, 0];
+    const place = () => {
+      const [x, y, h] = spot, r = input.getBoundingClientRect(), line = r.top - input.scrollTop + y, ph = pop.offsetHeight;
+      const up = above ? line - ph >= 0 || line + h + ph > innerHeight : line + h + ph > innerHeight && line - ph >= 0;
+      pop.style.top = (up ? line - ph : line + h) + "px";
+      pop.style.left = Math.max(0, Math.min(r.left + x, r.right - pop.offsetWidth, innerWidth - pop.offsetWidth)) + "px";
+    };
+    // A scroll under an open list (the pane, an edit box) or a resize moves its input: the list follows.
+    // Capture: scroll does not bubble. Chrome fires no blur for a removed input: its list closes here.
+    const follow = (e) => { if (!input.isConnected) close(); else if (e.target !== pop) place(); };
     const render = () => {
       pop.hidden = !comp;
       input.setAttribute("aria-expanded", String(!!comp));
+      // Bound only while open: an edit box's completion must not leave a listener behind.
+      for (const type of ["scroll", "resize"]) (comp ? addEventListener : removeEventListener)(type, follow, true);
       if (!comp) { pop.replaceChildren(); input.removeAttribute("aria-activedescendant"); return; }
       pop.setAttribute("aria-label", comp.kind === "emoji" ? "emoji" : "members");
       pop.replaceChildren(...comp.items.map((it, i) => {
@@ -672,9 +686,7 @@
         return o;
       }));
       input.setAttribute("aria-activedescendant", `${pop.id}-${comp.active}`);
-      const [x, y, h] = caret(input);
-      pop.style.top = input.offsetTop - input.scrollTop + (above ? y - pop.offsetHeight : y + h) + "px";
-      pop.style.left = input.offsetLeft + Math.max(0, Math.min(x, input.offsetWidth - pop.offsetWidth)) + "px";
+      spot = caret(input); place();
       document.getElementById(`${pop.id}-${comp.active}`).scrollIntoView({ block: "nearest" });
     };
     const close = () => { clearTimeout(timer); want = null; comp = null; render(); };
