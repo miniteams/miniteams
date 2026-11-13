@@ -64,6 +64,8 @@ class Fake(browser_helpers.Fake):
             q = msg["q"].lower()
             if q == "nu":
                 items = MALFORMED
+            elif q == "horns":
+                items = [{"name": "signofthehorns", "char": "🤘"}]
             elif msg["complete"] == "emoji":
                 items = [e for e in EMOJIS if e["name"].startswith(q)]
             else:
@@ -116,6 +118,18 @@ async def test_colon_opens_the_emoji_list_and_enter_inserts_without_sending(fake
     assert await closed(page)
     await fake.settled()
     assert fake.of("send") == []
+
+
+async def test_the_typed_part_of_an_emoji_name_is_bold(fake: Fake) -> None:
+    """043-AC4: `:HORNS` bolds `horns` inside `:signofthehorns:`; a prefix match bolds its start."""
+    page, box = fake.page, fake.page.locator("#reply")  # type: ignore[union-attr]
+    await box.press_sequentially(":HORNS")
+    await shows(page, ["🤘:signofthehorns:"])
+    assert await page.locator("#pop-0 b").all_text_contents() == ["horns"]
+    await box.fill("")
+    await box.press_sequentially(":fi")
+    await shows(page, ["🔥:fire:", "🐟:fish:"])
+    assert await page.locator("#pop b").all_text_contents() == ["fi", "fi"]
 
 
 async def test_at_lists_members_everyone_first_and_send_carries_the_mentions(fake: Fake) -> None:

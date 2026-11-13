@@ -682,7 +682,11 @@
           const own = it.custom && /^\/emoji\/[\w-]+$/.test(it.src || "");
           o.append(own ? Object.assign(el("img"), { src: it.src, alt: "" }) : el("span", "ch", it.custom ? "" : it.char));
         }
-        o.append(Object.assign(el("span", "truncate", comp.kind === "emoji" ? `:${it.name}:` : it.name), { dir: "auto" }));
+        const label = Object.assign(el("span", "truncate", comp.kind === "emoji" ? `:${it.name}:` : it.name), { dir: "auto" });
+        // The typed part of an emoji name in bold: it shows why `horns` lists `signofthehorns`.
+        const at = comp.kind === "emoji" && comp.q ? it.name.toLowerCase().indexOf(comp.q.toLowerCase()) : -1;
+        if (at >= 0) label.replaceChildren(`:${it.name.slice(0, at)}`, el("b", null, it.name.slice(at, at + comp.q.length)), `${it.name.slice(at + comp.q.length)}:`);
+        o.append(label);
         o.onclick = () => { const t = word(); if (t && t.q === comp.q) { comp.active = i; insert(t); } };
         return o;
       }));

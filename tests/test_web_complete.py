@@ -158,7 +158,23 @@ async def test_a_custom_emoji_and_a_builtin_by_one_name_both_list(board: W.Board
     assert (await _complete(board, "emoji", "salute"))["items"] == [
         {"name": "salute", "custom": OID, "src": f"/emoji/{OID}"},
         {"name": "salute", "char": "🫡"},
+        {"name": "vulcansalute", "char": "🖖"},  # spec 043: found inside
     ]
+
+
+async def test_emoji_query_matches_inside_names_after_the_prefixes(board: W.Board) -> None:
+    """043-AC1, 043-AC2, 043-AC3: from 3 characters a query also matches inside a name, prefixes first."""
+    board.emojis.names = {"BigHorns": OID}
+    items = (await _complete(board, "emoji", "horns"))["items"]
+    assert {"name": "signofthehorns", "char": "🤘"} in items
+    assert {"name": "angryfacewithhorns", "char": "👿"} in items
+    assert {"name": "BigHorns", "custom": OID, "src": f"/emoji/{OID}"} in items
+    fire = [it["name"] for it in (await _complete(board, "emoji", "fire"))["items"]]
+    inside = [n.casefold().startswith("fire") for n in fire]
+    assert inside == sorted(inside, reverse=True) and not all(inside)  # prefixes, then inside matches
+    assert "signofthehorns" in [it["name"] for it in (await _complete(board, "emoji", "orn"))["items"]]
+    short = [it["name"] for it in (await _complete(board, "emoji", "af"))["items"]]
+    assert short and all(n.startswith("af") for n in short)  # under 3 characters: prefixes only
 
 
 @pytest.mark.parametrize("q", [None, 3, "", "a" * 65, ["fi"]])

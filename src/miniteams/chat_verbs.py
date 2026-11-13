@@ -1611,7 +1611,7 @@ class ChatVerbs:
         return [media_url(thread_id, media, image.src) or image.src for image in form.images]
 
     async def complete(self, request: CompleteRequest, ws: ServerConnection | None = None) -> dict[str, Any]:
-        """Up to _COMPLETE_ITEMS emojis, or members of a chat, matching the prefix."""
+        """Up to _COMPLETE_ITEMS emojis or members of a chat matching the query (emojis: spec 043)."""
         if request.kind == "emoji":
             return {"items": self._emoji_items(request.q.casefold())}
         if not self.scope(ws, request.thread):
@@ -2075,8 +2075,14 @@ class ChatVerbs:
 
         self.background(push())
 
-    def _emoji_items(self, prefix: str) -> list[dict[str, Any]]:
+    def _emoji_items(self, q: str) -> list[dict[str, Any]]:
         keys = self.emojis.keys
+        # From 3 characters a name also matches inside (`horns` → `signofthehorns`), after the prefixes.
+        inside = len(q) >= 3
+
+        def matches(name: str) -> bool:
+            return name.startswith(q) or inside and q in name
+
         found: list[dict[str, Any]] = [
             {
                 "name": name,
@@ -2085,14 +2091,18 @@ class ChatVerbs:
                 **({"key": keys[name]} if name in keys else {}),
             }
             for name, oid in self.emojis.names.items()
-            if name.casefold().startswith(prefix)
+            if matches(name.casefold())
         ]
         # Both list under a shared name: a built-in pick inserts its character, a custom one `:name:`.
-        found += [
-            {"name": name, "char": char} for name, char in SHORTCODES.items() if name.startswith(prefix)
-        ]
-        # Shortest first (`fi` → `fire`), one name per character (`fireengine`, not `fire_engine` too).
-        found.sort(key=lambda it: (len(it["name"]), str(it["name"]).casefold()))
+        found += [{"name": name, "char": char} for name, char in SHORTCODES.items() if matches(name)]
+        # Prefixes first, then shortest (`fi` → `fire`); one name per character (`fireengine` only).
+        found.sort(
+            key=lambda it: (
+                not str(it["name"]).casefold().startswith(q),
+                len(it["name"]),
+                str(it["name"]).casefold(),
+            )
+        )
         items, seen = [], set()
         for it in found:
             char = it.get("char", "").replace("\ufe0f", "")
