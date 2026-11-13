@@ -44,3 +44,4 @@
 | [040](040-nested-lists.md) | Nested lists in the composer | shipped |
 | [041](041-list-tab-indent.md) | Tab and Shift+Tab indent list items | shipped |
 | [042](042-themed-reaction-art.md) | Teams art for themed reactions | shipped |
+| [043](043-emoji-search-inside.md) | Emoji search inside names | shipped |
