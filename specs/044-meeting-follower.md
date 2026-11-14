@@ -71,8 +71,10 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
       device of mine joining, and two triggers running at once (`archive --follow` and `follow`) start
       no second follower. The guard is a lock per `correlationId` under `<data-dir>/follow/`, released
       when the follower exits, even on a crash.
-- [ ] **AC4** When I leave and others stay, the follower leaves within 15 s, its `DELETE` on the call leg
-      answers 2xx, and no ghost participant remains.
+- [ ] **AC4** When my last device in the call leaves (the follower aside) and others stay, the follower
+      leaves within 15 s, its `DELETE` on the call leg answers 2xx, and no ghost participant remains. While
+      another of my devices is still in the call (PC and phone, a transfer, an added device), one of them
+      leaving does not stop it.
 - [ ] **AC5** When the call ends for everyone, the follower stops within 15 s and closes the transcript.
 - [ ] **AC6** Each line names its speaker from the run's own roster (MSI → `displayName`); an MSI absent
       from the roster falls back to the names store, then to the MRI. Overlapping speakers (up to 4) each
@@ -105,9 +107,12 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
 ### Phase 1 — Spike gates (scratchpad, never committed)
 - Work: in `.scratchpad/`, answer the three unknowns that can change the design; write the conclusions
   into **Decisions** below.
-  1. **Leave detection** while the follower keeps my account in the call: does `evt 116` still come? Does
-     the roster show my other endpoint (its `details.endpointId`), and its departure? Fallbacks in order:
-     roster endpoint, `evt 116`, active-call service, presence.
+  1. **Leave detection** while the follower keeps my account in the call: does `evt 116` still come, per
+     device or only for the last one? Does the roster show each of my other endpoints (their
+     `details.endpointId`), so the follower can count those that are not itself, with two devices of mine
+     in the call and one leaving? Fallbacks in order: roster endpoints, `evt 116`, active-call service,
+     presence. `evt 116` alone may not stop a follower while another device of mine stays (AC4): the
+     Phase 2 trigger's stop on 116 becomes a hint the follower confirms.
   2. **Join from the push**, for each call kind: phase 1 with the push's `meetingInfo`/thread, or a
      direct join on its `conversationController`; which one attaches to the live call instead of
      creating a new one (S18 hit this trap with chat links).
