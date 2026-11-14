@@ -33,6 +33,24 @@ def _cap_memory() -> None:
 
 
 _cap_memory()
+_STT_MEMORY_CAP = 8 << 30
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _stt_memory(request: pytest.FixtureRequest) -> Iterator[None]:
+    """A module of `stt` tests runs under a higher cap: MKL and onnxruntime reserve address space per
+    thread far past 4 GiB while both real models stay under 2 GiB resident. Module scope: the models
+    load in module fixtures, and engine children inherit the cap at spawn."""
+    import resource
+
+    marked = any(i.module is request.module and i.get_closest_marker("stt") for i in request.session.items)
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    if not marked or soft == resource.RLIM_INFINITY:
+        yield
+        return
+    resource.setrlimit(resource.RLIMIT_AS, (min(_STT_MEMORY_CAP, hard), hard))
+    yield
+    resource.setrlimit(resource.RLIMIT_AS, (soft, hard))
 
 
 @pytest.fixture(autouse=True)

@@ -122,8 +122,13 @@ follower is a detached process, `miniteams follow --call`, so restarting the tri
 running. A lock per call (`<data-dir>/follow/<call>.lock`, its log beside it) keeps it to one follower,
 whatever the device, the redelivery or the number of triggers. Off, or the chat in the skip list: the
 call is logged as skipped, nothing starts. Both need the `transcript` extra
-(`uv sync --inexact --extra transcript`: `--inexact` keeps the `widget` extra) and refuse to start
-without it; no other command does.
+(`uv sync --inexact --extra transcript`: `--inexact` keeps the `widget` extra) and the speech-to-text
+runtime, and refuse to start without them, naming the fix; no other command does.
+`scripts/build-transcribe.sh [parakeet|whisper|all]` builds libtranscribe (pinned, AVX2, in Docker when
+present) and fetches the pinned models into `~/.cache/miniteams` (`transcribe/lib/`, `models/`);
+`BUILD_JOBS` sets the compile jobs (default 2). `MINITEAMS_STT_ENGINE` picks `parakeet` (default) or
+`whisper`. Transcripts are text only, one NDJSON line per utterance:
+`<data-dir>/follow/<YYYY-MM>/<started>-<call>.ndjson`.
 
 `dump --jsonl` emits one full-detail record per message (raw resource + resolved sender/thread
 + attachment refs + reactions), every message type, no media download — pipe-friendly.

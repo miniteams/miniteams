@@ -10,8 +10,9 @@ import contextlib
 import os
 import tempfile
 from pathlib import Path
+from typing import Literal, Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -113,6 +114,41 @@ class Settings(BaseSettings):
     endpoint_suffix: str = ""
     cache_dir: Path = Field(default_factory=_default_cache_dir)  # regenerable downloads
 
+    # --- meeting follower speech to text (spec 044): from grill-room `stt/grill_stt/config.py` @ ae133de,
+    # Apache-2.0 ---
+    # parakeet: parakeet-ultra through transcribe.cpp. whisper: faster-whisper small.
+    stt_engine: Literal["parakeet", "whisper"] = "parakeet"
+    # Unset: where scripts/build-transcribe.sh puts them, under cache_dir (see the properties below).
+    transcribe_library: Path | None = None
+    parakeet_model: Path | None = None
+    whisper_model: Path | None = None
+    # Engine processes, each with stt_cpu_threads threads: two of 2 threads gave 8.4x real time on a
+    # 4-CPU node, one of 4 threads 6.2x (grill-room spike S10d).
+    stt_engine_processes: int = Field(default=2, ge=1)
+    stt_cpu_threads: int = Field(default=2, ge=1)
+    # An engine that has not answered by then is killed and restarted; a 15 s utterance takes ~3 s.
+    stt_engine_timeout_s: float = Field(default=60.0, gt=0)
+    # Utterances waiting for an engine; past it new ones are dropped and logged.
+    stt_queue_size: int = Field(default=64, ge=1)
+    # A speaker from whom no frame arrived for this long stopped talking: silence is fed for them. Above
+    # delivery jitter, or silence lands inside speech.
+    stt_quiet_s: float = Field(default=0.4, gt=0)
+    # At the end of a call, the wait for the lines still in the engines; within AC5's 15 s.
+    stt_close_timeout_s: float = Field(default=10.0, gt=0)
+    # Silence that ends an utterance, the longest one before a forced cut, and how far back from that cap
+    # the forced cut looks for the quietest window (0 cuts at the cap). Same defaults as stt.vad.Segmenter,
+    # not imported from it: config must load without the transcript extra's numpy.
+    vad_min_silence_ms: int = Field(default=800, ge=1)
+    vad_max_speech_s: float = Field(default=15.0, gt=0)
+    vad_cut_search_s: float = Field(default=3.0, ge=0)
+
+    @model_validator(mode="after")
+    def _cut_search_within_cap(self) -> Self:
+        # A search as long as the cap could cut at the utterance's first window and emit a stub.
+        if self.vad_cut_search_s >= self.vad_max_speech_s:
+            raise ValueError("vad_cut_search_s must be below vad_max_speech_s")
+        return self
+
     @property
     def authority(self) -> str:
         return f"https://login.microsoftonline.com/{self.tenant_id}"
@@ -121,6 +157,17 @@ class Settings(BaseSettings):
     def media_dir(self) -> Path:
         # Downloaded media is regenerable cache (XDG_CACHE_HOME), not config/state.
         return self.cache_dir / "media"
+
+    @property
+    def stt_library(self) -> Path:
+        return self.transcribe_library or self.cache_dir / "transcribe" / "lib" / "libtranscribe.so"
+
+    @property
+    def stt_model(self) -> Path:
+        """The selected engine's model: the parakeet GGUF file or the whisper model directory."""
+        if self.stt_engine == "parakeet":
+            return self.parakeet_model or self.cache_dir / "models" / "parakeet" / "parakeet-ultra-Q8_0.gguf"
+        return self.whisper_model or self.cache_dir / "models" / "whisper-small"
 
     @property
     def scope_list(self) -> list[str]:

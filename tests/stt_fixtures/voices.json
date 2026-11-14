@@ -1,0 +1,75 @@
+{
+ "origin": "Copied with every WAV file listed here from grill-room `stt/tests/fixtures` @ 682b106 (spec 044, AC16), Apache-2.0; the voices keep the licences below.",
+ "about": "Piper 1.8 voices, 16 kHz mono. glitch-mls.wav is the 6 s the MLS voice produced for \"Ça demande du travail.\" in spike S5, cut out by the VAD; Whisper turns it into babble. mls-oui.wav is that voice failing a plain \"Oui.\". siwis-jargon.wav and joe-jargon.wav are one sentence dense in English tech terms, in French and in English: the language guess must not call the French one English (spec 007, AC5). post_parakeet: parakeet turns both MLS glitches into Latin-script babble that its filter (spec 007, AC3) cannot tell from speech, so they post.",
+ "voices": {
+  "fr_FR-siwis-medium": "CC-BY-4.0, SIWIS French Speech Synthesis Database",
+  "fr_FR-mls-medium": "CC-BY-4.0, Multilingual LibriSpeech (OpenSLR 94), speaker 84",
+  "en_US-joe-medium": "CC0, OHF-Voice voice-datasets",
+  "en_GB-cori-medium": "public domain, LibriVox"
+ },
+ "files": [
+  {
+   "file": "glitch-mls.wav",
+   "voice": "fr_FR-mls-medium",
+   "said": "Ça demande du travail.",
+   "post": false,
+   "post_parakeet": true
+  },
+  {
+   "file": "mls-oui.wav",
+   "voice": "fr_FR-mls-medium",
+   "said": "Oui.",
+   "post": false,
+   "post_parakeet": true
+  },
+  {
+   "file": "siwis-oui.wav",
+   "voice": "fr_FR-siwis-medium",
+   "said": "Oui.",
+   "post": true,
+   "heard": "oui"
+  },
+  {
+   "file": "siwis-daccord.wav",
+   "voice": "fr_FR-siwis-medium",
+   "said": "D'accord.",
+   "post": true,
+   "heard": "d'accord"
+  },
+  {
+   "file": "cori-yes.wav",
+   "voice": "en_GB-cori-medium",
+   "said": "Yes.",
+   "post": true,
+   "heard": "yes"
+  },
+  {
+   "file": "cori-okay.wav",
+   "voice": "en_GB-cori-medium",
+   "said": "Okay.",
+   "post": true,
+   "heard": "okay"
+  },
+  {
+   "file": "joe-ok.wav",
+   "voice": "en_US-joe-medium",
+   "said": "OK.",
+   "post": true,
+   "heard": "okay"
+  }
+ ],
+ "leak": [
+  {
+   "file": "siwis-jargon.wav",
+   "voice": "fr_FR-siwis-medium",
+   "said": "On a mergé la pull request, puis le pipeline de CI a déployé le chart Helm sur le cluster Kubernetes avec Argo CD.",
+   "lang": "fr"
+  },
+  {
+   "file": "joe-jargon.wav",
+   "voice": "en_US-joe-medium",
+   "said": "We merged the pull request, then the pipeline deployed the Helm chart to the cluster with Argo CD.",
+   "lang": "en"
+  }
+ ]
+}

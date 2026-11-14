@@ -6,6 +6,9 @@ resolution-markers = [
     "python_full_version < '3.15'",
 ]
 
+[manifest]
+overrides = [{ name = "transcribe-cpp-native", marker = "python_full_version < '0'" }]
+
 [[package]]
 name = "annotated-types"
 version = "0.7.0"
@@ -586,6 +589,7 @@ transcript = [
     { name = "faster-whisper" },
     { name = "numpy" },
     { name = "onnxruntime" },
+    { name = "transcribe-cpp" },
 ]
 widget = [
     { name = "pyside6-addons" },
@@ -597,6 +601,7 @@ widget = [
 dev = [
     { name = "detect-secrets" },
     { name = "mypy" },
+    { name = "numpy" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -618,6 +623,7 @@ requires-dist = [
     { name = "pyside6-webengine", marker = "extra == 'widget'", specifier = ">=6.12" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "structlog", specifier = ">=24.4" },
+    { name = "transcribe-cpp", marker = "extra == 'transcript'", specifier = "==0.4.0" },
     { name = "websockets", specifier = ">=16.0" },
 ]
 provides-extras = ["widget", "transcript"]
@@ -626,6 +632,7 @@ provides-extras = ["widget", "transcript"]
 dev = [
     { name = "detect-secrets", specifier = ">=1.5" },
     { name = "mypy", specifier = ">=1.11" },
+    { name = "numpy", specifier = ">=2.5.4" },
     { name = "pre-commit", specifier = ">=3.8" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
@@ -1175,6 +1182,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/0d/ea/b2a5bd54b28a324dae8211928b2d730b6547500342c7e6c6dea08bd0a485/tqdm-4.70.1.tar.gz", hash = "sha256:cefd0eca11b2a37a3aee776544d4f4ae913f02688135b5556b8788dfa474afc4", size = 171846, upload-time = "2026-09-11T07:25:16.601Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a7/03/921a3d3c75785aca9ebfbfcabfbc3a1be12e2ab5265deb026d55a5a3f83e/tqdm-4.70.1-py3-none-any.whl", hash = "sha256:c293e525e6fef9c20e8728fd4612df02a0aa31bb5fe91ecd93e123b1b7bffa73", size = 80199, upload-time = "2026-09-11T07:25:14.599Z" },
+]
+
+[[package]]
+name = "transcribe-cpp"
+version = "0.4.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/39/1a/31460b4a253d2080ac062d77de1796ddc8cd27d71f0ac588f04e5374b2fc/transcribe_cpp-0.4.0.tar.gz", hash = "sha256:80255c52ec4109c9fc8e865f6585a19215456b75d71848ec16b03cb6ea980eb6", size = 118034, upload-time = "2026-10-12T00:30:43.424Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9f/6f/526ea6b0e430eb7d526bf8508634aa671b9a7db1a0e5b24ccf2d03e15af5/transcribe_cpp-0.4.0-py3-none-any.whl", hash = "sha256:9e1b8e522944bb3771829af91f5517a75fe1887a913329d8a25637f05adeed48", size = 47190, upload-time = "2026-10-12T00:30:28.228Z" },
 ]
 
 [[package]]

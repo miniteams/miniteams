@@ -483,6 +483,7 @@ def test_archive_live_exits_1_when_the_refresh_token_dies(monkeypatch) -> None:
     from miniteams import follow
 
     monkeypatch.setattr(follow, "missing_extra", lambda: [])
+    monkeypatch.setattr(follow, "stt_ready", lambda _s: None)
     assert cli.main(["archive", "--live", "--follow"]) == 1
     assert calls[3]["follow"] is True
 

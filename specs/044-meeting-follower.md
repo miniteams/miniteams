@@ -47,7 +47,8 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
 - Transcript files in the archive, appended live.
 - MCP `read_transcript` lists and reads followed calls.
 - A global on/off switch and a per-chat skip list.
-- A `transcript` optional extra; a make target that builds libtranscribe and fetches the Parakeet model.
+- A `transcript` optional extra; `scripts/build-transcribe.sh` (the repo has no Makefile) builds libtranscribe
+  and fetches the Parakeet and Whisper models.
 
 ## Out of scope
 
@@ -138,8 +139,13 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
   call kind joined and left cleanly, `DELETE` 2xx logged.
 
 ### Phase 4 — Speech to text and transcript files
-- Work: copy from grill-room `stt/grill_stt` @ `56e5e89`:
-  - as is: `line.py`, `vad.py`, `engines.py`, `parakeet.py`, `transcribe.py`;
+- Work: copy from grill-room `stt/grill_stt` @ `56e5e89` (each file identical there to its last change:
+  `89744d1` for `line.py`, `engines.py`, `parakeet.py`, `transcribe.py`; `ae133de` for `vad.py`,
+  `pipeline.py`, `config.py`; each file's notice names its own):
+  - as is: `line.py`, `parakeet.py`, `transcribe.py`;
+  - adapted: `engines.py` (an env per engine, `python -P -m miniteams.stt.engines`, miniteams logging,
+    HF offline instead of grill's secret filter, a final stop safe from another thread, a clean exit on
+    stop), `vad.py` (`Cut.trail_s` and `Cut.end_ago_s`, to place a cut on the call's timeline);
   - trimmed: `pipeline.py` (queue, per-speaker order, `Plausibility` filters; drop `RoomAPI` and the
     Prometheus metrics, replaced by the NDJSON writer), `config.py` (engine and VAD settings only, merged
     into miniteams `Settings`);
@@ -147,13 +153,14 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
     `test_pool.py`, `fake_engine.py` and the fixtures they need;
   - not copied: `worker.py`, `replay.py`, `__main__.py`, `logs.py`, the LiveKit tests.
 
-  One pipeline per call feeding up to 4 tracks; NDJSON writer; a make target that builds libtranscribe
-  (pinned commit, AVX2, rewritten from grill-room's `stt/Dockerfile`) and fetches the GGUF model.
+  One pipeline per call feeding up to 4 tracks; NDJSON writer; `scripts/build-transcribe.sh` builds
+  libtranscribe (pinned commit, AVX2, rewritten from grill-room's `stt/Dockerfile`) and fetches the GGUF
+  model and faster-whisper small (pinned revision), all under the cache dir.
   `faster-whisper` is needed with either engine: the VAD loads its Silero model from that package.
 - **Covers**: AC6, AC7, AC8, AC10, AC12, AC16
 - **Data model impact**: transcript files under `<data-dir>/follow/<YYYY-MM>/<started>-<call>.ndjson`
 - **DoD**: replay test of a synthetic multi-speaker WAV through both engines; live call meets AC7, the
-  latency computed from the line timestamps by a script kept in the repo.
+  latency computed from the follower log's `line_done.latency_s` by `scripts/follow-latency.py`.
 
 ### Phase 5 — MCP
 - Work: `read_transcript` lists followed calls of a thread and pages one by `call`.

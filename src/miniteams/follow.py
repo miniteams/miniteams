@@ -16,6 +16,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import signal
 import stat
 import subprocess
@@ -35,7 +36,8 @@ log = structlog.get_logger()
 
 EVT_JOINED = 115
 EVT_ENDED = 116
-TRANSCRIPT_MODULES = ("numpy", "onnxruntime", "faster_whisper")
+TRANSCRIPT_MODULES = ("numpy", "onnxruntime", "faster_whisper", "transcribe_cpp")
+BUILD_HINT = "scripts/build-transcribe.sh"
 EXTRA_HINT = "uv sync --inexact --extra transcript, then uv run --extra transcript miniteams follow"
 _LOCK_TRIES, _LOCK_PAUSE = 10, 0.02  # ~200 ms before a follower concedes the lock
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -45,6 +47,41 @@ def missing_extra() -> list[str]:
     """Transcript modules not installed. find_spec, not import: the archiver hosting the trigger
     must not carry onnxruntime in memory."""
     return [m for m in TRANSCRIPT_MODULES if importlib.util.find_spec(m) is None]
+
+
+def _build_command(settings: Settings, engine: str) -> str:
+    """The build script, by absolute path in a source checkout. The cache dir is passed explicitly: the
+    script reads the environment, not `.env`."""
+    script = Path(__file__).resolve().parents[2] / BUILD_HINT
+    where = shlex.quote(str(script)) if script.is_file() else f"{BUILD_HINT} (in the miniteams repository)"
+    return f"MINITEAMS_CACHE_DIR={shlex.quote(str(settings.cache_dir))} {where} {engine}"
+
+
+def stt_ready(settings: Settings) -> str | None:
+    """None when the chosen engine can run, else what is missing and how to fix it (044-AC10). File
+    checks only: nothing is loaded."""
+    if missing := missing_extra():
+        return f"transcript extra missing ({', '.join(missing)}): {EXTRA_HINT}"
+    engine = settings.stt_engine
+    build = f"run `{_build_command(settings, engine)}`"
+    if engine == "parakeet" and not settings.stt_library.is_file():
+        fix = (
+            "point MINITEAMS_TRANSCRIBE_LIBRARY at an existing file" if settings.transcribe_library else build
+        )
+        return f"libtranscribe missing at {settings.stt_library}: {fix}"
+    model = settings.stt_model
+    if engine == "parakeet":
+        ok, own, kind = model.is_file(), settings.parakeet_model, "an existing GGUF file"
+    else:
+        ok, own, kind = (
+            (model / "model.bin").is_file(),
+            settings.whisper_model,
+            "a downloaded model directory",
+        )
+    if not ok:
+        fix = f"point MINITEAMS_{engine.upper()}_MODEL at {kind}" if own else build
+        return f"{engine} model missing at {model}: {fix}"
+    return None
 
 
 def decode_push(req: dict[str, Any]) -> tuple[int, dict[str, Any]] | None:

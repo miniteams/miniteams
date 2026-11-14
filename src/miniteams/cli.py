@@ -405,7 +405,7 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
     from .archive import RefreshingToken, run_archive
     from .auth import token_source
 
-    if args.follow and not _follow_extra_ok():
+    if args.follow and not _follow_extra_ok(settings):
         return 1
     # Acquire once (may prompt), then hand a self-refreshing provider to the run: a full-account
     # archive outlives the ~45-min skype token, so it must be re-minted mid-run.
@@ -545,11 +545,15 @@ def cmd_names(settings: Settings, args: argparse.Namespace) -> int:
     return 0 if directory.flush() else 1
 
 
-def _follow_extra_ok() -> bool:
-    from .follow import EXTRA_HINT, missing_extra
+def _follow_extra_ok(settings: Settings) -> bool:
+    """044-AC10, AC15: a call it cannot transcribe is never joined."""
+    from .follow import EXTRA_HINT, missing_extra, stt_ready
 
     if missing := missing_extra():
         log.error("follow_extra_missing", missing=missing, hint=EXTRA_HINT)
+        return False
+    if fix := stt_ready(settings):
+        log.error("follow_stt_missing", engine=settings.stt_engine, fix=fix)
         return False
     return True
 
@@ -560,6 +564,8 @@ def cmd_follow(settings: Settings, args: argparse.Namespace) -> int:
 
     data_dir = Path(args.data_dir)
     if args.call is not None:
+        if not _follow_extra_ok(settings):
+            return 1
         return follow.run_call(data_dir.resolve(), args.call)
     if args.enable or args.disable or args.skip or args.unskip or args.status:
         switch = follow.load_switch(settings)
@@ -576,7 +582,7 @@ def cmd_follow(settings: Settings, args: argparse.Namespace) -> int:
             follow.save_switch(settings, enabled, skip)
         print(json.dumps({"enabled": enabled, "skip": skip}))
         return 0
-    if not _follow_extra_ok():
+    if not _follow_extra_ok(settings):
         return 1
     import asyncio
 

@@ -69,6 +69,16 @@ def _until(cond: Callable[[], bool], what: str, timeout: float = 15.0) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _stt_runtime(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    """044-AC10: `follow` and `follow --call` start only with a library and a model; empty stand-ins, by
+    env so the followers these tests spawn see them too."""
+    root = tmp_path_factory.mktemp("stt")
+    for name, var in (("lib.so", "MINITEAMS_TRANSCRIBE_LIBRARY"), ("model.gguf", "MINITEAMS_PARAKEET_MODEL")):
+        (root / name).touch()
+        monkeypatch.setenv(var, str(root / name))
+
+
+@pytest.fixture(autouse=True)
 def _info_logs() -> None:
     structlog.configure(
         wrapper_class=structlog.make_filtering_bound_logger(logging.INFO)

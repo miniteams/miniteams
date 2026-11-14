@@ -19,7 +19,8 @@ dependencies = [
 [project.optional-dependencies]
 widget = ["pyside6-essentials>=6.12", "pyside6-addons>=6.12", "pyside6-webengine>=6.12"]
 # `miniteams follow`, the meeting follower's speech to text (spec 044): `uv sync --inexact --extra transcript`
-transcript = ["numpy>=2.3", "onnxruntime>=1.23", "faster-whisper>=1.2"]
+# transcribe-cpp: the ctypes binding only; scripts/build-transcribe.sh builds libtranscribe itself (pinned, AVX2).
+transcript = ["numpy>=2.3", "onnxruntime>=1.23", "faster-whisper>=1.2", "transcribe-cpp==0.4.0"]
 
 [project.scripts]
 miniteams = "miniteams.cli:main"
@@ -33,7 +34,14 @@ dev = [
     "ruff>=0.6",
     "pre-commit>=3.8",
     "detect-secrets>=1.5",
+    # mypy on src/miniteams/stt needs numpy's types even where the transcript extra is not synced
+    "numpy>=2.5.4",
 ]
+
+[tool.uv]
+# The prebuilt provider wheel is tuned for no CPU in particular and ships Vulkan: the follower loads its
+# own build through TRANSCRIBE_LIBRARY instead. A false marker drops the dependency.
+override-dependencies = ["transcribe-cpp-native; python_version < '0'"]
 
 [build-system]
 requires = ["hatchling"]
@@ -66,10 +74,18 @@ ignore_missing_imports = true
 module = ["PySide6.*", "shiboken6"]
 ignore_missing_imports = true
 
+# The `transcript` extra's untyped runtimes (spec 044)
+[[tool.mypy.overrides]]
+module = ["numpy.*", "faster_whisper.*", "ctranslate2.*", "onnxruntime.*", "transcribe_cpp.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 addopts = "-v --tb=short"
-markers = ["browser: headless Chrome tests (`uv run --with playwright pytest tests/test_browser.py`)"]
+markers = [
+    "browser: headless Chrome tests (`uv run --with playwright pytest tests/test_browser.py`)",
+    "stt: real speech-to-text engines, skipped until scripts/build-transcribe.sh has run (spec 044)",
+]
 
 [tool.coverage.run]
 source = ["miniteams"]
