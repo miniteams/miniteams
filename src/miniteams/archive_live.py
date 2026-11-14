@@ -408,9 +408,11 @@ async def run_live(
     media_types: frozenset[str] = attachments.DEFAULT_MEDIA,
     reconcile: float = 1800.0,
     verify_media: bool = False,
+    follow: bool = False,
 ) -> bool:
     """Returns True when it stopped on a dead refresh token (re-login needed). `verify_media` runs
-    (or resumes) one media sweep; without it, the progress of an unfinished one is dropped."""
+    (or resumes) one media sweep; without it, the progress of an unfinished one is dropped. `follow`
+    hosts the meeting follower's trigger on the same socket (spec 044)."""
     live = LiveArchive(
         settings,
         data_dir.resolve(),
@@ -421,6 +423,11 @@ async def run_live(
         media_types=media_types,
     )
     live.directory.start_roster_import(live.data_dir)
+    on_call = None
+    if follow:
+        from .follow import trigger
+
+        on_call = trigger(settings, live.data_dir)
     stream = asyncio.create_task(
         run_forever(
             settings,
@@ -428,6 +435,7 @@ async def run_live(
             on_gap=live.on_gap,
             on_alive=live.on_alive,
             epid_name="endpoint_id-archive",
+            on_call=on_call,
         )
     )
     stop = asyncio.create_task(live.stopped.wait())

@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import json
 import os
 import stat
 import sys
@@ -404,6 +405,8 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
     from .archive import RefreshingToken, run_archive
     from .auth import token_source
 
+    if args.follow and not _follow_extra_ok():
+        return 1
     # Acquire once (may prompt), then hand a self-refreshing provider to the run: a full-account
     # archive outlives the ~45-min skype token, so it must be re-minted mid-run.
     source = token_source(settings)
@@ -424,6 +427,7 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
                     media_types=args.media,
                     reconcile=args.live,
                     verify_media=args.verify_media,
+                    follow=args.follow,
                 )
             )
         except KeyboardInterrupt:
@@ -541,6 +545,63 @@ def cmd_names(settings: Settings, args: argparse.Namespace) -> int:
     return 0 if directory.flush() else 1
 
 
+def _follow_extra_ok() -> bool:
+    from .follow import EXTRA_HINT, missing_extra
+
+    if missing := missing_extra():
+        log.error("follow_extra_missing", missing=missing, hint=EXTRA_HINT)
+        return False
+    return True
+
+
+def cmd_follow(settings: Settings, args: argparse.Namespace) -> int:
+    """Meeting follower (spec 044): the trigger, one call's follower (--call), or the switch and skip list."""
+    from . import follow
+
+    data_dir = Path(args.data_dir)
+    if args.call is not None:
+        return follow.run_call(data_dir.resolve(), args.call)
+    if args.enable or args.disable or args.skip or args.unskip or args.status:
+        switch = follow.load_switch(settings)
+        if switch is None:
+            return 1  # never overwrite a file the user may be editing
+        enabled, skip = switch
+        if args.enable or args.disable:
+            enabled = bool(args.enable)
+        if args.skip and args.skip not in skip:
+            skip = [*skip, args.skip]
+        if args.unskip:
+            skip = [t for t in skip if t != args.unskip]
+        if not args.status:
+            follow.save_switch(settings, enabled, skip)
+        print(json.dumps({"enabled": enabled, "skip": skip}))
+        return 0
+    if not _follow_extra_ok():
+        return 1
+    import asyncio
+
+    from .stream import run_forever
+
+    async def ignore(_obj: dict[str, Any]) -> None:
+        return None  # chat events: this socket only hosts the call trigger
+
+    settings.use_device_code = True  # long-running, often headless: as `stream`
+    try:
+        asyncio.run(
+            run_forever(
+                settings,
+                on_event=ignore,
+                epid_name="endpoint_id-follow",
+                on_call=follow.trigger(settings, data_dir),
+            )
+        )
+    except KeyboardInterrupt:
+        log.info("interrupted")
+        return 0
+    log.error("follow_stopped", reason="auth_expired", hint="run `miniteams login`")
+    return 1
+
+
 def cmd_stream(settings: Settings, args: argparse.Namespace) -> int:
     """Full chain → websocket → authenticate → register → stream, with auto-reconnect (M2-M4)."""
     import asyncio
@@ -604,6 +665,12 @@ _MEDIA_HELP = (
 def _reaction_key(value: str) -> str:
     if not valid_reaction_key(value):
         raise argparse.ArgumentTypeError("a Teams reaction key, without spaces")
+    return value
+
+
+def _non_empty(value: str) -> str:
+    if not value:
+        raise argparse.ArgumentTypeError("must not be empty")
     return value
 
 
@@ -809,7 +876,27 @@ def main(argv: list[str] | None = None) -> int:
         help="one-shot: re-walk the history of every chat active since WHEN (ISO date/datetime) "
         "down to it, filling any hole under the newest stored message",
     )
+    p_archive.add_argument(
+        "--follow",
+        action="store_true",
+        help="with --live: also start the meeting follower on each call I join (spec 044)",
+    )
     p_archive.set_defaults(func=cmd_archive)
+
+    p_follow = sub.add_parser("follow", help="follow the calls I join: one follower per call (spec 044)")
+    p_follow.add_argument("--data-dir", default="data", help="archive root (default: ./data)")
+    follow_mode = p_follow.add_mutually_exclusive_group()
+    follow_mode.add_argument("--call", metavar="PUSH", help=argparse.SUPPRESS)  # the trigger's own launch
+    follow_mode.add_argument("--enable", action="store_true", help="turn following on (follow.json)")
+    follow_mode.add_argument("--disable", action="store_true", help="turn following off (follow.json)")
+    follow_mode.add_argument(
+        "--skip", type=_non_empty, metavar="THREAD", help="never follow calls of this chat"
+    )
+    follow_mode.add_argument(
+        "--unskip", type=_non_empty, metavar="THREAD", help="take a chat off the skip list"
+    )
+    follow_mode.add_argument("--status", action="store_true", help="print the switch and the skip list")
+    p_follow.set_defaults(func=cmd_follow)
 
     p_web = sub.add_parser("web", help="serve the live conversation-list widget (local page)")
     p_web.add_argument(
@@ -912,6 +999,8 @@ def main(argv: list[str] | None = None) -> int:
         clash = [f for f in flags if getattr(args, f) not in (None, False)]
         if clash:
             parser.error(f"--live cannot be combined with --{clash[0].replace('_', '-')}")
+    if getattr(args, "follow", False) and not getattr(args, "live", None):
+        parser.error("--follow needs --live")
     if getattr(args, "func", None) is cmd_watch:
         from .watch import Watch
 

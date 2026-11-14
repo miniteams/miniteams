@@ -11,9 +11,11 @@ session lasts, the token pair on the shared `Directory` is renewed before it exp
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
@@ -34,6 +36,7 @@ log = structlog.get_logger()
 
 _PING_INTERVAL = 30.0  # seconds; handshake advertised a 70s heartbeat window
 _REREGISTER_DEBOUNCE = 20.0  # seconds; collapse the message_loss flood into one re-register
+_NGC_RETRY_MIN = 30.0  # seconds before retrying a failed calling registration; doubles up to the TTL
 _BACKOFF_MAX = 60.0
 _STABLE_AFTER = 60.0  # a connection alive this long resets the backoff
 _TOKEN_REFRESH_RATIO = 0.8  # renew the directory's skype token at 80% of its lifetime
@@ -41,12 +44,23 @@ _TOKEN_REFRESH_MIN = 60.0  # floor between renewals; a failed renewal retries af
 _LOGIN_POLL = 5.0  # seconds between looks at the token cache while waiting for a `miniteams login`
 _TOKEN_LIFETIME_FALLBACK = 1800.0  # authz response without expiresIn: assume a short lifetime
 _CONNECT_FLOOD = 30.0  # seconds after registration in which a message_loss is the connect flood
+# Calling registration (spec 044): call pushes arrive on the surl + this path, never on the messaging one.
+NGC_PATH = "NGCallManagerWin"
+_NGC_CLIENT = {
+    "appId": "NextGenCalling",
+    "aesKey": "",
+    "languageId": "en-US",
+    "platform": "edge",
+    "templateKey": "DesktopNgc_2.5:SkypeNgc",
+    "platformUIVersion": "49/1.0.0",
+}
 
 EventHook = Callable[[dict[str, Any]], Awaitable[None]]  # receives each decoded EventMessage
 GapHook = Callable[[str], Awaitable[None]]  # events may have been missed; arg = reason
 AliveHook = Callable[[], Awaitable[None]]  # the socket is up: at connect and on every keepalive
 SessionHook = Callable[[str, str], Awaitable[None]]  # (endpoint id, surl) of a registered socket
 PresenceHook = Callable[[dict[str, Any]], Awaitable[None]]  # a decoded presence delivery body
+CallHook = Callable[[dict[str, Any]], Awaitable[None]]  # a raw NGCallManagerWin delivery (spec 044)
 # The Teams session: up, down (reconnecting) or login (waiting for a `miniteams login`).
 LinkState = Literal["up", "down", "login"]
 LinkHook = Callable[[LinkState], None]
@@ -75,6 +89,7 @@ class TrouterClient:
         on_alive: AliveHook | None = None,
         on_session: SessionHook | None = None,
         on_presence: PresenceHook | None = None,
+        on_call: CallHook | None = None,
     ) -> None:
         self.settings = settings
         self.aad = aad
@@ -91,6 +106,12 @@ class TrouterClient:
         self.on_alive = on_alive
         self.on_session = on_session
         self.on_presence = on_presence
+        self.on_call = on_call  # set → also registers on NGC_PATH, its pushes go to this hook only
+        # Stable per endpoint, so reconnects renew one registration; never the epid, which would replace
+        # the messaging registration.
+        self._ngc_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"miniteams:ngc:{epid}"))
+        self._ngc_ok = False
+        self._ngc_wake = asyncio.Event()  # set by every (re-)register: _ngc_loop renews the calling one
         self._loss_etag: str | None = None  # `messaging` etag of the last message_loss seen
         self._count = 0
         self._last_register = 0.0
@@ -141,6 +162,9 @@ class TrouterClient:
         )
 
     async def _register(self) -> None:
+        # Before the messaging POST, which may raise: the calling registration is renewed regardless.
+        self._ngc_ok = False
+        self._ngc_wake.set()
         body = {
             "clientDescription": {
                 "appId": self.settings.registrar_app_id,
@@ -156,6 +180,28 @@ class TrouterClient:
                 "TROUTER": [{"context": "", "path": self.info["surl"], "ttl": self.settings.trouter_ttl}]
             },
         }
+        status = await self._post_registration(body)
+        self._last_register = time.monotonic()
+        log.info("registered", status=status, surl=self.info["surl"])
+
+    async def _register_ngc(self) -> None:
+        path = self.info["surl"] + NGC_PATH
+        body = {
+            "clientDescription": _NGC_CLIENT,
+            "registrationId": self._ngc_id,
+            "nodeId": "",
+            "transports": {"TROUTER": [{"context": "", "path": path, "ttl": self.settings.trouter_ttl}]},
+        }
+        try:
+            status = await self._post_registration(body)
+        except Exception as exc:  # noqa: BLE001 — the call trigger must not cost the chat socket
+            self._ngc_ok = False  # _ngc_loop retries it
+            log.warning("ngc_register_failed", error=str(exc), error_type=type(exc).__name__)
+            return
+        self._ngc_ok = True
+        log.info("ngc_registered", status=status)
+
+    async def _post_registration(self, body: dict[str, Any]) -> int:
         headers = {
             "X-Skypetoken": self.directory.skype_token or self.skype_token,
             "Authorization": f"Bearer {self._bearer}",
@@ -164,8 +210,7 @@ class TrouterClient:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(self.settings.registrar_url, headers=headers, json=body)
             resp.raise_for_status()
-        self._last_register = time.monotonic()
-        log.info("registered", status=resp.status_code, surl=self.info["surl"])
+        return int(resp.status_code)
 
     async def _maybe_reregister(self, reason: str) -> None:
         if time.monotonic() - self._last_register < _REREGISTER_DEBOUNCE:
@@ -182,6 +227,18 @@ class TrouterClient:
             await self._send_regular({"name": "ping"})
             log.debug("ping_sent", count=self._count)
             await self._alive()
+
+    async def _ngc_loop(self) -> None:
+        """The calling registration, off the frame and ping paths: a hanging registrar delays neither."""
+        delay = _NGC_RETRY_MIN
+        while True:
+            self._ngc_wake.clear()
+            if not self._ngc_ok:
+                await self._register_ngc()
+            wait = None if self._ngc_ok else delay  # a failure retries on the timeout, backing off
+            delay = _NGC_RETRY_MIN if self._ngc_ok else min(delay * 2, float(self.settings.trouter_ttl))
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._ngc_wake.wait(), wait)
 
     async def _alive(self) -> None:
         if self.on_alive is None:
@@ -213,6 +270,8 @@ class TrouterClient:
             asyncio.create_task(self._ping_loop()),
             asyncio.create_task(self._ttl_loop()),
         ]
+        if self.on_call is not None:
+            self._tasks.append(asyncio.create_task(self._ngc_loop()))
 
     async def _on_named(self, data: str) -> None:
         if self.raw:
@@ -265,6 +324,11 @@ class TrouterClient:
         await self._ws.send(f"3:::{ack}")
         if self.raw:
             await emit_raw_delivery(req)  # every endpoint, decoded, no filtering
+        elif self.on_call is not None and str(req.get("url") or "").endswith(NGC_PATH):
+            try:
+                await self.on_call(req)
+            except Exception as exc:  # noqa: BLE001 — a bad call push must not drop the socket
+                log.warning("call_hook_failed", error=str(exc), error_type=type(exc).__name__)
         elif self.on_presence is not None and str(req.get("url") or "").endswith(PRESENCE_PATHS):
             try:
                 await self.on_presence(_decode_body(req) or {})
@@ -386,6 +450,7 @@ async def run_forever(
     on_session: SessionHook | None = None,
     on_presence: PresenceHook | None = None,
     on_link: LinkHook | None = None,
+    on_call: CallHook | None = None,
 ) -> None:
     """Re-establish a full session on every disconnect.
 
@@ -449,6 +514,7 @@ async def run_forever(
                     on_alive=alive,
                     on_session=on_session,
                     on_presence=on_presence,
+                    on_call=on_call,
                 ).run()
             finally:
                 refresher.cancel()

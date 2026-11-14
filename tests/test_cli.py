@@ -416,6 +416,7 @@ _LIVE_HONOURED = {
     "--videos",
     "--media",
     "--verify-media",
+    "--follow",
 }
 _LIVE_REFUSED = {
     "--loop": [],
@@ -478,6 +479,18 @@ def test_archive_live_exits_1_when_the_refresh_token_dies(monkeypatch) -> None:
     assert cli.main(["archive", "--live", "--verify-media", "--videos", "--all", "--no-avatars"]) == 1
     assert calls[2]["verify_media"] is True and "videos" in calls[2]["media_types"]
     assert calls[2]["include_all"] is True and calls[2]["download_avatars"] is False
+    assert calls[2]["follow"] is False
+    from miniteams import follow
+
+    monkeypatch.setattr(follow, "missing_extra", lambda: [])
+    assert cli.main(["archive", "--live", "--follow"]) == 1
+    assert calls[3]["follow"] is True
+
+
+def test_archive_follow_needs_live(capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["archive", "--follow"])
+    assert exc.value.code == 2 and "--follow needs --live" in capsys.readouterr().err
 
 
 def test_recheck_since_is_one_shot_and_validated(capsys) -> None:

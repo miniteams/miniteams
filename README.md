@@ -64,6 +64,7 @@ uv run miniteams archive --live                        # catch up, then store ea
                                                        # arrives, plus a pass every 1800s (--live N);
                                                        # stops on auth expiry (exit 1)
 uv run miniteams archive --live --verify-media         # same, plus one background media sweep
+uv run --extra transcript miniteams archive --live --follow   # same, plus the meeting follower (below)
 uv run miniteams archive --recheck-since 2026-09-22    # one-shot: re-walk chats active since the
                                                        # date down to it, filling any hole
 uv run miniteams names --sweep    # learn the names the archive holds (--data-dir; below)
@@ -73,6 +74,9 @@ uv run miniteams web --limit 0 --bind 127.0.0.5:8765   # load every chat (with a
 uv run miniteams web --data-dir /srv/teams-archive     # seed rows from an archive kept elsewhere
 uv run --extra widget miniteams widget   # the running web's board in its own window + tray icon (spec 024)
 uv run miniteams mcp              # MCP server over stdio for an agent (spec 008; see below)
+uv run --extra transcript miniteams follow   # meeting follower on its own socket (spec 044; below)
+uv run miniteams follow --disable                      # switch off (--enable); --skip / --unskip THREAD,
+                                                       # --status (`~/.config/miniteams/follow.json`)
 uv run miniteams watch --thread 19:xxx@thread.v2 --once   # one JSON line per matching live event
                                                        # (spec 009; docs/watch.md)
 uv run miniteams dump             # dump your Notes' full history (oldest → newest)
@@ -110,6 +114,16 @@ API is called or `read_messages` meets an app card due a refresh (with no token:
 same flow. The server needs the project's `.env` and `data/`, so register it as
 `uv run --directory /path/to/miniteams miniteams mcp` (a gitignored `.mcp.json` at the repo root
 does it for Claude Code).
+
+`follow` (spec 044, in progress: followers only log their start and stop for now) starts one
+follower per call when you join it from any device, and signals it when the call ends for you. The
+trigger runs on its own socket (`miniteams follow`) or on the archiver's (`archive --live --follow`); each
+follower is a detached process, `miniteams follow --call`, so restarting the trigger's host leaves it
+running. A lock per call (`<data-dir>/follow/<call>.lock`, its log beside it) keeps it to one follower,
+whatever the device, the redelivery or the number of triggers. Off, or the chat in the skip list: the
+call is logged as skipped, nothing starts. Both need the `transcript` extra
+(`uv sync --inexact --extra transcript`: `--inexact` keeps the `widget` extra) and refuse to start
+without it; no other command does.
 
 `dump --jsonl` emits one full-detail record per message (raw resource + resolved sender/thread
 + attachment refs + reactions), every message type, no media download — pipe-friendly.

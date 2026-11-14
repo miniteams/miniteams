@@ -18,6 +18,8 @@ dependencies = [
 # `miniteams widget`, the native window (spec 024): `uv sync --extra widget`
 [project.optional-dependencies]
 widget = ["pyside6-essentials>=6.12", "pyside6-addons>=6.12", "pyside6-webengine>=6.12"]
+# `miniteams follow`, the meeting follower's speech to text (spec 044): `uv sync --inexact --extra transcript`
+transcript = ["numpy>=2.3", "onnxruntime>=1.23", "faster-whisper>=1.2"]
 
 [project.scripts]
 miniteams = "miniteams.cli:main"
