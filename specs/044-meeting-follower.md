@@ -209,5 +209,23 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
     0.27 s CPU). The same capture paced on its RTP clock through `Session` (parakeet): 12 lines on 3
     speakers, latency median 1.19 s, p90 1.98 s, max 3.0 s. `aioice` and `pylibsrtp` against Teams: _live,
     to fill_.
-  - Q1 leave detection, Q2 join from the push per call kind: _live, to fill_ (prototype follower
-    running: probe unit joins every meeting I join through S18's client, captures Trouter and RTP).
+  - Q1 leave detection, live in a test tenant, 2026-11-14 (two devices of mine plus the S18 client, two
+    talkers):
+    - `evt 115` fires once, on my first endpoint's join; neither a second device nor the follower pushes
+      one. `evt 116` fires once, when the last endpoint of my account leaves, the follower included: never
+      while the follower is in the call.
+    - My roster entry is one participant whose `call.mediaStreams` holds one `main-audio` stream per
+      endpoint; each device leaving drops its stream from the next `Full` rosterUpdate (~1 s).
+      `details.endpointId` is zeros and `participantLink` is shared, so the follower recognises itself by
+      its own audio MSI, `a=x-source-streamid` on the `main-audio` m-line of the server's answer SDP.
+    - Leave rule: the follower leaves when my roster entry has no `main-audio` stream but its own. The
+      trigger's stop on `evt 116` only covers the follower already gone or the call over.
+  - Q2 join from the push:
+    - Meeting and ad hoc group call: the push carries `groupContext` and `meetingInfo` (for a group call
+      the caller is the organizer, `messageId` "0"); the meetup-join link built from it attaches to the
+      live call.
+    - 1:1 call: the push has `conversationController` and `additionalData.participantList` but no
+      `groupContext` nor `meetingInfo`; an `evt 107` (incoming call, `links.attach`) precedes it. The join
+      must go straight to `join_conversation_with_sdp` on the push's `conversationController`: not tried.
+  - Q3 live (`aioice`, `pylibsrtp` against Teams) and the 1:1 join are settled by Phase 3's first slice,
+    in the test tenant; if either fails, Phase 3 stops at that fork.
