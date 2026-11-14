@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import Literal, Self
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -166,6 +166,17 @@ class Settings(BaseSettings):
         if self.vad_cut_search_s >= self.vad_max_speech_s:
             raise ValueError("vad_cut_search_s must be below vad_max_speech_s")
         return self
+
+    # The calling conversation service (spec 044): runtime state from the last skype token exchange, no env.
+    _conversation_url: str = PrivateAttr("")
+
+    @property
+    def conversation_url(self) -> str:
+        return self._conversation_url
+
+    @conversation_url.setter
+    def conversation_url(self, url: str) -> None:
+        self._conversation_url = url
 
     @property
     def authority(self) -> str:

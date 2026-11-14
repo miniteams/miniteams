@@ -429,7 +429,7 @@ def test_follow_refuses_to_start_without_the_model(argv: list[str], monkeypatch:
     monkeypatch.setattr(F, "run_call", lambda *_a: pytest.fail("joined a call it cannot transcribe"))
     with capture_logs() as logs:
         assert cli.main(argv) == 1
-    (event,) = [e for e in logs if e["event"] == "follow_stt_missing"]
+    (event,) = [e for e in logs if e["event"] == "follow_not_ready"]
     assert event["engine"] == "parakeet"
     assert event["fix"].startswith("libtranscribe missing at ")
     assert event["fix"].endswith("/scripts/build-transcribe.sh parakeet`")

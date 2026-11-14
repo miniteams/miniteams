@@ -28,7 +28,7 @@ from ._io import force_blocking_stdout
 from .auth import AuthExpired, TokenSource, token_source
 from .config import Settings
 from .directory import Directory
-from .messages import _decode_body, decode_event, emit_raw_delivery, emit_raw_named, handle_delivery
+from .messages import decode_body, decode_event, emit_raw_delivery, emit_raw_named, handle_delivery
 from .presence import PATHS as PRESENCE_PATHS
 from .skype import exchange_skype_token
 from .trouter import common_query, get_or_create_epid, handshake, trouter_info
@@ -66,6 +66,7 @@ AGENT_PATH = "/callAgent/"  # a joined call's own callbacks (spec 044), on the s
 # The Teams session: up, down (reconnecting) or login (waiting for a `miniteams login`).
 LinkState = Literal["up", "down", "login"]
 LinkHook = Callable[[LinkState], None]
+ErrorHook = Callable[[str, BaseException], None]  # a failed attempt: ("sign-in" | "Trouter", its error)
 
 
 async def off_loop[T](fn: Callable[..., T], *args: Any, name: str = "") -> T:
@@ -102,6 +103,15 @@ def _correlation_vector() -> str:
     return base64.b64encode(os.urandom(16)).decode().rstrip("=")[:22]
 
 
+def ack(req: dict[str, Any], headers: dict[str, str] | None = None) -> str:
+    """The 200 a delivery is answered with."""
+    out: dict[str, Any] = {"id": req.get("id"), "status": 200}
+    if headers is not None:
+        out["headers"] = headers
+    out["body"] = ""
+    return json.dumps(out, separators=(",", ":"))
+
+
 def agent_ack(req: dict[str, Any]) -> str:
     """A call callback's response: without the request's MS-CV + ".0", its trouter-request and a
     trouter-client header, the call controller redelivers and then ends the call with 408/10056."""
@@ -112,7 +122,7 @@ def agent_ack(req: dict[str, Any]) -> str:
     if treq := headers.get("trouter-request"):
         out["trouter-request"] = treq
     out["trouter-client"] = '{"cd":1}'
-    return json.dumps({"id": req.get("id"), "status": 200, "headers": out, "body": ""}, separators=(",", ":"))
+    return ack(req, out)
 
 
 class TrouterClient:
@@ -366,11 +376,7 @@ class TrouterClient:
             return
         agent = self.on_agent is not None and AGENT_PATH in str(req.get("url") or "")
         # Ack regardless of whether we print anything — missing acks cause redelivery/disconnect.
-        if agent:
-            ack = agent_ack(req)
-        else:
-            ack = json.dumps({"id": req.get("id"), "status": 200, "body": ""}, separators=(",", ":"))
-        await self._ws.send(f"3:::{ack}")
+        await self._ws.send(f"3:::{agent_ack(req) if agent else ack(req)}")
         if agent and self.on_agent is not None:
             try:
                 await self.on_agent(req)
@@ -385,7 +391,7 @@ class TrouterClient:
                 log.warning("call_hook_failed", error=str(exc), error_type=type(exc).__name__)
         elif self.on_presence is not None and str(req.get("url") or "").endswith(PRESENCE_PATHS):
             try:
-                await self.on_presence(_decode_body(req) or {})
+                await self.on_presence(decode_body(req) or {})
             except Exception as exc:  # noqa: BLE001 — a bad presence frame must not drop the socket
                 log.warning("presence_hook_failed", error=str(exc), error_type=type(exc).__name__)
         elif self.on_event is not None:
@@ -506,6 +512,7 @@ async def run_forever(
     on_link: LinkHook | None = None,
     on_call: CallHook | None = None,
     on_agent: CallHook | None = None,
+    on_error: ErrorHook | None = None,
 ) -> None:
     """Re-establish a full session on every disconnect.
 
@@ -543,10 +550,12 @@ async def run_forever(
     backoff = 1.0
     while True:
         connected_at: float | None = None
+        step = "sign-in"
         try:
             # Silent; AuthExpired when the refresh token is dead.
             aad = await off_loop(tokens.refresh)
             skype = await off_loop(exchange_skype_token, settings, aad["access_token"])
+            step = "Trouter"
             skype_token = skype["skype_token"]
             directory.set_token(skype_token, str(aad["access_token"]))
             epid = epid or get_or_create_epid(settings, epid_name)
@@ -597,7 +606,9 @@ async def run_forever(
             backoff = 1.0
             continue
         except Exception as exc:  # noqa: BLE001 — any other failure is recoverable via reconnect
-            log.warning("stream_error", error=str(exc), error_type=type(exc).__name__)
+            log.warning("stream_error", step=step, error=str(exc), error_type=type(exc).__name__)
+            if on_error is not None:
+                on_error(step, exc)
 
         if connected_at is not None and time.monotonic() - connected_at > _STABLE_AFTER:
             backoff = 1.0

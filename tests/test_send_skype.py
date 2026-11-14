@@ -174,7 +174,8 @@ def test_exchange_skype_token_tokens_shape(settings: Settings, monkeypatch) -> N
         lambda *a, **k: _Resp({"tokens": {"skypeToken": "ST", "expiresIn": 3600}, "region": "fr"}),
     )
     out = skype.exchange_skype_token(settings, "aad")
-    assert out == {"skype_token": "ST", "expires_in": 3600, "region": "fr", "conversation_url": ""}
+    assert out == {"skype_token": "ST", "expires_in": 3600, "region": "fr"}
+    assert settings.conversation_url == ""
 
 
 def test_exchange_skype_token_legacy_shape(settings: Settings, monkeypatch) -> None:
@@ -350,4 +351,5 @@ def test_exchange_skype_token_names_the_conversation_service(settings: Settings,
     url = "https://api-emea.flightproxy.teams.microsoft.invalid/api/v2/epconv"
     reply = {"tokens": {"skypeToken": "ST"}, "regionGtms": {"calling_conversationServiceUrl": url}}
     monkeypatch.setattr(skype.httpx, "post", lambda *a, **k: _Resp(reply))
-    assert skype.exchange_skype_token(settings, "aad")["conversation_url"] == url
+    skype.exchange_skype_token(settings, "aad")
+    assert settings.conversation_url == url

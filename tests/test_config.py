@@ -17,6 +17,16 @@ def test_authority_and_scope() -> None:
     assert s.scope_list == ["https://api.spaces.skype.com/.default"]
 
 
+def test_the_conversation_service_is_runtime_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the skype token exchange sets it: no env var, not dumped."""
+    monkeypatch.setenv("MINITEAMS_CONVERSATION_URL", "https://env.invalid/epconv")
+    s = Settings(tenant_id="abc")
+    assert s.conversation_url == "" and "conversation_url" not in s.model_dump()
+    s.conversation_url = "https://conv.invalid/epconv"
+    assert s.conversation_url == "https://conv.invalid/epconv"
+    assert Settings(tenant_id="abc").conversation_url == ""  # per instance
+
+
 def test_media_dir_under_cache(tmp_path) -> None:
     s = Settings(tenant_id="abc")
     s.cache_dir = tmp_path

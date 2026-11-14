@@ -821,7 +821,7 @@ def test_044_ac9_an_unreadable_lock_costs_only_live(settings: Settings, followed
     assert [r["message_id"] for r in listing["recordings"]] == ["r1", "r2"]
     assert [f["live"] for f in listing["follows"]] == [False, False, False]
     assert not page["error"] and page["total"] == 5 and page["live"] is False
-    assert {e["event"] for e in logs} >= {"follow_lock_unreadable"}
+    assert {e["event"] for e in logs} >= {"follow_live_check_failed"}
 
 
 @pytest.mark.parametrize("bad", ["../../index", "*", f"{CALL}/..", CALL[:-1], f"{CALL}.ndjson"])

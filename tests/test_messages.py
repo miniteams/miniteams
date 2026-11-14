@@ -9,8 +9,8 @@ from miniteams import messages as M
 from miniteams.compose import reply_quote
 from miniteams.directory import Directory
 from miniteams.messages import (
-    _decode_body,
     _print_reactions,
+    decode_body,
     emit_raw_delivery,
     emit_raw_named,
     event_to_record,
@@ -33,29 +33,29 @@ def b64(obj: Any) -> str:
 
 def test_decode_plain_body() -> None:
     req = {"body": json.dumps({"type": "EventMessage"})}
-    assert _decode_body(req) == {"type": "EventMessage"}
+    assert decode_body(req) == {"type": "EventMessage"}
 
 
 def test_decode_gzip_header() -> None:
     inner = {"type": "EventMessage", "resource": {"x": 1}}
     req = {"headers": {"X-Microsoft-Skype-Content-Encoding": "gzip"}, "body": gzip_b64(inner)}
-    assert _decode_body(req) == inner
+    assert decode_body(req) == inner
 
 
 def test_decode_cp_member_is_gzipped() -> None:
     payload = {"type": "EventMessage", "resource": {"a": 2}}
     req = {"body": json.dumps({"cp": gzip_b64(payload)})}
-    assert _decode_body(req) == payload
+    assert decode_body(req) == payload
 
 
 def test_decode_gp_member_is_plain_base64() -> None:
     payload = {"type": "EventMessage", "resource": {"b": 3}}
     req = {"body": json.dumps({"gp": b64(payload)})}
-    assert _decode_body(req) == payload
+    assert decode_body(req) == payload
 
 
 def test_decode_empty_body_returns_none() -> None:
-    assert _decode_body({}) is None
+    assert decode_body({}) is None
 
 
 def test_strip_html_unescapes_and_removes_tags() -> None:

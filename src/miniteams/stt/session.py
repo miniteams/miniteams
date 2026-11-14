@@ -23,7 +23,7 @@ import numpy.typing as npt
 import structlog
 
 from ..config import Settings
-from ..follow import _follow_dir
+from ..follow import follow_dir, transcript_path
 from .engines import STOP_GRACE_S, ProcessEngine, Transcribe, argv
 from .line import Line
 from .pipeline import Pipeline, Utterance
@@ -62,14 +62,13 @@ def transcript_header(
 
 
 class Transcript:
-    """`<data-dir>/follow/<YYYY-MM>/<started>-<call>.ndjson`: a header, then one line per utterance,
-    each in one write() so another process reads whole lines as soon as they land (044-AC8)."""
+    """transcript_path's file: a header, then one line per utterance, each in one write() so another
+    process reads whole lines as soon as they land (044-AC8)."""
 
     def __init__(self, data_dir: Path, call: str, started: float, header: dict[str, Any]) -> None:
-        day = datetime.fromtimestamp(started, UTC)
-        month = _follow_dir(data_dir) / f"{day:%Y-%m}"
-        month.mkdir(mode=0o700, exist_ok=True)
-        self.path = month / f"{day:%Y%m%dT%H%M%SZ}-{call}.ndjson"
+        follow_dir(data_dir)
+        self.path = transcript_path(data_dir, call, started)
+        self.path.parent.mkdir(mode=0o700, exist_ok=True)
         self._fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         self.write(header)
 

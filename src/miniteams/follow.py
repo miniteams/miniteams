@@ -4,16 +4,15 @@
 process; `evt 116` (the call ended for me) signals it. The follower holds `<data-dir>/follow/<call>.lock`
 (flock) for its whole life: the kernel drops it on any exit, a crash included.
 
-`evt 116` also appends the ended join's `userJoinTime` to `<call>.ended`: a follower of that join not
-yet holding its lock, or launched by another trigger, reads it once locked and stops; a redelivered
-115 of that join is skipped. A rejoin of the same call has another join time: neither is touched by it.
-A follower that ends on its own (my last device left, the call ended, the join failed) appends its join
-time too and exits without waiting for evt 116, which only comes once the follower is gone. Its lock is
-freed once its hang-up and transcript close are done; my rejoin's 115 may come before that, and the
-rejoin's follower then waits up to _LEAVE_S for the lock.
+`<call>.ended` lists the joins of the call that ended (mark_ended names its writers): a follower of such
+a join, not yet holding its lock or launched by another trigger, stops once locked; a redelivered 115 of
+it is skipped. A rejoin of the same call has another join time: neither is touched by it. A follower
+ending on its own exits without waiting for evt 116, which only comes once it is gone; its lock is freed
+once its hang-up and transcript close are done, and my rejoin's follower waits up to _LEAVE_S for it.
 
-The follower's main thread only waits for the stop signal; a thread of its own joins, transcribes and
-leaves the call (`miniteams.call`, the `transcript` extra).
+This module owns the layout of `<data-dir>/follow/`: locks, markers, logs and transcripts. The follower's
+main thread only waits for the stop signal; a thread of its own joins, transcribes and leaves the call
+(`miniteams.follower`, the `transcript` extra).
 """
 
 import contextlib
@@ -30,13 +29,14 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import structlog
 
 from .config import Settings, write_private
-from .messages import _gunzip_b64
+from .messages import delivery_json, unwrap_payload
 from .presence import dm_ids, same_chat
 from .stream import CallHook
 
@@ -95,12 +95,18 @@ def stt_ready(settings: Settings) -> str | None:
     return None
 
 
+def as_dict(value: Any) -> dict[str, Any]:
+    """`value` when a dict, else empty: a JSON field of a shape we cannot rely on."""
+    return value if isinstance(value, dict) else {}
+
+
 def decode_push(req: dict[str, Any]) -> tuple[int, dict[str, Any]] | None:
-    """`{"evt": int, "cp": base64 gzip JSON}` → (evt, payload); None when it is not that shape."""
+    """`{"evt": int, "cp" | "gp": payload}`, in any delivery encoding → (evt, payload); None when it is not
+    that shape."""
     try:
-        outer = json.loads(req.get("body") or "")
-        evt, cp = outer["evt"], outer["cp"]
-        payload = json.loads(_gunzip_b64(cp))
+        outer = delivery_json(req)
+        evt = outer["evt"]
+        payload = unwrap_payload(outer) if "cp" in outer or "gp" in outer else None
     except ValueError, KeyError, TypeError, OSError, EOFError:
         return None
     if not isinstance(evt, int) or not isinstance(payload, dict):
@@ -108,10 +114,15 @@ def decode_push(req: dict[str, Any]) -> tuple[int, dict[str, Any]] | None:
     return evt, payload
 
 
+def is_call_id(value: Any) -> bool:
+    """A UUID: a call id names files."""
+    return isinstance(value, str) and _UUID.fullmatch(value) is not None
+
+
 def call_id(payload: dict[str, Any]) -> str | None:
-    """The correlationId, only when it is a UUID: it names a file."""
+    """The correlationId, only when it is a call id."""
     value = payload.get("correlationId")
-    return value if isinstance(value, str) and _UUID.fullmatch(value) else None
+    return value if is_call_id(value) else None
 
 
 def is_one_to_one(payload: dict[str, Any]) -> bool:
@@ -119,17 +130,15 @@ def is_one_to_one(payload: dict[str, Any]) -> bool:
     return not payload.get("groupContext") and not payload.get("meetingInfo")
 
 
-def thread_of(payload: dict[str, Any]) -> str:
+def call_thread(payload: dict[str, Any]) -> str:
     """The call's chat. A 1:1 push names none: its two participants give the 1:1 chat's id, sorted (Teams'
     usual spelling, not always its own: compare 1:1 ids with same_chat)."""
-    group = payload.get("groupContext")
-    thread = group.get("threadId") if isinstance(group, dict) else None
+    thread = as_dict(payload.get("groupContext")).get("threadId")
     if isinstance(thread, str) and thread:
         return thread
     if not is_one_to_one(payload):
         return ""
-    extra = payload.get("additionalData")
-    people = extra.get("participantList") if isinstance(extra, dict) else None
+    people = as_dict(payload.get("additionalData")).get("participantList")
     mris = [str(p.get("id")) for p in people if isinstance(p, dict)] if isinstance(people, list) else []
     ids = dm_ids(*mris) if len(mris) == 2 else ()
     return min(ids) if ids else ""
@@ -138,7 +147,7 @@ def thread_of(payload: dict[str, Any]) -> str:
 def call_kind(payload: dict[str, Any]) -> str:
     if is_one_to_one(payload):
         return "1:1"
-    return "meeting" if thread_of(payload).startswith("19:meeting_") else "group"
+    return "meeting" if call_thread(payload).startswith("19:meeting_") else "group"
 
 
 # --- switch and skip list ---
@@ -158,8 +167,8 @@ def load_switch(settings: Settings) -> tuple[bool, list[str]] | None:
     except (OSError, ValueError) as exc:
         log.error("follow_config_unreadable", path=str(path), error=str(exc))
         return None
-    enabled = data.get("enabled") if isinstance(data, dict) else None
-    skip = data.get("skip", []) if isinstance(data, dict) else None
+    config = as_dict(data)
+    enabled, skip = config.get("enabled"), config.get("skip", [])
     if (
         not isinstance(enabled, bool)
         or not isinstance(skip, list)
@@ -174,10 +183,10 @@ def save_switch(settings: Settings, enabled: bool, skip: list[str]) -> None:
     write_private(_switch_path(settings), json.dumps({"enabled": enabled, "skip": skip}, indent=2) + "\n")
 
 
-# --- per-call lock ---
+# --- the follow dir: per-call lock, marker, log; transcripts ---
 
 
-def _follow_dir(data_dir: Path) -> Path:
+def follow_dir(data_dir: Path) -> Path:
     path = data_dir / "follow"
     path.mkdir(parents=True, exist_ok=True)
     if stat.S_IMODE(path.stat().st_mode) & 0o077:  # mkdir's mode leaves an existing dir as it was
@@ -194,7 +203,7 @@ def lock_path(data_dir: Path, call: str) -> Path:
 
 def take_lock(path: Path, tries: int = _LOCK_TRIES) -> int | None:
     """An fd holding the exclusive flock on `path`, or None when another process holds it."""
-    _follow_dir(path.parent.parent)
+    follow_dir(path.parent.parent)
     # O_RDWR: on NFS flock becomes a POSIX lock, whose exclusive form needs a writable fd.
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     for attempt in range(tries):
@@ -226,15 +235,35 @@ def ended_joins(data_dir: Path, call: str) -> set[str]:
 
 
 def mark_ended(data_dir: Path, call: str, join: str) -> None:
+    """Records `join` of `call` as ended, once: a join already listed is not added again. Writers: the
+    trigger on evt 116, first, whatever runs; a follower ending on its own (not stopped), before its
+    hang-up when it was in the call (that hang-up's 116 may be followed at once by my rejoin's 115, which
+    must find this join ended), and run_call once it returned, whatever its outcome."""
     if not join:
         return  # nothing to match a follower or a redelivery against
-    path = _follow_dir(data_dir) / f"{call}.ended"
+    path = follow_dir(data_dir) / f"{call}.ended"
+    if join in ended_joins(data_dir, call):
+        return
     # O_APPEND: a concurrent 116 of another join adds its line, never replaces this one.
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         os.write(fd, f"{join}\n".encode())
     finally:
         os.close(fd)
+
+
+def transcript_path(data_dir: Path, call: str, started: float) -> Path:
+    """`<data-dir>/follow/<YYYY-MM>/<started>-<call>.ndjson`: names sort by start."""
+    day = datetime.fromtimestamp(started, UTC)
+    return data_dir / "follow" / f"{day:%Y-%m}" / f"{day:%Y%m%dT%H%M%SZ}-{call}.ndjson"
+
+
+def transcript_files(data_dir: Path, call: str = "*") -> list[tuple[str, Path]]:
+    """(call, transcript) of followed calls, of `call` or every one, oldest first. A rejoin of a call
+    writes another file under the same call id."""
+    paths = sorted((data_dir / "follow").glob(f"*/*-{call}.ndjson"), key=lambda p: p.name)
+    named = [(p.stem.split("-", 1)[1], p) for p in paths]
+    return [(c, p) for c, p in named if is_call_id(c)]
 
 
 def lock_held(path: Path) -> bool:
@@ -255,26 +284,31 @@ def lock_held(path: Path) -> bool:
 # --- trigger ---
 
 
-def follower_command(data_dir: Path, payload: dict[str, Any]) -> list[str]:
+def follower_command(settings: Settings, data_dir: Path, payload: dict[str, Any]) -> list[str]:
+    """The trigger's own log level and capture dir go along."""
+    capture = ["--capture", str(settings.follow_capture)] if settings.follow_capture else []
     return [
         sys.executable,
         "-P",  # no cwd on sys.path: the data dir's parent is not code
         "-m",
         "miniteams",
+        "--log-level",
+        settings.log_level,
         "follow",
         "--data-dir",
         str(data_dir),
+        *capture,
         "--call",
         json.dumps(payload),
     ]
 
 
-def launch(data_dir: Path, call: str, payload: dict[str, Any]) -> subprocess.Popen[bytes]:
+def launch(settings: Settings, data_dir: Path, call: str, payload: dict[str, Any]) -> subprocess.Popen[bytes]:
     """Own session: a restart (or Ctrl-C) of the trigger's host leaves the follower running."""
-    log_file = _follow_dir(data_dir) / f"{call}.log"
+    log_file = follow_dir(data_dir) / f"{call}.log"
     with os.fdopen(os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "ab") as out:
         proc = subprocess.Popen(
-            follower_command(data_dir, payload),
+            follower_command(settings, data_dir, payload),
             stdin=subprocess.DEVNULL,
             stdout=out,
             stderr=subprocess.STDOUT,
@@ -308,7 +342,7 @@ def _winding_down(data_dir: Path, call: str, join: str) -> bool:
     return bool(join) and running is not None and running != join and running in ended_joins(data_dir, call)
 
 
-def stop(data_dir: Path, call: str, payload: dict[str, Any]) -> None:
+def stop_follower(data_dir: Path, call: str, payload: dict[str, Any]) -> None:
     join = join_time(payload)
     # First, whatever runs: a follower between its launch and its pid line reads it once locked.
     try:
@@ -350,9 +384,9 @@ def handle(settings: Settings, data_dir: Path, req: dict[str, Any]) -> None:
         log.warning("call_push_bad_id", evt=evt)
         return
     if evt == EVT_ENDED:
-        stop(data_dir, call, payload)
+        stop_follower(data_dir, call, payload)
         return
-    thread = thread_of(payload)
+    thread = call_thread(payload)
     # Unreadable = off: following a call the user may have excluded is worse than missing one.
     enabled, skip = load_switch(settings) or (False, [])
     skipped = any(same_chat(thread, s) for s in skip)
@@ -370,7 +404,7 @@ def handle(settings: Settings, data_dir: Path, req: dict[str, Any]) -> None:
     if join and join in ended:  # a redelivered 115 of the join a 116 already ended
         log.info("follow_skipped", call=call, thread=thread, reason="ended")
         return
-    launch(data_dir, call, payload)
+    launch(settings, data_dir, call, payload)
 
 
 def trigger(settings: Settings, data_dir: Path) -> CallHook:
@@ -385,7 +419,9 @@ def trigger(settings: Settings, data_dir: Path) -> CallHook:
             try:
                 handle(settings, data_dir, req)
             except Exception as exc:  # noqa: BLE001 — a bad push must not stop the trigger
-                log.warning("call_hook_failed", error=str(exc), error_type=type(exc).__name__, exc_info=True)
+                log.warning(
+                    "follow_trigger_failed", error=str(exc), error_type=type(exc).__name__, exc_info=True
+                )
 
     threading.Thread(target=work, name="follow-trigger", daemon=True).start()
 
@@ -398,21 +434,21 @@ def trigger(settings: Settings, data_dir: Path) -> CallHook:
 # --- follower ---
 
 
-def _attend(data_dir: Path, payload: dict[str, Any], stop: threading.Event) -> str:
+def _attend(settings: Settings, data_dir: Path, payload: dict[str, Any], stop: threading.Event) -> str:
     """Joins the call and transcribes it until `stop` is set or the call ends; the outcome."""
     import asyncio
 
-    from .call import follow  # the transcript extra: never loaded by the trigger's hosts
+    from .follower import follow  # the transcript extra: never loaded by the trigger's hosts
 
     try:
-        return asyncio.run(follow(Settings(), data_dir, payload, stop))  # type: ignore[call-arg]
+        return asyncio.run(follow(settings, data_dir, payload, stop))
     # A stray CancelledError too: else the thread dies with no outcome and the process lingers to 116.
     except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 — the lock and the stop line outlive any failure
         log.error("follow_failed", error=str(exc), error_type=type(exc).__name__, exc_info=True)
         return "error"
 
 
-def run_call(data_dir: Path, push_json: str) -> int:
+def run_call(settings: Settings, data_dir: Path, push_json: str) -> int:
     try:
         payload = json.loads(push_json)
     except ValueError:
@@ -438,19 +474,15 @@ def run_call(data_dir: Path, push_json: str) -> int:
         if join and join in ended_joins(data_dir, call):
             log.info("follow_stop", call=call, reason="ended_before_start")
             return 0
-        thread = thread_of(payload)
-        log.info("follow_start", call=call, thread=thread, kind=call_kind(payload))
-        stop, main = threading.Event(), threading.get_ident()
+        log.info("follow_start", call=call, thread=call_thread(payload), kind=call_kind(payload))
+        stop_event, main = threading.Event(), threading.get_ident()
         outcome: list[str] = []
 
         def attend() -> None:
-            outcome.append(_attend(data_dir, payload, stop))
-            if not stop.is_set():
-                # A redelivered 115 of this join is skipped from now on; a rejoin has its own join time.
-                # follow() marked an ended call itself, before its hang-up: once is enough.
-                try:
-                    if join not in ended_joins(data_dir, call):
-                        mark_ended(data_dir, call, join)
+            outcome.append(_attend(settings, data_dir, payload, stop_event))
+            if not stop_event.is_set():
+                try:  # see mark_ended
+                    mark_ended(data_dir, call, join)
                 except OSError as exc:
                     log.warning("follow_ended_marker_failed", call=call, error=str(exc))
                 signal.pthread_kill(main, _DONE)
@@ -459,7 +491,7 @@ def run_call(data_dir: Path, push_json: str) -> int:
         worker = threading.Thread(target=attend, name="follower", daemon=True)
         worker.start()
         sig = signal.sigwait({*_SIGNALS, _DONE})
-        stop.set()
+        stop_event.set()
         worker.join(_LEAVE_S)
         if sig == _DONE:
             log.info("follow_stop", call=call, reason=outcome[0])

@@ -38,7 +38,7 @@ from .drafts import (
     notes_thread_id,
     unused_client_id,
 )
-from .follow import call_id, lock_held, lock_path
+from .follow import is_call_id, lock_held, lock_path, transcript_files
 from .http import failure
 from .mcp_api import ApiReader
 from .messages import (
@@ -507,22 +507,14 @@ class Archive:
             result["next_offset"] = offset + limit
         return result
 
-    def _follow_files(self, call: str) -> list[Path]:
-        """Transcripts of followed calls (spec 044), oldest first: `<started>-<call>.ndjson` names sort by
-        start. A rejoin of a call writes another file under the same call id."""
-        return sorted((self.data_dir / "follow").glob(f"*/*-{call}.ndjson"), key=lambda p: p.name)
-
     def follows(self, thread_id: str) -> list[dict[str, Any]]:
         """One entry per transcript file whose header names `thread_id`; `live` while its follower holds
         the call's lock (only the call's newest file can still grow)."""
         # ponytail: reads every header per listing; an index if the follow dir grows to thousands of files
-        files = self._follow_files("*")
-        newest = {p.stem.split("-", 1)[1]: p for p in files}
+        files = transcript_files(self.data_dir)
+        newest = dict(files)
         found: list[dict[str, Any]] = []
-        for path in files:
-            call = path.stem.split("-", 1)[1]
-            if not call_id({"correlationId": call}):
-                continue
+        for call, path in files:
             try:
                 with path.open("rb") as f:
                     first = f.readline()
@@ -550,17 +542,17 @@ class Archive:
         try:
             return lock_held(lock_path(self.data_dir, call))
         except OSError as exc:  # a lock this reader cannot open must not cost the listing
-            log.warning("follow_lock_unreadable", call=call, error=str(exc))
+            log.warning("follow_live_check_failed", call=call, error=str(exc))
             return False
 
     def follow(self, thread_id: str, call: str, offset: int, limit: int) -> dict[str, Any]:
         """A followed call's lines across its transcript files, paged; header fields per join."""
-        if not call_id({"correlationId": call}):  # it names files: a UUID only, as the follower wrote it
+        if not is_call_id(call):  # it names files, as the follower wrote them
             raise ToolError(f"not a call id: {call!r}")
         header: dict[str, Any] = {}
         joins: list[dict[str, Any]] = []
         lines: list[dict[str, Any]] = []
-        for path in self._follow_files(call):
+        for _, path in transcript_files(self.data_dir, call):
             try:
                 # The last line may still be half written: only newline-terminated lines are whole.
                 raw = path.read_bytes().split(b"\n")[:-1]

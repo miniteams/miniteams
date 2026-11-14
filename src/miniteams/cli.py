@@ -547,13 +547,10 @@ def cmd_names(settings: Settings, args: argparse.Namespace) -> int:
 
 def _follow_extra_ok(settings: Settings) -> bool:
     """044-AC10, AC15: a call it cannot transcribe is never joined."""
-    from .follow import EXTRA_HINT, missing_extra, stt_ready
+    from .follow import stt_ready
 
-    if missing := missing_extra():
-        log.error("follow_extra_missing", missing=missing, hint=EXTRA_HINT)
-        return False
     if fix := stt_ready(settings):
-        log.error("follow_stt_missing", engine=settings.stt_engine, fix=fix)
+        log.error("follow_not_ready", engine=settings.stt_engine, fix=fix)
         return False
     return True
 
@@ -565,12 +562,11 @@ def cmd_follow(settings: Settings, args: argparse.Namespace) -> int:
 
     data_dir = Path(args.data_dir)
     if args.capture:
-        # By the environment: the followers the trigger launches, and `--call`'s own Settings, read it.
-        os.environ["MINITEAMS_FOLLOW_CAPTURE"] = str(Path(args.capture).resolve())
+        settings.follow_capture = Path(args.capture).resolve()
     if args.call is not None:
         if not _follow_extra_ok(settings):
             return 1
-        return follow.run_call(data_dir.resolve(), args.call)
+        return follow.run_call(settings, data_dir.resolve(), args.call)
     if args.enable or args.disable or args.skip or args.unskip or args.status:
         switch = follow.load_switch(settings)
         if switch is None:

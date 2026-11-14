@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 import structlog
 from structlog.testing import capture_logs
+from test_stream import _client
 
 from miniteams import archive_live as AL
 from miniteams import cli
@@ -30,7 +31,6 @@ from miniteams import stream as S
 from miniteams.archive import StaticToken
 from miniteams.config import Settings
 from miniteams.directory import Directory
-from miniteams.stream import TrouterClient
 
 CALL = "00000000-0000-4000-8000-000000000001"
 OTHER = "00000000-0000-4000-8000-000000000002"
@@ -97,7 +97,7 @@ def _info_logs() -> None:
 @pytest.fixture
 def launches(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     seen: list[str] = []
-    monkeypatch.setattr(F, "launch", lambda _d, call, _p: seen.append(call))
+    monkeypatch.setattr(F, "launch", lambda _s, _d, call, _p: seen.append(call))
     return seen
 
 
@@ -126,7 +126,7 @@ def in_process(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """run_call in this process: no real signal mask, wait or wake-up (they would reach pytest), no real
     join, a SIGTERM stop; records waits."""
     waits: list[str] = []
-    monkeypatch.setattr(F, "_attend", lambda _d, _p, stop: "attended" if stop.wait(5) else "late")
+    monkeypatch.setattr(F, "_attend", lambda _s, _d, _p, stop: "attended" if stop.wait(5) else "late")
 
     def sigwait(_sigs: Any) -> int:
         waits.append("wait")
@@ -168,11 +168,23 @@ def test_decode_keeps_evt_and_classifies_the_call() -> None:
     assert [F.call_kind(p) for p in pushes] == ["meeting", "1:1", "group", "1:1"]
 
 
+def test_decode_reads_every_delivery_encoding() -> None:
+    """A transport-gzipped body, or a `gp` (base64 JSON) payload, decodes too."""
+    plain = _push(115)
+    gz = base64.b64encode(gzip.compress(plain["body"].encode())).decode()
+    zipped = {**plain, "headers": {"X-Microsoft-Skype-Content-Encoding": "gzip"}, "body": gz}
+    assert F.decode_push(zipped) == (115, _payload())
+    gp = base64.b64encode(json.dumps(_payload()).encode()).decode()
+    assert F.decode_push({"body": json.dumps({"evt": 116, "gp": gp})}) == (116, _payload())
+    assert F.decode_push({"body": json.dumps({"evt": 116})}) is None  # no payload
+    assert F.decode_push({"body": json.dumps([115])}) is None
+
+
 def test_044_a_blank_thread_with_meeting_info_is_no_1to1() -> None:
     """One predicate: neither groupContext nor meetingInfo. A blank thread next to meetingInfo is not it."""
     blank = {**_one_to_one(), "groupContext": {"threadId": "", "messageId": "0"}}
     blank["meetingInfo"] = _payload()["meetingInfo"]
-    assert not F.is_one_to_one(blank) and F.call_kind(blank) == "group" and F.thread_of(blank) == ""
+    assert not F.is_one_to_one(blank) and F.call_kind(blank) == "group" and F.call_thread(blank) == ""
     assert F.is_one_to_one({**_one_to_one(), "groupContext": None, "meetingInfo": None})
 
 
@@ -194,13 +206,13 @@ def _one_to_one(people: list[Any] | None = None) -> dict[str, Any]:
 
 def test_044_a_1to1_push_names_its_chat() -> None:
     """A 1:1 push has no thread: its two participants give the chat id, sorted, whatever their order."""
-    assert F.thread_of(_one_to_one()) == DM_SORTED
-    assert F.thread_of(_one_to_one([{"id": PEER}, {"id": ME}])) == DM_SORTED
+    assert F.call_thread(_one_to_one()) == DM_SORTED
+    assert F.call_thread(_one_to_one([{"id": PEER}, {"id": ME}])) == DM_SORTED
     assert F.call_kind(_one_to_one()) == "1:1"
     for people in ([{"id": ME}], [{"id": ME}, {"id": PEER}, {"id": OTHER}], [{"id": ME}, {"id": ME}]):
-        assert F.thread_of(_one_to_one(people)) == ""  # not two distinct people
-    assert F.thread_of({**_one_to_one(), "additionalData": None}) == ""
-    assert F.thread_of(_one_to_one([{"id": "28:bot"}, {"id": PEER}])) == ""  # no org user: no 1:1 id
+        assert F.call_thread(_one_to_one(people)) == ""  # not two distinct people
+    assert F.call_thread({**_one_to_one(), "additionalData": None}) == ""
+    assert F.call_thread(_one_to_one([{"id": "28:bot"}, {"id": PEER}])) == ""  # no org user: no 1:1 id
 
 
 @pytest.mark.parametrize("listed", [DM_SORTED, DM_UNSORTED])
@@ -271,9 +283,11 @@ def test_two_triggers_racing_on_one_lock(tmp_path: Path) -> None:
     assert not F.lock_held(path)
 
 
-def test_two_followers_of_one_call_leave_one_running(tmp_path: Path, procs: list[Any]) -> None:
+def test_two_followers_of_one_call_leave_one_running(
+    settings: Settings, tmp_path: Path, procs: list[Any]
+) -> None:
     """044-AC3: two real follower processes for one call: the second exits 0 on the held lock."""
-    cmd = F.follower_command(tmp_path, _payload())
+    cmd = F.follower_command(settings, tmp_path, _payload())
     procs.append(subprocess.Popen(cmd))
     _until(lambda: F.lock_held(F.lock_path(tmp_path, CALL)), "first follower holds the lock")
     second = subprocess.run(cmd, capture_output=True, timeout=30)
@@ -407,7 +421,7 @@ def test_end_while_the_pid_line_is_empty_stops_the_follower_once_locked(
     os.close(fd)
     assert killed == [] and [e["event"] for e in logs] == ["follow_lock_unreadable"]
     with capture_logs() as logs:
-        assert F.run_call(tmp_path, json.dumps(_payload())) == 0  # the follower's next step
+        assert F.run_call(settings, tmp_path, json.dumps(_payload())) == 0  # the follower's next step
     assert in_process == [] and not F.lock_held(F.lock_path(tmp_path, CALL))
     assert [(e["event"], e.get("reason")) for e in logs] == [("follow_stop", "ended_before_start")]
 
@@ -456,11 +470,12 @@ def test_a_stale_end_neither_blocks_nor_stops_a_starting_rejoin(
     F.handle(settings, tmp_path, _push(115, join=J2))  # redelivered while it is still starting
     assert launches == [CALL, CALL]  # the second launch loses the lock to the first
     with capture_logs() as logs:
-        assert F.run_call(tmp_path, json.dumps(_payload(join=J2))) == 0
+        assert F.run_call(settings, tmp_path, json.dumps(_payload(join=J2))) == 0
     assert [e["event"] for e in logs][0] == "follow_start" and in_process == ["wait"]
     F.handle(settings, tmp_path, _push(116, join=J2))
     with capture_logs() as logs:
-        assert F.run_call(tmp_path, json.dumps(_payload(join=J2))) == 0  # a J2 follower starting late
+        # a J2 follower starting late
+        assert F.run_call(settings, tmp_path, json.dumps(_payload(join=J2))) == 0
         F.handle(settings, tmp_path, _push(115, join=J2))  # redelivered after its end
     assert [(e["event"], e.get("reason")) for e in logs] == [
         ("follow_stop", "ended_before_start"),
@@ -482,7 +497,7 @@ def test_pushes_without_a_join_time(
     F.handle(settings, tmp_path, _push(115, join=""))
     assert launches == [CALL] and F.ended_path(tmp_path, CALL).read_text() == f"{JOIN}\n"
     with capture_logs() as logs:
-        assert F.run_call(tmp_path, json.dumps(_payload(join=""))) == 0
+        assert F.run_call(settings, tmp_path, json.dumps(_payload(join=""))) == 0
     assert [e["event"] for e in logs][0] == "follow_start" and in_process == ["wait"]
 
 
@@ -490,7 +505,7 @@ def test_pushes_without_a_join_time(
     "error", [PermissionError("not the owner"), OSError(errno.ENOTSUP, "no modes on this mount")]
 )
 def test_a_refused_chmod_costs_privacy_not_the_launch(
-    tmp_path: Path, procs: list[Any], monkeypatch: pytest.MonkeyPatch, error: OSError
+    settings: Settings, tmp_path: Path, procs: list[Any], monkeypatch: pytest.MonkeyPatch, error: OSError
 ) -> None:
     data = tmp_path / "data"
     (data / "follow").mkdir(parents=True)
@@ -501,7 +516,7 @@ def test_a_refused_chmod_costs_privacy_not_the_launch(
 
     monkeypatch.setattr(F.os, "chmod", refuse)
     with capture_logs() as logs:
-        procs.append(F.launch(data, CALL, _payload(call=CALL)))
+        procs.append(F.launch(settings, data, CALL, _payload(call=CALL)))
     assert "follow_dir_not_private" in [e["event"] for e in logs]
     assert (data / "follow" / f"{CALL}.log").exists()
 
@@ -510,7 +525,7 @@ def test_a_private_dir_is_not_chmodded_again(tmp_path: Path, monkeypatch: pytest
     (tmp_path / "follow").mkdir(mode=0o700)
     calls: list[Any] = []
     monkeypatch.setattr(F.os, "chmod", lambda *a: calls.append(a))
-    F._follow_dir(tmp_path)
+    F.follow_dir(tmp_path)
     assert calls == []
 
 
@@ -518,7 +533,7 @@ def test_per_call_files_are_private(settings: Settings, tmp_path: Path, procs: l
     data = tmp_path / "data"
     (data / "follow").mkdir(parents=True)
     os.chmod(data / "follow", 0o755)  # made by an older run, or by hand
-    procs.append(F.launch(data, CALL, _payload(call=CALL)))
+    procs.append(F.launch(settings, data, CALL, _payload(call=CALL)))
     F.handle(settings, data, _push(116, call=OTHER))
     modes = {
         f.name: stat.S_IMODE(f.stat().st_mode)
@@ -615,6 +630,13 @@ def test_odd_join_times_and_a_corrupt_marker(tmp_path: Path) -> None:
     assert JOIN in F.ended_joins(tmp_path, CALL)
 
 
+def test_a_join_is_marked_ended_once(tmp_path: Path) -> None:
+    """The follower and the trigger's 116 may both mark one join: one line, other joins still added."""
+    for join in (JOIN, JOIN, J2, JOIN):
+        F.mark_ended(tmp_path, CALL, join)
+    assert F.ended_path(tmp_path, CALL).read_text() == f"{JOIN}\n{J2}\n"
+
+
 def test_a_probe_does_not_make_a_starting_follower_give_up(tmp_path: Path) -> None:
     """A trigger's lock_held probe holding the lock for an instant: take_lock waits it out."""
     path = F.lock_path(tmp_path, CALL)
@@ -692,11 +714,11 @@ def test_join_and_end_back_to_back_leave_nothing_running(
     assert "ended_before_start" in log and "follow_start" not in log
 
 
-def test_a_follower_losing_the_race_is_reaped(tmp_path: Path, procs: list[Any]) -> None:
+def test_a_follower_losing_the_race_is_reaped(settings: Settings, tmp_path: Path, procs: list[Any]) -> None:
     """A long-running host leaves no zombie behind."""
     fd = F.take_lock(F.lock_path(tmp_path, CALL))
     try:
-        proc = F.launch(tmp_path, CALL, _payload())
+        proc = F.launch(settings, tmp_path, CALL, _payload())
         procs.append(proc)
         _until(lambda: proc.returncode is not None, "reaped without our wait")
     finally:
@@ -705,14 +727,14 @@ def test_a_follower_losing_the_race_is_reaped(tmp_path: Path, procs: list[Any]) 
     assert proc.returncode == 0
 
 
-def test_run_call_in_process(tmp_path: Path, in_process: list[str]) -> None:
+def test_run_call_in_process(settings: Settings, tmp_path: Path, in_process: list[str]) -> None:
     """The stub's own lines, measured in this process (the subprocess runs cover the real signals)."""
     with capture_logs() as logs:
-        assert F.run_call(tmp_path, "not json") == 2
-        assert F.run_call(tmp_path, json.dumps({"correlationId": "x"})) == 2
-        assert F.run_call(tmp_path, json.dumps(_payload())) == 0
+        assert F.run_call(settings, tmp_path, "not json") == 2
+        assert F.run_call(settings, tmp_path, json.dumps({"correlationId": "x"})) == 2
+        assert F.run_call(settings, tmp_path, json.dumps(_payload())) == 0
         fd = F.take_lock(F.lock_path(tmp_path, CALL))
-        assert F.run_call(tmp_path, json.dumps(_payload())) == 0
+        assert F.run_call(settings, tmp_path, json.dumps(_payload())) == 0
     assert fd is not None
     os.close(fd)
     events = [(e["event"], e.get("reason")) for e in logs]
@@ -724,207 +746,6 @@ def test_run_call_in_process(tmp_path: Path, in_process: list[str]) -> None:
         ("follow_already_running", None),
     ]
     assert in_process == ["wait"] and F.lock_path(tmp_path, CALL).read_text().strip().isdigit()
-
-
-# --- 044-AC13: registration on connect and re-register; hook isolation ---
-
-
-class _Ws:
-    def __init__(self) -> None:
-        self.sent: list[str] = []
-
-    async def send(self, data: str) -> None:
-        self.sent.append(data)
-
-
-def _client(settings: Settings, directory: Directory, **kw: Any) -> TrouterClient:
-    c = TrouterClient(
-        settings,
-        {"access_token": "a"},
-        "sk",
-        {"surl": "https://surl.invalid/s/"},
-        "sid",
-        "epid-1",
-        directory,
-        **kw,
-    )
-    c._ws = _Ws()
-    return c
-
-
-class _Registrar:
-    """Fake registrar: `ngc` / `messaging` = "ok", "fail" or "hang"; every body posted, in order."""
-
-    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self.bodies: list[dict[str, Any]] = []
-        self.ngc, self.messaging = "ok", "ok"
-        registrar = self
-
-        class _Http:
-            def __init__(self, *_a: Any, **_k: Any) -> None:
-                pass
-
-            async def __aenter__(self) -> _Http:
-                return self
-
-            async def __aexit__(self, *_: Any) -> bool:
-                return False
-
-            async def post(self, _url: str, headers: dict[str, str], json: Any) -> Any:
-                registrar.bodies.append(json)
-                ngc = json["clientDescription"]["appId"] == "NextGenCalling"
-                mode = registrar.ngc if ngc else registrar.messaging
-                if mode == "hang":
-                    await asyncio.Event().wait()
-                if mode == "fail":
-                    raise OSError("registrar down")
-                return type("R", (), {"status_code": 202, "raise_for_status": lambda self: None})()
-
-        monkeypatch.setattr(S.httpx, "AsyncClient", _Http)
-
-    @property
-    def ngc_bodies(self) -> list[dict[str, Any]]:
-        return [b for b in self.bodies if b["clientDescription"]["appId"] == "NextGenCalling"]
-
-
-async def _noop(_req: dict[str, Any]) -> None:
-    return None
-
-
-async def _until_async(cond: Callable[[], bool], what: str) -> None:
-    async with asyncio.timeout(5):
-        while not cond():
-            await asyncio.sleep(0.005)
-
-
-@pytest.fixture
-def no_auth(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def skip(self: TrouterClient) -> None:
-        pass
-
-    monkeypatch.setattr(TrouterClient, "_authenticate", skip)
-
-
-async def test_ngc_is_registered_on_connect_and_on_every_reregister(
-    settings: Settings, directory: Directory, monkeypatch: pytest.MonkeyPatch, no_auth: None
-) -> None:
-    """044-AC13"""
-    reg = _Registrar(monkeypatch)
-    client = _client(settings, directory, on_call=_noop)
-    await client._on_connected()
-    try:
-        await _until_async(lambda: len(reg.ngc_bodies) == 1, "registered on connect")
-        for n, reason in ((2, "message_loss"), (3, "ttl")):
-            client._last_register -= S._REREGISTER_DEBOUNCE + 1
-            await client._maybe_reregister(reason)
-            await _until_async(lambda: len(reg.ngc_bodies) == n, reason)  # noqa: B023
-    finally:
-        for task in client._tasks:
-            task.cancel()
-    assert len(reg.bodies) == 6
-    paths = {b["transports"]["TROUTER"][0]["path"] for b in reg.ngc_bodies}
-    assert paths == {"https://surl.invalid/s/NGCallManagerWin"}
-    ids = {b["registrationId"] for b in reg.ngc_bodies}
-    assert len(ids) == 1 and "epid-1" not in ids  # one registration renewed, never the messaging one's id
-
-
-async def test_without_the_hook_only_messaging_registers(
-    settings: Settings, directory: Directory, monkeypatch: pytest.MonkeyPatch, no_auth: None
-) -> None:
-    reg = _Registrar(monkeypatch)
-    client = _client(settings, directory)
-    await client._on_connected()
-    await asyncio.sleep(0.05)
-    for task in client._tasks:
-        task.cancel()
-    assert [b["clientDescription"]["appId"] for b in reg.bodies] == [settings.registrar_app_id]
-
-
-async def test_a_failed_ngc_registration_is_retried_with_backoff(
-    settings: Settings, directory: Directory, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """044-AC13, 044-AC17: the socket stays; retries back off instead of hammering the registrar."""
-    reg = _Registrar(monkeypatch)
-    reg.ngc = "fail"
-    monkeypatch.setattr(S, "_NGC_RETRY_MIN", 0.01)
-    client = _client(settings, directory, on_call=_noop)
-    await client._register()  # must not raise
-    loop = asyncio.create_task(client._ngc_loop())
-    try:
-        await asyncio.sleep(0.35)  # backoff: tries at 0, .01, .03, .07, .15, .31; a flat retry: ~35
-        tries = len(reg.ngc_bodies)
-        assert 2 <= tries <= 8 and not client._ngc_ok
-        reg.ngc = "ok"
-        await _until_async(lambda: client._ngc_ok, "registered on a later retry")
-        settled = len(reg.ngc_bodies)
-        await asyncio.sleep(0.1)
-        assert len(reg.ngc_bodies) == settled  # no more once registered
-    finally:
-        loop.cancel()
-
-
-async def test_a_failed_messaging_reregister_still_renews_the_calling_one(
-    settings: Settings, directory: Directory, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """044-AC13"""
-    reg = _Registrar(monkeypatch)
-    client = _client(settings, directory, on_call=_noop)
-    loop = asyncio.create_task(client._ngc_loop())
-    try:
-        await _until_async(lambda: client._ngc_ok, "first registration")
-        reg.messaging = "fail"
-        with pytest.raises(OSError):
-            await client._register()
-        assert not client._ngc_ok
-        await _until_async(lambda: client._ngc_ok and len(reg.ngc_bodies) == 2, "renewed anyway")
-    finally:
-        loop.cancel()
-
-
-async def test_a_hanging_ngc_registrar_does_not_delay_the_keepalive(
-    settings: Settings, directory: Directory, monkeypatch: pytest.MonkeyPatch, no_auth: None
-) -> None:
-    """044-AC13"""
-    reg = _Registrar(monkeypatch)
-    reg.ngc = "hang"
-    monkeypatch.setattr(S, "_PING_INTERVAL", 0.01)
-    client = _client(settings, directory, on_call=_noop)
-    await asyncio.wait_for(client._on_connected(), 1)  # connect does not wait for the calling registration
-    try:
-        await _until_async(lambda: sum('"ping"' in f for f in client._ws.sent) >= 5, "pings keep flowing")
-    finally:
-        for task in client._tasks:
-            task.cancel()
-    assert len(reg.ngc_bodies) == 1  # still hanging
-
-
-def test_ngc_registration_id_is_stable_per_endpoint(settings: Settings, directory: Directory) -> None:
-    """044-AC13: reconnects renew one registration instead of piling new ones up."""
-    a, b = _client(settings, directory), _client(settings, directory)
-    assert a._ngc_id == b._ngc_id != "epid-1"
-    other = TrouterClient(settings, {}, "sk", {}, "sid", "epid-2", directory)
-    assert other._ngc_id != a._ngc_id
-
-
-async def test_call_pushes_go_to_the_hook_only_and_its_failure_keeps_the_socket(
-    settings: Settings, directory: Directory, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """044-AC13, 044-AC17: a trigger exception is logged; the frame is acked, the socket stays."""
-    events: list[Any] = []
-
-    async def on_event(obj: dict[str, Any]) -> None:
-        events.append(obj)
-
-    def boom(*_a: Any) -> None:
-        raise RuntimeError("trigger bug")
-
-    monkeypatch.setattr(F, "handle", boom)
-    client = _client(settings, directory, on_event=on_event, on_call=F.trigger(settings, Path("data")))
-    with capture_logs() as logs:
-        await client._on_delivery(json.dumps(_push(115)))
-        await _until_async(lambda: bool(logs), "the trigger's thread logged it")
-    assert events == [] and client._ws.sent == ['3:::{"id":9,"status":200,"body":""}']
-    assert [e["event"] for e in logs] == ["call_hook_failed"]
 
 
 # --- 044-AC17: hosted by the archiver, detached from it ---
@@ -950,8 +771,9 @@ def test_end_handled_by_another_trigger_instance(settings: Settings, tmp_path: P
     for call in (CALL, OTHER):
         data = tmp_path / call
         launcher = (
-            "import json, sys\nfrom pathlib import Path\nfrom miniteams.follow import launch\n"
-            "print(launch(Path(sys.argv[1]), sys.argv[2], json.loads(sys.argv[3])).pid)\n"
+            "import json, sys\nfrom pathlib import Path\nfrom miniteams.config import Settings\n"
+            "from miniteams.follow import launch\n"
+            "print(launch(Settings(), Path(sys.argv[1]), sys.argv[2], json.loads(sys.argv[3])).pid)\n"
         )
         subprocess.run(
             [sys.executable, "-c", launcher, str(data), call, json.dumps(_payload(call=call))],
@@ -971,8 +793,9 @@ def test_follower_survives_its_launcher(tmp_path: Path) -> None:
     """044-AC17: the launcher (the trigger's host) exits; the follower, in its own session, keeps running."""
     data = tmp_path / "data"
     launcher = (
-        "import json, sys\nfrom pathlib import Path\nfrom miniteams.follow import launch\n"
-        "print(launch(Path(sys.argv[1]), sys.argv[2], json.loads(sys.argv[3])).pid)\n"
+        "import json, sys\nfrom pathlib import Path\nfrom miniteams.config import Settings\n"
+        "from miniteams.follow import launch\n"
+        "print(launch(Settings(), Path(sys.argv[1]), sys.argv[2], json.loads(sys.argv[3])).pid)\n"
     )
     out = subprocess.run(
         [sys.executable, "-c", launcher, str(data), CALL, json.dumps(_payload())],
@@ -984,7 +807,7 @@ def test_follower_survives_its_launcher(tmp_path: Path) -> None:
     try:
         _until(lambda: F.lock_held(path), "detached follower holds the lock")
         assert os.getsid(pid) == pid != os.getsid(0)
-        F.stop(data, CALL, _payload())
+        F.stop_follower(data, CALL, _payload())
         _until(lambda: not F.lock_held(path), "follower stopped")
     finally:
         if F.lock_held(path):
@@ -1033,7 +856,7 @@ def test_cli_starts_the_trigger_on_its_own_endpoint(
 def test_cli_call_runs_the_follower(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli, "setup_logging", lambda _level: None)
     got: list[Any] = []
-    monkeypatch.setattr(F, "run_call", lambda d, push: got.append((d, push)) or 0)
+    monkeypatch.setattr(F, "run_call", lambda _s, d, push: got.append((d, push)) or 0)
     assert cli.main(["follow", "--data-dir", str(tmp_path), "--call", "{}"]) == 0
     assert got == [(tmp_path.resolve(), "{}")]
 
@@ -1049,8 +872,8 @@ def test_trigger_refuses_to_start_without_the_extra(argv: list[str], monkeypatch
     monkeypatch.setattr(S, "run_forever", lambda *_a, **_k: pytest.fail("connected without the extra"))
     with capture_logs() as logs:
         assert cli.main(argv) == 1
-    missing = next(e for e in logs if e["event"] == "follow_extra_missing")
-    assert missing["missing"] == ["onnxruntime"] and "uv sync --inexact --extra transcript" in missing["hint"]
+    missing = next(e for e in logs if e["event"] == "follow_not_ready")
+    assert "(onnxruntime)" in missing["fix"] and "uv sync --inexact --extra transcript" in missing["fix"]
 
 
 def test_end_still_signals_when_the_marker_cannot_be_written(
@@ -1072,7 +895,7 @@ def test_end_still_signals_when_the_marker_cannot_be_written(
 
 @pytest.mark.parametrize("outcome", ["call_ended", "join_failed", "error"])
 def test_a_follower_ending_on_its_own_marks_its_join_and_exits_without_waiting_for_116(
-    tmp_path: Path, in_process: list[str], monkeypatch: pytest.MonkeyPatch, outcome: str
+    settings: Settings, tmp_path: Path, in_process: list[str], monkeypatch: pytest.MonkeyPatch, outcome: str
 ) -> None:
     """044-AC4, AC5, AC14: no wait for a SIGTERM (evt 116 only comes once the follower is gone): it marks
     its join ended, so a redelivered 115 of it is skipped, and wakes its own wait."""
@@ -1082,7 +905,7 @@ def test_a_follower_ending_on_its_own_marks_its_join_and_exits_without_waiting_f
     monkeypatch.setattr(F.signal, "sigwait", lambda _s: F._DONE if kicked.wait(5) else signal.SIGTERM)
     t0 = time.monotonic()
     with capture_logs() as logs:
-        assert F.run_call(tmp_path, json.dumps(_payload())) == 0
+        assert F.run_call(settings, tmp_path, json.dumps(_payload())) == 0
     assert time.monotonic() - t0 < 2
     assert [(e["event"], e.get("reason")) for e in logs] == [
         ("follow_start", None),
@@ -1093,24 +916,24 @@ def test_a_follower_ending_on_its_own_marks_its_join_and_exits_without_waiting_f
 
 
 def test_a_join_the_follower_already_marked_is_not_marked_twice(
-    tmp_path: Path, in_process: list[str], monkeypatch: pytest.MonkeyPatch
+    settings: Settings, tmp_path: Path, in_process: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """follow() marks an ended call itself, before its hang-up; run_call adds no second line."""
     kicked = threading.Event()
 
-    def attend(data: Path, payload: dict[str, Any], _stop: threading.Event) -> str:
+    def attend(_s: Settings, data: Path, payload: dict[str, Any], _stop: threading.Event) -> str:
         F.mark_ended(data, CALL, F.join_time(payload))
         return "call_ended"
 
     monkeypatch.setattr(F, "_attend", attend)
     monkeypatch.setattr(F.signal, "pthread_kill", lambda _tid, sig: kicked.set() if sig == F._DONE else None)
     monkeypatch.setattr(F.signal, "sigwait", lambda _s: F._DONE if kicked.wait(5) else signal.SIGTERM)
-    assert F.run_call(tmp_path, json.dumps(_payload())) == 0
+    assert F.run_call(settings, tmp_path, json.dumps(_payload())) == 0
     assert F.ended_path(tmp_path, CALL).read_text() == f"{JOIN}\n"
 
 
 def test_a_follower_whose_marker_fails_still_exits(
-    tmp_path: Path, in_process: list[str], monkeypatch: pytest.MonkeyPatch
+    settings: Settings, tmp_path: Path, in_process: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     kicked = threading.Event()
     monkeypatch.setattr(F, "_attend", lambda *_a: "call_ended")
@@ -1122,7 +945,7 @@ def test_a_follower_whose_marker_fails_still_exits(
 
     monkeypatch.setattr(F, "mark_ended", broken)
     with capture_logs() as logs:
-        assert F.run_call(tmp_path, json.dumps(_payload())) == 0
+        assert F.run_call(settings, tmp_path, json.dumps(_payload())) == 0
     assert [e["event"] for e in logs] == ["follow_start", "follow_ended_marker_failed", "follow_stop"]
 
 
@@ -1178,21 +1001,25 @@ def test_a_rejoin_while_the_previous_follower_still_follows_is_dropped(
 
 
 def test_a_rejoin_whose_previous_follower_never_lets_go_gives_up(
-    tmp_path: Path, procs: list[Any], monkeypatch: pytest.MonkeyPatch, in_process: list[str]
+    settings: Settings,
+    tmp_path: Path,
+    procs: list[Any],
+    monkeypatch: pytest.MonkeyPatch,
+    in_process: list[str],
 ) -> None:
     procs.append(_holder(F.lock_path(tmp_path, CALL), "follow", "--call", json.dumps(_payload())))
     F.mark_ended(tmp_path, CALL, JOIN)
     monkeypatch.setattr(F, "_LEAVE_S", 0.1)
     with capture_logs() as logs:
-        assert F.run_call(tmp_path, json.dumps(_payload(join=J2))) == 0
+        assert F.run_call(settings, tmp_path, json.dumps(_payload(join=J2))) == 0
     assert [e["event"] for e in logs] == ["follow_waiting_for_previous", "follow_already_running"]
     assert in_process == []
 
 
 def test_attend_runs_the_follower_and_survives_its_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from miniteams import call as C
+    from miniteams import follower as FL
 
     seen: list[Any] = []
 
@@ -1200,24 +1027,24 @@ def test_attend_runs_the_follower_and_survives_its_failure(
         seen.append((settings.tenant_id, data, payload["correlationId"], stop.is_set()))
         return "call_ended"
 
-    monkeypatch.setattr(C, "follow", follow)
-    assert F._attend(tmp_path, _payload(), threading.Event()) == "call_ended"
-    assert seen == [("t", tmp_path, CALL, False)]
+    monkeypatch.setattr(FL, "follow", follow)
+    assert F._attend(settings, tmp_path, _payload(), threading.Event()) == "call_ended"
+    assert seen == [("tenant-123", tmp_path, CALL, False)]
 
     async def broken(*_a: Any) -> str:
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(C, "follow", broken)
+    monkeypatch.setattr(FL, "follow", broken)
     with capture_logs() as logs:
-        assert F._attend(tmp_path, _payload(), threading.Event()) == "error"
+        assert F._attend(settings, tmp_path, _payload(), threading.Event()) == "error"
     assert [(e["event"], e["error"]) for e in logs] == [("follow_failed", "boom")]
 
     async def stray_cancel(*_a: Any) -> str:
         raise asyncio.CancelledError  # e.g. a cancelled inner future nobody asked to cancel
 
-    monkeypatch.setattr(C, "follow", stray_cancel)
+    monkeypatch.setattr(FL, "follow", stray_cancel)
     with capture_logs() as logs:
-        assert F._attend(tmp_path, _payload(), threading.Event()) == "error"
+        assert F._attend(settings, tmp_path, _payload(), threading.Event()) == "error"
     assert [e["event"] for e in logs] == ["follow_failed"]
 
 
@@ -1242,30 +1069,32 @@ def test_a_follower_that_cannot_join_retries_writes_why_and_exits(
     assert [(e["event"], e.get("reason")) for e in logs] == [("follow_skipped", "ended")]
 
 
-def test_cli_capture_reaches_the_followers_by_the_environment(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_cli_capture_and_log_level_reach_the_followers_on_their_argv(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """044-AC12: --capture is opt-in; the detached followers inherit it."""
+    """044-AC12: --capture is opt-in; the detached followers get it, and the trigger's log level, on argv."""
     monkeypatch.setattr(cli, "setup_logging", lambda _level: None)
-    # setenv first: teardown then restores the original state, whatever cli.main wrote meanwhile.
-    monkeypatch.setenv("MINITEAMS_FOLLOW_CAPTURE", "x")
-    monkeypatch.delenv("MINITEAMS_FOLLOW_CAPTURE")
+    monkeypatch.delenv("MINITEAMS_FOLLOW_CAPTURE", raising=False)
     monkeypatch.chdir(tmp_path)  # the relative `cap` resolves here, never in the repository
-    monkeypatch.setattr(F, "run_call", lambda d, push: 0)
+    got: list[Settings] = []
+    monkeypatch.setattr(F, "run_call", lambda s, _d, _push: got.append(s) or 0)
     assert cli.main(["follow", "--data-dir", str(tmp_path), "--call", "{}"]) == 0
-    assert "MINITEAMS_FOLLOW_CAPTURE" not in os.environ and Settings().follow_capture is None  # type: ignore[call-arg]
-    assert cli.main(["follow", "--capture", "cap", "--call", "{}"]) == 0
-    assert os.environ["MINITEAMS_FOLLOW_CAPTURE"] == str(Path("cap").resolve())
-    assert Settings().follow_capture == Path("cap").resolve()  # type: ignore[call-arg]
+    assert got[0].follow_capture is None and "--capture" not in F.follower_command(got[0], tmp_path, {})
+    assert cli.main(["--log-level", "DEBUG", "follow", "--capture", "cap", "--call", "{}"]) == 0
+    assert got[1].follow_capture == tmp_path / "cap"
+    cmd = F.follower_command(got[1], tmp_path, _payload())
+    assert cli.main(cmd[cmd.index("--log-level") :]) == 0  # the follower's own CLI parses it
+    assert (got[2].follow_capture, got[2].log_level) == (tmp_path / "cap", "DEBUG")
+    assert "MINITEAMS_FOLLOW_CAPTURE" not in os.environ
 
 
 def test_a_signalled_stop_logs_the_follower_outcome(
-    tmp_path: Path, in_process: list[str], monkeypatch: pytest.MonkeyPatch
+    settings: Settings, tmp_path: Path, in_process: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The stop line says what the follower thread made of the signal (it hung up: "stopped")."""
-    monkeypatch.setattr(F, "_attend", lambda _d, _p, stop: "stopped" if stop.wait(5) else "late")
+    monkeypatch.setattr(F, "_attend", lambda _s, _d, _p, stop: "stopped" if stop.wait(5) else "late")
     with capture_logs() as logs:
-        assert F.run_call(tmp_path, json.dumps(_payload())) == 0
+        assert F.run_call(settings, tmp_path, json.dumps(_payload())) == 0
     (stop,) = [e for e in logs if e["event"] == "follow_stop"]
     assert (stop["reason"], stop["signal"], stop["outcome"]) == ("signal", "SIGTERM", "stopped")
     assert not F.ended_path(tmp_path, CALL).exists()  # the 116 that sent it wrote the marker
