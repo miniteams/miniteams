@@ -805,6 +805,8 @@ def test_044_ac9_a_call_of_another_chat_is_refused(settings: Settings, followed:
     _followed(followed, blank, "20260702T140000Z", "", 1, join="ok")  # a header naming no chat
     refused = _call(_server(settings, followed), "read_transcript", thread_id=GROUP, call=blank)
     assert refused["error"] and "belongs to another chat" in refused["text"]
+    read = _call(_server(settings, followed), "read_transcript", thread_id="", call=blank)  # a guest's 1:1
+    assert not read["error"] and read["total"] == 1
 
 
 def test_044_ac9_an_unreadable_lock_costs_only_live(settings: Settings, followed: Path) -> None:

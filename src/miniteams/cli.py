@@ -903,7 +903,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_archive.set_defaults(func=cmd_archive)
 
-    p_follow = sub.add_parser("follow", help="follow the calls I join: one follower per call (spec 044)")
+    p_follow = sub.add_parser(
+        "follow",
+        help="follow the calls I join: one follower per call (spec 044)",
+        epilog="Bare `follow` (--data-dir and --capture aside) runs the trigger. --skip and --unskip match "
+        "a 1:1 chat id in either spelling (its two member ids in either order).",
+    )
     p_follow.add_argument("--data-dir", default="data", help="archive root (default: ./data)")
     p_follow.add_argument(
         "--capture",

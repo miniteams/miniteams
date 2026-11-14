@@ -1,6 +1,6 @@
 """One call's transcription: per-speaker VAD tracks into the engine pipeline, lines into the transcript.
 
-The Phase 3 follower feeds 16 kHz PCM per speaker MSI with the wall-clock time of each frame. Two clocks:
+The follower feeds 16 kHz PCM per speaker MSI with the wall-clock time of each frame. Two clocks:
 t_wall places audio on the call's timeline (line timestamps, holes between frames); the monotonic time
 a frame arrives says whether a speaker went quiet. A track that receives nothing for stt_quiet_s gets
 silence fed on its behalf, so its last utterance is cut without waiting for its next word; delivery

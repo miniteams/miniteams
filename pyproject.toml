@@ -96,6 +96,7 @@ addopts = "-v --tb=short"
 markers = [
     "browser: headless Chrome tests (`uv run --with playwright pytest tests/test_browser.py`)",
     "stt: real speech-to-text engines, skipped until scripts/build-transcribe.sh has run (spec 044)",
+    "transcript: needs the `transcript` extra, skipped without it (fails under CI) (spec 044)",
 ]
 
 [tool.coverage.run]

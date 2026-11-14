@@ -25,7 +25,7 @@ log = structlog.get_logger()
 
 PENDING_MAX = 60 * 4 * 50  # frames held while the engines load: 60 s of 4 speakers
 JOIN_RETRY_PAUSE_S = 5.0
-MARK_TIMEOUT_S = 2.0  # a stalled config dir (NFS home) must not hold the hang-up
+MARK_TIMEOUT_S = 1.0  # a stalled config dir (NFS home) must not hold the hang-up
 
 Frame = tuple[int, npt.NDArray[np.int16], float]  # (msi, 20 ms of 16 kHz PCM, wall time)
 
@@ -35,8 +35,7 @@ async def follow(settings: Settings, data_dir: Path, payload: dict[str, Any], st
     follower = Follower(settings, data_dir, payload)
     task = asyncio.ensure_future(follower.attend())
     try:
-        # Whatever phase it is in (join, engines loading, transcribing), a stop is not held: the
-        # follower's _LEAVE_S must leave room for the DELETE.
+        # A stop is never held, whatever the step: the follower's _LEAVE_S must leave room for the DELETE.
         if await _until(stop, task):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -196,8 +195,7 @@ class Follower:
         pauses."""
         old = self.call
         await old.leave()
-        # Straight on the controller the first join reached, when it got that far: no phase 1 (an ended
-        # 1:1 answers 404; an ended meeting comes back with us alone, and the leave rule ends it).
+        # The controller the first join reached, if any: phase 2 straight to it, no phase 1.
         self.call = Call(
             self.settings,
             self.payload,

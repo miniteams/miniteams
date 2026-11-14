@@ -344,6 +344,7 @@ def test_two_triggers_racing_on_one_lock(settings: Settings, tmp_path: Path) -> 
     assert not F.lock_held(path)
 
 
+@pytest.mark.transcript
 def test_two_followers_of_one_call_leave_one_running(
     settings: Settings, tmp_path: Path, procs: list[Any]
 ) -> None:
@@ -450,6 +451,17 @@ def test_cli_skip_and_unskip_take_a_1to1_in_either_spelling(
 # --- evt 116: stop ---
 
 
+SENTINEL = "00000000-0000-4000-8000-0000000000ff"
+
+
+def _sentinel_stopped(settings: Settings, tmp_path: Path, procs: list[Any]) -> None:
+    """A 116 to a third follower, handled after the ones under test, until it dies: a SIGTERM they sent
+    went out earlier and had longer to land."""
+    procs.append(_holder(F.lock_path(settings, SENTINEL), *_argv(settings, _payload(call=SENTINEL))))
+    F.handle(settings, tmp_path, _push(116, call=SENTINEL))
+    assert procs[-1].wait(timeout=10) == -signal.SIGTERM
+
+
 def test_end_signals_our_follower(settings: Settings, tmp_path: Path, procs: list[Any]) -> None:
     path = F.lock_path(settings, CALL)
     procs.append(_holder(path, *_argv(settings, _payload())))
@@ -465,7 +477,7 @@ def test_end_never_signals_a_pid_that_is_not_our_follower(
     procs.append(_holder(F.lock_path(settings, OTHER), "not-a-follower"))
     F.handle(settings, tmp_path, _push(116))
     F.handle(settings, tmp_path, _push(116, call=OTHER))
-    time.sleep(0.2)  # a SIGTERM sent would have landed by now
+    _sentinel_stopped(settings, tmp_path, procs)
     assert procs[0].poll() is None and procs[1].poll() is None
 
 
@@ -514,7 +526,7 @@ def test_a_late_end_of_an_earlier_join_spares_the_rejoin(
     with capture_logs() as logs:
         F.handle(settings, tmp_path, _push(116))  # late, J1
         F.handle(settings, tmp_path, _push(115, join=J2))  # redelivered
-    time.sleep(0.2)  # a SIGTERM sent would have landed by now
+    _sentinel_stopped(settings, tmp_path, procs)
     assert procs[0].poll() is None and launches == [CALL, CALL]
     assert [e["event"] for e in logs] == ["follow_stop_other_join", "follow_already_running"]
     F.handle(settings, tmp_path, _push(116, join=J2))
@@ -590,6 +602,7 @@ def test_a_private_dir_is_not_chmodded_again(tmp_path: Path, monkeypatch: pytest
     assert calls == []
 
 
+@pytest.mark.transcript
 def test_per_call_files_are_private(settings: Settings, tmp_path: Path, procs: list[Any]) -> None:
     data = tmp_path / "data"
     (data / "follow").mkdir(parents=True)
@@ -744,6 +757,7 @@ def test_unusable_pushes_are_logged_and_dropped(
 # --- behavioral guard: the real trigger and the real CLI stub ---
 
 
+@pytest.mark.transcript
 def test_join_then_end_runs_the_real_follower(
     settings: Settings, tmp_path: Path, real_launches: list[Any]
 ) -> None:
@@ -763,6 +777,7 @@ def test_join_then_end_runs_the_real_follower(
     _until(lambda: procs[0].returncode == 0, "follower reaped by its host")  # the reaper waited, not us
 
 
+@pytest.mark.transcript
 def test_join_and_end_back_to_back_leave_nothing_running(
     settings: Settings, tmp_path: Path, real_launches: list[Any]
 ) -> None:
@@ -775,6 +790,7 @@ def test_join_and_end_back_to_back_leave_nothing_running(
     assert "ended_before_start" in log and "follow_start" not in log
 
 
+@pytest.mark.transcript
 def test_a_follower_losing_the_race_is_reaped(settings: Settings, tmp_path: Path, procs: list[Any]) -> None:
     """A long-running host leaves no zombie behind."""
     fd = F.take_lock(F.lock_path(settings, CALL))
@@ -827,6 +843,7 @@ async def test_run_live_hosts_the_trigger_only_when_asked(
     assert seen[0] is None and callable(seen[1])
 
 
+@pytest.mark.transcript
 def test_end_handled_by_another_trigger_instance(settings: Settings, tmp_path: Path) -> None:
     """044-AC17: the host that launched it is gone; a new trigger's 116 stops it, before or after its lock."""
     for call in (CALL, OTHER):
@@ -851,6 +868,7 @@ def test_end_handled_by_another_trigger_instance(settings: Settings, tmp_path: P
         _until(lambda: not F.lock_held(F.lock_path(settings, call)), "lock freed")  # noqa: B023
 
 
+@pytest.mark.transcript
 def test_follower_survives_its_launcher(tmp_path: Path) -> None:
     """044-AC17: the launcher (the trigger's host) exits; the follower, in its own session, keeps running."""
     data, settings = tmp_path / "data", Settings()  # the launcher's own, from the same environment
@@ -879,14 +897,27 @@ def test_follower_survives_its_launcher(tmp_path: Path) -> None:
 # --- 044-AC15: the extra stays optional ---
 
 
-def test_cli_and_archiver_never_import_the_transcript_modules() -> None:
-    """044-AC15"""
+def test_only_the_followers_modules_import_the_transcript_modules() -> None:
+    """044-AC15: every module but the follower's own (and the widget's, its own extra) imports without
+    loading one."""
     code = (
-        "import sys, miniteams.cli, miniteams.archive_live, miniteams.follow\n"
-        f"print([m for m in {F.TRANSCRIPT_MODULES!r} if m in sys.modules])\n"
+        "import pkgutil, sys, miniteams\n"
+        "own = {'miniteams.call', 'miniteams.follower', 'miniteams.widget_qt'}\n"
+        "names = [m.name for m in pkgutil.walk_packages(miniteams.__path__, 'miniteams.')]\n"
+        "for name in names:\n"
+        "    if name not in own and name.split('.')[:2] != ['miniteams', 'stt']:\n"
+        "        __import__(name)\n"
+        "print(len(names), [m for m in sys.argv[1:] if m in sys.modules])\n"
     )
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60, check=True)
-    assert out.stdout.strip() == "[]"
+    out = subprocess.run(
+        [sys.executable, "-c", code, *F.TRANSCRIPT_MODULES],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    count, loaded = out.stdout.split(" ", 1)
+    assert int(count) > 40 and loaded.strip() == "[]"
 
 
 def test_missing_extra_names_the_absent_modules(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -915,6 +946,7 @@ def test_cli_starts_the_trigger_on_its_own_endpoint(
     assert asyncio.run(seen["on_event"]({})) is None
 
 
+@pytest.mark.transcript
 def test_cli_call_runs_the_follower(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli, "setup_logging", lambda _level: None)
     got: list[Any] = []
@@ -1028,6 +1060,7 @@ def test_a_follower_whose_marker_fails_still_exits(
     assert [e["event"] for e in logs] == ["follow_start", "follow_ended_marker_failed", "follow_stop"]
 
 
+@pytest.mark.transcript
 def test_a_rejoin_while_the_previous_follower_winds_down_gets_its_own(
     settings: Settings, tmp_path: Path, real_launches: list[Any]
 ) -> None:
@@ -1095,6 +1128,7 @@ def test_a_rejoin_whose_previous_follower_never_lets_go_gives_up(
     assert in_process == []
 
 
+@pytest.mark.transcript
 def test_attend_runs_the_follower_and_survives_its_failure(
     settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1127,6 +1161,7 @@ def test_attend_runs_the_follower_and_survives_its_failure(
     assert [e["event"] for e in logs] == ["follow_failed"]
 
 
+@pytest.mark.transcript
 def test_a_follower_that_cannot_join_retries_writes_why_and_exits(
     settings: Settings, tmp_path: Path, real_launches: list[Any]
 ) -> None:
@@ -1148,6 +1183,7 @@ def test_a_follower_that_cannot_join_retries_writes_why_and_exits(
     assert [(e["event"], e.get("reason")) for e in logs] == [("follow_skipped", "ended")]
 
 
+@pytest.mark.transcript
 def test_cli_capture_and_log_level_reach_the_followers_on_their_argv(
     settings: Settings, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1183,6 +1219,7 @@ def test_a_signalled_stop_logs_the_follower_outcome(
 # --- swarm-review step 2: host-local state, argv, scopes, the switch on running followers ---
 
 
+@pytest.mark.transcript
 def test_two_triggers_with_different_data_dirs_start_one_follower(
     settings: Settings, tmp_path: Path, real_launches: list[Any]
 ) -> None:
@@ -1203,6 +1240,7 @@ def test_two_triggers_with_different_data_dirs_start_one_follower(
     _until(lambda: real_launches[0].returncode is not None, "first follower stopped")
 
 
+@pytest.mark.transcript
 def test_the_push_stays_off_argv_and_a_big_one_still_launches(
     settings: Settings, tmp_path: Path, real_launches: list[Any]
 ) -> None:
@@ -1244,6 +1282,7 @@ exec "$@"
 """
 
 
+@pytest.mark.transcript
 def test_a_follower_runs_in_its_own_scope_when_systemd_run_exists(
     settings: Settings, tmp_path: Path, real_launches: list[Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1311,6 +1350,7 @@ def test_a_follower_exiting_in_error_is_logged_by_its_host(
     assert "Failed to connect to bus" in (tmp_path / "data" / "follow" / f"{CALL}.log").read_text()
 
 
+@pytest.mark.transcript
 def test_a_follower_exiting_cleanly_logs_nothing_more(
     settings: Settings, tmp_path: Path, procs: list[Any]
 ) -> None:

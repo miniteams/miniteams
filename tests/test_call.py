@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import struct
+import threading
 import time
 import types
 from collections.abc import Callable, Iterator
@@ -743,8 +744,15 @@ async def test_a_1to1_push_joins_its_live_call_on_its_controller(
     assert await call.leave() == 202
 
 
-# Regression pin, not a live capture: sha256 of the phase 2 bodies (random ids numbered, offer blanked)
-# as commit 7c535b5 built them, the code whose joins were checked live in the test tenant.
+# Regression pin, not a live capture: the phase 2 bodies (random ids numbered, offer blanked) as commit
+# 7c535b5 built them, the code whose joins were checked live in the test tenant. The digests (of
+# json.dumps(sort_keys=True) of them) keep the fixture files those bodies.
+PHASE2_FIXTURES = Path(__file__).with_name("fixtures")
+PHASE2_FILES = {
+    "1:1": "phase2-one-to-one.json",
+    "meeting": "phase2-meeting.json",
+    "group": "phase2-group.json",
+}
 LIVE_PHASE2 = {
     "1:1": "9c0e4fb5414970cb2863d76345bb5816c14d53f6a271425c7f1699b38ab2ead0",  # pragma: allowlist secret
     "meeting": "ebc8c674cb07c31bf2c0f617f79856a0a5d514f763f93e95385a2e302c04281c",  # pragma: allowlist secret
@@ -792,9 +800,9 @@ async def test_direct_phase2_bodies_stay_the_live_verified_ones(
     server.call = call
     await call.join()
     await call.leave()
-    blanked = _blanked(server.body("phase2"))
-    digest = hashlib.sha256(blanked.encode()).hexdigest()
-    assert digest == LIVE_PHASE2[shape], f"{digest} {blanked}"
+    pinned = json.loads((PHASE2_FIXTURES / PHASE2_FILES[shape]).read_text())
+    assert hashlib.sha256(json.dumps(pinned, sort_keys=True).encode()).hexdigest() == LIVE_PHASE2[shape]
+    assert json.loads(_blanked(server.body("phase2"))) == pinned
 
 
 @pytest.mark.parametrize(
@@ -1435,8 +1443,12 @@ async def test_a_failed_leave_is_logged_and_still_closes(make_call: Any, server:
     """044-AC4: the DELETE status is reported; a refused or failed one is logged, never raised."""
     call, ice, _ = make_call()
     await call.join()
-    server.status["delete"] = 404
-    assert await call.leave() == 404
+    server.status["delete"] = 401  # e.g. the fallback token had expired
+    with capture_logs() as logs:
+        assert await call.leave() == 401
+    assert ("call_leave_rejected", 401, "warning") in [
+        (e["event"], e.get("status"), e["log_level"]) for e in logs
+    ]
     call, ice, _ = make_call()
     await call.join()
 
@@ -1449,10 +1461,11 @@ async def test_a_failed_leave_is_logged_and_still_closes(make_call: Any, server:
     assert ice.closed and "call_leave_failed" in [e["event"] for e in logs]
 
 
-async def test_a_token_failure_at_leave_still_closes_everything(
+async def test_a_token_failure_at_leave_hangs_up_with_the_last_token(
     make_call: Any, server: Server, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A non-JoinError from the IC3 refresh (MSAL) is logged; ICE, Trouter, HTTP and capture still close."""
+    """044-AC4: a failing IC3 refresh (MSAL) at leave: the DELETE goes with the token the join used; with
+    none, no DELETE and a log. ICE, Trouter and HTTP close either way."""
     call, ice, _ = make_call()
     await call.join()
 
@@ -1462,9 +1475,59 @@ async def test_a_token_failure_at_leave_still_closes_everything(
 
     monkeypatch.setattr(C, "token_source", lambda _s: Broken())
     with capture_logs() as logs:
-        assert await call.leave() is None
+        assert await call.leave() == 202
+    delete = next(r for r in server.requests if server.step(r) == "delete")
+    assert delete.headers["Authorization"] == "Bearer ic3-token"
+    assert ("call_leave_token_failed", "RuntimeError", True) in [
+        (e["event"], e.get("error_type"), e.get("cached")) for e in logs
+    ]
+    assert "call_leave_rejected" not in [e["event"] for e in logs]  # a 202 is no rejection
     assert ice.closed and call._trouter is not None and call._trouter.done() and call.http.is_closed
-    assert ("call_leave_failed", "RuntimeError") in [(e["event"], e.get("error_type")) for e in logs]
+    call, ice, _ = make_call()
+    monkeypatch.setattr(C, "token_source", lambda _s: FakeTokens())
+    await call.join()
+    monkeypatch.setattr(C, "token_source", lambda _s: Broken())
+    call._last_ic3 = ""  # e.g. a join that never got that far
+    deletes = sum(server.step(r) == "delete" for r in server.requests)
+    with capture_logs() as logs:
+        assert await call.leave() is None
+    assert sum(server.step(r) == "delete" for r in server.requests) == deletes
+    assert "call_leave_skipped" in [e["event"] for e in logs] and ice.closed and call.http.is_closed
+
+
+async def test_a_hung_token_or_delete_at_leave_is_given_up_in_time(
+    make_call: Any, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """044-AC4: the hang-up's token fetch and DELETE each have a deadline: a stuck MSAL refresh falls back
+    to the last token, a stuck DELETE is logged; the closes still run."""
+    monkeypatch.setattr(C, "LEAVE_TOKEN_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(C, "DELETE_TIMEOUT_S", 0.05)
+    call, ice, _ = make_call()
+    await call.join()
+    release = threading.Event()
+
+    class Stuck(FakeTokens):
+        def ic3_token(self) -> str | None:
+            release.wait(5)
+            return "late"
+
+    async def hung(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(5)
+        return httpx.Response(202)
+
+    monkeypatch.setattr(C, "token_source", lambda _s: Stuck())
+    call.http = httpx.AsyncClient(transport=httpx.MockTransport(hung))
+    started = time.monotonic()
+    try:
+        with capture_logs() as logs:
+            assert await call.leave() is None
+    finally:
+        release.set()
+    assert time.monotonic() - started < 2
+    events = [(e["event"], e.get("error_type")) for e in logs]
+    assert ("call_leave_token_failed", "TimeoutError") in events
+    assert ("call_leave_failed", "TimeoutError") in events
+    assert ice.closed and call.http.is_closed
 
 
 async def test_a_failing_close_step_does_not_skip_the_next(make_call: Any) -> None:

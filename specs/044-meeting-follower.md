@@ -84,9 +84,12 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
       ≤ 2 s, p90 ≤ 4 s, over a call of 10 min or more with 3 or more speakers.
 - [ ] **AC8** The transcript is NDJSON, one object per line: `t` (UTC ISO start of the utterance),
       `end`, `speaker`, `mri`, `text`, `engine`; a header line holds `call` (`correlationId`), `thread`,
-      `kind` (meeting, group, 1:1), `started`. A line is readable by another process as soon as written.
+      `kind` (meeting, group, 1:1), `started`, `engine`, `join` (`ok` or `failed`) and, when failed,
+      `error`. A line is readable by another process as soon as written.
 - [ ] **AC9** MCP `read_transcript` without `message_id` lists the thread's followed calls next to its
-      recordings; with `call` it returns the lines, paged by offset; both work while the call runs.
+      recordings, each `live` while its follower runs on this host; with `call` it returns the lines,
+      paged by offset, the call's `joins` (started, join outcome, error) and `live`; both work while the
+      call runs.
 - [ ] **AC10** `engine` = `parakeet` or `whisper`. A missing library, model or extra makes `follow`
       refuse to start with the exact command to fix it, and never join a call it cannot transcribe.
 - [ ] **AC11** With the switch off, or the chat in the skip list, `follow` joins nothing and logs the
@@ -105,7 +108,9 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
 
 ## Phases
 
-### Phase 1 — Spike gates (scratchpad, never committed)
+All five are done. Where a phase's text and the **Decisions** differ, the Decisions hold.
+
+### Phase 1 — Spike gates (scratchpad, never committed) — done
 - Work: in `.scratchpad/`, answer the three unknowns that can change the design; write the conclusions
   into **Decisions** below.
   1. **Leave detection** while the follower keeps my account in the call: does `evt 116` still come, per
@@ -123,11 +128,10 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
 - **Data model impact**: none
 - **DoD**: Decisions holds one verified answer per unknown, each citing the run that showed it.
 
-### Phase 2 — Trigger
+### Phase 2 — Trigger — done
 - Work: the trigger (`NGCallManagerWin` registration, `cp` decode keeping `evt`, switch and skip
   list), hosted by `archive --live --follow` and by `miniteams follow` (own endpoint id); the per-call
-  lock; the detached `miniteams follow --call-file` launch; the extra and its startup checks. Followers are
-  stubs that log start and stop.
+  lock; the detached `miniteams follow --call-file` launch; the extra and its startup checks.
 - **Covers**: AC3, AC11, AC13, AC15, AC17
 - **Data model impact**: `follow.json` in the config dir (switch, skip list); lock files under
   `<config-dir>/follow/`
@@ -135,7 +139,7 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
   two triggers racing on one lock; live: joining and leaving a meeting logs one start and one stop,
   with the archiver restarted in between.
 
-### Phase 3 — Join, media, leave
+### Phase 3 — Join, media, leave — done
 - Work: signaling per S18 and Phase 1 (create/join, Trouter callAgent callbacks with the expected
   response headers, acceptance, renegotiation answer, roster `Full`), ICE, SRTP, silence out, demux,
   G.722 to 16 kHz PCM per MSI, leave detection and `DELETE`, retry once.
@@ -144,7 +148,7 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
 - **DoD**: tests on synthetic captures (wraps, gaps, 2 to 4 speakers, a new MSI mid-call); live: each
   call kind joined and left cleanly, `DELETE` 2xx logged.
 
-### Phase 4 — Speech to text and transcript files
+### Phase 4 — Speech to text and transcript files — done
 - Work: copy from grill-room `stt/grill_stt` @ `56e5e89` (each file identical there to its last change:
   `89744d1` for `line.py`, `engines.py`, `parakeet.py`, `transcribe.py`; `ae133de` for `vad.py`,
   `pipeline.py`, `config.py`; each file's notice names its own):
@@ -155,8 +159,7 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
   - trimmed: `pipeline.py` (queue, per-speaker order, `Plausibility` filters; drop `RoomAPI` and the
     Prometheus metrics, replaced by the NDJSON writer), `config.py` (engine and VAD settings only, merged
     into miniteams `Settings`);
-  - tests: `test_vad.py`, `test_parakeet.py`, `test_pipeline.py`, `test_plausibility.py`,
-    `test_pool.py`, `fake_engine.py` and the fixtures they need;
+  - tests: as `tests/test_stt_*.py`, `tests/stt_fake_engine.py` and `tests/stt_fixtures/`;
   - not copied: `worker.py`, `replay.py`, `__main__.py`, `logs.py`, the LiveKit tests.
 
   One pipeline per call feeding up to 4 tracks; NDJSON writer; `scripts/build-transcribe.sh` builds
@@ -168,7 +171,7 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
 - **DoD**: replay test of a synthetic multi-speaker WAV through both engines; live call meets AC7, the
   latency computed from the follower log's `line_done.latency_s` by `scripts/follow-latency.py`.
 
-### Phase 5 — MCP
+### Phase 5 — MCP — done
 - Work: `read_transcript` lists followed calls of a thread and pages one by `call`.
 - **Covers**: AC9
 - **Data model impact**: none
@@ -177,10 +180,13 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
 ## Data model impact (summary)
 
 - `follow.json` (config dir): `{"enabled": bool, "skip": [thread ids]}`.
-- `<data-dir>/follow/<YYYY-MM>/<started>-<call>.ndjson`: header line + one line per utterance.
-- `<config-dir>/follow/<call>.lock`: held by the running follower; `<call>.ended` (the joins that ended)
-  and `<call>-<join hash>.push.json` (the push, 0600, removed by its follower on exit) beside it.
+- `<data-dir>/follow/<YYYY-MM>/<started>-<call>.ndjson`: header line + one line per utterance; one file
+  per join.
+- `<config-dir>/follow/<call>.lock`: held by the running follower (its pid inside).
+- `<config-dir>/follow/<call>.ended`: the join times of the call that ended, one per line.
+- `<config-dir>/follow/<call>-<join hash>.push.json`: the push, 0600, deleted by its follower on exit.
 - `<data-dir>/follow/<call>.log`: the follower's log.
+- `DIR/<call>/<endpoint>/`: one capture per join, only with `--capture DIR` (`MINITEAMS_FOLLOW_CAPTURE`).
 - No database change.
 
 ## Open questions
@@ -215,8 +221,7 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
   B left, `DELETE` 202 6.2 s after C's stream left the roster, then `evt 116` (no ghost); 22 lines on 2
   speakers.
 - Live, 2026-11-14 (probe, 2 runs): `evt 115` arrives about 0.1 s after `userJoinTime`, `evt 116` on
-  leaving, both on a second endpoint of mine. Still open for Phase 1: `evt 116` when others stay, and
-  when the follower keeps my account in the call.
+  leaving, both on a second endpoint of mine.
 - Phase order 2 → 4 → 1 → 3 → 5 (user call, 2026-11-14): the offline phases go first; the spike
   waits for real calls. A prototype follower runs permanently meanwhile and follows every call I join.
 - Phase 1 results (spike in `.scratchpad/044/spike/`, never committed):
@@ -282,3 +287,28 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
     conversation and changes nothing), yet no callback reaches the new socket: B's and C's leaves sent
     no roster and the follower stayed in the call, deaf. The rosters are registered at the conversation
     level (phase 2's `conversationRequest`), which neither request moves. The re-attach stays.
+- 1:1 chat id: a 1:1 push names no chat, so the header takes the sorted pair of its two member ids; Teams
+  does not always sort them, so the skip list, `--skip`/`--unskip` and MCP match either spelling. With a
+  member who has no org id (a guest) there is no such id: `thread` is empty, and MCP reads the call with
+  `thread_id` `""` and its `call`.
+- STUN defaults to a third party, `stun.l.google.com:19302`: it sees this host's public address on each
+  join. `MINITEAMS_STUN_SERVER=""` gathers host candidates only.
+- AC4's 15 s, worst case included, from my last device leaving to the `DELETE`'s answer: the roster's ~1 s
+  lag, `follow_leave_grace_s` 5 s (live-validated: a device transfer's moment), the ended mark
+  (`MARK_TIMEOUT_S`, 1 s), the IC3 token (`LEAVE_TOKEN_TIMEOUT_S`, 3 s, else the last one the call used,
+  else no `DELETE` and a log), the `DELETE` (`DELETE_TIMEOUT_S`, 4 s; a non-2xx answer is logged as
+  `call_leave_rejected`): 14 s. Live, mark + token + `DELETE` took ~1.2 s (202 at 6.2 s with the 5 s
+  grace). A test pins the sum, and AC5's: the mark, then the hang-up beside `stt_close_timeout_s`.
+- `follow`'s `--call-file`, `--enable`, `--disable`, `--skip`, `--unskip` and `--status` are mutually
+  exclusive: one action per run; bare `follow` runs the trigger.
+- Re-attach deadline: `follow_reattach_deadline_s`, 300 s by default (see the outage entry above).
+- Each follower runs in its own transient systemd user scope when `systemd-run` and a user manager exist:
+  systemd-oomd kills whole cgroups, so in the trigger's cgroup one kill would take every follower. No
+  scope when an argument holds `$` (systemd-run would expand it).
+- `MEDIA_IDLE_S` = 60 s without any packet, RTCP included, means a network outage: RTCP flows every ~5 s
+  even in silence; the longest gap over every live capture (S18 runs up to 30 min, Phase 3 runs) was
+  6.2 s; 4x that, floored at a minute.
+- Engines default to two processes of 2 threads: 8.4x real time on a 4-CPU node, against 6.2x for one of
+  4 threads (grill-room spike S10d).
+- The calling requests carry the AMER region headers whatever the tenant's region: they worked for a
+  tenant elsewhere in S18.

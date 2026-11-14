@@ -776,3 +776,15 @@ async def test_a_re_attach_failing_for_good_while_loading_ends_the_follow(
     FakeCall.instances[0].move()
     assert await asyncio.wait_for(task, 5) == "join_failed"
     assert _header(tmp_path)["error"] == C.TROUTER_MOVED and len(FakeCall.instances) == 2
+
+
+ROSTER_LAG_S = 1.0  # a device's leave shows in the next Full roster ~1 s late (spec 044, Q1)
+
+
+def test_default_timeouts_fit_the_15_s_of_ac4_and_ac5() -> None:
+    """044-AC4, worst case: the roster's lag, the grace, the ended mark, the IC3 token, the DELETE. AC5: the
+    mark, then the hang-up beside the last lines (wind_down gathers them)."""
+    grace, close = (Settings.model_fields[f].default for f in ("follow_leave_grace_s", "stt_close_timeout_s"))
+    hang_up = C.LEAVE_TOKEN_TIMEOUT_S + C.DELETE_TIMEOUT_S
+    assert ROSTER_LAG_S + grace + FL.MARK_TIMEOUT_S + hang_up <= 15
+    assert FL.MARK_TIMEOUT_S + max(close, hang_up) <= 15

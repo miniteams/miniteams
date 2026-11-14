@@ -54,7 +54,7 @@ EXTRA_HINT = "uv sync --inexact --extra transcript, then uv run --extra transcri
 _LOCK_TRIES, _LOCK_PAUSE = 10, 0.02  # ~200 ms before a follower concedes the lock
 _SIGNALS = {signal.SIGTERM, signal.SIGINT}
 _DONE = signal.SIGUSR1  # the follower thread ended on its own: wakes the main thread's sigwait
-_LEAVE_S = 40.0  # DELETE (10 s) + the transcript's last lines (stt_close_timeout_s) + margin
+_LEAVE_S = 40.0  # the hang-up (token + DELETE, 7 s) beside the last lines (stt_close_timeout_s) + margin
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 

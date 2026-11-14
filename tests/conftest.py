@@ -5,9 +5,11 @@ import contextlib
 import ipaddress
 import json
 import logging
+import os
 import socket
 import sys
 from collections.abc import AsyncIterator, Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -16,8 +18,48 @@ import websockets
 
 from miniteams.config import Settings
 from miniteams.directory import Directory
+from miniteams.follow import missing_extra
 
 _MEMORY_CAP = 4 << 30  # bytes of address space; glibc reserves 64 MiB per thread arena
+_NO_EXTRA = missing_extra()
+_NO_EXTRA_WHY = f"transcript extra missing ({', '.join(_NO_EXTRA)}): uv run --extra transcript pytest"
+# The test modules importing the extra, directly or through call_fakes, stt_helpers or stt.session.
+_EXTRA_MODULES = {
+    "test_call.py",
+    "test_follower.py",
+    "test_stt_parakeet.py",
+    "test_stt_pipeline.py",
+    "test_stt_pool.py",
+    "test_stt_real.py",
+    "test_stt_session.py",
+    "test_stt_vad.py",
+}
+
+
+def _needs_extra() -> None:
+    # Under CI a missing extra fails: the follower's tests must never silently stop running.
+    if os.getenv("CI"):
+        pytest.fail(_NO_EXTRA_WHY)
+    pytest.skip(_NO_EXTRA_WHY)
+
+
+class _NeedsExtra(pytest.File):
+    def collect(self) -> Iterator[pytest.Item]:
+        _needs_extra()
+        yield from ()
+
+
+def pytest_pycollect_makemodule(module_path: Path, parent: pytest.Collector) -> pytest.File | None:
+    """The modules that import the transcript extra (spec 044) skip whole: they cannot even be imported."""
+    if _NO_EXTRA and module_path.name in _EXTRA_MODULES:
+        return _NeedsExtra.from_parent(parent, path=module_path)
+    return None
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """`transcript`-marked tests of other modules need the extra too."""
+    if _NO_EXTRA and item.get_closest_marker("transcript"):
+        _needs_extra()
 
 
 def _cap_memory() -> None:

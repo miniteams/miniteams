@@ -40,8 +40,7 @@ from .stream import AGENT_PATH, off_loop, run_forever
 
 log = structlog.get_logger()
 
-# Headers and capability masks seen from Teams clients (ost); the AMER region headers worked for a
-# European tenant in S18.
+# Headers and capability masks seen from Teams clients; the AMER region headers work for other regions.
 SKYPE_CLIENT = "SkypeSpaces/1415/teams-cli/TsCallingVersion=2025.49.01.15"
 REGION = {"ms-teams-partition": "amer03", "ms-teams-region": "amer", "ms-teams-ring": "general"}
 PT_MULTICHANNEL, PT_PCMU = 110, 0
@@ -51,19 +50,19 @@ PCMU_SILENCE = b"\xff" * 160  # mu-law zero, 20 ms at 8 kHz
 RESYNC_S = 2.0  # an RTP clock this far from the arrival time jumped: re-anchor it
 ACCEPT_TIMEOUT_S = 300.0  # a meeting lobby waits for someone to admit us
 STEP_TIMEOUT_S = 30.0  # Trouter session, ICE
-# RTCP reaches us every ~5 s even in silence: the longest gap between two packets of any kind over every
-# live capture (S18 runs up to 30 min, Phase 3 runs) was 6.2 s; 4x that, floored at a minute.
-MEDIA_IDLE_S = 60.0
+MEDIA_IDLE_S = 60.0  # RTCP flows even in silence: no packet at all this long is a network outage
 # A key's base64, also as JSON may escape it (`\/`, `\u002b`).
 _KEY = re.compile(r"inline:(?:[A-Za-z0-9+/=]|\\/|\\u[0-9A-Fa-f]{4})+")
 HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+# With the leave grace and the ended mark, these keep a hang-up within AC4's 15 s (a test pins the sum).
+LEAVE_TOKEN_TIMEOUT_S = 3.0
+DELETE_TIMEOUT_S = 4.0
 LAST_DEVICE_LEFT = "last_device_left"
 TROUTER_MOVED = "trouter_moved"  # our socket reconnected on a new surl: the callbacks name the old one
 MEDIA_IDLE = "media: nothing received"
 MEDIA_LOST = "media: ICE connection lost"
 REATTACH = (TROUTER_MOVED, MEDIA_IDLE, MEDIA_LOST)  # ends a fresh join may recover from (a network outage)
-# Every host the live captures showed for the URLs we send the IC3 bearer or the skype token to (the
-# conversation service, the controller, the call leg, the acknowledgement and media answer links).
+# Every host live captures showed for the URLs we send the IC3 bearer or the skype token to.
 TRUSTED_HOSTS = (".flightproxy.teams.microsoft.com",)
 SILENCE_STALL_S = 0.2  # a send loop this late resumes its pace from now: no burst of catch-up packets
 # The callback headers a capture keeps: diagnosis ids and encodings, no tenant, host or tunnel ids.
@@ -435,8 +434,7 @@ class Stats:
 
 class _Ice(aioice.Connection):
     async def query_consent(self) -> None:
-        """No RFC 7675 consent checks: a Teams relay stopped answering them on a pair still carrying
-        media, and their expiry hung up a working call 30 s in (seen live); the S18 client sent none."""
+        """No RFC 7675 consent checks: a Teams relay may stop answering them while media flows."""
 
 
 def stun(settings: Settings) -> tuple[str, int] | None:
@@ -498,9 +496,7 @@ class Call:
         self._tasks: set[asyncio.Future[Any]] = set()
         self._conn: aioice.Connection | None = None
         self._offer = ""
-        # The call's controller, given by an earlier join of this call, or read from a 1:1's push in
-        # join(): phase 2 goes straight to it. An ended 1:1 then answers 404; an ended meeting or group
-        # call comes back with only us in it (seen live), which the leave rule ends after its grace.
+        # Known (an earlier join's, or a 1:1 push's in join()): phase 2 goes straight to it, no phase 1.
         self.controller = controller
         self._direct = bool(controller)
         self._key = os.urandom(30)
@@ -508,6 +504,7 @@ class Call:
         self._rx: pylibsrtp.Session | None = None
         self._remote_key = b""
         self.leg = ""  # links.callLeg: DELETE leaves
+        self._last_ic3 = ""  # the hang-up's fallback when a fresh token is late
         self.stats = Stats()
 
     # --- tokens and requests ---
@@ -517,7 +514,21 @@ class Call:
         token = await off_loop(token_source(self.settings).ic3_token)
         if not token:
             raise JoinError("no IC3 token")
+        self._last_ic3 = token
         return token
+
+    async def _leave_token(self) -> str | None:
+        """A fresh IC3 token within LEAVE_TOKEN_TIMEOUT_S, else the last one this call used; None without."""
+        try:
+            return await asyncio.wait_for(self._ic3(), LEAVE_TOKEN_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001 — a late or failed token must not cost the hang-up
+            log.warning(
+                "call_leave_token_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+                cached=bool(self._last_ic3),
+            )
+            return self._last_ic3 or None
 
     async def _post(
         self, url: str, body: dict[str, Any], what: str, migration: bool = False
@@ -595,8 +606,7 @@ class Call:
             },
             "debugContent": {"ecsEtag": '"0"', "causeId": message_id[:8]},
         }
-        # Direct: what the push left empty goes. A 1:1 names neither; with them null its controller answers
-        # 400 (seen live).
+        # Direct: what the push left empty goes; a 1:1's controller answers 400 to them null.
         if self._direct:
             if not body["meetingInfo"]:
                 del body["meetingInfo"]
@@ -645,8 +655,7 @@ class Call:
         if not self._surl.done():
             self._surl.set_result(surl)
             return
-        # A second session is a reconnect: callbacks sent meanwhile are lost, even on the same surl (and
-        # a new surl gets none): deaf, and blind to my leaving.
+        # A reconnect: callbacks sent meanwhile are lost, on any surl, so we are deaf to my leaving.
         leaving = self.leaving
         self._end_or_leave(TROUTER_MOVED)
         log.warning("call_trouter_moved", call=call_id(self.payload), leaving=leaving)
@@ -724,8 +733,7 @@ class Call:
         """044-AC4: my last device gone from the roster (the follower aside), leave once
         follow_leave_grace_s passes without one coming back (a transfer, a rejoin, a lagging roster)."""
         own = self.roster.own
-        # Judged only on a roster listing our own stream: a complete view of my entry. One without it
-        # (our MSI unknown before the acceptance, my entry missing) proves nothing about my devices.
+        # Only a roster listing our own stream shows my whole entry; any other proves nothing.
         if own is None or own not in self.roster.mine:
             return
         if self.roster.mine - {own}:
@@ -843,8 +851,7 @@ class Call:
         group, meeting = self.payload.get("groupContext"), self.payload.get("meetingInfo")
         if isinstance(meeting, dict) and isinstance(group, dict) and group.get("threadId"):
             return
-        # A 1:1 push names neither: phase 1 without them creates an ad hoc call of ours instead, so phase 2
-        # goes straight to the live call's controller, which attaches us to it (seen live).
+        # A 1:1 push names neither: phase 1 would create a call of ours; its controller attaches us.
         direct = self.payload.get("conversationController")
         if not isinstance(direct, str) or not direct:
             raise JoinError("push names no meeting nor conversation controller", retry=False)
@@ -1060,13 +1067,16 @@ class Call:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         status = None
-        if self.leg:
+        token = await self._leave_token() if self.leg else None
+        if self.leg and token is None:
+            log.warning("call_leave_skipped", call=call_id(self.payload), reason="no IC3 token")
+        elif self.leg:
             try:
-                headers = {
-                    "Authorization": f"Bearer {await self._ic3()}",
-                    "X-Skypetoken": self.directory.skype_token,
-                }
-                status = (await self.http.delete(_https(self.leg), headers=headers)).status_code
+                headers = {"Authorization": f"Bearer {token}", "X-Skypetoken": self.directory.skype_token}
+                delete = self.http.delete(_https(self.leg), headers=headers)
+                status = (await asyncio.wait_for(delete, DELETE_TIMEOUT_S)).status_code
+                if not 200 <= status < 300:  # e.g. a fallback token expired: we may stay in the call as me
+                    log.warning("call_leave_rejected", call=call_id(self.payload), status=status)
             except Exception as exc:  # noqa: BLE001 — a failed hang-up must not skip the closes below
                 log.warning("call_leave_failed", error=str(exc), error_type=type(exc).__name__)
         log.info(

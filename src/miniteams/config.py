@@ -113,15 +113,11 @@ class Settings(BaseSettings):
     # steals its deliveries. A suffix gives it its own ids while sharing the token cache.
     endpoint_suffix: str = ""
     cache_dir: Path = Field(default_factory=_default_cache_dir)  # regenerable downloads
-    # `follow --capture DIR` (spec 044): each follower dumps its call's RTP, Trouter callbacks and SDP
-    # under DIR/<call>/<endpoint>/ (one dir per join) for protocol diagnosis. Off by default: nothing but
-    # text is written otherwise.
+    # `follow --capture DIR` (spec 044): protocol dumps, audio included; unset, only text is written.
     follow_capture: Path | None = None
-    # The follower's STUN server for its server-reflexive ICE candidate (a third party: it sees this
-    # host's address); empty: host candidates only.
+    # A third party: it sees this host's public address. Empty: host candidates only.
     stun_server: str = "stun.l.google.com:19302"
-    # My last device gone from the roster, the follower waits this long for one to come back (a transfer
-    # to another device) before it leaves; the roster shows a leave ~1 s late, AC4 allows 15 s.
+    # The wait for one of my devices to come back before leaving; part of AC4's 15 s (see call.py).
     follow_leave_grace_s: float = Field(default=5.0, ge=0)
     # A follower that lost its media or its socket (a network outage) keeps re-attaching this long.
     follow_reattach_deadline_s: float = Field(default=300.0, ge=0)
@@ -134,22 +130,17 @@ class Settings(BaseSettings):
     transcribe_library: Path | None = None
     parakeet_model: Path | None = None
     whisper_model: Path | None = None
-    # Engine processes, each with stt_cpu_threads threads: two of 2 threads gave 8.4x real time on a
-    # 4-CPU node, one of 4 threads 6.2x (grill-room spike S10d).
     stt_engine_processes: int = Field(default=2, ge=1)
     stt_cpu_threads: int = Field(default=2, ge=1)
     # An engine that has not answered by then is killed and restarted; a 15 s utterance takes ~3 s.
     stt_engine_timeout_s: float = Field(default=60.0, gt=0)
     # Utterances waiting for an engine; past it new ones are dropped and logged.
     stt_queue_size: int = Field(default=64, ge=1)
-    # A speaker from whom no frame arrived for this long stopped talking: silence is fed for them. Above
-    # delivery jitter, or silence lands inside speech.
+    # No frame from a speaker for this long: silence is fed for them. Below delivery jitter it cuts speech.
     stt_quiet_s: float = Field(default=0.4, gt=0)
     # At the end of a call, the wait for the lines still in the engines; within AC5's 15 s.
     stt_close_timeout_s: float = Field(default=10.0, gt=0)
-    # Silence that ends an utterance, the longest one before a forced cut, and how far back from that cap
-    # the forced cut looks for the quietest window (0 cuts at the cap). Same defaults as stt.vad.Segmenter,
-    # not imported from it: config must load without the transcript extra's numpy.
+    # stt.vad.Segmenter's defaults, copied: config loads without the transcript extra.
     vad_min_silence_ms: int = Field(default=800, ge=1)
     vad_max_speech_s: float = Field(default=15.0, gt=0)
     vad_cut_search_s: float = Field(default=3.0, ge=0)
