@@ -14,6 +14,7 @@ import base64
 import contextlib
 import json
 import os
+import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -61,14 +62,57 @@ AliveHook = Callable[[], Awaitable[None]]  # the socket is up: at connect and on
 SessionHook = Callable[[str, str], Awaitable[None]]  # (endpoint id, surl) of a registered socket
 PresenceHook = Callable[[dict[str, Any]], Awaitable[None]]  # a decoded presence delivery body
 CallHook = Callable[[dict[str, Any]], Awaitable[None]]  # a raw NGCallManagerWin delivery (spec 044)
+AGENT_PATH = "/callAgent/"  # a joined call's own callbacks (spec 044), on the surl of the socket that joined
 # The Teams session: up, down (reconnecting) or login (waiting for a `miniteams login`).
 LinkState = Literal["up", "down", "login"]
 LinkHook = Callable[[LinkState], None]
 
 
+async def off_loop[T](fn: Callable[..., T], *args: Any, name: str = "") -> T:
+    """`fn(*args)` in a daemon thread: the event loop keeps running, and a Ctrl-C or a stop does not wait
+    for a hung HTTP call to time out (asyncio.to_thread's executor threads are joined at exit)."""
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[T] = loop.create_future()
+
+    def settle(ok: bool, value: Any) -> None:
+        if fut.done():  # the awaiting task is gone (cancelled)
+            return
+        if ok:
+            fut.set_result(value)
+        else:
+            fut.set_exception(value)
+
+    def run() -> None:
+        try:
+            result: Any = (True, fn(*args))
+        except BaseException as exc:  # noqa: BLE001 — handed to the awaiting task
+            result = (False, exc)
+        try:
+            loop.call_soon_threadsafe(settle, *result)
+        except RuntimeError:  # the loop closed meanwhile: nobody waits for it
+            pass
+
+    label = name or f"off-loop-{getattr(fn, '__name__', 'call')}"
+    threading.Thread(target=run, name=label, daemon=True).start()
+    return await fut
+
+
 def _correlation_vector() -> str:
     """22-char base64-ish token (purple-teams teams_generate_correlation_vector)."""
     return base64.b64encode(os.urandom(16)).decode().rstrip("=")[:22]
+
+
+def agent_ack(req: dict[str, Any]) -> str:
+    """A call callback's response: without the request's MS-CV + ".0", its trouter-request and a
+    trouter-client header, the call controller redelivers and then ends the call with 408/10056."""
+    headers = {str(k).lower(): v for k, v in (req.get("headers") or {}).items()}
+    out = {}
+    if cv := headers.get("ms-cv"):
+        out["MS-CV"] = f"{cv}.0"
+    if treq := headers.get("trouter-request"):
+        out["trouter-request"] = treq
+    out["trouter-client"] = '{"cd":1}'
+    return json.dumps({"id": req.get("id"), "status": 200, "headers": out, "body": ""}, separators=(",", ":"))
 
 
 class TrouterClient:
@@ -90,6 +134,7 @@ class TrouterClient:
         on_session: SessionHook | None = None,
         on_presence: PresenceHook | None = None,
         on_call: CallHook | None = None,
+        on_agent: CallHook | None = None,
     ) -> None:
         self.settings = settings
         self.aad = aad
@@ -107,6 +152,7 @@ class TrouterClient:
         self.on_session = on_session
         self.on_presence = on_presence
         self.on_call = on_call  # set → also registers on NGC_PATH, its pushes go to this hook only
+        self.on_agent = on_agent  # set → AGENT_PATH deliveries go to this hook only
         # Stable per endpoint, so reconnects renew one registration; never the epid, which would replace
         # the messaging registration.
         self._ngc_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"miniteams:ngc:{epid}"))
@@ -318,11 +364,19 @@ class TrouterClient:
         except json.JSONDecodeError:
             log.warning("delivery_parse_failed", data=data[:200])
             return
-        msg_id = req.get("id")
+        agent = self.on_agent is not None and AGENT_PATH in str(req.get("url") or "")
         # Ack regardless of whether we print anything — missing acks cause redelivery/disconnect.
-        ack = json.dumps({"id": msg_id, "status": 200, "body": ""}, separators=(",", ":"))
+        if agent:
+            ack = agent_ack(req)
+        else:
+            ack = json.dumps({"id": req.get("id"), "status": 200, "body": ""}, separators=(",", ":"))
         await self._ws.send(f"3:::{ack}")
-        if self.raw:
+        if agent and self.on_agent is not None:
+            try:
+                await self.on_agent(req)
+            except Exception as exc:  # noqa: BLE001 — a bad callback must not drop the socket
+                log.warning("agent_hook_failed", error=str(exc), error_type=type(exc).__name__)
+        elif self.raw:
             await emit_raw_delivery(req)  # every endpoint, decoded, no filtering
         elif self.on_call is not None and str(req.get("url") or "").endswith(NGC_PATH):
             try:
@@ -404,8 +458,8 @@ async def _refresh_directory_token(
     while True:
         await sleep(max(_TOKEN_REFRESH_MIN, delay))
         try:
-            aad = await asyncio.to_thread(tokens.refresh)
-            skype = await asyncio.to_thread(exchange_skype_token, settings, aad["access_token"])
+            aad = await off_loop(tokens.refresh)
+            skype = await off_loop(exchange_skype_token, settings, aad["access_token"])
         except AuthExpired as exc:
             # Ours may only be stale: a sibling (archive, login) rotates the token on disk, and the
             # session can outlive this by hours, every call 401ing on the token we stopped renewing.
@@ -451,6 +505,7 @@ async def run_forever(
     on_presence: PresenceHook | None = None,
     on_link: LinkHook | None = None,
     on_call: CallHook | None = None,
+    on_agent: CallHook | None = None,
 ) -> None:
     """Re-establish a full session on every disconnect.
 
@@ -465,9 +520,12 @@ async def run_forever(
     # refresh silently — never re-prompt — so a failed connect can't spin into endless logins.
     tokens = token_source(settings)
     if prompt:
+        # In this thread: it may prompt, and Ctrl-C must reach it at once.
         tokens.acquire()
     else:
-        tokens.refresh()  # silent only: a watch owns stdout and cannot show a device code
+        # Silent only (a watch owns stdout and cannot show a device code), off the event loop like the
+        # calls below: a host's other tasks (a call's media) keep running.
+        await off_loop(tokens.refresh)
 
     def link(state: LinkState) -> None:
         if on_link is None:
@@ -486,13 +544,14 @@ async def run_forever(
     while True:
         connected_at: float | None = None
         try:
-            aad = tokens.refresh()  # silent; raises AuthExpired when the refresh token is dead
-            skype = exchange_skype_token(settings, aad["access_token"])
+            # Silent; AuthExpired when the refresh token is dead.
+            aad = await off_loop(tokens.refresh)
+            skype = await off_loop(exchange_skype_token, settings, aad["access_token"])
             skype_token = skype["skype_token"]
             directory.set_token(skype_token, str(aad["access_token"]))
             epid = epid or get_or_create_epid(settings, epid_name)
-            info = trouter_info(settings, skype_token, epid)
-            session_id = handshake(settings, info, skype_token, epid)
+            info = await off_loop(trouter_info, settings, skype_token, epid)
+            session_id = await off_loop(handshake, settings, info, skype_token, epid)
             connected_at = time.monotonic()
             refresher = asyncio.create_task(
                 _refresh_directory_token(settings, tokens, directory, _lifetime(skype))
@@ -515,6 +574,7 @@ async def run_forever(
                     on_session=on_session,
                     on_presence=on_presence,
                     on_call=on_call,
+                    on_agent=on_agent,
                 ).run()
             finally:
                 refresher.cancel()

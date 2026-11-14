@@ -709,3 +709,22 @@ async def test_long_frames_land_where_short_ones_do(
     for (t0, e0), (t1, e1) in zip(short, long, strict=True):
         assert abs(t1 - t0) <= 512 / SR and abs(e1 - e0) <= 512 / SR
     assert abs(short[0][1] - (T0 + 1.3)) <= 512 / SR
+
+
+async def test_header_carries_the_join_outcome(settings: Settings, tmp_path: Path, now: list[float]) -> None:
+    """044-AC14: the follower adds its join outcome to the header."""
+    s = S.Session(
+        settings,
+        tmp_path,
+        CALL,
+        THREAD,
+        NAMES.get,
+        engines=[by_level],
+        vad=lambda: loudness,
+        clock=lambda: now[0],
+        header={"join": "ok"},
+    )
+    await s.start()
+    await s.close()
+    assert s.transcript is not None
+    assert lines(s.transcript.path)[0]["join"] == "ok"

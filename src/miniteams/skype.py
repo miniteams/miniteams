@@ -48,7 +48,14 @@ def exchange_skype_token(settings: Settings, access_token: str) -> dict[str, Any
     if csa_url.startswith("https://") and "csa_url" not in settings.model_fields_set:
         settings.csa_url = csa_url
     log.info("skype_token_acquired", expires_in=expires_in, region=region, chat_host=settings.contacts_host)
-    return {"skype_token": token, "expires_in": expires_in, "region": region}
+    # The meeting follower places its calls there (spec 044).
+    conversation_url = str(gtms.get("calling_conversationServiceUrl") or "")
+    return {
+        "skype_token": token,
+        "expires_in": expires_in,
+        "region": region,
+        "conversation_url": conversation_url,
+    }
 
 
 def persist_skype_token(settings: Settings, token_data: dict[str, Any]) -> Path:

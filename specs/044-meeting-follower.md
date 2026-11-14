@@ -207,8 +207,15 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
   - Q3, offline part, 2026-11-14: PyAV decodes the `x-multichannel` G.722 blocks packet by packet with
     output identical to the ffmpeg CLI on the whole stream (S18 run of 1 min, 5 MSIs, 2969 packets,
     0.27 s CPU). The same capture paced on its RTP clock through `Session` (parakeet): 12 lines on 3
-    speakers, latency median 1.19 s, p90 1.98 s, max 3.0 s. `aioice` and `pylibsrtp` against Teams: _live,
-    to fill_.
+    speakers, latency median 1.19 s, p90 1.98 s, max 3.0 s.
+  - Q3 live, test tenant, 2026-11-14 (Phase 3 slice 1, `miniteams.call`): `aioice` (host + STUN, controlling)
+    and `pylibsrtp` (SDES `AES_CM_128_HMAC_SHA1_80`, libsrtp's per-SSRC streams) interoperate with Teams. A
+    meeting: joined 8 s after the push, 7359 packets, 0 undecryptable (renegotiation rekey included), 30
+    lines on 2 speakers, latency median 1.02 s, p90 1.76 s; `DELETE` 202, and the follower's MSI left the
+    roster an S18 observer saw at once (no ghost). An ad hoc group call: same join, attached, `DELETE` 202.
+    aioice's RFC 7675 consent checks are off: in one run the relay stopped answering them while RTP still
+    flowed, and their expiry hung up the call 30 s later; the S18 client never sent any. A 4-minute rerun
+    without them: 12614 packets, 46 lines, latency median 1.04 s, p90 1.81 s, `DELETE` 202, no ghost.
   - Q1 leave detection, live in a test tenant, 2026-11-14 (two devices of mine plus the S18 client, two
     talkers):
     - `evt 115` fires once, on my first endpoint's join; neither a second device nor the follower pushes
@@ -227,5 +234,4 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
     - 1:1 call: the push has `conversationController` and `additionalData.participantList` but no
       `groupContext` nor `meetingInfo`; an `evt 107` (incoming call, `links.attach`) precedes it. The join
       must go straight to `join_conversation_with_sdp` on the push's `conversationController`: not tried.
-  - Q3 live (`aioice`, `pylibsrtp` against Teams) and the 1:1 join are settled by Phase 3's first slice,
-    in the test tenant; if either fails, Phase 3 stops at that fork.
+  - The 1:1 join is left to Phase 3's second slice, with leave detection and the retry.

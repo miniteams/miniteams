@@ -9,10 +9,8 @@ paused while a pass runs and cancelled mid-chat when one starts, so it never wri
 """
 
 import asyncio
-import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -35,34 +33,13 @@ from .chats import in_archive_scope
 from .config import Settings
 from .directory import Directory
 from .messages import message_files, message_names, thread_of
-from .stream import run_forever
+from .stream import off_loop, run_forever
 
 log = structlog.get_logger()
 
 _BUFFER_MAX = 10_000  # buffered entries (cards weigh KBs); past it only thread ids are kept
 _LOSS_WINDOW = 300.0  # seconds: chats written live this recently are forced on a message_loss
 _RETRY_MAX = 300.0  # seconds: cap of the backoff between failed catch-up passes
-
-
-async def _in_thread[T](fn: Callable[[], T]) -> T:
-    """Run `fn` in a daemon thread: `asyncio.to_thread` would make Ctrl-C wait for a whole pass."""
-    loop = asyncio.get_running_loop()
-    future: asyncio.Future[T] = loop.create_future()
-
-    def _settle(setter: Callable[[Any], None], value: Any) -> None:
-        if not future.done():  # cancelled on shutdown
-            setter(value)
-
-    def _work() -> None:
-        try:
-            result = fn()
-        except BaseException as exc:  # noqa: BLE001 — handed to the awaiting coroutine
-            loop.call_soon_threadsafe(_settle, future.set_exception, exc)
-        else:
-            loop.call_soon_threadsafe(_settle, future.set_result, result)
-
-    threading.Thread(target=_work, name="archive-catchup", daemon=True).start()
-    return await future
 
 
 class LiveArchive:
@@ -268,7 +245,8 @@ class LiveArchive:
             force, self._force = frozenset(self._force), set()
             log.info("live_catchup_start", forced=len(force), buffered=len(self._buffer))
             try:
-                expired = await _in_thread(partial(self._pass, force))
+                # A daemon thread: asyncio.to_thread would make Ctrl-C wait for a whole pass.
+                expired = await off_loop(self._pass, force, name="archive-catchup")
             except Exception as exc:  # noqa: BLE001 — transient (network, 5xx): the pass is reentrant
                 failures += 1
                 self._force |= force

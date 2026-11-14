@@ -20,7 +20,15 @@ dependencies = [
 widget = ["pyside6-essentials>=6.12", "pyside6-addons>=6.12", "pyside6-webengine>=6.12"]
 # `miniteams follow`, the meeting follower's speech to text (spec 044): `uv sync --inexact --extra transcript`
 # transcribe-cpp: the ctypes binding only; scripts/build-transcribe.sh builds libtranscribe itself (pinned, AVX2).
-transcript = ["numpy>=2.3", "onnxruntime>=1.23", "faster-whisper>=1.2", "transcribe-cpp==0.4.0"]
+transcript = [
+    "numpy>=2.3",
+    "onnxruntime>=1.23",
+    "faster-whisper>=1.2",
+    "transcribe-cpp==0.4.0",
+    "aioice>=0.13.0",
+    "pylibsrtp>=1.0.0",
+    "av>=19.0.2",
+]
 
 [project.scripts]
 miniteams = "miniteams.cli:main"
@@ -76,7 +84,10 @@ ignore_missing_imports = true
 
 # The `transcript` extra's untyped runtimes (spec 044)
 [[tool.mypy.overrides]]
-module = ["numpy.*", "faster_whisper.*", "ctranslate2.*", "onnxruntime.*", "transcribe_cpp.*"]
+module = [
+    "numpy.*", "faster_whisper.*", "ctranslate2.*", "onnxruntime.*", "transcribe_cpp.*", "aioice.*", "av.*",
+    "pylibsrtp.*",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

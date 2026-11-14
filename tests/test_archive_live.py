@@ -784,3 +784,29 @@ def test_live_pass_leaves_the_sweep_heartbeat_alone(settings: Settings, tmp_path
     finally:
         arch.close()
     assert seen and seen[0]["live_pass"] is True
+
+
+@pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
+def test_ctrl_c_during_a_catch_up_pass_leaves_no_thread_error(live: AL.LiveArchive) -> None:
+    """Ctrl-C cancels the loop while a pass runs in its daemon thread; the pass ending later meets a
+    closed loop and must not die on it ("Event loop is closed")."""
+    release, entered = threading.Event(), threading.Event()
+
+    def pass_(force: frozenset[str]) -> bool:
+        entered.set()
+        release.wait(5)
+        return False
+
+    live._pass = pass_  # type: ignore[method-assign]
+    loop = asyncio.new_event_loop()
+    task = loop.create_task(live._catch_up())
+    loop.run_until_complete(asyncio.sleep(0.01))
+    assert entered.wait(5)
+    task.cancel()  # what asyncio.run does on Ctrl-C
+    loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+    loop.close()
+    (worker,) = [t for t in threading.enumerate() if t.name == "archive-catchup"]
+    assert worker.daemon
+    release.set()
+    worker.join(5)
+    assert not worker.is_alive()

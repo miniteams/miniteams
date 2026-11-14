@@ -180,7 +180,7 @@ class TokenSource:
         self.settings = settings
         self._cache, self._cache_path = _build_cache(settings)
         self._cache_stamp = _stamp(self._cache_path)
-        # `stream` refreshes from two threads (session loop + refresher task via to_thread).
+        # `stream` refreshes from two threads (session loop + refresher task, each via off_loop).
         # Reload → mint → persist has to be atomic per process: otherwise one thread reloads the
         # file over the token the other just rotated in memory, restoring the revoked one.
         # Re-entrant: refresh() holds it across _silent() and _persist().

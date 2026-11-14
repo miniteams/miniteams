@@ -12,6 +12,7 @@ only its engine's runtime, never the follower's call stack.
 """
 
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -160,6 +161,8 @@ def child_env() -> dict[str, str]:
 
 def serve(transcribe: Transcribe, read_fd: int, write_fd: int) -> None:
     """The child's loop: ready once loaded, then one answer per utterance until the parent goes."""
+    # The follower blocks its stop signals for sigwait, and a child inherits the mask across exec.
+    signal.pthread_sigmask(signal.SIG_SETMASK, set())
     inbox = Connection(read_fd, writable=False)
     outbox = Connection(write_fd, readable=False)
     outbox.send(("ready", os.getpid()))

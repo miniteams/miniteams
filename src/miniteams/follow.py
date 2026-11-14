@@ -1,4 +1,4 @@
-"""Meeting follower trigger (spec 044, phase 2): call pushes start and stop one follower per call.
+"""Meeting follower (spec 044): call pushes start and stop one follower per call.
 
 `evt 115` (I joined a call, any device) spawns `miniteams follow --call <payload>` as a detached
 process; `evt 116` (the call ended for me) signals it. The follower holds `<data-dir>/follow/<call>.lock`
@@ -7,6 +7,9 @@ process; `evt 116` (the call ended for me) signals it. The follower holds `<data
 `evt 116` also appends the ended join's `userJoinTime` to `<call>.ended`: a follower of that join not
 yet holding its lock, or launched by another trigger, reads it once locked and stops; a redelivered
 115 of that join is skipped. A rejoin of the same call has another join time: neither is touched by it.
+
+The follower's main thread only waits for the stop signal; a thread of its own joins, transcribes and
+leaves the call (`miniteams.call`, the `transcript` extra).
 """
 
 import contextlib
@@ -36,10 +39,16 @@ log = structlog.get_logger()
 
 EVT_JOINED = 115
 EVT_ENDED = 116
-TRANSCRIPT_MODULES = ("numpy", "onnxruntime", "faster_whisper", "transcribe_cpp")
+TRANSCRIPT_MODULES = ("numpy", "onnxruntime", "faster_whisper", "transcribe_cpp", "av", "aioice", "pylibsrtp")
 BUILD_HINT = "scripts/build-transcribe.sh"
 EXTRA_HINT = "uv sync --inexact --extra transcript, then uv run --extra transcript miniteams follow"
 _LOCK_TRIES, _LOCK_PAUSE = 10, 0.02  # ~200 ms before a follower concedes the lock
+_SIGNALS = {signal.SIGTERM, signal.SIGINT}
+_DONE = signal.SIGUSR1  # the follower thread ended on its own: wakes the main thread's sigwait
+# A follower whose call ended keeps its lock until the trigger's SIGTERM: evt 116 follows a call's end
+# within about a second (seen live), and a redelivered 115 must not join again meanwhile.
+_LINGER_S = 60.0
+_LEAVE_S = 40.0  # DELETE (10 s) + the transcript's last lines (stt_close_timeout_s) + margin
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
@@ -110,6 +119,8 @@ def thread_of(payload: dict[str, Any]) -> str:
 
 
 def call_kind(thread: str) -> str:
+    if not thread:  # a 1:1 push names no thread (no groupContext), seen live
+        return "1:1"
     if thread.startswith("19:meeting_"):
         return "meeting"
     if thread.endswith("@unq.gbl.spaces"):
@@ -361,7 +372,21 @@ def trigger(settings: Settings, data_dir: Path) -> CallHook:
     return on_call
 
 
-# --- follower (stub until phases 3 and 4) ---
+# --- follower ---
+
+
+def _attend(data_dir: Path, payload: dict[str, Any], stop: threading.Event) -> str:
+    """Joins the call and transcribes it until `stop` is set or the call ends; the outcome."""
+    import asyncio
+
+    from .call import follow  # the transcript extra: never loaded by the trigger's hosts
+
+    try:
+        return asyncio.run(follow(Settings(), data_dir, payload, stop))  # type: ignore[call-arg]
+    # A stray CancelledError too: else the thread dies with no outcome and the process lingers to 116.
+    except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 — the lock and the stop line outlive any failure
+        log.error("follow_failed", error=str(exc), error_type=type(exc).__name__, exc_info=True)
+        return "error"
 
 
 def run_call(data_dir: Path, push_json: str) -> int:
@@ -373,7 +398,8 @@ def run_call(data_dir: Path, push_json: str) -> int:
     if payload is None or call is None:
         log.error("follow_bad_call")
         return 2
-    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
+    # Blocked before any thread starts, so every thread inherits it and sigwait alone takes them.
+    signal.pthread_sigmask(signal.SIG_BLOCK, {*_SIGNALS, _DONE})
     fd = take_lock(lock_path(data_dir, call))
     if fd is None:
         log.info("follow_already_running", call=call)
@@ -388,8 +414,31 @@ def run_call(data_dir: Path, push_json: str) -> int:
             return 0
         thread = thread_of(payload)
         log.info("follow_start", call=call, thread=thread, kind=call_kind(thread))
-        sig = signal.sigwait({signal.SIGTERM, signal.SIGINT})
-        log.info("follow_stop", call=call, reason="signal", signal=signal.Signals(sig).name)
+        stop, main = threading.Event(), threading.get_ident()
+        outcome: list[str] = []
+
+        def attend() -> None:
+            outcome.append(_attend(data_dir, payload, stop))
+            if not stop.wait(_LINGER_S):
+                signal.pthread_kill(main, _DONE)
+
+        # Daemon: a follower hung past _LEAVE_S must not hold the process (and the lock) at exit.
+        worker = threading.Thread(target=attend, name="follower", daemon=True)
+        worker.start()
+        sig = signal.sigwait({*_SIGNALS, _DONE})
+        stop.set()
+        worker.join(_LEAVE_S)
+        if sig == _DONE:
+            log.info("follow_stop", call=call, reason=outcome[0])
+        else:
+            name = signal.Signals(sig).name
+            log.info(
+                "follow_stop",
+                call=call,
+                reason="signal",
+                signal=name,
+                outcome=outcome[0] if outcome else None,
+            )
     finally:
         # ponytail: .lock, .ended and .log stay, three small files per call (unlinking a flock file races
         # a new holder); a cleanup of old calls when they pile up.

@@ -47,6 +47,18 @@ def iso(t: float) -> str:
     return datetime.fromtimestamp(t, UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def transcript_header(call: str, thread: str, started: float, engine: str, **extra: Any) -> dict[str, Any]:
+    """The transcript's first line (044-AC8), plus what the follower adds (its join outcome)."""
+    return {
+        "call": call,
+        "thread": thread,
+        "kind": call_kind(thread),
+        "started": iso(started),
+        "engine": engine,
+        **extra,
+    }
+
+
 class Transcript:
     """`<data-dir>/follow/<YYYY-MM>/<started>-<call>.ndjson`: a header, then one line per utterance,
     each in one write() so another process reads whole lines as soon as they land (044-AC8)."""
@@ -93,8 +105,10 @@ class Session:
         vad: Callable[[], Probs] = Silero,
         clock: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
+        header: dict[str, Any] | None = None,
     ) -> None:
         self._settings = settings
+        self._extra = header or {}  # added to the transcript header, e.g. the join outcome
         self._data_dir = data_dir
         self._call = call
         self._thread = thread
@@ -124,13 +138,7 @@ class Session:
 
     async def start(self) -> None:
         started = self._clock()
-        header = {
-            "call": self._call,
-            "thread": self._thread,
-            "kind": call_kind(self._thread),
-            "started": iso(started),
-            "engine": self._engine,
-        }
+        header = transcript_header(self._call, self._thread, started, self._engine, **self._extra)
         self.transcript = Transcript(self._data_dir, self._call, started, header)
         try:
             await self._pipeline.start()

@@ -75,6 +75,7 @@ uv run miniteams web --data-dir /srv/teams-archive     # seed rows from an archi
 uv run --extra widget miniteams widget   # the running web's board in its own window + tray icon (spec 024)
 uv run miniteams mcp              # MCP server over stdio for an agent (spec 008; see below)
 uv run --extra transcript miniteams follow   # meeting follower on its own socket (spec 044; below)
+                                                       # --capture DIR: debug dump, audio included
 uv run miniteams follow --disable                      # switch off (--enable); --skip / --unskip THREAD,
                                                        # --status (`~/.config/miniteams/follow.json`)
 uv run miniteams watch --thread 19:xxx@thread.v2 --once   # one JSON line per matching live event
@@ -115,9 +116,12 @@ same flow. The server needs the project's `.env` and `data/`, so register it as
 `uv run --directory /path/to/miniteams miniteams mcp` (a gitignored `.mcp.json` at the repo root
 does it for Claude Code).
 
-`follow` (spec 044, in progress: followers only log their start and stop for now) starts one
-follower per call when you join it from any device, and signals it when the call ends for you. The
-trigger runs on its own socket (`miniteams follow`) or on the archiver's (`archive --live --follow`); each
+`follow` (spec 044, in progress) starts one follower per call when you join it from any device. The
+follower joins the call as a second endpoint of your account (meetings and group calls for now, not yet 1:1
+calls; a 1:1 call is logged as a failed join), transcribes each speaker, and leaves (`DELETE` on its
+call leg) when the call ends, when it is stopped (SIGTERM to the pid in its `.lock`), or when no media
+packet at all arrives for a minute (RTCP included, which flows even in silence). It does not yet leave by
+itself when your own devices leave while others stay, so stop it then. The trigger runs on its own socket (`miniteams follow`) or on the archiver's (`archive --live --follow`); each
 follower is a detached process, `miniteams follow --call`, so restarting the trigger's host leaves it
 running. A lock per call (`<data-dir>/follow/<call>.lock`, its log beside it) keeps it to one follower,
 whatever the device, the redelivery or the number of triggers. Off, or the chat in the skip list: the
@@ -128,7 +132,15 @@ runtime, and refuse to start without them, naming the fix; no other command does
 present) and fetches the pinned models into `~/.cache/miniteams` (`transcribe/lib/`, `models/`);
 `BUILD_JOBS` sets the compile jobs (default 2). `MINITEAMS_STT_ENGINE` picks `parakeet` (default) or
 `whisper`. Transcripts are text only, one NDJSON line per utterance:
-`<data-dir>/follow/<YYYY-MM>/<started>-<call>.ndjson`.
+`<data-dir>/follow/<YYYY-MM>/<started>-<call>.ndjson`, its header holding the join outcome (`"join":
+"ok"`, or `"failed"` and the `error`). `MINITEAMS_STUN_SERVER` (`host:port`, empty for host candidates only)
+sets the follower's STUN server; the default, `stun.l.google.com:19302`, is a third party that sees this
+host's public address once per call.
+
+`follow --capture DIR` is a debug tool for protocol breakage: each follower the trigger starts writes under
+`DIR/<call>/` the call's RTP headers and **payloads** (so the audio, `ssrc-<n>.pay`), RTCP arrivals, its
+Trouter callbacks and every SDP, SRTP keys redacted, in the layout grill-room's S18 `analyze.py` reads.
+Delete it after use; without the flag nothing but text is written.
 
 `dump --jsonl` emits one full-detail record per message (raw resource + resolved sender/thread
 + attachment refs + reactions), every message type, no media download — pipe-friendly.

@@ -7,6 +7,7 @@
 import asyncio
 import logging
 import os
+import signal
 import sys
 import threading
 import time
@@ -360,3 +361,26 @@ def test_a_stop_racing_a_spawn_kills_the_new_child(monkeypatch: pytest.MonkeyPat
     with pytest.raises(EngineDied):
         e.start(30)
     assert spawned[0].poll() is not None and e.pid is None
+
+
+def test_the_engine_child_takes_signals_again() -> None:
+    """The follower blocks its stop signals for sigwait and a child inherits that mask across exec: the
+    engine child clears it, or a SIGTERM to it would be held forever."""
+    blocked = {signal.SIGTERM, signal.SIGINT, signal.SIGUSR1}
+    seen: list[str] = []
+
+    def spawn() -> None:
+        signal.pthread_sigmask(signal.SIG_BLOCK, blocked)  # this thread only, as the follower's
+        e = ProcessEngine([sys.executable, FAKE_ENGINE], 30)
+        try:
+            e.start()
+            assert e._proc is not None
+            status = Path(f"/proc/{e._proc.pid}/status").read_text()
+            seen.append(next(x for x in status.splitlines() if x.startswith("SigBlk:")))
+        finally:
+            e.stop()
+
+    t = threading.Thread(target=spawn)
+    t.start()
+    t.join(30)
+    assert seen == ["SigBlk:\t0000000000000000"]

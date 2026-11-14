@@ -446,3 +446,113 @@ async def test_a_failing_link_hook_does_not_stop_the_loop(
     assert len(sessions) == 2
     failed = [e for e in logs if e["event"] == "link_hook_failed"]
     assert len(failed) == 6 and failed[0]["error_type"] == "ValueError"  # 2 × (up, up, down)
+
+
+# --- off_loop: blocking calls in daemon threads (spec 044) ---
+
+
+async def test_off_loop_returns_raises_and_keeps_the_loop_free() -> None:
+    import threading as th
+
+    gate = th.Event()
+    ticks: list[int] = []
+
+    def slow() -> str:
+        gate.wait(5)
+        return th.current_thread().name
+
+    async def tick() -> None:
+        ticks.append(1)
+        gate.set()
+
+    name, _ = await asyncio.gather(S.off_loop(slow), tick())
+    assert ticks == [1] and name.startswith("off-loop-slow")  # the loop ran while it blocked
+
+    def boom(x: int) -> None:
+        raise ValueError(x)
+
+    with pytest.raises(ValueError, match="7"):
+        await S.off_loop(boom, 7)
+
+
+async def test_off_loop_cancelled_or_outlived_by_its_thread() -> None:
+    """A cancelled wait: the thread's late result lands on a done future and is dropped, never an
+    InvalidStateError in the loop's exception handler."""
+    import threading as th
+
+    loop = asyncio.get_running_loop()
+    errors: list[dict[str, Any]] = []
+    loop.set_exception_handler(lambda _loop, ctx: errors.append(ctx))
+    release, finished = th.Event(), th.Event()
+
+    def held() -> int:
+        release.wait(5)
+        finished.set()
+        return 1
+
+    task = asyncio.ensure_future(S.off_loop(held))
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+    assert finished.wait(5)
+    await asyncio.sleep(0.05)  # the late settle runs on this loop now
+    loop.set_exception_handler(None)
+    assert errors == []
+
+
+@pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
+def test_off_loop_thread_ending_after_its_loop_closed() -> None:
+    """Ctrl-C closes the loop under a running call: the thread's result is dropped, no thread error."""
+    import threading as th
+
+    release = th.Event()
+
+    def held() -> int:
+        release.wait(5)
+        return 1
+
+    async def start() -> asyncio.Future[int]:
+        task = asyncio.ensure_future(S.off_loop(held, name="off-loop-test-closed"))
+        await asyncio.sleep(0.01)
+        return task
+
+    loop = asyncio.new_event_loop()
+    task = loop.run_until_complete(start())
+    task.cancel()
+    loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+    loop.close()
+    (t,) = [t for t in th.enumerate() if t.name == "off-loop-test-closed"]
+    assert t.daemon
+    release.set()
+    t.join(5)
+    assert not t.is_alive()
+
+
+async def test_a_silent_start_refreshes_off_the_loop_and_stops_on_a_dead_login(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """prompt=False (watch, follower): the first refresh runs off the loop; a dead login ends the run."""
+    import threading as th
+
+    from miniteams.auth import AuthExpired
+
+    threads: list[str] = []
+
+    class Dead:
+        def refresh(self) -> dict[str, Any]:
+            threads.append(th.current_thread().name)
+            raise AuthExpired("refresh token expired")
+
+    monkeypatch.setattr(S, "token_source", lambda _s: Dead())
+    with pytest.raises(AuthExpired):
+        await S.run_forever(settings, prompt=False)
+    assert threads == ["off-loop-refresh"]
+
+
+def test_websocket_url_names_the_session_and_the_query(settings: Settings, directory: Directory) -> None:
+    info = {"socketio": "https://trouter.invalid/", "connectparams": {"sr": "x"}, "surl": "s"}
+    client = TrouterClient(settings, {}, "sk", info, "sid", "ep", directory)
+    url = client._ws_url()
+    assert url.startswith("wss://trouter.invalid/socket.io/1/websocket/sid?v=v4&sr=x&") and "epid=ep" in url

@@ -563,6 +563,9 @@ def cmd_follow(settings: Settings, args: argparse.Namespace) -> int:
     from . import follow
 
     data_dir = Path(args.data_dir)
+    if args.capture:
+        # By the environment: the followers the trigger launches, and `--call`'s own Settings, read it.
+        os.environ["MINITEAMS_FOLLOW_CAPTURE"] = str(Path(args.capture).resolve())
     if args.call is not None:
         if not _follow_extra_ok(settings):
             return 1
@@ -891,6 +894,9 @@ def main(argv: list[str] | None = None) -> int:
 
     p_follow = sub.add_parser("follow", help="follow the calls I join: one follower per call (spec 044)")
     p_follow.add_argument("--data-dir", default="data", help="archive root (default: ./data)")
+    p_follow.add_argument(
+        "--capture", metavar="DIR", help="debug: dump each call's RTP, callbacks and SDP under DIR/<call>/"
+    )
     follow_mode = p_follow.add_mutually_exclusive_group()
     follow_mode.add_argument("--call", metavar="PUSH", help=argparse.SUPPRESS)  # the trigger's own launch
     follow_mode.add_argument("--enable", action="store_true", help="turn following on (follow.json)")

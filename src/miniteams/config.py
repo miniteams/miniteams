@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import Literal, Self
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -113,6 +113,12 @@ class Settings(BaseSettings):
     # steals its deliveries. A suffix gives it its own ids while sharing the token cache.
     endpoint_suffix: str = ""
     cache_dir: Path = Field(default_factory=_default_cache_dir)  # regenerable downloads
+    # `follow --capture DIR` (spec 044): each follower dumps its call's RTP, Trouter callbacks and SDP
+    # under DIR/<call>/ for protocol diagnosis. Off by default: nothing but text is written otherwise.
+    follow_capture: Path | None = None
+    # The follower's STUN server for its server-reflexive ICE candidate (a third party: it sees this
+    # host's address); empty: host candidates only.
+    stun_server: str = "stun.l.google.com:19302"
 
     # --- meeting follower speech to text (spec 044): from grill-room `stt/grill_stt/config.py` @ ae133de,
     # Apache-2.0 ---
@@ -141,6 +147,14 @@ class Settings(BaseSettings):
     vad_min_silence_ms: int = Field(default=800, ge=1)
     vad_max_speech_s: float = Field(default=15.0, gt=0)
     vad_cut_search_s: float = Field(default=3.0, ge=0)
+
+    @field_validator("stun_server")
+    @classmethod
+    def _stun_host_port(cls, value: str) -> str:
+        host, sep, port = value.rpartition(":")
+        if value and not (sep and host and port.isdigit() and 0 < int(port) < 65536):
+            raise ValueError("stun_server must be empty or host:port")
+        return value
 
     @model_validator(mode="after")
     def _cut_search_within_cap(self) -> Self:

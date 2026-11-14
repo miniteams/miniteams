@@ -79,6 +79,15 @@ def _stt_runtime(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.M
 
 
 @pytest.fixture(autouse=True)
+def _offline_followers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The followers these tests spawn try to sign in: a dead proxy keeps them off the internet."""
+    for var in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
+        monkeypatch.setenv(var, "http://127.0.0.1:9")
+    for var in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _info_logs() -> None:
     structlog.configure(
         wrapper_class=structlog.make_filtering_bound_logger(logging.INFO)
@@ -114,8 +123,10 @@ def real_launches(procs: list[Any], monkeypatch: pytest.MonkeyPatch) -> list[Any
 
 @pytest.fixture
 def in_process(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """run_call in this process: no real signal mask or wait (they would reach pytest); records waits."""
+    """run_call in this process: no real signal mask or wait (they would reach pytest), no real join;
+    records waits."""
     waits: list[str] = []
+    monkeypatch.setattr(F, "_attend", lambda *_a: "attended")
 
     def sigwait(_sigs: Any) -> int:
         waits.append("wait")
@@ -154,6 +165,7 @@ def test_decode_keeps_evt_and_classifies_the_call() -> None:
     assert F.call_id({"correlationId": "../../etc/passwd"}) is None  # names a file: UUID only
     kinds = [F.call_kind(t) for t in (MEETING, "19:aa_bb@unq.gbl.spaces", "19:fakegroup@thread.v2")]
     assert kinds == ["meeting", "1:1", "group"]
+    assert F.call_kind("") == "1:1"  # a 1:1 push carries no groupContext
 
 
 # --- 044-AC3: one follower per call ---
@@ -973,3 +985,100 @@ def test_end_still_signals_when_the_marker_cannot_be_written(
         F.handle(settings, tmp_path, _push(116))
     assert procs[0].wait(timeout=10) == -signal.SIGTERM
     assert [e["event"] for e in logs] == ["follow_ended_marker_failed", "follow_stop_sent"]
+
+
+# --- phase 3: the follower thread ---
+
+
+def test_a_follower_whose_call_ended_stops_itself_after_the_linger(
+    tmp_path: Path, in_process: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """044-AC5: no SIGTERM after the call's end: the follower wakes its own wait and logs the outcome."""
+    kicked = threading.Event()
+    monkeypatch.setattr(F, "_attend", lambda *_a: "call_ended")
+    monkeypatch.setattr(F, "_LINGER_S", 0.05)
+    monkeypatch.setattr(F.signal, "pthread_kill", lambda _tid, sig: kicked.set() if sig == F._DONE else None)
+    monkeypatch.setattr(F.signal, "sigwait", lambda _s: F._DONE if kicked.wait(5) else signal.SIGTERM)
+    with capture_logs() as logs:
+        assert F.run_call(tmp_path, json.dumps(_payload())) == 0
+    assert [(e["event"], e.get("reason")) for e in logs] == [
+        ("follow_start", None),
+        ("follow_stop", "call_ended"),
+    ]
+
+
+def test_attend_runs_the_follower_and_survives_its_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from miniteams import call as C
+
+    seen: list[Any] = []
+
+    async def follow(settings: Settings, data: Path, payload: dict[str, Any], stop: threading.Event) -> str:
+        seen.append((settings.tenant_id, data, payload["correlationId"], stop.is_set()))
+        return "call_ended"
+
+    monkeypatch.setattr(C, "follow", follow)
+    assert F._attend(tmp_path, _payload(), threading.Event()) == "call_ended"
+    assert seen == [("t", tmp_path, CALL, False)]
+
+    async def broken(*_a: Any) -> str:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(C, "follow", broken)
+    with capture_logs() as logs:
+        assert F._attend(tmp_path, _payload(), threading.Event()) == "error"
+    assert [(e["event"], e["error"]) for e in logs] == [("follow_failed", "boom")]
+
+    async def stray_cancel(*_a: Any) -> str:
+        raise asyncio.CancelledError  # e.g. a cancelled inner future nobody asked to cancel
+
+    monkeypatch.setattr(C, "follow", stray_cancel)
+    with capture_logs() as logs:
+        assert F._attend(tmp_path, _payload(), threading.Event()) == "error"
+    assert [e["event"] for e in logs] == ["follow_failed"]
+
+
+def test_a_follower_that_cannot_join_writes_why_and_keeps_its_lock_until_the_end(
+    settings: Settings, tmp_path: Path, real_launches: list[Any]
+) -> None:
+    """044-AC14: the real `follow --call`, signed out: the cause lands in the transcript header, the lock
+    stays until the trigger's stop."""
+    data = tmp_path / "data"
+    F.handle(settings, data, _push(115))
+    log = data / "follow" / f"{CALL}.log"
+    _until(lambda: log.exists() and "follow_join_failed" in log.read_text(), "join failure logged")
+    (path,) = (data / "follow").rglob("*.ndjson")
+    header = json.loads(path.read_text().splitlines()[0])
+    assert header["join"] == "failed" and header["error"].startswith("sign-in: ")
+    assert F.lock_held(F.lock_path(data, CALL))
+    F.handle(settings, data, _push(116))
+    _until(lambda: real_launches[0].returncode == 0, "stopped by the end")
+
+
+def test_cli_capture_reaches_the_followers_by_the_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """044-AC12: --capture is opt-in; the detached followers inherit it."""
+    monkeypatch.setattr(cli, "setup_logging", lambda _level: None)
+    # setenv first: teardown then restores the original state, whatever cli.main wrote meanwhile.
+    monkeypatch.setenv("MINITEAMS_FOLLOW_CAPTURE", "x")
+    monkeypatch.delenv("MINITEAMS_FOLLOW_CAPTURE")
+    monkeypatch.chdir(tmp_path)  # the relative `cap` resolves here, never in the repository
+    monkeypatch.setattr(F, "run_call", lambda d, push: 0)
+    assert cli.main(["follow", "--data-dir", str(tmp_path), "--call", "{}"]) == 0
+    assert "MINITEAMS_FOLLOW_CAPTURE" not in os.environ and Settings().follow_capture is None  # type: ignore[call-arg]
+    assert cli.main(["follow", "--capture", "cap", "--call", "{}"]) == 0
+    assert os.environ["MINITEAMS_FOLLOW_CAPTURE"] == str(Path("cap").resolve())
+    assert Settings().follow_capture == Path("cap").resolve()  # type: ignore[call-arg]
+
+
+def test_a_signalled_stop_logs_the_follower_outcome(
+    tmp_path: Path, in_process: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stop line says what the follower thread made of the signal (it hung up: "stopped")."""
+    monkeypatch.setattr(F, "_attend", lambda _d, _p, stop: "stopped" if stop.wait(5) else "late")
+    with capture_logs() as logs:
+        assert F.run_call(tmp_path, json.dumps(_payload())) == 0
+    (stop,) = [e for e in logs if e["event"] == "follow_stop"]
+    assert (stop["reason"], stop["signal"], stop["outcome"]) == ("signal", "SIGTERM", "stopped")
