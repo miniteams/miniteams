@@ -1,8 +1,9 @@
 """Meeting follower (spec 044): call pushes start and stop one follower per call.
 
-`evt 115` (I joined a call, any device) spawns `miniteams follow --call <payload>` as a detached
-process; `evt 116` (the call ended for me) signals it. The follower holds `<data-dir>/follow/<call>.lock`
-(flock) for its whole life: the kernel drops it on any exit, a crash included.
+`evt 115` (I joined a call, any device) spawns `miniteams follow --call-file <push file>` as a detached
+process; `evt 116` (the call ended for me) signals it. The follower holds `<config-dir>/follow/<call>.lock`
+(flock) for its whole life: the kernel drops it on any exit, a crash included. Locks, markers and push
+files live in the config dir, host-local and per user, so triggers with different data dirs share them.
 
 `<call>.ended` lists the joins of the call that ended (mark_ended names its writers): a follower of such
 a join, not yet holding its lock or launched by another trigger, stops once locked; a redelivered 115 of
@@ -10,19 +11,22 @@ it is skipped. A rejoin of the same call has another join time: neither is touch
 ending on its own exits without waiting for evt 116, which only comes once it is gone; its lock is freed
 once its hang-up and transcript close are done, and my rejoin's follower waits up to _LEAVE_S for it.
 
-This module owns the layout of `<data-dir>/follow/`: locks, markers, logs and transcripts. The follower's
+This module owns the layout of `<config-dir>/follow/` (locks, markers, push files) and of
+`<data-dir>/follow/` (logs, transcripts). The follower's
 main thread only waits for the stop signal; a thread of its own joins, transcribes and leaves the call
 (`miniteams.follower`, the `transcript` extra).
 """
 
 import contextlib
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
 import queue
 import re
 import shlex
+import shutil
 import signal
 import stat
 import subprocess
@@ -145,9 +149,13 @@ def call_thread(payload: dict[str, Any]) -> str:
 
 
 def call_kind(payload: dict[str, Any]) -> str:
+    """An ad hoc group call's push names its chat's thread and messageId "0" (seen live); a channel
+    meeting names its channel thread and the meeting's post."""
     if is_one_to_one(payload):
         return "1:1"
-    return "meeting" if call_thread(payload).startswith("19:meeting_") else "group"
+    message = as_dict(payload.get("groupContext")).get("messageId")
+    meeting = call_thread(payload).startswith("19:meeting_") or str(message or "0") != "0"
+    return "meeting" if meeting else "group"
 
 
 # --- switch and skip list ---
@@ -183,11 +191,10 @@ def save_switch(settings: Settings, enabled: bool, skip: list[str]) -> None:
     write_private(_switch_path(settings), json.dumps({"enabled": enabled, "skip": skip}, indent=2) + "\n")
 
 
-# --- the follow dir: per-call lock, marker, log; transcripts ---
+# --- the follow dirs: per-call lock, marker, push file (config dir); log, transcripts (data dir) ---
 
 
-def follow_dir(data_dir: Path) -> Path:
-    path = data_dir / "follow"
+def _private_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     if stat.S_IMODE(path.stat().st_mode) & 0o077:  # mkdir's mode leaves an existing dir as it was
         try:
@@ -197,13 +204,23 @@ def follow_dir(data_dir: Path) -> Path:
     return path
 
 
-def lock_path(data_dir: Path, call: str) -> Path:
-    return data_dir / "follow" / f"{call}.lock"
+def follow_dir(data_dir: Path) -> Path:
+    return _private_dir(data_dir / "follow")
+
+
+def state_dir(settings: Settings) -> Path:
+    """Host-local, per user: a lock in a data dir shared by two triggers (or hosts) is one only if both
+    name that dir the same way."""
+    return settings.config_dir / "follow"
+
+
+def lock_path(settings: Settings, call: str) -> Path:
+    return state_dir(settings) / f"{call}.lock"
 
 
 def take_lock(path: Path, tries: int = _LOCK_TRIES) -> int | None:
     """An fd holding the exclusive flock on `path`, or None when another process holds it."""
-    follow_dir(path.parent.parent)
+    _private_dir(path.parent)
     # O_RDWR: on NFS flock becomes a POSIX lock, whose exclusive form needs a writable fd.
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     for attempt in range(tries):
@@ -217,8 +234,8 @@ def take_lock(path: Path, tries: int = _LOCK_TRIES) -> int | None:
     return None
 
 
-def ended_path(data_dir: Path, call: str) -> Path:
-    return data_dir / "follow" / f"{call}.ended"
+def ended_path(settings: Settings, call: str) -> Path:
+    return state_dir(settings) / f"{call}.ended"
 
 
 def join_time(payload: dict[str, Any]) -> str:
@@ -227,22 +244,22 @@ def join_time(payload: dict[str, Any]) -> str:
     return value.strip() if isinstance(value, str) and value.isprintable() else ""
 
 
-def ended_joins(data_dir: Path, call: str) -> set[str]:
+def ended_joins(settings: Settings, call: str) -> set[str]:
     try:
-        return set(ended_path(data_dir, call).read_text(encoding="utf-8", errors="replace").splitlines())
+        return set(ended_path(settings, call).read_text(encoding="utf-8", errors="replace").splitlines())
     except FileNotFoundError:
         return set()
 
 
-def mark_ended(data_dir: Path, call: str, join: str) -> None:
+def mark_ended(settings: Settings, call: str, join: str) -> None:
     """Records `join` of `call` as ended, once: a join already listed is not added again. Writers: the
     trigger on evt 116, first, whatever runs; a follower ending on its own (not stopped), before its
     hang-up when it was in the call (that hang-up's 116 may be followed at once by my rejoin's 115, which
     must find this join ended), and run_call once it returned, whatever its outcome."""
     if not join:
         return  # nothing to match a follower or a redelivery against
-    path = follow_dir(data_dir) / f"{call}.ended"
-    if join in ended_joins(data_dir, call):
+    path = _private_dir(state_dir(settings)) / f"{call}.ended"
+    if join in ended_joins(settings, call):
         return
     # O_APPEND: a concurrent 116 of another join adds its line, never replaces this one.
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -284,8 +301,15 @@ def lock_held(path: Path) -> bool:
 # --- trigger ---
 
 
-def follower_command(settings: Settings, data_dir: Path, payload: dict[str, Any]) -> list[str]:
-    """The trigger's own log level and capture dir go along."""
+def push_path(settings: Settings, payload: dict[str, Any]) -> Path:
+    """One file per join: a rejoin's push never replaces the one its winding-down predecessor names."""
+    digest = hashlib.sha256(join_time(payload).encode()).hexdigest()[:16]
+    return state_dir(settings) / f"{call_id(payload)}-{digest}.push.json"
+
+
+def follower_command(settings: Settings, data_dir: Path, push: Path) -> list[str]:
+    """The trigger's own log level and capture dir go along. The push stays off argv (readable by any
+    local user in /proc, and bounded by the kernel's per-argument limit)."""
     capture = ["--capture", str(settings.follow_capture)] if settings.follow_capture else []
     return [
         sys.executable,
@@ -298,63 +322,111 @@ def follower_command(settings: Settings, data_dir: Path, payload: dict[str, Any]
         "--data-dir",
         str(data_dir),
         *capture,
-        "--call",
-        json.dumps(payload),
+        "--call-file",
+        str(push),
     ]
+
+
+def _scope(cmd: list[str]) -> list[str]:
+    """A transient scope of its own: systemd-oomd kills whole cgroups, the archiver's would take every
+    follower with it. systemd-run execs the command, so the pid stays the follower's."""
+    run = shutil.which("systemd-run")
+    if run is None or not os.environ.get("XDG_RUNTIME_DIR"):  # no user manager to ask
+        return []
+    if any("$" in arg for arg in cmd):  # systemd-run expands ${VAR} and $$ in the command it runs
+        return []
+    return [run, "--user", "--scope", "--collect", "--quiet", "--"]
+
+
+def _reap(proc: subprocess.Popen[bytes], call: str) -> None:
+    """No zombie while the host lives; a follower (or systemd-run) failing shows in the trigger's log."""
+    if (rc := proc.wait()) != 0:
+        log.warning("follow_exited", call=call, pid=proc.pid, rc=rc)
 
 
 def launch(settings: Settings, data_dir: Path, call: str, payload: dict[str, Any]) -> subprocess.Popen[bytes]:
     """Own session: a restart (or Ctrl-C) of the trigger's host leaves the follower running."""
+    push = push_path(settings, payload)
+    _private_dir(push.parent)
+    write_private(push, json.dumps(payload))
     log_file = follow_dir(data_dir) / f"{call}.log"
+    # The follower's config dir is the trigger's, set or not by env: one lock dir for both.
+    env = {**os.environ, "MINITEAMS_CONFIG_DIR": str(settings.config_dir)}
+    cmd = follower_command(settings, data_dir, push)
     with os.fdopen(os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "ab") as out:
         proc = subprocess.Popen(
-            follower_command(settings, data_dir, payload),
+            [*_scope(cmd), *cmd],
             stdin=subprocess.DEVNULL,
             stdout=out,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=env,
         )
-    threading.Thread(target=proc.wait, daemon=True).start()  # reaps it: no zombie while the host lives
+    threading.Thread(target=_reap, args=(proc, call), daemon=True).start()
     log.info("follow_launched", call=call, pid=proc.pid)
     return proc
 
 
-def _follower_join(pid: int, call: str) -> str | None:
-    """The join time `pid` follows when it is our follower of `call`, else None (pid reused, other call)."""
+def read_push(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError, ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _follower_push(pid: int, call: str) -> dict[str, Any] | None:
+    """The push `pid` follows when it is our follower of `call`, else None (pid reused, other call)."""
     try:
         args = Path(f"/proc/{pid}/cmdline").read_bytes().decode().split("\0")
-        i = args.index("--call")
-        payload = json.loads(args[i + 1])
+        i = args.index("--call-file")
+        path = args[i + 1]
     except OSError, UnicodeDecodeError, ValueError, IndexError:
         return None
-    if "follow" not in args[:i] or not isinstance(payload, dict) or payload.get("correlationId") != call:
-        return None
-    return join_time(payload)
+    payload = read_push(Path(path)) if "follow" in args[:i] else None
+    return payload if payload is not None and payload.get("correlationId") == call else None
 
 
-def _winding_down(data_dir: Path, call: str, join: str) -> bool:
+def _follower_join(pid: int, call: str) -> str | None:
+    """The join time `pid` follows when it is our follower of `call`, else None."""
+    payload = _follower_push(pid, call)
+    return None if payload is None else join_time(payload)
+
+
+def _holder(path: Path) -> int:
+    """The pid line of a lock file; OSError or ValueError when unreadable."""
+    return int(path.read_text().strip())
+
+
+def _winding_down(settings: Settings, call: str, join: str) -> bool:
     """The lock's holder follows another join of `call`, one already ended: it is leaving, not ours."""
     try:
-        pid = int(lock_path(data_dir, call).read_text().strip())
+        pid = _holder(lock_path(settings, call))
     except OSError, ValueError:
         return False
     running = _follower_join(pid, call)
-    return bool(join) and running is not None and running != join and running in ended_joins(data_dir, call)
+    return bool(join) and running is not None and running != join and running in ended_joins(settings, call)
 
 
-def stop_follower(data_dir: Path, call: str, payload: dict[str, Any]) -> None:
+def _signal(call: str, pid: int, **why: Any) -> None:
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
+        log.info("follow_stop_sent", call=call, pid=pid, **why)
+
+
+def stop_follower(settings: Settings, call: str, payload: dict[str, Any]) -> None:
     join = join_time(payload)
     # First, whatever runs: a follower between its launch and its pid line reads it once locked.
     try:
-        mark_ended(data_dir, call, join)
+        mark_ended(settings, call, join)
     except OSError as exc:  # still signal a running follower
         log.warning("follow_ended_marker_failed", call=call, error=str(exc))
-    path = lock_path(data_dir, call)
+    path = lock_path(settings, call)
     if not lock_held(path):
         log.info("follow_not_running", call=call)
         return
     try:
-        pid = int(path.read_text().strip())
+        pid = _holder(path)
     except (OSError, ValueError) as exc:
         log.warning("follow_lock_unreadable", call=call, error=str(exc))
         return
@@ -365,9 +437,27 @@ def stop_follower(data_dir: Path, call: str, payload: dict[str, Any]) -> None:
     if join and running != join:  # a late 116 of an earlier join: the follower of a rejoin stays
         log.info("follow_stop_other_join", call=call, pid=pid)
         return
-    with contextlib.suppress(ProcessLookupError):
-        os.kill(pid, signal.SIGTERM)
-        log.info("follow_stop_sent", call=call, pid=pid)
+    _signal(call, pid)
+
+
+def stop_running(settings: Settings, thread: str | None = None) -> int:
+    """SIGTERMs the running followers (`follow --disable`), only those of `thread`'s calls when given
+    (`--skip`); how many were signalled. Each is checked as stop_follower does: never another process."""
+    stopped = 0
+    for path in sorted(state_dir(settings).glob("*.lock")):  # no dir yet: nothing
+        call = path.stem
+        if not is_call_id(call) or not lock_held(path):
+            continue
+        try:
+            pid = _holder(path)
+        except OSError, ValueError:
+            continue  # between its lock and its pid line: the switch stops its next call
+        payload = _follower_push(pid, call)
+        if payload is None or (thread is not None and not same_chat(call_thread(payload), thread)):
+            continue
+        _signal(call, pid, reason="skip_list" if thread is not None else "disabled")
+        stopped += 1
+    return stopped
 
 
 def handle(settings: Settings, data_dir: Path, req: dict[str, Any]) -> None:
@@ -384,7 +474,7 @@ def handle(settings: Settings, data_dir: Path, req: dict[str, Any]) -> None:
         log.warning("call_push_bad_id", evt=evt)
         return
     if evt == EVT_ENDED:
-        stop_follower(data_dir, call, payload)
+        stop_follower(settings, call, payload)
         return
     thread = call_thread(payload)
     # Unreadable = off: following a call the user may have excluded is worse than missing one.
@@ -397,10 +487,10 @@ def handle(settings: Settings, data_dir: Path, req: dict[str, Any]) -> None:
     # A self-join or redelivered push: the running follower holds the lock. Two racing triggers both
     # passing this check are settled by the follower, which exits when it cannot take the lock.
     join = join_time(payload)
-    if lock_held(lock_path(data_dir, call)) and not _winding_down(data_dir, call, join):
+    if lock_held(lock_path(settings, call)) and not _winding_down(settings, call, join):
         log.info("follow_already_running", call=call)
         return
-    ended = ended_joins(data_dir, call)
+    ended = ended_joins(settings, call)
     if join and join in ended:  # a redelivered 115 of the join a 116 already ended
         log.info("follow_skipped", call=call, thread=thread, reason="ended")
         return
@@ -448,20 +538,16 @@ def _attend(settings: Settings, data_dir: Path, payload: dict[str, Any], stop: t
         return "error"
 
 
-def run_call(settings: Settings, data_dir: Path, push_json: str) -> int:
-    try:
-        payload = json.loads(push_json)
-    except ValueError:
-        payload = None
-    call = call_id(payload) if isinstance(payload, dict) else None
+def run_call(settings: Settings, data_dir: Path, payload: dict[str, Any] | None) -> int:
+    call = call_id(payload) if payload is not None else None
     if payload is None or call is None:
         log.error("follow_bad_call")
         return 2
     # Blocked before any thread starts, so every thread inherits it and sigwait alone takes them.
     signal.pthread_sigmask(signal.SIG_BLOCK, {*_SIGNALS, _DONE})
-    path, join = lock_path(data_dir, call), join_time(payload)
+    path, join = lock_path(settings, call), join_time(payload)
     fd = take_lock(path)
-    if fd is None and _winding_down(data_dir, call, join):
+    if fd is None and _winding_down(settings, call, join):
         log.info("follow_waiting_for_previous", call=call)
         fd = take_lock(path, tries=int(_LEAVE_S / _LOCK_PAUSE))
     if fd is None:
@@ -471,7 +557,7 @@ def run_call(settings: Settings, data_dir: Path, push_json: str) -> int:
         os.ftruncate(fd, 0)
         os.write(fd, f"{os.getpid()}\n".encode())
         # After the pid line: a 116 from now on either sees this pid or left the marker read here.
-        if join and join in ended_joins(data_dir, call):
+        if join and join in ended_joins(settings, call):
             log.info("follow_stop", call=call, reason="ended_before_start")
             return 0
         log.info("follow_start", call=call, thread=call_thread(payload), kind=call_kind(payload))
@@ -482,7 +568,7 @@ def run_call(settings: Settings, data_dir: Path, push_json: str) -> int:
             outcome.append(_attend(settings, data_dir, payload, stop_event))
             if not stop_event.is_set():
                 try:  # see mark_ended
-                    mark_ended(data_dir, call, join)
+                    mark_ended(settings, call, join)
                 except OSError as exc:
                     log.warning("follow_ended_marker_failed", call=call, error=str(exc))
                 signal.pthread_kill(main, _DONE)
@@ -505,7 +591,11 @@ def run_call(settings: Settings, data_dir: Path, push_json: str) -> int:
                 outcome=outcome[0] if outcome else None,
             )
     finally:
-        # ponytail: .lock, .ended and .log stay, three small files per call (unlinking a flock file races
-        # a new holder); a cleanup of old calls when they pile up.
+        # The holder's push goes with it. Not with an empty join time: a rejoin's push would share its name.
+        if join:
+            with contextlib.suppress(OSError):
+                push_path(settings, payload).unlink(missing_ok=True)
+        # ponytail: .lock, .ended and .log stay, small files per call (unlinking a flock file races a new
+        # holder); a cleanup of old calls when they pile up.
         os.close(fd)
     return 0

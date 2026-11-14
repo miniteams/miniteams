@@ -206,6 +206,7 @@ class Archive:
         self.cards = CardRefresher(settings, CardStore(data_dir / "cards.db")) if settings else None
 
         self._down_until = 0.0
+        self.index_missing = False  # the last probe found no index.db (not a hung or broken one)
         self._probe: Callable[[], None] = self._open_index
         self._directory: Directory | None = None
 
@@ -253,6 +254,7 @@ class Archive:
         worker = threading.Thread(target=_run, daemon=True)
         worker.start()
         worker.join(_PROBE_DEADLINE)
+        self.index_missing = not worker.is_alive() and isinstance(outcome.get("error"), FileNotFoundError)
         if worker.is_alive() or "error" in outcome:
             reason = str(outcome.get("error") or f"no answer within {_PROBE_DEADLINE:.0f} s")
             log.warning("archive_unavailable", data_dir=str(self.data_dir), error=reason)
@@ -539,8 +541,10 @@ class Archive:
         return found
 
     def _live(self, call: str) -> bool:
+        if self.settings is None:  # the locks live in the config dir
+            return False
         try:
-            return lock_held(lock_path(self.data_dir, call))
+            return lock_held(lock_path(self.settings, call))
         except OSError as exc:  # a lock this reader cannot open must not cost the listing
             log.warning("follow_live_check_failed", call=call, error=str(exc))
             return False
@@ -768,10 +772,14 @@ def _search_messages(server: Server, args: dict[str, Any]) -> dict[str, Any]:
 
 def _read_transcript(server: Server, args: dict[str, Any]) -> dict[str, Any]:
     archive = server.archive
-    if not archive.available():
-        raise ToolError(f"transcripts need the archive, which is unavailable at {archive.data_dir}")
-    meta = archive.meta()
     thread_id = args["thread_id"]
+    if archive.available():
+        meta = archive.meta()
+    elif archive.index_missing and not args.get("message_id") and (archive.data_dir / "follow").is_dir():
+        # A follow-only data dir (`miniteams follow` without an archiver): no recordings, follows still read.
+        meta = {"source": "follow"}
+    else:
+        raise ToolError(f"transcripts need the archive, which is unavailable at {archive.data_dir}")
     offset, limit = args.get("offset", 0), args.get("limit", 200)
     if args.get("call"):
         if args.get("message_id"):
@@ -789,7 +797,7 @@ def _read_transcript(server: Server, args: dict[str, Any]) -> dict[str, Any]:
                 ),
                 "videos": len(e.get("videos") or []),
             }
-            for e in archive.recordings(thread_id)
+            for e in (archive.recordings(thread_id) if meta["source"] == "archive" else [])
         ]
         follows = archive.follows(thread_id)
         return {**meta, "thread_id": thread_id, "recordings": recordings, "follows": follows}

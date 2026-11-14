@@ -6,6 +6,8 @@ import json
 import logging
 import re
 import struct
+import time
+import types
 from collections.abc import Callable, Iterator
 from dataclasses import asdict
 from pathlib import Path
@@ -1587,6 +1589,280 @@ async def test_the_default_ice_runs_no_consent_checks(settings: Settings) -> Non
     await call.http.aclose()
 
 
-def test_callback_path_from_its_url() -> None:
-    url = f"{SURL}callAgent/ep/1234abcd/call/acceptance/?x=1"
-    assert C._tc_path(url) == "call/acceptance"
+def test_callback_path_from_its_url(settings: Settings) -> None:
+    call = C.Call(settings, payload(), lambda *_a: None)
+    own = f"{SURL}callAgent/{call.endpoint}/{call._tag}/"
+    assert call._own_path(f"{own}call/acceptance/?x=1") == "call/acceptance"
+    for foreign in (
+        f"{SURL}callAgent/{call.endpoint}/beefbeef/call/acceptance/",  # another join's tag
+        f"{SURL}callAgent/{uuid_like()}/{call._tag}/call/acceptance/",  # another endpoint
+        f"{own}",  # no path
+        f"{SURL}other/{call.endpoint}/{call._tag}/call/acceptance/",  # not a call callback
+    ):
+        assert call._own_path(foreign) is None, foreign
+
+
+def uuid_like() -> str:
+    return "00000000-0000-4000-8000-00000000dead"
+
+
+# --- swarm-review step 2 ---
+
+ATTACKER = "https://attacker.example/x"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        ATTACKER,
+        "https://flightproxy.teams.microsoft.com.attacker.example/x",
+        "https://evilflightproxy.teams.microsoft.com/x",
+        "https://teams.microsoft.com/x",
+        "https://api.flightproxy.teams.microsoft.com@attacker.example/x",
+    ],
+)
+def test_a_bearer_goes_only_to_the_teams_hosts(url: str) -> None:
+    with pytest.raises(C.JoinError) as err:
+        C._https(url)
+    assert str(err.value) == "refused a URL outside the Teams hosts" and not err.value.retry
+    assert C._https("https://api.flightproxy.teams.microsoft.com/api/v2/epconv")
+    assert C._https("https://API-EMEA.flightproxy.teams.microsoft.com/api/v2/epconv")
+
+
+def sent_to_attacker(server: Server) -> list[str]:
+    return [str(r.url) for r in server.requests if "attacker" in str(r.url)]
+
+
+async def test_the_conversation_service_and_phase_1_controller_must_be_teams_hosts(
+    make_call: Any, server: Server
+) -> None:
+    server.conversation_url = ATTACKER
+    assert await failed(make_call()[0]) == "refused a URL outside the Teams hosts"
+    server.conversation_url = CONV
+    server.phase1 = {"conversationController": ATTACKER}
+    assert await failed(make_call()[0]) == "refused a URL outside the Teams hosts"
+    assert sent_to_attacker(server) == [] and "phase2" not in [server.step(r) for r in server.requests]
+
+
+async def test_a_push_controller_must_be_a_teams_host(
+    settings: Settings, directory: Directory, server: Server
+) -> None:
+    call = bare_call(settings, directory, server, {**one_to_one(), "conversationController": ATTACKER})
+    assert await failed(call) == "refused a URL outside the Teams hosts"
+    assert sent_to_attacker(server) == []
+
+
+@pytest.mark.parametrize("link", ["acknowledgement", "callLeg"])
+async def test_acceptance_links_must_be_teams_hosts(make_call: Any, server: Server, link: str) -> None:
+    accepted = server.accept_after_phase2
+    assert accepted is not None
+    accepted["callAcceptance"]["links"][link] = ATTACKER
+    call = make_call()[0]
+    with pytest.raises(C.JoinError) as err:
+        await call.join()
+    assert str(err.value) == "refused a URL outside the Teams hosts" and not err.value.retry
+    with capture_logs() as logs:
+        await call.leave()  # a callLeg off the hosts gets no DELETE either
+    assert sent_to_attacker(server) == []
+    if link == "callLeg":
+        assert "call_leave_failed" in [e["event"] for e in logs]
+
+
+async def test_a_resent_acceptance_acknowledges_only_teams_hosts(make_call: Any, server: Server) -> None:
+    call = make_call()[0]
+    await call.join()
+    server.deliver("call/acceptance/", {"callAcceptance": {"links": {"acknowledgement": ATTACKER}}})
+    await asyncio.sleep(0.05)
+    assert sent_to_attacker(server) == [] and not call.ended.is_set()
+    await call.leave()
+
+
+async def test_a_media_answer_link_must_be_a_teams_host(make_call: Any, server: Server) -> None:
+    call = make_call()[0]
+    await call.join()
+    nego = {"mediaContent": {"blob": server_sdp(KEY_C)}, "links": {"mediaAnswer": ATTACKER}}
+    server.deliver("call/mediaRenegotiation/", {"mediaNegotiation": nego})
+    await asyncio.wait_for(call.ended.wait(), 5)
+    assert call.end_reason == "renegotiation: JoinError" and not call.retryable  # a retry would ask the same
+    assert sent_to_attacker(server) == []
+    await call.leave()
+
+
+@pytest.mark.parametrize("which", ["endpoint", "tag"])
+async def test_a_callback_for_another_endpoint_or_tag_is_dropped(
+    make_call: Any, server: Server, which: str
+) -> None:
+    """A delivery naming another join (an older socket's, a forged one) is not acted on: no request goes
+    out, the call does not end."""
+    call = make_call()[0]
+    await call.join()
+    before = len(server.requests)
+    endpoint, tag = (uuid_like(), call._tag) if which == "endpoint" else (call.endpoint, "beefbeef")
+    base = f"{SURL}callAgent/{endpoint}/{tag}/"
+    for path, body in (
+        ("call/acceptance/", server.accept_after_phase2),
+        ("call/mediaRenegotiation/", {"mediaNegotiation": {"links": {"mediaAnswer": ANSWER_URL}}}),
+        ("call/end/", {"callEnd": {"subCode": 0}}),
+    ):
+        await call.on_agent({"id": 1, "url": base + path, "headers": {}, "body": json.dumps(body)})
+    await asyncio.sleep(0.05)
+    assert len(server.requests) == before and not call.ended.is_set()
+    await call.leave()
+
+
+class _BrokenLog:
+    """Every log write fails, as on a full disk."""
+
+    def __getattr__(self, _name: str) -> Callable[..., None]:
+        def write(*_a: Any, **_k: Any) -> None:
+            raise OSError(28, "No space left on device")
+
+        return write
+
+
+async def test_an_end_that_cannot_be_logged_still_ends(
+    make_call: Any, server: Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The follower must not stay in the call as me because a log line failed."""
+    server.accept_after_phase2 = None
+    call = make_call()[0]
+    joining = asyncio.ensure_future(call.join())
+    await until(lambda: "phase2" in [server.step(r) for r in server.requests], "in the lobby")
+    monkeypatch.setattr(C, "log", _BrokenLog())
+    with pytest.raises(OSError):
+        call._end("call/end: 0")
+    assert call.ended.is_set() and call.end_reason == "call/end: 0"
+    with pytest.raises(C.JoinError):
+        await joining  # the lobby wait failed with the end, not stuck
+    monkeypatch.undo()
+    await call.leave()
+
+
+async def test_a_last_device_gone_that_cannot_be_logged_still_schedules_the_leave(
+    joined: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    call, roster_of = await joined()
+    await roster_of(me(ME_B, OWN), OTHER_ONE)
+    call.roster.update(roster(10_000, me(OWN), OTHER_ONE))
+    monkeypatch.setattr(C, "log", _BrokenLog())
+    with pytest.raises(OSError):
+        call._check_devices()
+    assert call.leaving
+    monkeypatch.undo()
+    await asyncio.wait_for(call.ended.wait(), 5)
+    assert call.end_reason == "last_device_left"
+    await call.leave()
+
+
+async def test_media_idle_with_a_leave_pending_ends_as_left(
+    joined: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Silence is re-attached (a network outage), unless my last device already left: then it leaves."""
+    monkeypatch.setattr(C, "MEDIA_IDLE_S", 0.1)
+    call, roster_of = await joined()
+    call.settings.follow_leave_grace_s = 30.0
+    await roster_of(me(ME_B, OWN), OTHER_ONE)
+    await roster_of(me(OWN), OTHER_ONE)
+    assert call.leaving
+    await asyncio.wait_for(call.ended.wait(), 5)
+    assert (call.end_reason, call.retryable) == ("last_device_left", False)
+    await call.leave()
+
+
+def test_a_capture_keeps_only_the_diagnosis_headers(tmp_path: Path) -> None:
+    cap = C.Capture(tmp_path)
+    headers = {
+        "MS-CV": "cv.1",
+        "trouter-request": "{}",
+        "X-Microsoft-Skype-Tenant-Id": "tenant-guid",
+        "Host": "pub-ent.example",
+        "__RequestTunnelId__": "tunnel",
+        "traceparent": "00-ab-cd-01",
+    }
+    cap.trouter("call/acceptance", headers, {"x": 1})
+    cap.trouter("call/end", None, {})
+    cap.close()
+    rows = [json.loads(x) for x in (tmp_path / "trouter.jsonl").read_text().splitlines()]
+    assert rows[0]["headers"] == {
+        "MS-CV": "cv.1",
+        "trouter-request": "{}",
+        "X-Microsoft-Skype-Tenant-Id": "<redacted>",
+        "Host": "<redacted>",
+        "__RequestTunnelId__": "<redacted>",
+        "traceparent": "<redacted>",
+    }
+    assert rows[1]["headers"] == {}
+
+
+async def test_silence_resumes_its_pace_after_a_stall(
+    make_call: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A loop stalled for a second sends no burst of 50 packets to catch up: it resumes from now."""
+    clock = [0.0]
+    monkeypatch.setattr(C, "time", types.SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
+    ice = FakeIce()
+    real_send = ice.send
+
+    async def send(data: bytes) -> None:
+        await real_send(data)
+        if len(ice.sent) == 3:
+            clock[0] = 1.0  # the loop was held a second between two packets
+
+    ice.send = send  # type: ignore[method-assign]
+    call = make_call(ice)[0]
+    task = asyncio.ensure_future(call._send_silence(ice, C.srtp_session(KEY_A, inbound=False)))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert 3 <= len(ice.sent) < 15  # paced at 20 ms (of real sleep) after the stall; a burst sends 50+
+    await call.http.aclose()
+
+
+async def test_an_abandoned_trouter_session_takes_no_late_failure(
+    make_call: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The join gave up waiting for its socket: a sign-in failure the socket reports later lands nowhere
+    (no "Future exception was never retrieved"), and a late session is no move."""
+    monkeypatch.setattr(C, "STEP_TIMEOUT_S", 0.05)
+
+    async def silent(settings: Settings, **kw: Any) -> None:
+        await asyncio.Event().wait()
+
+    call = make_call()[0]
+    call._trouter_fn = silent
+    assert await failed(call) == "no Trouter session"
+    assert call._surl is not None and call._surl.cancelled()
+    call._trouter_failed("sign-in", RuntimeError("late"))
+    await call._on_session("ep", SURL)
+    assert call._surl.cancelled() and not call.ended.is_set()
+
+
+async def test_an_abort_before_phase_2_never_enters_the_call(make_call: Any, server: Server) -> None:
+    """The engines failed while the join ran: phase 2 is never posted."""
+    call = make_call()[0]
+    original = server.handler
+
+    async def phase1_then_abort(request: httpx.Request) -> httpx.Response:
+        response = await original(request)
+        if server.step(request) == "phase1":
+            call.abort("engines: EngineDied: boom")
+        return response
+
+    call.http = httpx.AsyncClient(transport=httpx.MockTransport(phase1_then_abort))
+    with pytest.raises(C.JoinError) as err:
+        await call.join()
+    assert str(err.value) == "engines: EngineDied: boom" and not err.value.retry
+    assert "phase2" not in [server.step(r) for r in server.requests]
+    await call.leave()
+
+
+async def test_an_abort_in_the_lobby_fails_the_join_at_once(make_call: Any, server: Server) -> None:
+    server.accept_after_phase2 = None
+    call = make_call()[0]
+    joining = asyncio.ensure_future(call.join())
+    await until(lambda: "phase2" in [server.step(r) for r in server.requests], "in the lobby")
+    call.abort("engines: EngineDied: boom")
+    with pytest.raises(C.JoinError) as err:
+        await asyncio.wait_for(joining, 1)
+    assert not err.value.retry
+    await call.leave()

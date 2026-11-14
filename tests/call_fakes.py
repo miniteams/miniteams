@@ -18,18 +18,19 @@ ME = "8:orgid:00000000-0000-4000-8000-0000000000a0"
 OTHER = "8:orgid:00000000-0000-4000-8000-0000000000b0"
 KEY_A, KEY_B, KEY_C = bytes(range(30)), bytes(range(1, 31)), bytes(range(2, 32))
 SURL = "https://trouter.invalid/v4/f/s/"
-CONV = "https://conv.invalid/api/v2/epconv"
-CONTROLLER = "https://conv.invalid/conv/c1"
-LEG = "https://cc.invalid/cc/v1/active/leg1"
-ACK = "https://cc.invalid/cc/v1/callAcceptance/1/acknowledge"
-ANSWER_URL = "https://cc.invalid/cc/v1/active/leg1/answer"
+# Under the one host suffix the call trusts (call.TRUSTED_HOSTS); synthetic names, never resolved.
+CONV = "https://conv.test.flightproxy.teams.microsoft.com/api/v2/epconv"
+CONTROLLER = "https://conv.test.flightproxy.teams.microsoft.com/conv/c1"
+LEG = "https://cc.test.flightproxy.teams.microsoft.com/cc/v1/active/leg1"
+ACK = "https://cc.test.flightproxy.teams.microsoft.com/cc/v1/callAcceptance/1/acknowledge"
+ANSWER_URL = "https://cc.test.flightproxy.teams.microsoft.com/cc/v1/active/leg1/answer"
 SERVER_PWD = "serverpassword0123456789"  # pragma: allowlist secret
 
 
 def payload() -> dict[str, Any]:
     return {
         "correlationId": CALL,
-        "conversationController": "https://cc.invalid/x",
+        "conversationController": "https://cc.test.flightproxy.teams.microsoft.com/x",
         "userJoinTime": "2026-01-01T00:00:00Z",
         "groupContext": {"threadId": THREAD, "messageId": "0"},
         "meetingInfo": {"organizerId": "00000000-0000-4000-8000-0000000000c0", "tenantId": "t"},

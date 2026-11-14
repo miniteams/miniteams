@@ -713,7 +713,7 @@ def test_044_ac9_a_file_still_being_written(settings: Settings, recorded: Path) 
     with path.open("ab") as f:
         f.write(json.dumps(_utterance(2)).encode()[:25])  # a line caught half written
     server = _server(settings, recorded)
-    fd = F.take_lock(F.lock_path(recorded, CALL))  # the follower is running
+    fd = F.take_lock(F.lock_path(settings, CALL))  # the follower is running
     assert fd is not None
     try:
         listing = _call(server, "read_transcript", thread_id=MEETING)
@@ -736,7 +736,7 @@ def test_044_ac9_a_file_still_being_written(settings: Settings, recorded: Path) 
 def test_044_ac9_only_the_newest_file_of_a_call_is_live(settings: Settings, followed: Path) -> None:
     from miniteams import follow as F
 
-    fd = F.take_lock(F.lock_path(followed, CALL))
+    fd = F.take_lock(F.lock_path(settings, CALL))
     assert fd is not None
     try:
         follows = _call(_server(settings, followed), "read_transcript", thread_id=MEETING)["follows"]
@@ -808,7 +808,10 @@ def test_044_ac9_a_call_of_another_chat_is_refused(settings: Settings, followed:
 
 
 def test_044_ac9_an_unreadable_lock_costs_only_live(settings: Settings, followed: Path) -> None:
-    lock = followed / "follow" / f"{CALL}.lock"
+    from miniteams import follow as F
+
+    lock = F.lock_path(settings, CALL)
+    lock.parent.mkdir(parents=True)
     lock.write_text("1\n")
     lock.chmod(0o400)  # EACCES on the probe's O_RDWR open
     try:
@@ -2352,3 +2355,43 @@ def test_a_card_for_someone_else_is_never_asked(settings: Settings, data: Path) 
     for _ in range(2):
         assert _cards_of(_call(server, "read_messages", thread_id=PRIVATE))["10"] == [_line("OPEN")]
     assert bot.invokes == 0 and bot.lookups == 0 and provider.calls == 2
+
+
+def test_044_follows_read_from_a_data_dir_without_an_archive(settings: Settings, tmp_path: Path) -> None:
+    """`miniteams follow` alone writes no index.db: its calls are still listed and read, recordings []."""
+    from miniteams import follow as F
+
+    data = tmp_path / "followonly"
+    _followed(data, CALL, "20260702T110000Z", MEETING, 2, join="ok")
+    server = _server(settings, data)
+    listing = _call(server, "read_transcript", thread_id=MEETING)
+    assert listing["source"] == "follow" and listing["recordings"] == []
+    assert [(f["call"], f["lines"], f["live"]) for f in listing["follows"]] == [(CALL, 2, False)]
+    fd = F.take_lock(
+        F.lock_path(settings, CALL)
+    )  # live: the lock in the config dir, as the follower holds it
+    assert fd is not None
+    try:
+        page = _call(server, "read_transcript", thread_id=MEETING, call=CALL)
+    finally:
+        os.close(fd)
+    assert page["source"] == "follow" and page["total"] == 2 and page["live"]
+    recording = _call(server, "read_transcript", thread_id=MEETING, message_id="r1")
+    assert recording["error"] and "unavailable" in recording["text"]  # recordings need the index
+    assert sorted(p.name for p in data.iterdir()) == ["follow"]  # nothing created
+
+
+def test_044_a_hung_archive_is_no_follow_only_dir(settings: Settings, followed: Path) -> None:
+    """Only a missing index means a follow-only dir: a hung or broken one stays an unavailable archive."""
+    server = _server(settings, followed)
+
+    def broken() -> None:
+        raise OSError("stale file handle")
+
+    server.archive._probe = broken
+    out = _call(server, "read_transcript", thread_id=MEETING)
+    assert out["error"] and "unavailable" in out["text"]
+
+
+def test_044_live_needs_settings_for_the_lock_dir(followed: Path) -> None:
+    assert M.Archive(followed)._live(CALL) is False

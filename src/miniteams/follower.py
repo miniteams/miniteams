@@ -1,6 +1,6 @@
 """One call's follower (spec 044): joins the call, transcribes it, leaves it.
 
-Run by `follow --call`'s follower thread (miniteams.follow); imported only there: it needs the
+Run by `follow --call-file`'s follower thread (miniteams.follow); imported only there: it needs the
 `transcript` extra.
 """
 
@@ -15,7 +15,7 @@ import numpy as np
 import numpy.typing as npt
 import structlog
 
-from .call import TROUTER_MOVED, Call, JoinError
+from .call import REATTACH, Call, JoinError
 from .config import Settings
 from .follow import call_id, call_kind, call_thread, join_time, mark_ended
 from .stream import off_loop
@@ -25,6 +25,7 @@ log = structlog.get_logger()
 
 PENDING_MAX = 60 * 4 * 50  # frames held while the engines load: 60 s of 4 speakers
 JOIN_RETRY_PAUSE_S = 5.0
+MARK_TIMEOUT_S = 2.0  # a stalled config dir (NFS home) must not hold the hang-up
 
 Frame = tuple[int, npt.NDArray[np.int16], float]  # (msi, 20 ms of 16 kHz PCM, wall time)
 
@@ -57,21 +58,24 @@ async def follow(settings: Settings, data_dir: Path, payload: dict[str, Any], st
 
 class Follower:
     """`call` is the current join of the call: fresh() replaces it for a retry or a re-attach. `session`
-    transcribes every join; the frames heard before it started are in `pending`, None once fed."""
+    transcribes every join; its engines load while the first join runs, and the frames heard before it
+    begins are in `pending`, None once fed."""
 
     def __init__(self, settings: Settings, data_dir: Path, payload: dict[str, Any]) -> None:
         self.settings, self.data_dir, self.payload = settings, data_dir, payload
         self.call_id, self.thread, self.kind = str(call_id(payload)), call_thread(payload), call_kind(payload)
         self.capture = settings.follow_capture / self.call_id if settings.follow_capture else None
         self.call = Call(settings, payload, self.on_audio, capture=self.capture)
-        self.session: Session | None = None  # closed by the wind-down even if never started
-        # Audio flows as soon as join() returns, the engines load after: a second or two held here.
+        self.session = Session(
+            settings, data_dir, self.call_id, self.thread, self.resolve, kind=self.kind, header={"join": "ok"}
+        )
+        self.loading: asyncio.Future[None] | None = None
         self.pending: list[Frame] | None = []
         self.dropped = 0
+        self.closing = False
 
     def on_audio(self, msi: int, pcm: npt.NDArray[np.int16], t: float) -> None:
         if self.pending is None:
-            assert self.session is not None  # pending goes None once the session is started
             self.session.feed(msi, pcm, t)
         elif len(self.pending) < PENDING_MAX:
             self.pending.append((msi, pcm, t))
@@ -85,57 +89,98 @@ class Follower:
         return name or self.call.directory.known_name(mri), mri
 
     async def attend(self) -> str:
-        for attempt in (1, 2):  # 044-AC14: one retry; a stop cancels this task, never retried
+        self.loading = asyncio.ensure_future(self.session.load())
+        self.loading.add_done_callback(self._loaded)
+        if (cause := await self._join()) is not None:
+            started = time.time()
+            header = transcript_header(
+                self.call_id,
+                self.thread,
+                self.kind,
+                started,
+                self.settings.stt_engine,
+                join="failed",
+                error=cause,
+            )
+            Transcript(self.data_dir, self.call_id, started, header).close()
+            return "join_failed"
+        self._begin()
+        outcome = "call_ended"
+        await self.call.ended.wait()
+        while self.call.end_reason in REATTACH:  # 044-AC13: re-attached, the transcript goes on
+            log.warning("follow_reattach", call=self.call_id, reason=self.call.end_reason)
+            if (failed := await self.reattach(self.call.end_reason)) is not None:
+                outcome = failed
+                break
+            await self.call.ended.wait()
+        try:  # before the hang-up: see mark_ended
+            mark = off_loop(mark_ended, self.settings, self.call_id, join_time(self.payload))
+            await asyncio.wait_for(mark, MARK_TIMEOUT_S)
+        except TimeoutError:
+            log.warning("follow_ended_marker_slow", call=self.call_id, timeout_s=MARK_TIMEOUT_S)
+        except OSError as exc:
+            log.warning("follow_ended_marker_failed", call=self.call_id, error=str(exc))
+        return outcome
+
+    def _engines_failed(self) -> str | None:
+        """The engines' load failure, as the transcript header names it; None while loading or loaded."""
+        if self.loading is None or not self.loading.done() or self.loading.cancelled():
+            return None
+        exc = self.loading.exception()
+        return None if exc is None else f"engines: {_cause(exc)}"
+
+    def _loaded(self, _loading: asyncio.Future[None]) -> None:
+        """Engines that cannot load end the join in progress: a call it cannot transcribe is not joined."""
+        if (cause := self._engines_failed()) is not None and not self.closing:
+            self.call.abort(cause)
+
+    async def _join(self) -> str | None:
+        """None once joined with the engines loaded, else the cause for the transcript header."""
+        assert self.loading is not None
+        attempt = 1
+        while True:  # 044-AC14: one retry; a stop cancels this task, never retried
+            if (cause := self._engines_failed()) is not None:
+                return cause
             try:
                 await self.call.join()
-                break
             except Exception as exc:  # noqa: BLE001 — any join failure is logged and written, not raised
+                if (cause := self._engines_failed()) is not None:
+                    return cause
                 cause = _cause(exc)
                 retry = attempt == 1 and _retryable(self.call, exc)
                 log.warning(
                     "follow_join_failed", call=self.call_id, cause=cause, attempt=attempt, retry=retry
                 )
                 if not retry:
-                    started = time.time()
-                    header = transcript_header(
-                        self.call_id,
-                        self.thread,
-                        self.kind,
-                        started,
-                        self.settings.stt_engine,
-                        join="failed",
-                        error=cause,
-                    )
-                    Transcript(self.data_dir, self.call_id, started, header).close()
-                    return "join_failed"
-            await self.fresh()
-        await self._transcribe()
-        outcome = "call_ended"
-        await self.call.ended.wait()
-        while self.call.end_reason == TROUTER_MOVED:  # 044-AC13: re-attached, the transcript goes on
-            log.warning("follow_reattach", call=self.call_id)
-            if (failed := await self.reattach()) is not None:
-                outcome = failed
-                break
-            await self.call.ended.wait()
-        try:  # before the hang-up: see mark_ended
-            await off_loop(mark_ended, self.data_dir, self.call_id, join_time(self.payload))
-        except OSError as exc:
-            log.warning("follow_ended_marker_failed", call=self.call_id, error=str(exc))
-        return outcome
+                    return cause
+                attempt = 2
+                await self.fresh()
+                continue
+            return await self._until_loaded()
 
-    async def _transcribe(self) -> None:
-        """Starts the session, then feeds it the frames held meanwhile and the next ones."""
-        self.session = Session(
-            self.settings,
-            self.data_dir,
-            self.call_id,
-            self.thread,
-            self.resolve,
-            kind=self.kind,
-            header={"join": "ok"},
-        )
-        await self.session.start()
+    async def _until_loaded(self) -> str | None:
+        """Joined before the engines are up: its audio is held meanwhile. None once they are, else the
+        cause. A call ending meanwhile is hung up now, not once loaded (a load may take minutes; the
+        wind-down stops it), unless a fresh join may recover it (044-AC13): then it re-attaches."""
+        assert self.loading is not None
+        while True:
+            ended: asyncio.Future[Any] = asyncio.ensure_future(self.call.ended.wait())
+            waits: set[asyncio.Future[Any]] = {self.loading, ended}
+            try:
+                await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                ended.cancel()
+            if self.loading.done():
+                return self._engines_failed()
+            if self.call.end_reason not in REATTACH:
+                return self.call.end_reason
+            log.warning("follow_reattach", call=self.call_id, reason=self.call.end_reason)
+            if (failed := await self.reattach(self.call.end_reason)) is not None:
+                return failed
+
+    def _begin(self) -> None:
+        """Opens the transcript, feeds it the frames held meanwhile, then the next ones."""
+        self.session.begin()
         assert self.pending is not None  # fed once only
         if self.dropped:
             log.warning(
@@ -167,9 +212,11 @@ class Follower:
         # A call that ended meanwhile gets its evt 116 (the trigger's stop) in this pause.
         await asyncio.sleep(JOIN_RETRY_PAUSE_S)
 
-    async def reattach(self) -> str | None:
-        """A fresh join on the moved call, one more when the failure allows it. None when joined, else the
-        follow's outcome: the call's own end (over, my last device gone) if it had one, else the move."""
+    async def reattach(self, reason: str) -> str | None:
+        """Fresh joins on the call, until one holds, a failure rules the next out, or
+        follow_reattach_deadline_s passes (a network outage). None when joined, else the follow's
+        outcome: the call's own end (over, my last device gone) if it had one, else `reason`."""
+        deadline = time.monotonic() + self.settings.follow_reattach_deadline_s
         attempt = 1
         while True:
             await self.fresh()
@@ -177,7 +224,7 @@ class Follower:
                 await self.call.join()
                 return None
             except Exception as exc:  # noqa: BLE001 — fail safe: no follower sitting deaf as me
-                again = attempt == 1 and _retryable(self.call, exc)
+                again = _retryable(self.call, exc) and time.monotonic() < deadline
                 log.warning(
                     "follow_reattach_failed",
                     call=self.call_id,
@@ -186,14 +233,17 @@ class Follower:
                     retry=again,
                 )
                 if not again:
-                    return TROUTER_MOVED if self.call.retryable else self.call.end_reason
-                attempt = 2
+                    return reason if self.call.retryable else self.call.end_reason
+                attempt += 1
 
     async def wind_down(self) -> BaseException | None:
         """Hangs up and closes the transcript at once, each whatever the other does (both fit in _LEAVE_S);
-        the first failure. close() also stops engines a cancelled start() left loading."""
-        closing = [self.session.close()] if self.session is not None else []
-        outcomes = await asyncio.gather(self.call.leave(), *closing, return_exceptions=True)
+        the first failure. close() also stops engines still loading."""
+        self.closing = True
+        outcomes = await asyncio.gather(self.call.leave(), self.session.close(), return_exceptions=True)
+        if self.loading is not None:  # its engines are stopped: what is left of the load goes too
+            self.loading.cancel()
+            await asyncio.gather(self.loading, return_exceptions=True)
         return next((o for o in outcomes if isinstance(o, BaseException)), None)
 
 

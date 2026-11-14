@@ -59,6 +59,25 @@ _KEY = re.compile(r"inline:(?:[A-Za-z0-9+/=]|\\/|\\u[0-9A-Fa-f]{4})+")
 HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 LAST_DEVICE_LEFT = "last_device_left"
 TROUTER_MOVED = "trouter_moved"  # our socket reconnected on a new surl: the callbacks name the old one
+MEDIA_IDLE = "media: nothing received"
+MEDIA_LOST = "media: ICE connection lost"
+REATTACH = (TROUTER_MOVED, MEDIA_IDLE, MEDIA_LOST)  # ends a fresh join may recover from (a network outage)
+# Every host the live captures showed for the URLs we send the IC3 bearer or the skype token to (the
+# conversation service, the controller, the call leg, the acknowledgement and media answer links).
+TRUSTED_HOSTS = (".flightproxy.teams.microsoft.com",)
+SILENCE_STALL_S = 0.2  # a send loop this late resumes its pace from now: no burst of catch-up packets
+# The callback headers a capture keeps: diagnosis ids and encodings, no tenant, host or tunnel ids.
+CAPTURE_HEADERS = frozenset(
+    {
+        "ms-cv",
+        "trouter-request",
+        "content-type",
+        "content-encoding",
+        "x-microsoft-skype-content-encoding",
+        "x-microsoft-skype-chain-id",
+        "x-microsoft-skype-message-id",
+    }
+)
 _CC_LINKS = (
     "mediaAcknowledgement rejection acknowledgement mediaRenegotiation replacement progress mediaAnswer "
     "newMediaOffer redirection balanceUpdate acceptance controlVideoStreaming dominantSpeakerInfo csrcInfo "
@@ -382,8 +401,12 @@ class Capture:
         self._rtcp.write(json.dumps({"t": self._t(), "pt": data[1], "len": len(data)}) + "\n")
 
     def trouter(self, path: str, headers: Any, body: Any) -> None:
+        kept = {
+            str(k): v if str(k).lower() in CAPTURE_HEADERS else "<redacted>"
+            for k, v in (headers if isinstance(headers, dict) else {}).items()
+        }
         # The acceptance and renegotiation bodies carry SDP: their keys go too.
-        row = json.dumps({"t": self._t(), "path": path, "headers": headers, "body": body})
+        row = json.dumps({"t": self._t(), "path": path, "headers": kept, "body": body})
         self._trouter.write(redact(row) + "\n")
         self._trouter.flush()
 
@@ -425,16 +448,13 @@ def stun(settings: Settings) -> tuple[str, int] | None:
 
 
 def _https(url: str) -> str:
-    """A server-given URL we send a bearer to: https only."""
+    """A server-given URL we send a bearer to: https, on a Teams host only. A retry asks the same."""
     parsed = urlparse(url)
     if parsed.scheme != "https" or not parsed.hostname:
-        raise JoinError("refused a non-https URL")
+        raise JoinError("refused a non-https URL", retry=False)
+    if not f".{parsed.hostname}".endswith(TRUSTED_HOSTS):
+        raise JoinError("refused a URL outside the Teams hosts", retry=False)
     return url
-
-
-def _tc_path(url: str) -> str:
-    """`.../callAgent/<endpoint>/<tag>/call/acceptance/` → `call/acceptance`."""
-    return "/".join(url.split(AGENT_PATH, 1)[-1].split("?")[0].strip("/").split("/")[2:])
 
 
 class Call:
@@ -620,24 +640,40 @@ class Call:
 
     async def _on_session(self, _epid: str, surl: str) -> None:
         assert self._surl is not None
-        if self._surl.done() and self._surl.exception() is not None:
+        if self._surl.cancelled() or (self._surl.done() and self._surl.exception() is not None):
             return  # the join already failed on an earlier attempt: leave() closes this socket
         if not self._surl.done():
             self._surl.set_result(surl)
             return
         # A second session is a reconnect: callbacks sent meanwhile are lost, even on the same surl (and
         # a new surl gets none): deaf, and blind to my leaving.
-        log.warning("call_trouter_moved", call=call_id(self.payload), leaving=self.leaving)
-        # My last device already left: re-attaching would sit in the call as me past AC4's 15 s.
+        leaving = self.leaving
+        self._end_or_leave(TROUTER_MOVED)
+        log.warning("call_trouter_moved", call=call_id(self.payload), leaving=leaving)
+
+    def _end_or_leave(self, reason: str) -> None:
+        """A loss a fresh join may recover from; with my last device already gone, re-attaching would sit
+        in the call as me past AC4's 15 s: the call ends as left."""
         if self.leaving:
             self._end(LAST_DEVICE_LEFT, retry=False)
         else:
-            self._end(TROUTER_MOVED)
+            self._end(reason)
+
+    def _own_path(self, url: str) -> str | None:
+        """`.../callAgent/<endpoint>/<tag>/call/acceptance/` → `call/acceptance`; None when the URL names
+        another endpoint or tag than this call's (another call's socket, a forged delivery)."""
+        parts = url.split(AGENT_PATH, 1)[-1].split("?")[0].strip("/").split("/")
+        if AGENT_PATH not in url or parts[:2] != [self.endpoint, self._tag] or len(parts) < 3:
+            return None
+        return "/".join(parts[2:])
 
     async def on_agent(self, req: dict[str, Any]) -> None:
         """One call callback, already acked by the socket. Long work goes to tasks: the socket's read
         loop awaits this."""
-        path = _tc_path(str(req.get("url") or ""))
+        path = self._own_path(str(req.get("url") or ""))
+        if path is None:
+            log.debug("call_callback_foreign", call=call_id(self.payload))
+            return
         try:
             body = decode_body(req) or {}
         except ValueError, OSError, EOFError:
@@ -694,17 +730,18 @@ class Call:
             return
         if self.roster.mine - {own}:
             if self._leaving is not None:
-                if self.ended.is_set():
-                    log.info("call_device_back_too_late", call=call_id(self.payload))
-                else:
+                late = self.ended.is_set()
+                if not late:
                     self._leaving.cancel()
-                    log.info("call_device_back", call=call_id(self.payload))
                 self._leaving = None
+                log.info(
+                    "call_device_back_too_late" if late else "call_device_back", call=call_id(self.payload)
+                )
         elif self._leaving is None and not self.ended.is_set():
             grace = self.settings.follow_leave_grace_s
+            # Scheduled before the log: a failing log write must not keep the follower in the call as me.
+            self._leaving = asyncio.get_running_loop().call_later(grace, self._end, LAST_DEVICE_LEFT, False)
             log.info("call_last_device_gone", call=call_id(self.payload), grace_s=grace)
-            loop = asyncio.get_running_loop()
-            self._leaving = loop.call_later(grace, self._end, LAST_DEVICE_LEFT, False)
 
     def _trouter_failed(self, step: str, exc: BaseException) -> None:
         """Our socket's sign-in failed before its session: the join fails at once, with the cause (a
@@ -718,12 +755,20 @@ class Call:
             self._end("trouter: stopped", retry=False)
 
     def _end(self, reason: str, retry: bool = True) -> None:
-        if not self.ended.is_set():
+        first = not self.ended.is_set()
+        if first:  # the state first: a failing log write must not keep the follower in the call as me
             self.end_reason, self.retryable = reason, retry
-            log.info("call_ended", call=call_id(self.payload), reason=reason)
             self.ended.set()
         if self._accepted is not None and not self._accepted.done():
             self._accepted.set_exception(JoinError(reason, retry=retry))
+            self._accepted.exception()  # retrieved: a join that fails before its lobby wait never awaits it
+        if first:
+            log.info("call_ended", call=call_id(self.payload), reason=reason)
+
+    def abort(self, reason: str) -> None:
+        """Ends the call for good from outside (the engines cannot load): a join in progress fails before
+        phase 2, in the lobby, or once connected (then hung up at once)."""
+        self._end(reason, retry=False)
 
     def _spawn(self, coro: Awaitable[Any]) -> asyncio.Future[Any]:
         task = asyncio.ensure_future(coro)
@@ -745,7 +790,10 @@ class Call:
         try:
             await self._answer(nego)
         except Exception as exc:
-            self._end(f"renegotiation: {type(exc).__name__}")
+            self._end(
+                f"renegotiation: {type(exc).__name__}",
+                retry=not (isinstance(exc, JoinError) and not exc.retry),
+            )
             raise
 
     async def _answer(self, nego: dict[str, Any]) -> None:
@@ -838,6 +886,7 @@ class Call:
         waits: set[asyncio.Future[Any]] = {self._surl, self._trouter}
         await asyncio.wait(waits, timeout=STEP_TIMEOUT_S, return_when=asyncio.FIRST_COMPLETED)
         if not self._surl.done():
+            self._surl.cancel()  # a sign-in failure the socket reports later has nobody to take it
             if self._trouter.done():  # it returns on a dead login, raises on anything else
                 failure = self._trouter.exception()
                 raise JoinError(f"Trouter: {type(failure).__name__ if failure else 'stopped'}")
@@ -861,6 +910,8 @@ class Call:
         acknowledged and our callbacks registered on the call leg. The acceptance."""
         if not self.controller:
             self.controller = await self._phase1(conv_url, me, name)
+        if self.ended.is_set():  # aborted meanwhile: never enter the call
+            raise JoinError(self.end_reason, retry=self.retryable)
         joined = (
             await self._post(self.controller, self._conversation(me, name, self._offer), "phase2", True)
         ).json()
@@ -940,10 +991,10 @@ class Call:
                 try:
                     data = await asyncio.wait_for(conn.recv(), MEDIA_IDLE_S)
                 except TimeoutError:
-                    reason = "media: nothing received"
+                    reason = MEDIA_IDLE
                     return
                 except ConnectionError:
-                    reason = "media: ICE connection lost"
+                    reason = MEDIA_LOST
                     return
                 try:
                     self._packet(data, timeline, decoder)
@@ -958,7 +1009,9 @@ class Call:
             reason = ""
             raise
         finally:
-            if reason:
+            if reason in REATTACH:
+                self._end_or_leave(reason)
+            elif reason:
                 self._end(reason)
 
     def _packet(self, data: bytes, timeline: Timeline, decoder: Decoder) -> None:
@@ -993,8 +1046,10 @@ class Call:
         while True:
             await conn.send(tx.protect(rtp_packet(PT_PCMU, seq, ts, self._ssrc, PCMU_SILENCE)))
             seq, ts = seq + 1, ts + 160
-            due += FRAME_S
-            await asyncio.sleep(max(0.0, due - time.monotonic()))
+            due, now = due + FRAME_S, time.monotonic()
+            if now - due > SILENCE_STALL_S:
+                due = now
+            await asyncio.sleep(max(0.0, due - now))
 
     async def leave(self) -> int | None:
         """Hangs up (`DELETE` on the call leg; a meeting leg has no end link, and `POST .../end` answers

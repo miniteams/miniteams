@@ -77,7 +77,8 @@ uv run miniteams mcp              # MCP server over stdio for an agent (spec 008
 uv run --extra transcript miniteams follow   # meeting follower on its own socket (spec 044; below)
                                                        # --capture DIR: debug dump, audio included
 uv run miniteams follow --disable                      # switch off (--enable); --skip / --unskip THREAD,
-                                                       # --status (`~/.config/miniteams/follow.json`)
+                                                       # --status (`~/.config/miniteams/follow.json`);
+                                                       # --disable and --skip also stop running followers
 uv run miniteams watch --thread 19:xxx@thread.v2 --once   # one JSON line per matching live event
                                                        # (spec 009; docs/watch.md)
 uv run miniteams dump             # dump your Notes' full history (oldest → newest)
@@ -122,25 +123,35 @@ follower joins the call as a second endpoint of your account (meetings, group ca
 on the push's conversation controller), transcribes each speaker, and leaves (`DELETE` on its call leg)
 `follow_leave_grace_s` after your last device leaves the call (default 5 s, `MINITEAMS_FOLLOW_LEAVE_GRACE_S`;
 it stays while another of your devices is in the call), when the call ends, when it is stopped (SIGTERM to
-the pid in its `.lock`), or when no media packet at all arrives for a minute (RTCP included, which flows
-even in silence). A failed join is retried once, unless the call is over, your last device has left, or
-its Trouter socket stops after the join. When its own Trouter
-socket reconnects, it re-attaches to the call (hang-up, pause, fresh join on the call's controller) and the
-transcript goes on; the seconds in between are lost. If a leave was already pending at that moment, it
-leaves instead; a re-attach failing twice (once, if the call is over) ends the follower. The trigger runs on its own socket (`miniteams follow`) or on the archiver's (`archive --live --follow`); each
-follower is a detached process, `miniteams follow --call`, so restarting the trigger's host leaves it
-running. A lock per call (`<data-dir>/follow/<call>.lock`, its log beside it) keeps it to one follower,
-whatever the device, the redelivery or the number of triggers. Off, or the chat in the skip list: the
+the pid in its `.lock`, or `follow --disable` / `--skip` of its chat). A failed join is retried once,
+unless the call is over, your last device has left, or its Trouter socket stops after the join; the
+speech-to-text engines load while it joins, and engines that cannot load end the join (`"join":
+"failed"`, `"error": "engines: …"`). When its own Trouter socket reconnects, or no media packet at all
+arrives for a minute (RTCP included, which flows even in silence: a network outage), it re-attaches to the
+call (hang-up, pause, fresh join on the call's controller) and the transcript goes on; the seconds in
+between are lost. If a leave was already pending at that moment, it leaves instead; re-attaches go on for
+`follow_reattach_deadline_s` (default 300 s, `MINITEAMS_FOLLOW_REATTACH_DEADLINE_S`), unless one shows the
+call over, then the follower ends. The trigger runs on its own socket (`miniteams follow`) or on the
+archiver's (`archive --live --follow`); each follower is a detached process, `miniteams follow
+--call-file`, in a transient systemd scope of its own when `systemd-run` and a user manager are there, so
+restarting the trigger's host leaves it running. A lock per call keeps it to one follower, whatever the
+device, the redelivery or the number of triggers, even with different `--data-dir`s:
+`<config-dir>/follow/<call>.lock` (`~/.config/miniteams/follow/`, host-local), next to the call's
+`.ended` marker and its push (`.push.json`, 0600, removed on exit: the follower's argv names the file,
+never the participants); its log is `<data-dir>/follow/<call>.log`. Off, or the chat in the skip list: the
 call is logged as skipped, nothing starts. Both need the `transcript` extra
 (`uv sync --inexact --extra transcript`: `--inexact` keeps the `widget` extra) and the speech-to-text
-runtime, and refuse to start without them, naming the fix; no other command does.
+runtime; `follow` refuses to start without them, naming the fix, and `archive --live --follow` logs the
+fix and archives without the trigger; no other command needs them.
 `scripts/build-transcribe.sh [parakeet|whisper|all]` builds libtranscribe (pinned, AVX2, in Docker when
 present) and fetches the pinned models into `~/.cache/miniteams` (`transcribe/lib/`, `models/`);
 `BUILD_JOBS` sets the compile jobs (default 2). `MINITEAMS_STT_ENGINE` picks `parakeet` (default) or
 `whisper`. Transcripts are text only, one NDJSON line per utterance:
 `<data-dir>/follow/<YYYY-MM>/<started>-<call>.ndjson`, its header holding the join outcome (`"join":
 "ok"`, or `"failed"` and the `error`). MCP `read_transcript` lists a chat's followed calls next to its
-recordings (`live` while the follower holds the call's lock) and pages one by `call`, during the call too.
+recordings (`live` while a follower on this host holds the call's lock) and pages one by `call`, during the call too;
+a data dir with followed calls but no archive (`miniteams follow` alone) answers with `source: "follow"`
+and no recordings.
 A 1:1 push names no chat: the header takes the 1:1 chat id built from its two participants; there and
 in the skip list, either spelling of a 1:1 chat id (its two member ids in either order) matches. `MINITEAMS_STUN_SERVER` (`host:port`, empty for host candidates only)
 sets the follower's STUN server; the default, `stun.l.google.com:19302`, is a third party that sees this
@@ -149,7 +160,8 @@ host's public address once per call.
 `follow --capture DIR` is a debug tool for protocol breakage: each follower the trigger starts writes under
 `DIR/<call>/<endpoint>/`, one directory per join (a retry or a re-attach gets its own), the call's RTP
 headers and **payloads** (so the audio, `ssrc-<n>.pay`), RTCP arrivals, its
-Trouter callbacks and every SDP, SRTP keys redacted, in the layout grill-room's S18 `analyze.py` reads.
+Trouter callbacks (diagnosis headers only) and every SDP, SRTP keys redacted, in the layout grill-room's S18
+`analyze.py` reads.
 Delete it after use; without the flag nothing but text is written.
 
 `dump --jsonl` emits one full-detail record per message (raw resource + resolved sender/thread

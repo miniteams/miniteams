@@ -608,7 +608,10 @@ async def run_forever(
         except Exception as exc:  # noqa: BLE001 — any other failure is recoverable via reconnect
             log.warning("stream_error", step=step, error=str(exc), error_type=type(exc).__name__)
             if on_error is not None:
-                on_error(step, exc)
+                try:
+                    on_error(step, exc)
+                except Exception as hook_exc:  # noqa: BLE001 — a failure note must not stop the session loop
+                    log.warning("error_hook_failed", error=str(hook_exc), error_type=type(hook_exc).__name__)
 
         if connected_at is not None and time.monotonic() - connected_at > _STABLE_AFTER:
             backoff = 1.0

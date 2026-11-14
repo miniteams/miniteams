@@ -2,8 +2,27 @@
 
 import logging
 import sys
+from typing import Any, TextIO
 
 import structlog
+
+
+class SafePrintLogger(structlog.PrintLogger):
+    """A log line that cannot be written (disk full, a stale NFS handle, a closed pipe) is lost, never
+    raised into the code that logged it: a follower must still hang up."""
+
+    def msg(self, message: str) -> None:
+        try:
+            super().msg(message)
+        except OSError:
+            pass
+
+    log = debug = info = warn = warning = msg
+    fatal = failure = err = error = critical = exception = msg
+
+
+def _safe_factory(file: TextIO) -> Any:
+    return lambda *_args: SafePrintLogger(file)
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -24,6 +43,6 @@ def setup_logging(level: str = "INFO") -> None:
             *tail,
         ],
         wrapper_class=structlog.make_filtering_bound_logger(log_level),
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
+        logger_factory=_safe_factory(sys.stderr),
         cache_logger_on_first_use=True,
     )

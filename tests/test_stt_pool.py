@@ -11,7 +11,9 @@ import signal
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -110,6 +112,11 @@ async def test_one_speaker_posts_in_speech_order() -> None:
     assert [text for pid, text in posted if pid == 1] == ["line 1", "line 2"]
 
 
+async def until_alive(engines: list[ProcessEngine]) -> None:
+    while not all(e.alive() for e in engines):
+        await asyncio.sleep(0.05)
+
+
 def fake_engines(n: int, timeout_s: float = 30) -> list[ProcessEngine]:
     return [ProcessEngine([sys.executable, FAKE_ENGINE], timeout_s) for _ in range(n)]
 
@@ -128,21 +135,21 @@ async def test_a_dead_engine_is_restarted_and_the_other_carries_on() -> None:
         p.submit(utt(2, 2))
         await asyncio.wait_for(p.idle(), 30)
         assert posted == [(2, "line 2")]
-        # The restart happens before the engine takes anything else: the next line proves it.
+        # The speaker is let go before the restart: its next line needs no wait for it.
         p.submit(utt(1, 3))
         p.submit(utt(2, 4))
         await asyncio.wait_for(p.idle(), 30)
         assert sorted(posted[1:]) == [(1, "line 3"), (2, "line 4")]
-        assert all(e.alive() for e in engines)
+        await asyncio.wait_for(until_alive(engines), 30)
         assert len({e.pid for e in engines} - pids) == 1
-        # One dies while idle: it is restarted before its next utterance, which is not lost.
+        # One dies while idle: the utterance it took goes back, untried, not lost; it restarts meanwhile.
         engines[0]._proc.kill()  # type: ignore[union-attr]
         await asyncio.to_thread(engines[0]._proc.wait)  # type: ignore[union-attr]
         for n in (5, 6, 7):
             p.submit(utt(n, n))
         await asyncio.wait_for(p.idle(), 30)
         assert sorted(posted[3:]) == [(5, "line 5"), (6, "line 6"), (7, "line 7")]
-        assert all(e.alive() for e in engines)
+        await asyncio.wait_for(until_alive(engines), 30)
     finally:
         task.cancel()
         p.stop()
@@ -384,3 +391,116 @@ def test_the_engine_child_takes_signals_again() -> None:
     t.start()
     t.join(30)
     assert seen == ["SigBlk:\t0000000000000000"]
+
+
+class _Flaky(ProcessEngine):
+    """An engine dead from the start or dying on its first utterance, whose restarts fail or work."""
+
+    def __init__(self, dies_on_call: bool, restarts: bool) -> None:
+        super().__init__([sys.executable, "-c", "pass"], 5)
+        self.up, self.dies_on_call, self.restarts = dies_on_call, dies_on_call, restarts
+
+    def alive(self) -> bool:
+        return self.up
+
+    def start(self, load_timeout_s: float = 600) -> None:
+        if not self.restarts:
+            raise EngineDied("model gone")
+        self.up, self.dies_on_call = True, False
+
+    def __call__(self, audio: Audio, prompt: str = "") -> Line:
+        if self.dies_on_call:
+            self.up = False
+            raise EngineDied("receive: EOFError()")
+        return Line(f"line {float(audio[1]):g}", "en")
+
+
+@pytest.mark.parametrize(
+    ("dies_on_call", "restarts"), [(False, False), (True, False), (False, True), (True, True)]
+)
+async def test_an_engine_that_never_comes_back_stalls_no_speaker(
+    dies_on_call: bool, restarts: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec 044: one engine's restart failing for good holds neither its utterance's speaker nor the
+    transcript: the other engine keeps transcribing every speaker; one that comes back serves again."""
+    monkeypatch.setattr(asyncio, "to_thread", _inline)
+    posted: list[tuple[int, str]] = []
+    unmarked: list[int] = []  # speakers an engine served while the pipeline no longer marked them busy
+
+    def good(a: Audio, _p: str) -> Line:
+        if int(a[2]) not in p._busy:
+            unmarked.append(int(a[2]))
+        return Line(f"line {float(a[1]):g}", "en")
+
+    flaky = _Flaky(dies_on_call, restarts)
+    p = Pipeline([flaky, good], room(posted), size=16)
+    task = asyncio.create_task(p.run())
+    try:
+        # The dying engine's speaker comes next too: the other engine takes it during the restart.
+        for n, speaker in enumerate((1, 1, 2, 3, 1, 2), 1):
+            p.submit(gated(speaker, n))
+        await asyncio.wait_for(p.idle(), 10)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    lost = 1 if dies_on_call else 0  # the utterance an engine dies on is lost with it; an untried one is not
+    assert len(posted) == 6 - lost and {pid for pid, _ in posted} == {1, 2, 3}
+    assert flaky.up == restarts and unmarked == []
+
+
+async def _inline(fn: Any, *args: Any) -> Any:
+    """asyncio.to_thread without the thread: the fakes are instant, and the order stays deterministic."""
+    await asyncio.sleep(0)
+    return fn(*args)
+
+
+class _DiesOnce(ProcessEngine):
+    """Dies on its first utterance, then restarts slowly (a model reloading) and serves."""
+
+    def __init__(self, record: Callable[[int], Line]) -> None:
+        super().__init__([sys.executable, "-c", "pass"], 5)
+        self.record, self.died = record, False
+
+    def alive(self) -> bool:
+        return True
+
+    def start(self, load_timeout_s: float = 600) -> None:
+        time.sleep(0.3)
+
+    def __call__(self, audio: Audio, prompt: str = "") -> Line:
+        if not self.died:
+            self.died = True
+            raise EngineDied("receive: EOFError()")
+        return self.record(int(audio[1]))
+
+
+async def test_same_speaker_never_in_two_engines_and_idle_waits_for_every_line() -> None:
+    """Spec 044: an engine that died lets its speaker go once, before its restart; once restarted it must
+    not clear the mark another engine set meanwhile on the same speaker, or a third engine takes that
+    speaker too and idle() returns with a line still in an engine (Session.close() would lose it)."""
+    lock = threading.Lock()
+    inside: dict[int, int] = {}
+    peak = [0]
+    posted: list[tuple[int, str]] = []
+
+    def record(n: int, speaker: int = 1) -> Line:
+        with lock:
+            inside[speaker] = inside.get(speaker, 0) + 1
+            peak[0] = max(peak[0], inside[speaker])
+        time.sleep(0.2)
+        with lock:
+            inside[speaker] -= 1
+        return Line(f"line {n}", "en")
+
+    engines: list[Any] = [_DiesOnce(record), lambda a, _p: record(int(a[1])), lambda a, _p: record(int(a[1]))]
+    p = Pipeline(engines, room(posted), size=16)
+    for n in range(1, 8):
+        p.submit(utt(1, n))
+    task = asyncio.create_task(p.run())
+    try:
+        await asyncio.wait_for(p.idle(), 20)
+        assert len(posted) == 6  # every line but the one its engine died on, all in by idle()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert peak[0] == 1 and [t for _, t in posted] == [f"line {n}" for n in range(2, 8)]

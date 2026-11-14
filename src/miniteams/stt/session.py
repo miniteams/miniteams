@@ -70,10 +70,17 @@ class Transcript:
         self.path = transcript_path(data_dir, call, started)
         self.path.parent.mkdir(mode=0o700, exist_ok=True)
         self._fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        self._torn = False  # the last write may have left part of a line: the next one starts afresh
         self.write(header)
 
     def write(self, obj: dict[str, Any]) -> None:
-        os.write(self._fd, (json.dumps(obj, ensure_ascii=False) + "\n").encode())
+        data = memoryview(
+            (("\n" if self._torn else "") + json.dumps(obj, ensure_ascii=False) + "\n").encode()
+        )
+        self._torn = True
+        while data:  # a full disk or a file size limit writes part of it, then raises
+            data = data[os.write(self._fd, data) :]
+        self._torn = False
 
     def close(self) -> None:
         # Once only: a second os.close could close an fd number another file got meanwhile.
@@ -140,14 +147,18 @@ class Session:
         self.transcript: Transcript | None = None
 
     async def start(self) -> None:
+        await self.load()
+        self.begin()
+
+    async def load(self) -> None:
+        """Loads the engines; no transcript yet (the follower runs this while it joins)."""
+        await self._pipeline.start()
+
+    def begin(self) -> None:
+        """Opens the transcript and starts transcribing; frames are fed from now on."""
         started = self._clock()
         header = transcript_header(self._call, self._thread, self._kind, started, self._engine, **self._extra)
         self.transcript = Transcript(self._data_dir, self._call, started, header)
-        try:
-            await self._pipeline.start()
-        except BaseException:
-            self.transcript.close()
-            raise
         self._tasks = [asyncio.create_task(self._pipeline.run()), asyncio.create_task(self._ticker())]
         log.info("stt_started", call=self._call, engine=self._engine, path=str(self.transcript.path))
 

@@ -5,6 +5,8 @@ import gzip
 import json
 from typing import Any
 
+import pytest
+
 from miniteams import messages as M
 from miniteams.compose import reply_quote
 from miniteams.directory import Directory
@@ -368,3 +370,24 @@ def test_malformed_activity_is_none() -> None:
         ("ThreadActivity/MemberJoined", _added(_ANN, _BOB)),
     ]:
         assert M.parse_activity(msgtype, content) is None, content
+
+
+def test_a_gzip_bomb_or_trailing_data_is_unreadable() -> None:
+    """Spec 044: a delivery body inflates to at most GUNZIP_MAX; past it, truncated, corrupt or followed
+    by more data, it is refused as unreadable (ValueError), never decompressed whole."""
+    from miniteams.messages import GUNZIP_MAX, gunzip_b64
+
+    bomb = base64.b64encode(gzip.compress(b"0" * (GUNZIP_MAX + 1))).decode()
+    whole = gzip.compress(b'{"a": 1}')
+    for bad in (
+        bomb,
+        base64.b64encode(whole + whole).decode(),  # a second member
+        base64.b64encode(whole[:-6]).decode(),  # cut short
+        base64.b64encode(b"\x1f\x8b\x08\x00garbage").decode(),
+    ):
+        with pytest.raises(ValueError):
+            gunzip_b64(bad)
+    assert gunzip_b64(base64.b64encode(gzip.compress(b"0" * GUNZIP_MAX)).decode()) == "0" * GUNZIP_MAX
+    req = {"headers": {"X-Microsoft-Skype-Content-Encoding": "gzip"}, "body": bomb}
+    with pytest.raises(ValueError):
+        decode_body(req)

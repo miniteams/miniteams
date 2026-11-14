@@ -410,10 +410,12 @@ def test_settings_paths_override_the_cache_defaults(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "argv", [["follow"], ["archive", "--live", "--follow"], ["follow", "--call", json.dumps({"x": 1})]]
+    "argv",
+    [["follow"], ["follow", "--call-file", "push.json"], ["follow", "--call", json.dumps({"x": 1})]],
 )
 def test_follow_refuses_to_start_without_the_model(argv: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
-    """044-AC10: the trigger and a follower both stop before Teams or the call, with the fix command."""
+    """044-AC10: the trigger and a follower both stop before Teams or the call, with the fix command (the
+    archiver archives on without its trigger: test_follow)."""
     from structlog.testing import capture_logs
 
     from miniteams import stream
@@ -532,7 +534,8 @@ async def test_close_is_bounded_when_an_engine_never_comes_back(settings: Settin
         await asyncio.wait_for(s.close(), 5)
     assert time.monotonic() - began < 1.5
     (timeout,) = [x for x in logs if x["event"] == "stt_close_timeout"]
-    assert (timeout["pending"], timeout["busy"]) == (1, 1)
+    # The dead engine let its speaker go before its restart loop: the next utterance waits for an engine.
+    assert (timeout["pending"], timeout["busy"]) == (1, 0)
     assert not e.alive()
     assert s.transcript is not None
     with pytest.raises(OSError):
@@ -552,9 +555,7 @@ async def test_a_failed_engine_load_stops_the_others_and_closes_the_transcript(
     with pytest.raises(EngineDied):
         await asyncio.wait_for(s.start(), 30)
     assert good.pid is None and not good.alive() and bad.pid is None
-    assert s.transcript is not None
-    with pytest.raises(OSError):
-        os.fstat(s.transcript._fd)
+    assert s.transcript is None and not (tmp_path / "follow").exists()  # engines first: no file yet
     # A caller closing anyway, twice: the descriptor numbers others now hold are left alone.
     other = os.open(os.devnull, os.O_RDONLY)
     try:
@@ -738,3 +739,38 @@ async def test_header_carries_the_join_outcome(settings: Settings, tmp_path: Pat
     await s.close()
     assert s.transcript is not None
     assert lines(s.transcript.path)[0]["join"] == "ok"
+
+
+def test_a_torn_write_never_glues_two_lines(tmp_path: Path) -> None:
+    """044-AC8: a file size limit (or a full disk) writes part of a line and raises: the next line
+    starts on a line of its own, so only the torn one is lost to readers."""
+    import resource
+    import signal
+
+    t = S.Transcript(tmp_path, CALL, T0, {"call": CALL})
+    size = t.path.stat().st_size
+    soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+    previous = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)  # EFBIG instead of the default kill
+    try:
+        resource.setrlimit(resource.RLIMIT_FSIZE, (size + 10, hard))
+        with pytest.raises(OSError):
+            t.write({"text": "x" * 50})
+    finally:
+        resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+        signal.signal(signal.SIGXFSZ, previous)
+    t.write({"text": "next"})
+    t.write({"text": "after"})
+    t.close()
+    raw = t.path.read_bytes().split(b"\n")
+    assert len(raw[1]) == 10 and raw[2:] == [b'{"text": "next"}', b'{"text": "after"}', b""]
+
+
+def test_short_writes_are_completed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A write() that takes part of the buffer (a signal, a pipe-like file) is resumed, not dropped."""
+    t = S.Transcript(tmp_path, CALL, T0, {"call": CALL})
+    real_write = os.write
+    monkeypatch.setattr(S.os, "write", lambda fd, data: real_write(fd, bytes(data[:3])))
+    t.write({"text": "whole line"})
+    monkeypatch.undo()
+    t.close()
+    assert lines(t.path)[1] == {"text": "whole line"}

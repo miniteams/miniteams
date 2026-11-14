@@ -38,9 +38,9 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
     `NGCallManagerWin`;
   - `miniteams follow`: a standalone process with its own Trouter socket and endpoint id, for a setup
     that does not archive, and for tests.
-- On `evt 115` the trigger starts one follower per call, `miniteams follow --call <push>`, a detached
-  process (own session) that does join, media and STT, and stops when I leave or the call ends. A
-  restart of the trigger's host does not touch it.
+- On `evt 115` the trigger starts one follower per call, `miniteams follow --call-file <push file>`, a
+  detached process (own session, own systemd scope when available) that does join, media and STT, and
+  stops when I leave or the call ends. A restart of the trigger's host does not touch it.
 - Every call kind: scheduled meetings, ad hoc group calls, 1:1 calls.
 - Join, media, per-speaker demux, G.722 decode, speaker names from the roster (names store as fallback).
 - Live STT, engine `parakeet` (default) or `whisper`, chosen by setting.
@@ -69,8 +69,9 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
 - [ ] **AC2** Same as AC1 for an ad hoc group call and for a 1:1 call, joined or answered on any device.
 - [ ] **AC3** One follower per call: the `evt 115` its own join causes, a redelivered push, a second
       device of mine joining, and two triggers running at once (`archive --follow` and `follow`) start
-      no second follower. The guard is a lock per `correlationId` under `<data-dir>/follow/`, released
-      when the follower exits, even on a crash.
+      no second follower, whatever data dir each trigger names. The guard is a lock per `correlationId`
+      under `<config-dir>/follow/` (host-local, per user), released when the follower exits, even on a
+      crash.
 - [ ] **AC4** When my last device in the call leaves (the follower aside) and others stay, the follower
       leaves within 15 s, its `DELETE` on the call leg answers 2xx, and no ghost participant remains. While
       another of my devices is still in the call (PC and phone, a transfer, an added device), one of them
@@ -125,11 +126,11 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
 ### Phase 2 — Trigger
 - Work: the trigger (`NGCallManagerWin` registration, `cp` decode keeping `evt`, switch and skip
   list), hosted by `archive --live --follow` and by `miniteams follow` (own endpoint id); the per-call
-  lock; the detached `miniteams follow --call` launch; the extra and its startup checks. Followers are
+  lock; the detached `miniteams follow --call-file` launch; the extra and its startup checks. Followers are
   stubs that log start and stop.
 - **Covers**: AC3, AC11, AC13, AC15, AC17
 - **Data model impact**: `follow.json` in the config dir (switch, skip list); lock files under
-  `<data-dir>/follow/`
+  `<config-dir>/follow/`
 - **DoD**: unit tests on recorded push shapes (synthetic ids) for 115, 116, redelivery, self-join and
   two triggers racing on one lock; live: joining and leaving a meeting logs one start and one stop,
   with the archiver restarted in between.
@@ -177,7 +178,9 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
 
 - `follow.json` (config dir): `{"enabled": bool, "skip": [thread ids]}`.
 - `<data-dir>/follow/<YYYY-MM>/<started>-<call>.ndjson`: header line + one line per utterance.
-- `<data-dir>/follow/<call>.lock`: held by the running follower.
+- `<config-dir>/follow/<call>.lock`: held by the running follower; `<call>.ended` (the joins that ended)
+  and `<call>-<join hash>.push.json` (the push, 0600, removed by its follower on exit) beside it.
+- `<data-dir>/follow/<call>.log`: the follower's log.
 - No database change.
 
 ## Open questions
@@ -196,8 +199,21 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
   registration id.
 - The archiver hosts only the trigger; each call runs in its own detached process, so archiver
   restarts (one per release) do not cut a transcript (user call, 2026-11-14).
-- The lock is an advisory `flock` on a file in the data dir: the kernel drops it when the holder dies.
-  ponytail: flock on NFS depends on the mount's lock support; a local run dir if it proves flaky.
+- The lock is an advisory `flock` on a file in the config dir: the kernel drops it when the holder dies.
+  Locks, `.ended` markers and push files moved there from the data dir (swarm review, 2026-11-14): two
+  triggers naming the data dir apart (a symlink, an NFS path) held two locks, so two followers each saw
+  the other as "another device of mine" and kept each other in the call; the config dir is host-local,
+  and an NFS stall no longer delays the hang-up. Transcripts and logs stay in the data dir.
+- The push travels in a 0600 file, its path on the follower's argv: argv is readable by every local user
+  in `/proc` and one argument is capped at 128 KiB.
+- A follower lost to a network outage (media idle, Trouter moved) keeps re-attaching for
+  `follow_reattach_deadline_s` (default 300 s) instead of one retry; a call over meanwhile still ends (404,
+  or alone and the leave rule).
+- Live, test tenant, 2026-11-14 (swarm-review step 2, meeting, devices B + C, two talkers): the follower ran
+  in its own transient scope (`run-p<pid>-….scope`, the pid of its lock), its lock, `.ended` and 0600 push
+  file under the config dir, nothing of the push on its argv; joined 7.1 s after `userJoinTime`, stayed when
+  B left, `DELETE` 202 6.2 s after C's stream left the roster, then `evt 116` (no ghost); 22 lines on 2
+  speakers.
 - Live, 2026-11-14 (probe, 2 runs): `evt 115` arrives about 0.1 s after `userJoinTime`, `evt 116` on
   leaving, both on a second endpoint of mine. Still open for Phase 1: `evt 116` when others stay, and
   when the follower keeps my account in the call.

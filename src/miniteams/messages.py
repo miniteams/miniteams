@@ -7,11 +7,11 @@ snippet, deleted/edited, mentions, `fold`) serve the stream, the web views, the 
 """
 
 import base64
-import gzip
 import html
 import json
 import re
 import unicodedata
+import zlib
 from collections import Counter
 from collections.abc import Callable
 from typing import Any, NamedTuple
@@ -248,8 +248,19 @@ def reaction_key(key: str) -> str | None:
     return "-".join(f"{ord(c):04x}" for c in chars) + "_" + words
 
 
+GUNZIP_MAX = 4 << 20  # the largest delivery seen live decompressed to 9 KB
+
+
 def gunzip_b64(data: str) -> str:
-    return gzip.decompress(base64.b64decode(data)).decode("utf-8")
+    """ValueError past GUNZIP_MAX (a gzip bomb) or with data left after the gzip stream."""
+    inflate = zlib.decompressobj(31)  # 16 + 15: gzip header, the largest window
+    try:
+        out = inflate.decompress(base64.b64decode(data), GUNZIP_MAX)
+    except zlib.error as exc:
+        raise ValueError(f"unreadable gzip body: {exc}") from exc
+    if inflate.unconsumed_tail or inflate.unused_data or not inflate.eof:
+        raise ValueError("gzip body over the size limit, truncated or followed by other data")
+    return out.decode("utf-8")
 
 
 def delivery_json(req: dict[str, Any]) -> Any:

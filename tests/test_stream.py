@@ -458,6 +458,30 @@ async def test_a_failing_link_hook_does_not_stop_the_loop(
     assert len(failed) == 6 and failed[0]["error_type"] == "ValueError"  # 2 × (up, up, down)
 
 
+async def test_a_failing_error_hook_does_not_stop_the_loop(
+    settings: Settings, directory: Directory, monkeypatch
+) -> None:
+    """Spec 044: a hook raising on a failed attempt is logged; the reconnect loop goes on."""
+    import structlog
+
+    aad = {"access_token": "A", "id_token": "I"}
+    st = {"skype_token": "ST", "expires_in": 3600}
+    sessions = _link_loop(
+        monkeypatch, aad, exchanges=[RuntimeError("authz down"), st, asyncio.CancelledError()]
+    )
+    seen: list[str] = []
+
+    def broken(step: str, _exc: BaseException) -> None:
+        seen.append(step)
+        raise ValueError("hook broke")
+
+    with structlog.testing.capture_logs() as logs, pytest.raises(asyncio.CancelledError):
+        await S.run_forever(settings, directory=directory, on_error=broken)
+    assert seen == ["sign-in"] and len(sessions) == 1  # reconnected after the failing hook
+    failed = [e for e in logs if e["event"] == "error_hook_failed"]
+    assert [(e["error"], e["error_type"]) for e in failed] == [("hook broke", "ValueError")]
+
+
 # --- off_loop: blocking calls in daemon threads (spec 044) ---
 
 

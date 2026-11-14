@@ -257,21 +257,34 @@ class Pipeline:
             wait = self._clock() - u.queued
             if wait > SLOW_WAIT_S:
                 log.warning("queue_wait_slow", msi=u.msi, wait_s=round(wait, 1))
+            if isinstance(engine, ProcessEngine) and not engine.alive():
+                # Died while idle: the untried utterance goes back for another engine, then this one
+                # restarts, however long that takes (spec 044: a restart failing for good).
+                log.error("engine_died", pid=engine.pid, idle=True)
+                self._pending.appendleft(u)
+                self._release(u)
+                await self._restart(engine)
+                continue
+            # Released exactly once per take: a second release would clear another engine's mark on the
+            # same speaker, putting two engines on one speaker and letting idle() return early.
+            released = False
             try:
-                if isinstance(engine, ProcessEngine) and not engine.alive():
-                    # Died while idle: restart it before it costs this utterance.
-                    log.error("engine_died", pid=engine.pid, idle=True)
-                    await self._restart(engine)
                 await self.process(u, engine)
             except EngineDied as e:
                 log.error("engine_died", msi=u.msi, error=str(e))
+                self._release(u)  # before the restart: the speaker's next utterances go to another engine
+                released = True
                 await self._restart(engine)
             except Exception:
                 # One utterance the model chokes on must not stop transcription for the call.
                 log.exception("utterance_failed", msi=u.msi)
             finally:
-                self._busy.discard(u.speaker)
-                self._wake.set()
+                if not released:
+                    self._release(u)
+
+    def _release(self, u: Utterance) -> None:
+        self._busy.discard(u.speaker)
+        self._wake.set()
 
     async def _restart(self, engine: Transcribe) -> None:
         if not isinstance(engine, ProcessEngine):

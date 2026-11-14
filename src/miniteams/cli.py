@@ -406,7 +406,7 @@ def cmd_archive(settings: Settings, args: argparse.Namespace) -> int:
     from .auth import token_source
 
     if args.follow and not _follow_extra_ok(settings):
-        return 1
+        args.follow = False  # 044-AC17: the archive keeps running, without the trigger
     # Acquire once (may prompt), then hand a self-refreshing provider to the run: a full-account
     # archive outlives the ~45-min skype token, so it must be re-minted mid-run.
     source = token_source(settings)
@@ -556,17 +556,25 @@ def _follow_extra_ok(settings: Settings) -> bool:
 
 
 def cmd_follow(settings: Settings, args: argparse.Namespace) -> int:
-    """Meeting follower (spec 044): the trigger, one call's follower (--call), or the switch and skip list."""
+    """Meeting follower (spec 044): the trigger, a call's follower (--call-file), switch and skip list."""
     from . import follow
     from .presence import same_chat
 
     data_dir = Path(args.data_dir)
     if args.capture:
         settings.follow_capture = Path(args.capture).resolve()
-    if args.call is not None:
+    if args.call is not None or args.call_file is not None:
         if not _follow_extra_ok(settings):
             return 1
-        return follow.run_call(settings, data_dir.resolve(), args.call)
+        if args.call_file is not None:
+            payload = follow.read_push(Path(args.call_file))
+        else:  # a trigger started before --call-file
+            try:
+                loaded = json.loads(args.call)
+            except ValueError:
+                loaded = None
+            payload = loaded if isinstance(loaded, dict) else None
+        return follow.run_call(settings, data_dir.resolve(), payload)
     if args.enable or args.disable or args.skip or args.unskip or args.status:
         switch = follow.load_switch(settings)
         if switch is None:
@@ -581,6 +589,11 @@ def cmd_follow(settings: Settings, args: argparse.Namespace) -> int:
             skip = [t for t in skip if not same_chat(t, args.unskip)]
         if not args.status:
             follow.save_switch(settings, enabled, skip)
+            # Saved first: a follower launched meanwhile reads the new switch, a running one is stopped.
+            if args.disable:
+                follow.stop_running(settings)
+            elif args.skip:
+                follow.stop_running(settings, args.skip)
         print(json.dumps({"enabled": enabled, "skip": skip}))
         return 0
     if not _follow_extra_ok(settings):
@@ -898,11 +911,14 @@ def main(argv: list[str] | None = None) -> int:
         help="debug: dump each join's RTP, callbacks and SDP under DIR/<call>/<endpoint>/",
     )
     follow_mode = p_follow.add_mutually_exclusive_group()
-    follow_mode.add_argument("--call", metavar="PUSH", help=argparse.SUPPRESS)  # the trigger's own launch
+    follow_mode.add_argument("--call-file", metavar="PATH", help=argparse.SUPPRESS)  # the trigger's launch
+    follow_mode.add_argument("--call", metavar="PUSH", help=argparse.SUPPRESS)  # an older trigger's
     follow_mode.add_argument("--enable", action="store_true", help="turn following on (follow.json)")
-    follow_mode.add_argument("--disable", action="store_true", help="turn following off (follow.json)")
     follow_mode.add_argument(
-        "--skip", type=_non_empty, metavar="THREAD", help="never follow calls of this chat"
+        "--disable", action="store_true", help="turn following off (follow.json), stop running followers"
+    )
+    follow_mode.add_argument(
+        "--skip", type=_non_empty, metavar="THREAD", help="never follow calls of this chat, stop its follower"
     )
     follow_mode.add_argument(
         "--unskip", type=_non_empty, metavar="THREAD", help="take a chat off the skip list"
