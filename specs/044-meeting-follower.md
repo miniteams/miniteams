@@ -198,4 +198,11 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
   when the follower keeps my account in the call.
 - Phase order 2 → 4 → 1 → 3 → 5 (user call, 2026-11-14): the offline phases go first; the spike
   waits for real calls. A prototype follower runs permanently meanwhile and follows every call I join.
-- Phase 1 results: _to fill_.
+- Phase 1 results (spike in `.scratchpad/044/spike/`, never committed):
+  - Q3, offline part, 2026-11-14: PyAV decodes the `x-multichannel` G.722 blocks packet by packet with
+    output identical to the ffmpeg CLI on the whole stream (S18 run of 1 min, 5 MSIs, 2969 packets,
+    0.27 s CPU). The same capture paced on its RTP clock through `Session` (parakeet): 12 lines on 3
+    speakers, latency median 1.19 s, p90 1.98 s, max 3.0 s. `aioice` and `pylibsrtp` against Teams: _live,
+    to fill_.
+  - Q1 leave detection, Q2 join from the push per call kind: _live, to fill_ (prototype follower
+    running: probe unit joins every meeting I join through S18's client, captures Trouter and RTP).
