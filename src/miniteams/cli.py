@@ -895,7 +895,9 @@ def main(argv: list[str] | None = None) -> int:
     p_follow = sub.add_parser("follow", help="follow the calls I join: one follower per call (spec 044)")
     p_follow.add_argument("--data-dir", default="data", help="archive root (default: ./data)")
     p_follow.add_argument(
-        "--capture", metavar="DIR", help="debug: dump each call's RTP, callbacks and SDP under DIR/<call>/"
+        "--capture",
+        metavar="DIR",
+        help="debug: dump each join's RTP, callbacks and SDP under DIR/<call>/<endpoint>/",
     )
     follow_mode = p_follow.add_mutually_exclusive_group()
     follow_mode.add_argument("--call", metavar="PUSH", help=argparse.SUPPRESS)  # the trigger's own launch

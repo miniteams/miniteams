@@ -35,7 +35,7 @@ import structlog
 from .auth import self_mri, token_source
 from .config import Settings
 from .directory import Directory
-from .follow import call_id, thread_of
+from .follow import call_id, join_time, mark_ended, thread_of
 from .messages import _decode_body
 from .skype import exchange_skype_token
 from .stream import AGENT_PATH, off_loop, run_forever
@@ -61,6 +61,9 @@ MEDIA_IDLE_S = 60.0
 _KEY = re.compile(r"inline:(?:[A-Za-z0-9+/=]|\\/|\\u[0-9A-Fa-f]{4})+")
 HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 PENDING_MAX = 60 * 4 * 50  # frames held while the engines load: 60 s of 4 speakers
+JOIN_RETRY_PAUSE_S = 5.0
+LAST_DEVICE_LEFT = "last_device_left"
+TROUTER_MOVED = "trouter_moved"  # our socket reconnected on a new surl: the callbacks name the old one
 _CC_LINKS = (
     "mediaAcknowledgement rejection acknowledgement mediaRenegotiation replacement progress mediaAnswer "
     "newMediaOffer redirection balanceUpdate acceptance controlVideoStreaming dominantSpeakerInfo csrcInfo "
@@ -72,7 +75,11 @@ Audio = Callable[[int, npt.NDArray[np.int16], float], None]  # (msi, 20 ms of 16
 
 
 class JoinError(RuntimeError):
-    """The join failed; the message is its cause."""
+    """The join failed; the message is its cause. `retry` False: a second try cannot do better."""
+
+    def __init__(self, cause: str, retry: bool = True) -> None:
+        super().__init__(cause)
+        self.retry = retry
 
 
 # --- SDP ---
@@ -441,6 +448,7 @@ class Call:
         trouter: Callable[..., Coroutine[Any, Any, None]] = run_forever,
         capture: Path | None = None,
         clock: Callable[[], float] = time.time,
+        controller: str = "",
     ) -> None:
         self.settings = settings
         self.payload = payload
@@ -449,12 +457,15 @@ class Call:
         self.http = http or httpx.AsyncClient(timeout=HTTP_TIMEOUT)
         self._ice = ice or (lambda: _Ice(ice_controlling=True, stun_server=stun(settings), use_ipv6=False))
         self._trouter_fn = trouter
-        self.capture = Capture(capture) if capture is not None else None
+        self.endpoint = str(uuid.uuid4())  # this call's endpoint id, in every callback URL
+        # One directory per Call: a retry or a re-attach of the same call never mixes its files in.
+        self.capture = Capture(capture / self.endpoint) if capture is not None else None
         self._clock = clock
         self.roster = Roster()
+        self._leaving: asyncio.TimerHandle | None = None
         self.ended = asyncio.Event()  # the call is over for us: call end, conversation end, media lost
         self.end_reason = ""
-        self.endpoint = str(uuid.uuid4())  # this call's endpoint id, in every callback URL
+        self.retryable = True  # False once the first end said a new join cannot do better
         self._chain = str(uuid.uuid4())
         self._tag = secrets.token_hex(4)
         self._surl: asyncio.Future[str] | None = None
@@ -463,6 +474,12 @@ class Call:
         self._tasks: set[asyncio.Future[Any]] = set()
         self._conn: aioice.Connection | None = None
         self._offer = ""
+        # The call's controller, given by an earlier join of this call, or read from a 1:1's push in
+        # join(): phase 2 goes straight to it. An ended 1:1 then answers 404; an ended meeting or group
+        # call comes back with only us in it (seen live), which the leave rule ends after its grace.
+        self.controller = controller
+        self._direct = bool(controller)
+        self._one_to_one = False
         self._key = os.urandom(30)
         self._ssrc = secrets.randbits(32)
         self._rx: pylibsrtp.Session | None = None
@@ -506,7 +523,9 @@ class Call:
         if self.capture is not None:
             self.capture.file(f"{what}.json", resp.text)
         if not resp.is_success:
-            raise JoinError(f"{what} answered {resp.status_code}")
+            # A 1:1's controller answers 404 once its call is over (seen live, subCode 5907): no retry.
+            gone = self._direct and what == "phase2" and resp.status_code == 404
+            raise JoinError(f"{what} answered {resp.status_code}", retry=not gone)
         return resp
 
     def _tc(self, path: str) -> str:
@@ -561,6 +580,8 @@ class Call:
             },
             "debugContent": {"ecsEtag": '"0"', "causeId": message_id[:8]},
         }
+        if self._one_to_one:  # a 1:1 has neither: with them null its controller answers 400 (seen live)
+            del body["groupChat"], body["meetingInfo"]
         if sdp is not None:
             body["conversationRequest"] |= {"conversationType": None, "suppressDialout": True}
             body["participants"]["to"] = []
@@ -592,13 +613,24 @@ class Call:
 
     # --- Trouter ---
 
+    @property
+    def leaving(self) -> bool:
+        """My last device is gone: a leave is pending (or fired)."""
+        return self._leaving is not None and not self._leaving.cancelled()
+
     async def _on_session(self, _epid: str, surl: str) -> None:
         assert self._surl is not None
         if not self._surl.done():
             self._surl.set_result(surl)
-        elif self._surl.result() != surl:
-            # ponytail: the callbacks of this call still name the old socket; slice 2 rejoins.
-            log.warning("call_trouter_moved", call=call_id(self.payload))
+            return
+        # A second session is a reconnect: callbacks sent meanwhile are lost, even on the same surl (and
+        # a new surl gets none): deaf, and blind to my leaving.
+        log.warning("call_trouter_moved", call=call_id(self.payload), leaving=self.leaving)
+        # My last device already left: re-attaching would sit in the call as me past AC4's 15 s.
+        if self.leaving:
+            self._end(LAST_DEVICE_LEFT, retry=False)
+        else:
+            self._end(TROUTER_MOVED)
 
     async def on_agent(self, req: dict[str, Any]) -> None:
         """One call callback, already acked by the socket. Long work goes to tasks: the socket's read
@@ -611,7 +643,8 @@ class Call:
         if self.capture is not None:
             self.capture.trouter(path, req.get("headers"), body)
         if path == "conversation/rosterUpdate":
-            self.roster.update(body)
+            if self.roster.update(body):
+                self._check_devices()
             return
         accepted = body.get("callAcceptance")
         if isinstance(accepted, dict):
@@ -628,17 +661,58 @@ class Call:
         end = body.get("callEnd") or body.get("sessionRejection")
         if isinstance(end, dict) or path == "conversation/conversationEnd":
             info = end if isinstance(end, dict) else body
-            self._end(f"{path}: {info.get('subCode')} {info.get('phrase') or ''}".strip())
+            # The call is over: a retry's phase 1 would start a new call as me. A rejection is not.
+            over = path == "conversation/conversationEnd" or isinstance(body.get("callEnd"), dict)
+            self._end(f"{path}: {info.get('subCode')} {info.get('phrase') or ''}".strip(), retry=not over)
+            return
+        if path == "call/redirection":
+            # Never seen live, so not acted on: a redirected leg would leave us following nothing.
+            redirection = body.get("redirection")
+            target = (redirection if isinstance(redirection, dict) else body).get("target")
+            # Peer-supplied, may carry a token anywhere (host included): its shape only, never its content.
+            raw = str(target or "")
+            log.warning(
+                "call_redirection",
+                call=call_id(self.payload),
+                target=f"<{type(target).__name__}, {len(raw)} chars>",
+            )
             return
         log.debug("call_callback", path=path)
 
-    def _end(self, reason: str) -> None:
+    def _check_devices(self) -> None:
+        """044-AC4: my last device gone from the roster (the follower aside), leave once
+        follow_leave_grace_s passes without one coming back (a transfer, a rejoin, a lagging roster)."""
+        own = self.roster.own
+        # Judged only on a roster listing our own stream: a complete view of my entry. One without it
+        # (our MSI unknown before the acceptance, my entry missing) proves nothing about my devices.
+        if own is None or own not in self.roster.mine:
+            return
+        if self.roster.mine - {own}:
+            if self._leaving is not None:
+                if self.ended.is_set():
+                    log.info("call_device_back_too_late", call=call_id(self.payload))
+                else:
+                    self._leaving.cancel()
+                    log.info("call_device_back", call=call_id(self.payload))
+                self._leaving = None
+        elif self._leaving is None and not self.ended.is_set():
+            grace = self.settings.follow_leave_grace_s
+            log.info("call_last_device_gone", call=call_id(self.payload), grace_s=grace)
+            loop = asyncio.get_running_loop()
+            self._leaving = loop.call_later(grace, self._end, LAST_DEVICE_LEFT, False)
+
+    def _trouter_done(self, task: asyncio.Task[None]) -> None:
+        """run_forever returns on a dead login: no callback reaches us any more, nor will a new join's."""
+        if not task.cancelled():
+            self._end("trouter: stopped", retry=False)
+
+    def _end(self, reason: str, retry: bool = True) -> None:
         if not self.ended.is_set():
-            self.end_reason = reason
+            self.end_reason, self.retryable = reason, retry
             log.info("call_ended", call=call_id(self.payload), reason=reason)
             self.ended.set()
         if self._accepted is not None and not self._accepted.done():
-            self._accepted.set_exception(JoinError(reason))
+            self._accepted.set_exception(JoinError(reason, retry=retry))
 
     def _spawn(self, coro: Awaitable[Any]) -> asyncio.Future[Any]:
         task = asyncio.ensure_future(coro)
@@ -696,8 +770,12 @@ class Call:
         """Raises JoinError with the failure's cause."""
         group, meeting = self.payload.get("groupContext"), self.payload.get("meetingInfo")
         if not (isinstance(meeting, dict) and isinstance(group, dict) and group.get("threadId")):
-            # A 1:1 push names neither: phase 1 without them creates an ad hoc call of ours instead.
-            raise JoinError("1:1 calls not supported yet")
+            # A 1:1 push names neither: phase 1 without them creates an ad hoc call of ours instead, so
+            # phase 2 goes straight to the live call's controller, which attaches us to it (seen live).
+            direct = self.payload.get("conversationController")
+            if not isinstance(direct, str) or not direct:
+                raise JoinError("push names no meeting nor conversation controller", retry=False)
+            self.controller, self._direct, self._one_to_one = self.controller or direct, True, True
         loop = asyncio.get_running_loop()
         self._conn = conn = self._ice()
         gathering = self._spawn(conn.gather_candidates())  # STUN takes seconds: meanwhile, sign in
@@ -734,6 +812,7 @@ class Call:
                 failure = self._trouter.exception()
                 raise JoinError(f"Trouter: {type(failure).__name__ if failure else 'stopped'}")
             raise JoinError("no Trouter session")
+        self._trouter.add_done_callback(self._trouter_done)
         await gathering
         default = conn.get_default_candidate(1)
         if default is None:
@@ -744,14 +823,16 @@ class Call:
         )
         if self.capture is not None:
             self.capture.file("offer.sdp", self._offer)
-        created = (await self._post(conv_url, self._conversation(me, name, None), "phase1", True)).json()
-        controller = created.get("conversationController") or (created.get("conversationResponse") or {}).get(
-            "conversationController"
-        )
-        if not controller:
-            raise JoinError("phase1 named no conversation controller")
+        if not self.controller:
+            created = (await self._post(conv_url, self._conversation(me, name, None), "phase1", True)).json()
+            controller = created.get("conversationController") or (
+                created.get("conversationResponse") or {}
+            ).get("conversationController")
+            if not isinstance(controller, str) or not controller:
+                raise JoinError("phase1 named no conversation controller")
+            self.controller = controller
         joined = (
-            await self._post(controller, self._conversation(me, name, self._offer), "phase2", True)
+            await self._post(self.controller, self._conversation(me, name, self._offer), "phase2", True)
         ).json()
         # A leg named before the acceptance is hung up even if we are never admitted. ponytail: the live
         # phase 2 answers carried none (only the conversation's `leave`, which may drop every endpoint
@@ -780,6 +861,9 @@ class Call:
         except ValueError as exc:
             raise JoinError(f"answer SDP: {exc}") from None
         self.roster.own = media.msi
+        if media.msi is None:
+            log.warning("call_no_own_msi", call=call_id(self.payload))  # AC4's leave rule is off then
+        self._check_devices()  # rosters that came before the acceptance
         if media.codec != PT_MULTICHANNEL:
             log.warning("call_codec_not_multichannel", codec=media.codec)
         conn.remote_username, conn.remote_password = media.ufrag, media.pwd
@@ -799,6 +883,8 @@ class Call:
             self._key_rx(media.key)
         self._spawn(self._receive(conn))
         self._spawn(self._send_silence(conn, srtp_session(self._key, inbound=False)))
+        if self.ended.is_set():  # ended once accepted (my last device gone, a renegotiation failed...)
+            raise JoinError(self.end_reason, retry=self.retryable)
         log.info("call_joined", call=call_id(self.payload), own_msi=media.msi, codec=media.codec)
 
     async def _receive(self, conn: aioice.Connection) -> None:
@@ -868,6 +954,8 @@ class Call:
     async def leave(self) -> int | None:
         """Hangs up (`DELETE` on the call leg; a meeting leg has no end link, and `POST .../end` answers
         404 and leaves a ghost participant) and closes everything; the DELETE status, None without a leg."""
+        if self._leaving is not None:
+            self._leaving.cancel()
         for task in list(self._tasks):
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -881,7 +969,7 @@ class Call:
                 status = (await self.http.delete(_https(self.leg), headers=headers)).status_code
             except Exception as exc:  # noqa: BLE001 — a failed hang-up must not skip the closes below
                 log.warning("call_leave_failed", error=str(exc), error_type=type(exc).__name__)
-        log.info("call_left", call=call_id(self.payload), status=status, **self.stats)
+        log.info("call_left", call=call_id(self.payload), status=status, reason=self.end_reason, **self.stats)
         for step, close in (
             ("ice", self._close_ice),
             ("trouter", self._stop_trouter),
@@ -940,7 +1028,7 @@ async def follow(settings: Settings, data_dir: Path, payload: dict[str, Any], st
             dropped += 1
 
     capture = settings.follow_capture / call if settings.follow_capture else None
-    c = Call(settings, payload, on_audio, capture=capture)
+    c = Call(settings, payload, on_audio, capture=capture)  # rebound by fresh(): the wind-down reads it
     built: Session | None = None  # closed by the wind-down even if never started
 
     def resolve(msi: int) -> tuple[str, str] | None:
@@ -949,17 +1037,55 @@ async def follow(settings: Settings, data_dir: Path, payload: dict[str, Any], st
             return None
         return name or c.directory.known_name(mri), mri
 
+    async def fresh() -> None:
+        """Hangs up `c` (its leg and sockets, before the next one opens its own), rebinds a new one on the
+        same call (phase 2 on its controller, phase 1 first only if no join reached it), pauses."""
+        nonlocal c
+        names = c.roster.names  # the same call: a line still in the engines keeps its speaker
+        await c.leave()
+        # Straight on the controller the first join reached, when it got that far: no phase 1 (an ended
+        # 1:1 answers 404; an ended meeting comes back with us alone, and the leave rule ends it).
+        c = Call(settings, payload, on_audio, directory=c.directory, capture=capture, controller=c.controller)
+        c.roster.names.update(names)
+        # A call that ended meanwhile gets its evt 116 (the trigger's stop) in this pause.
+        await asyncio.sleep(JOIN_RETRY_PAUSE_S)
+
+    async def reattach() -> str | None:
+        """A fresh join on the moved call, one more when the failure allows it. None when joined, else the
+        follow's outcome: the call's own end (over, my last device gone) if it had one, else the move."""
+        attempt = 1
+        while True:
+            await fresh()
+            try:
+                await c.join()
+                return None
+            except Exception as exc:  # noqa: BLE001 — fail safe: no follower sitting deaf as me
+                again = attempt == 1 and _retryable(c, exc)
+                log.warning(
+                    "follow_reattach_failed", call=call, cause=_cause(exc), attempt=attempt, retry=again
+                )
+                if not again:
+                    return TROUTER_MOVED if c.retryable else c.end_reason
+                attempt = 2
+
     async def attend() -> str:
         nonlocal session, built
-        try:
-            await c.join()
-        except Exception as exc:  # noqa: BLE001 — any join failure is logged and written, not raised
-            cause = str(exc) if isinstance(exc, JoinError) else f"{type(exc).__name__}: {exc}"
-            log.warning("follow_join_failed", call=call, cause=cause)
-            started = time.time()
-            header = transcript_header(call, thread, started, settings.stt_engine, join="failed", error=cause)
-            Transcript(data_dir, call, started, header).close()
-            return "join_failed"
+        for attempt in (1, 2):  # 044-AC14: one retry; a stop cancels this task, never retried
+            try:
+                await c.join()
+                break
+            except Exception as exc:  # noqa: BLE001 — any join failure is logged and written, not raised
+                cause = _cause(exc)
+                retry = attempt == 1 and _retryable(c, exc)
+                log.warning("follow_join_failed", call=call, cause=cause, attempt=attempt, retry=retry)
+                if not retry:
+                    started = time.time()
+                    header = transcript_header(
+                        call, thread, started, settings.stt_engine, join="failed", error=cause
+                    )
+                    Transcript(data_dir, call, started, header).close()
+                    return "join_failed"
+            await fresh()
         built = Session(settings, data_dir, call, thread, resolve, header={"join": "ok"})
         await built.start()
         if dropped:
@@ -968,8 +1094,21 @@ async def follow(settings: Settings, data_dir: Path, payload: dict[str, Any], st
             built.feed(*item)
         pending.clear()
         session = built
+        outcome = "call_ended"
         await c.ended.wait()
-        return "call_ended"
+        while c.end_reason == TROUTER_MOVED:  # 044-AC13: re-attached, the transcript goes on
+            log.warning("follow_reattach", call=call)
+            if (failed := await reattach()) is not None:
+                outcome = failed
+                break
+            await c.ended.wait()
+        # Before the hang-up, whose evt 116 may be followed by my rejoin's 115 at once: that 115 then
+        # finds this join ended and starts a follower of its own instead of being taken for ours.
+        try:
+            await off_loop(mark_ended, data_dir, call, join_time(payload))
+        except OSError as exc:
+            log.warning("follow_ended_marker_failed", call=call, error=str(exc))
+        return outcome
 
     task = asyncio.ensure_future(attend())
     try:
@@ -992,6 +1131,15 @@ async def follow(settings: Settings, data_dir: Path, payload: dict[str, Any], st
     if (error := await _wind_down(c, built)) is not None:
         raise error
     return outcome
+
+
+def _retryable(c: Call, exc: BaseException) -> bool:
+    """No new join when the failure, or the call's own first end (over, my device gone), rules it out."""
+    return c.retryable and not (isinstance(exc, JoinError) and not exc.retry)
+
+
+def _cause(exc: BaseException) -> str:
+    return str(exc) if isinstance(exc, JoinError) else f"{type(exc).__name__}: {exc}"
 
 
 async def _wind_down(c: Call, session: Session | None) -> BaseException | None:

@@ -123,10 +123,10 @@ def real_launches(procs: list[Any], monkeypatch: pytest.MonkeyPatch) -> list[Any
 
 @pytest.fixture
 def in_process(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """run_call in this process: no real signal mask or wait (they would reach pytest), no real join;
-    records waits."""
+    """run_call in this process: no real signal mask, wait or wake-up (they would reach pytest), no real
+    join, a SIGTERM stop; records waits."""
     waits: list[str] = []
-    monkeypatch.setattr(F, "_attend", lambda *_a: "attended")
+    monkeypatch.setattr(F, "_attend", lambda _d, _p, stop: "attended" if stop.wait(5) else "late")
 
     def sigwait(_sigs: Any) -> int:
         waits.append("wait")
@@ -134,6 +134,7 @@ def in_process(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
     monkeypatch.setattr(F.signal, "pthread_sigmask", lambda *_a: set())
     monkeypatch.setattr(F.signal, "sigwait", sigwait)
+    monkeypatch.setattr(F.signal, "pthread_kill", lambda *_a: None)
     return waits
 
 
@@ -979,7 +980,7 @@ def test_end_still_signals_when_the_marker_cannot_be_written(
     def refuse(*_a: Any) -> None:
         raise OSError("read-only data dir")
 
-    monkeypatch.setattr(F, "_mark_ended", refuse)
+    monkeypatch.setattr(F, "mark_ended", refuse)
     procs.append(_holder(F.lock_path(tmp_path, CALL), "follow", "--call", json.dumps(_payload())))
     with capture_logs() as logs:
         F.handle(settings, tmp_path, _push(116))
@@ -990,21 +991,123 @@ def test_end_still_signals_when_the_marker_cannot_be_written(
 # --- phase 3: the follower thread ---
 
 
-def test_a_follower_whose_call_ended_stops_itself_after_the_linger(
-    tmp_path: Path, in_process: list[str], monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("outcome", ["call_ended", "join_failed", "error"])
+def test_a_follower_ending_on_its_own_marks_its_join_and_exits_without_waiting_for_116(
+    tmp_path: Path, in_process: list[str], monkeypatch: pytest.MonkeyPatch, outcome: str
 ) -> None:
-    """044-AC5: no SIGTERM after the call's end: the follower wakes its own wait and logs the outcome."""
+    """044-AC4, AC5, AC14: no wait for a SIGTERM (evt 116 only comes once the follower is gone): it marks
+    its join ended, so a redelivered 115 of it is skipped, and wakes its own wait."""
     kicked = threading.Event()
-    monkeypatch.setattr(F, "_attend", lambda *_a: "call_ended")
-    monkeypatch.setattr(F, "_LINGER_S", 0.05)
+    monkeypatch.setattr(F, "_attend", lambda *_a: outcome)
     monkeypatch.setattr(F.signal, "pthread_kill", lambda _tid, sig: kicked.set() if sig == F._DONE else None)
     monkeypatch.setattr(F.signal, "sigwait", lambda _s: F._DONE if kicked.wait(5) else signal.SIGTERM)
+    t0 = time.monotonic()
     with capture_logs() as logs:
         assert F.run_call(tmp_path, json.dumps(_payload())) == 0
+    assert time.monotonic() - t0 < 2
     assert [(e["event"], e.get("reason")) for e in logs] == [
         ("follow_start", None),
-        ("follow_stop", "call_ended"),
+        ("follow_stop", outcome),
     ]
+    assert F.ended_path(tmp_path, CALL).read_text() == f"{JOIN}\n"
+    assert not F.lock_held(F.lock_path(tmp_path, CALL))
+
+
+def test_a_join_the_follower_already_marked_is_not_marked_twice(
+    tmp_path: Path, in_process: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """follow() marks an ended call itself, before its hang-up; run_call adds no second line."""
+    kicked = threading.Event()
+
+    def attend(data: Path, payload: dict[str, Any], _stop: threading.Event) -> str:
+        F.mark_ended(data, CALL, F.join_time(payload))
+        return "call_ended"
+
+    monkeypatch.setattr(F, "_attend", attend)
+    monkeypatch.setattr(F.signal, "pthread_kill", lambda _tid, sig: kicked.set() if sig == F._DONE else None)
+    monkeypatch.setattr(F.signal, "sigwait", lambda _s: F._DONE if kicked.wait(5) else signal.SIGTERM)
+    assert F.run_call(tmp_path, json.dumps(_payload())) == 0
+    assert F.ended_path(tmp_path, CALL).read_text() == f"{JOIN}\n"
+
+
+def test_a_follower_whose_marker_fails_still_exits(
+    tmp_path: Path, in_process: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kicked = threading.Event()
+    monkeypatch.setattr(F, "_attend", lambda *_a: "call_ended")
+    monkeypatch.setattr(F.signal, "pthread_kill", lambda _tid, sig: kicked.set() if sig == F._DONE else None)
+    monkeypatch.setattr(F.signal, "sigwait", lambda _s: F._DONE if kicked.wait(5) else signal.SIGTERM)
+
+    def broken(*_a: Any) -> None:
+        raise OSError("read-only")
+
+    monkeypatch.setattr(F, "mark_ended", broken)
+    with capture_logs() as logs:
+        assert F.run_call(tmp_path, json.dumps(_payload())) == 0
+    assert [e["event"] for e in logs] == ["follow_start", "follow_ended_marker_failed", "follow_stop"]
+
+
+def test_a_rejoin_while_the_previous_follower_winds_down_gets_its_own(
+    settings: Settings, tmp_path: Path, real_launches: list[Any]
+) -> None:
+    """044-AC4: the J1 follower left on its own (its join marked ended) and still hangs up; my rejoin's 115
+    (J2) launches a follower that waits for the lock instead of being taken for J1's; a redelivered 115 J1
+    and a late 116 J1 touch neither."""
+    data = tmp_path / "data"
+    lock = F.lock_path(data, CALL)
+    holder = _holder(lock, "follow", "--call", json.dumps(_payload()))  # J1, still winding down
+    real_launches.append(holder)
+    with capture_logs() as logs:
+        F.handle(settings, data, _push(115))  # J1 redelivered while it runs: dropped
+    assert [e["event"] for e in logs] == ["follow_already_running"]
+    F.mark_ended(data, CALL, JOIN)  # what the J1 follower does before its DELETE
+    F.handle(settings, data, _push(115, join=J2))
+    log = data / "follow" / f"{CALL}.log"
+    _until(lambda: log.exists() and "follow_waiting_for_previous" in log.read_text(), "J2 waiting")
+    assert "follow_start" not in log.read_text() and len(real_launches) == 2
+    F.handle(settings, data, _push(115))  # J1 redelivered once ended: skipped
+    holder.kill()
+    holder.wait()
+    _until(lambda: "follow_start" in log.read_text(), "J2 started once J1 let go")
+    _until(lambda: _follower_pid(lock) == real_launches[1].pid, "J2 holds the lock")
+    with capture_logs() as logs:
+        F.handle(settings, data, _push(116))  # late 116 J1
+    assert [e["event"] for e in logs] == ["follow_stop_other_join"]
+    F.handle(settings, data, _push(116, join=J2))
+    _until(lambda: real_launches[1].returncode is not None, "J2 stopped by its own 116")
+    assert len(real_launches) == 2
+
+
+def _follower_pid(lock: Path) -> int | None:
+    try:
+        return int(lock.read_text().strip())
+    except OSError, ValueError:
+        return None
+
+
+def test_a_rejoin_while_the_previous_follower_still_follows_is_dropped(
+    settings: Settings, tmp_path: Path, launches: list[str], procs: list[Any]
+) -> None:
+    """The J1 follower has not ended: whatever J2 is, the call has its follower (a stale holder never
+    makes a second one join)."""
+    procs.append(_holder(F.lock_path(tmp_path, CALL), "follow", "--call", json.dumps(_payload())))
+    F.handle(settings, tmp_path, _push(115, join=J2))
+    assert launches == []
+    F.mark_ended(tmp_path, CALL, J2)  # another join's marker
+    F.handle(settings, tmp_path, _push(115, join="2026-01-01T01:00:00Z"))
+    assert launches == []
+
+
+def test_a_rejoin_whose_previous_follower_never_lets_go_gives_up(
+    tmp_path: Path, procs: list[Any], monkeypatch: pytest.MonkeyPatch, in_process: list[str]
+) -> None:
+    procs.append(_holder(F.lock_path(tmp_path, CALL), "follow", "--call", json.dumps(_payload())))
+    F.mark_ended(tmp_path, CALL, JOIN)
+    monkeypatch.setattr(F, "_LEAVE_S", 0.1)
+    with capture_logs() as logs:
+        assert F.run_call(tmp_path, json.dumps(_payload(join=J2))) == 0
+    assert [e["event"] for e in logs] == ["follow_waiting_for_previous", "follow_already_running"]
+    assert in_process == []
 
 
 def test_attend_runs_the_follower_and_survives_its_failure(
@@ -1039,21 +1142,25 @@ def test_attend_runs_the_follower_and_survives_its_failure(
     assert [e["event"] for e in logs] == ["follow_failed"]
 
 
-def test_a_follower_that_cannot_join_writes_why_and_keeps_its_lock_until_the_end(
+def test_a_follower_that_cannot_join_retries_writes_why_and_exits(
     settings: Settings, tmp_path: Path, real_launches: list[Any]
 ) -> None:
-    """044-AC14: the real `follow --call`, signed out: the cause lands in the transcript header, the lock
-    stays until the trigger's stop."""
+    """044-AC14: the real `follow --call`, signed out: two tries, the cause in the transcript header, the
+    lock freed once it wound down, and the join marked ended, so a redelivered 115 joins nothing more."""
     data = tmp_path / "data"
     F.handle(settings, data, _push(115))
     log = data / "follow" / f"{CALL}.log"
-    _until(lambda: log.exists() and "follow_join_failed" in log.read_text(), "join failure logged")
+    _until(lambda: real_launches[0].returncode is not None, "exited on its own", timeout=30)
+    assert real_launches[0].returncode == 0 and not F.lock_held(F.lock_path(data, CALL))
+    attempts = [json.loads(x)["attempt"] for x in log.read_text().splitlines() if "follow_join_failed" in x]
+    assert attempts == [1, 2]
     (path,) = (data / "follow").rglob("*.ndjson")
     header = json.loads(path.read_text().splitlines()[0])
     assert header["join"] == "failed" and header["error"].startswith("sign-in: ")
-    assert F.lock_held(F.lock_path(data, CALL))
-    F.handle(settings, data, _push(116))
-    _until(lambda: real_launches[0].returncode == 0, "stopped by the end")
+    assert F.ended_joins(data, CALL) == {JOIN}
+    with capture_logs() as logs:
+        F.handle(settings, data, _push(115))
+    assert [(e["event"], e.get("reason")) for e in logs] == [("follow_skipped", "ended")]
 
 
 def test_cli_capture_reaches_the_followers_by_the_environment(
@@ -1082,3 +1189,4 @@ def test_a_signalled_stop_logs_the_follower_outcome(
         assert F.run_call(tmp_path, json.dumps(_payload())) == 0
     (stop,) = [e for e in logs if e["event"] == "follow_stop"]
     assert (stop["reason"], stop["signal"], stop["outcome"]) == ("signal", "SIGTERM", "stopped")
+    assert not F.ended_path(tmp_path, CALL).exists()  # the 116 that sent it wrote the marker

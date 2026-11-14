@@ -117,11 +117,16 @@ same flow. The server needs the project's `.env` and `data/`, so register it as
 does it for Claude Code).
 
 `follow` (spec 044, in progress) starts one follower per call when you join it from any device. The
-follower joins the call as a second endpoint of your account (meetings and group calls for now, not yet 1:1
-calls; a 1:1 call is logged as a failed join), transcribes each speaker, and leaves (`DELETE` on its
-call leg) when the call ends, when it is stopped (SIGTERM to the pid in its `.lock`), or when no media
-packet at all arrives for a minute (RTCP included, which flows even in silence). It does not yet leave by
-itself when your own devices leave while others stay, so stop it then. The trigger runs on its own socket (`miniteams follow`) or on the archiver's (`archive --live --follow`); each
+follower joins the call as a second endpoint of your account (meetings, group calls, and 1:1 calls, joined
+on the push's conversation controller), transcribes each speaker, and leaves (`DELETE` on its call leg)
+`follow_leave_grace_s` after your last device leaves the call (default 5 s, `MINITEAMS_FOLLOW_LEAVE_GRACE_S`;
+it stays while another of your devices is in the call), when the call ends, when it is stopped (SIGTERM to
+the pid in its `.lock`), or when no media packet at all arrives for a minute (RTCP included, which flows
+even in silence). A failed join is retried once, unless the call is over, your last device has left, or
+its Trouter socket stops after the join. When its own Trouter
+socket reconnects, it re-attaches to the call (hang-up, pause, fresh join on the call's controller) and the
+transcript goes on; the seconds in between are lost. If a leave was already pending at that moment, it
+leaves instead; a re-attach failing twice (once, if the call is over) ends the follower. The trigger runs on its own socket (`miniteams follow`) or on the archiver's (`archive --live --follow`); each
 follower is a detached process, `miniteams follow --call`, so restarting the trigger's host leaves it
 running. A lock per call (`<data-dir>/follow/<call>.lock`, its log beside it) keeps it to one follower,
 whatever the device, the redelivery or the number of triggers. Off, or the chat in the skip list: the
@@ -138,7 +143,8 @@ sets the follower's STUN server; the default, `stun.l.google.com:19302`, is a th
 host's public address once per call.
 
 `follow --capture DIR` is a debug tool for protocol breakage: each follower the trigger starts writes under
-`DIR/<call>/` the call's RTP headers and **payloads** (so the audio, `ssrc-<n>.pay`), RTCP arrivals, its
+`DIR/<call>/<endpoint>/`, one directory per join (a retry or a re-attach gets its own), the call's RTP
+headers and **payloads** (so the audio, `ssrc-<n>.pay`), RTCP arrivals, its
 Trouter callbacks and every SDP, SRTP keys redacted, in the layout grill-room's S18 `analyze.py` reads.
 Delete it after use; without the flag nothing but text is written.
 

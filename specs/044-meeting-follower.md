@@ -232,6 +232,37 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
       the caller is the organizer, `messageId` "0"); the meetup-join link built from it attaches to the
       live call.
     - 1:1 call: the push has `conversationController` and `additionalData.participantList` but no
-      `groupContext` nor `meetingInfo`; an `evt 107` (incoming call, `links.attach`) precedes it. The join
-      must go straight to `join_conversation_with_sdp` on the push's `conversationController`: not tried.
-  - The 1:1 join is left to Phase 3's second slice, with leave detection and the retry.
+      `groupContext` nor `meetingInfo`; an `evt 107` (incoming call, `links.attach`) precedes it. Phase 2
+      straight on the push's `conversationController`, without `groupChat` and `meetingInfo` (null: 400),
+      attaches to the live call (Phase 3 slice 2, test tenant, 2026-11-14): roster = both people, my device's
+      stream next to ours, no new correlationId, the caller transcribed, `DELETE` 202. Once the call is
+      over the same request answers 404, subCode 5907: no retry then.
+- Phase 3 slice 2, live in the test tenant, 2026-11-14:
+  - Leave rule with a `follow_leave_grace_s` (5 s): two devices, one leaving kept the follower (36 s
+    observed); the last leaving → `DELETE` 202 6 s later, then `evt 116` (my account gone: no ghost). A gap
+    of 12.9 s with a 20 s test grace: `call_device_back`, one transcript. A device on the Teams web prejoin
+    screen already has its `main-audio` stream in the roster, so it counts as in the call.
+  - Rejoin: after the follower left, my rejoin pushed a new 115 (new `userJoinTime`) and got a new
+    follower. The follower marks its join ended before its `DELETE` and exits without waiting for
+    `evt 116`; its lock is freed once the hang-up and the transcript close are done, and a rejoin's follower
+    waits up to `_LEAVE_S` for it.
+  - With the follower in a 1:1, my hang-up leaves the caller in the call with the follower until the
+    grace ends.
+  - A reconnect of the follower's own Trouter socket loses the callbacks sent meanwhile (it came back on
+    a new surl, which gets none). The follower re-attaches: `DELETE` on the old leg, a pause
+    (`JOIN_RETRY_PAUSE_S`, so a call that ended meanwhile gets its `evt 116` stop before the direct phase 2
+    brings the ended conversation back; a re-attach never runs phase 1), a fresh join on the call's
+    controller, the same transcript; with a leave already pending it leaves instead. Live
+    (forced drop): old leg 202 2 s after the drop, rejoined 11.5 s later with a new own MSI, no 115/116 in
+    between, the transcript went on; it still left on my last device leaving.
+  - Re-attach and retry go straight to the controller a join already reached (phase 1 answers with the
+    push's own `conversationController`): live, a meeting and a group call took the direct phase 2 (200,
+    no phase 1) and the transcript went on. On an ended meeting or group call the same request brings
+    the conversation back with only us in it (an ended 1:1 answers 404): the leave rule ends it after its
+    grace, `DELETE` 202. A call-over end, or my last device gone, rules out the retry.
+  - Moving the callbacks without a re-join does not work (live, 3 runs): after the reconnect, the leg's
+    callback registration (S18 3.1 step 5, fresh message id, new-surl links) answers 202, and the
+    conversation's `notificationLinks` answers 200 to every body tried (it returns a snapshot of the
+    conversation and changes nothing), yet no callback reaches the new socket: B's and C's leaves sent
+    no roster and the follower stayed in the call, deaf. The rosters are registered at the conversation
+    level (phase 2's `conversationRequest`), which neither request moves. The re-attach stays.

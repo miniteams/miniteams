@@ -4,6 +4,7 @@ import asyncio
 import base64
 import gzip
 import json
+import logging
 import struct
 import threading
 from collections.abc import Callable, Iterator
@@ -16,9 +17,11 @@ import numpy as np
 import numpy.typing as npt
 import pylibsrtp
 import pytest
+import structlog
 from structlog.testing import capture_logs
 
 from miniteams import call as C
+from miniteams import follow as F
 from miniteams import stream as S
 from miniteams.config import Settings
 from miniteams.directory import Directory
@@ -543,7 +546,6 @@ class Server:
     async def trouter(self, settings: Settings, **kw: Any) -> None:
         self.trouter_kwargs = kw
         await kw["on_session"]("ep", SURL)
-        await kw["on_session"]("ep", SURL)  # a re-register on the same socket
         await asyncio.Event().wait()
 
 
@@ -826,8 +828,8 @@ async def test_capture_dumps_rtp_callbacks_and_redacted_sdp(
     make_call: Any, server: Server, tmp_path: Path
 ) -> None:
     """044-AC12: audio is written only under --capture, in S18's layout; SDP keys never are."""
-    cap = tmp_path / "cap"
-    call, ice, _ = make_call(capture=cap)
+    call, ice, _ = make_call(capture=tmp_path / "cap")
+    cap = tmp_path / "cap" / call.endpoint
     await call.join()
     ice.incoming.put_nowait(bytes([0x80, 201, 0, 1]) + b"\x00" * 26)  # an (S)RTCP receiver report
     ice.incoming.put_nowait(tx(KEY_B).protect(rtp(110, 1, 0, 7, multichannel((201, g722()[0])))))
@@ -881,6 +883,18 @@ async def test_capture_dumps_rtp_callbacks_and_redacted_sdp(
     ]
 
 
+async def test_each_call_of_one_follow_captures_into_its_own_dir(settings: Settings, tmp_path: Path) -> None:
+    """A retry or a re-attach builds another Call on the same capture dir: its files never overwrite the
+    first one's (both write offer.sdp, phase1.json...)."""
+    made = [C.Call(settings, payload(), lambda *_a: None, capture=tmp_path / "cap") for _ in range(2)]
+    for c in made:
+        assert c.capture is not None
+        c.capture.file("offer.sdp", c.endpoint)
+        await c.leave()
+    offers = {p.parent.name: p.read_text() for p in (tmp_path / "cap").glob("*/offer.sdp")}
+    assert offers == {c.endpoint: c.endpoint for c in made} and len(offers) == 2
+
+
 async def test_a_mixed_codec_answer_is_logged(make_call: Any, server: Server) -> None:
     """Without x-multichannel the server mixes every voice into one stream: no per-speaker lines."""
     accepted = server.accept_after_phase2
@@ -902,19 +916,18 @@ async def test_no_capture_writes_nothing(make_call: Any, tmp_path: Path) -> None
     assert call.capture is None and written == []  # cfg/: the directory's names.db
 
 
-@pytest.mark.parametrize(
-    "push",
-    [
-        {k: v for k, v in payload().items() if k not in ("groupContext", "meetingInfo")},  # a 1:1 push
-        {**payload(), "meetingInfo": None},
-        {**payload(), "groupContext": None},
-        {**payload(), "groupContext": {"threadId": "", "messageId": "0"}},
-    ],
-)
-async def test_a_push_without_meeting_info_never_places_a_call(
-    settings: Settings, directory: Directory, server: Server, push: dict[str, Any]
-) -> None:
-    """Phase 1 without meetingInfo creates an ad hoc call of ours: a 1:1 push stops before any request."""
+def one_to_one() -> dict[str, Any]:
+    """A 1:1 push (seen live): a controller, the participants, neither groupContext nor meetingInfo."""
+    return {
+        "correlationId": CALL,
+        "conversationController": CONTROLLER,
+        "userJoinTime": "2026-01-01T00:00:00Z",
+        "participants": [OTHER, ME],
+        "additionalData": {"participantList": [{"id": OTHER}, {"id": ME}]},
+    }
+
+
+def bare_call(settings: Settings, directory: Directory, server: Server, push: dict[str, Any]) -> C.Call:
     ice = FakeIce()
     call = C.Call(
         settings,
@@ -925,8 +938,479 @@ async def test_a_push_without_meeting_info_never_places_a_call(
         ice=lambda: ice,
         trouter=server.trouter,
     )
-    assert await asyncio.wait_for(failed(call), 5) == "1:1 calls not supported yet"
+    server.call = call
+    return call
+
+
+@pytest.mark.parametrize(
+    "push",
+    [
+        one_to_one(),
+        {**one_to_one(), "groupContext": None, "meetingInfo": None},
+        {**payload(), "meetingInfo": None, "conversationController": CONTROLLER},
+        {
+            **payload(),
+            "groupContext": {"threadId": "", "messageId": "0"},
+            "conversationController": CONTROLLER,
+        },
+    ],
+)
+async def test_a_1to1_push_joins_its_live_call_on_its_controller(
+    settings: Settings, directory: Directory, server: Server, push: dict[str, Any]
+) -> None:
+    """044-AC2: no phase 1 (without meetingInfo it creates an ad hoc call of ours), phase 2 straight on the
+    push's controller, without groupChat nor meetingInfo (null, the controller answers 400; seen live)."""
+    call = bare_call(settings, directory, server, push)
+    await call.join()
+    assert [server.step(r) for r in server.requests] == ["phase2", "ack", "register"]
+    p2 = server.body("phase2")
+    assert "groupChat" not in p2 and "meetingInfo" not in p2 and p2["groupContext"] is None
+    assert p2["callInvitation"]["mediaContent"]["blob"] == call._offer
+    assert p2["participants"]["from"]["id"] == ME and p2["participants"]["to"] == []
+    assert await call.leave() == 202
+
+
+@pytest.mark.parametrize(
+    "push",
+    [{k: v for k, v in one_to_one().items() if k != "conversationController"}, {"correlationId": CALL}],
+)
+async def test_a_push_naming_no_call_places_none(
+    settings: Settings, directory: Directory, server: Server, push: dict[str, Any]
+) -> None:
+    """Neither a meeting nor a controller: nothing to attach to, nothing sent, nothing to retry."""
+    call = bare_call(settings, directory, server, push)
+    with pytest.raises(C.JoinError) as err:
+        await asyncio.wait_for(call.join(), 5)
+    await call.leave()
+    assert str(err.value) == "push names no meeting nor conversation controller" and not err.value.retry
     assert server.requests == [] and server.trouter_kwargs == {}
+
+
+async def test_only_a_gone_1to1_is_not_worth_a_retry(
+    settings: Settings, directory: Directory, server: Server, make_call: Any
+) -> None:
+    """044-AC14: a 1:1 controller answers 404 once its call is over (seen live, subCode 5907); a meeting's
+    404 or a 1:1's other refusals stay retried."""
+    server.status["phase2"] = 404
+    for push, retry in ((one_to_one(), False), (payload(), True)):
+        call = bare_call(settings, directory, server, push)
+        with pytest.raises(C.JoinError) as err:
+            await call.join()
+        await call.leave()
+        assert (str(err.value), err.value.retry) == ("phase2 answered 404", retry)
+    server.status["phase2"] = 400
+    call = bare_call(settings, directory, server, one_to_one())
+    with pytest.raises(C.JoinError) as err:
+        await call.join()
+    await call.leave()
+    assert err.value.retry
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "retry"),
+    [
+        ("call/end/", {"callEnd": {"code": 0, "subCode": 5003, "phrase": "conversation has ended"}}, False),
+        ("conversation/conversationEnd/", {"code": 0, "subCode": 5010, "phrase": "ended"}, False),
+        ("call/end/", {"sessionRejection": {"code": 403, "subCode": 10065, "phrase": "refused"}}, True),
+    ],
+)
+async def test_a_call_over_during_the_join_is_not_retried(
+    make_call: Any, server: Server, path: str, body: dict[str, Any], retry: bool
+) -> None:
+    """044-AC14: the call ended while we joined: a retry's phase 1 would start a new call as me. A
+    rejection (the lobby refusing us) is still retried."""
+    server.accept_after_phase2 = None
+    call = make_call()[0]
+    joining = asyncio.ensure_future(call.join())
+    await until(lambda: "phase2" in [server.step(r) for r in server.requests], "in the lobby")
+    server.deliver(path, body)
+    with pytest.raises(C.JoinError) as err:
+        await asyncio.wait_for(joining, 5)
+    assert err.value.retry is retry
+    await call.leave()
+
+
+async def test_a_known_controller_skips_phase_1_and_a_404_there_is_final(
+    settings: Settings, directory: Directory, server: Server
+) -> None:
+    """A re-attach or a retry on a meeting goes straight to the controller the first join reached, with the
+    meeting body (seen live: meetings and group calls accept it); its 404 is not retried."""
+    call = bare_call(settings, directory, server, payload())
+    call.controller, call._direct = CONTROLLER, True
+    await call.join()
+    assert [server.step(r) for r in server.requests] == ["phase2", "ack", "register"]
+    p2 = server.body("phase2")
+    assert p2["meetingInfo"] == payload()["meetingInfo"] and p2["groupChat"]["threadId"] == THREAD
+    await call.leave()
+    server.status["phase2"] = 404
+    call = C.Call(
+        settings,
+        payload(),
+        lambda *_a: None,
+        directory=directory,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(server.handler)),
+        ice=FakeIce,
+        trouter=server.trouter,
+        controller=CONTROLLER,
+    )
+    server.call = call
+    with pytest.raises(C.JoinError) as err:
+        await call.join()
+    await call.leave()
+    assert not err.value.retry
+
+
+async def test_phase_1_names_the_controller_a_later_join_reuses(make_call: Any, server: Server) -> None:
+    call = make_call()[0]
+    await call.join()
+    assert call.controller == CONTROLLER
+    await call.leave()
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "retryable"),
+    [
+        ("call/end/", {"callEnd": {"code": 0, "subCode": 5003, "phrase": "conversation has ended"}}, False),
+        ("conversation/conversationEnd/", {"code": 0, "subCode": 5010, "phrase": "ended"}, False),
+        ("call/end/", {"sessionRejection": {"code": 403, "subCode": 10065, "phrase": "refused"}}, True),
+    ],
+)
+async def test_the_first_end_keeps_its_verdict_after_the_acceptance(
+    make_call: Any, server: Server, path: str, body: dict[str, Any], retryable: bool
+) -> None:
+    """044-AC14: an end delivered once accepted (the join still on its ICE step) is remembered: a failure
+    after it is not retried when the call is over; a later end never changes the first verdict."""
+    call = make_call()[0]
+    await call.join()
+    server.deliver(path, body)
+    await until(call.ended.is_set, "ended")
+    server.deliver("call/end/", {"sessionRejection": {"code": 403, "subCode": 1, "phrase": "x"}})
+    await asyncio.sleep(0.05)
+    assert call.retryable is retryable
+    await call.leave()
+
+
+async def test_a_fired_leave_and_a_reconnect_keep_their_verdicts(joined: Any) -> None:
+    call, roster_of = await joined()
+    await roster_of(me(OWN), OTHER_ONE)
+    await asyncio.wait_for(call.ended.wait(), 2)
+    assert (call.end_reason, call.retryable) == ("last_device_left", False)
+    await call.leave()
+    call, _ = await joined()
+    await call._on_session("ep", SURL)
+    assert (call.end_reason, call.retryable) == (C.TROUTER_MOVED, True)
+    await call.leave()
+
+
+async def test_a_trouter_that_stops_after_the_join_ends_the_call(make_call: Any, server: Server) -> None:
+    """run_forever returns on a dead login: the follower would sit in the call deaf as me. It ends, for
+    good (a new join would sign in with the same dead login)."""
+    stopping = asyncio.Event()
+
+    async def trouter(settings: Settings, **kw: Any) -> None:
+        await kw["on_session"]("ep", SURL)
+        await stopping.wait()
+
+    call = make_call()[0]
+    call._trouter_fn = trouter
+    await call.join()
+    assert not call.ended.is_set()
+    stopping.set()
+    await asyncio.wait_for(call.ended.wait(), 2)
+    assert (call.end_reason, call.retryable) == ("trouter: stopped", False)
+    await call.leave()
+    call = make_call()[0]
+    await call.join()
+    await call.leave()  # its own cancel at leave() is not a stop
+    assert call.end_reason == ""
+
+
+async def test_a_trouter_that_stops_in_the_lobby_fails_the_join_for_good(
+    make_call: Any, server: Server
+) -> None:
+    server.accept_after_phase2 = None
+    stopping = asyncio.Event()
+
+    async def trouter(settings: Settings, **kw: Any) -> None:
+        await kw["on_session"]("ep", SURL)
+        await stopping.wait()
+
+    call = make_call()[0]
+    call._trouter_fn = trouter
+    joining = asyncio.ensure_future(call.join())
+    await until(lambda: "phase2" in [server.step(r) for r in server.requests], "in the lobby")
+    stopping.set()
+    with pytest.raises(C.JoinError) as err:
+        await asyncio.wait_for(joining, 5)
+    assert (str(err.value), err.value.retry) == ("trouter: stopped", False)
+    await call.leave()
+
+
+class SlowIce(FakeIce):
+    """ICE that takes a moment: callbacks land between the acceptance and join() returning."""
+
+    def __init__(self, during: Callable[[], None]) -> None:
+        super().__init__()
+        self.during = during
+
+    async def connect(self) -> None:
+        self.during()
+        await asyncio.sleep(0.1)
+
+
+async def test_my_last_device_gone_before_join_returns_fails_it_for_good(
+    make_call: Any, server: Server, settings: Settings
+) -> None:
+    """The leave fired between the acceptance and join() returning: no `join: ok`, no engines, no retry."""
+    settings.follow_leave_grace_s = 0.01
+    call = make_call(SlowIce(lambda: None))[0]
+    original = server.deliver
+
+    def roster_first(path: str, body: Any, gzip_it: bool = False) -> None:
+        if path == "call/acceptance/":
+            original("conversation/rosterUpdate/", roster(1, me(OWN), OTHER_ONE))
+        original(path, body, gzip_it)
+
+    server.deliver = roster_first  # type: ignore[method-assign]
+    with pytest.raises(C.JoinError) as err:
+        await call.join()
+    assert await call.leave() == 202  # the leg the acceptance named is hung up
+    assert (str(err.value), err.value.retry) == ("last_device_left", False)
+
+
+async def test_a_renegotiation_failing_before_join_returns_fails_it_for_a_retry(
+    make_call: Any, server: Server
+) -> None:
+    def renegotiate() -> None:
+        nego = {"mediaContent": {"blob": ""}, "links": {"mediaAnswer": ANSWER_URL}}  # nothing to answer
+        server.deliver("call/mediaRenegotiation/", {"mediaNegotiation": nego})
+
+    call = make_call(SlowIce(renegotiate))[0]
+    with pytest.raises(C.JoinError) as err:
+        await call.join()
+    assert await call.leave() == 202
+    assert (str(err.value), err.value.retry) == ("renegotiation: ValueError", True)
+
+
+@pytest.mark.parametrize(
+    ("target", "shown"),
+    [
+        ("https://TOKEN.cc.invalid/x", "<str, 26 chars>"),
+        ("TOKEN://cc.invalid", "<str, 18 chars>"),
+        ("https://cc.invalid\nTOKEN/x", "<str, 26 chars>"),
+        ("cc.invalid/cc/v1/TOKEN?x=TOKEN", "<str, 30 chars>"),
+        ("http://[x/TOKEN?token=TOKEN", "<str, 27 chars>"),
+        ({"token": "TOKEN"}, "<dict, 18 chars>"),
+        (["TOKEN"], "<list, 9 chars>"),
+    ],
+)
+async def test_a_redirection_is_logged_not_followed(
+    make_call: Any, server: Server, target: Any, shown: str
+) -> None:
+    """A peer-supplied target may carry a token anywhere, host included: only its shape is logged."""
+    call = make_call()[0]
+    await call.join()
+    with capture_logs() as logs:
+        server.deliver("call/redirection/", {"redirection": {"target": target}})
+        await until(lambda: any(e["event"] == "call_redirection" for e in logs), "logged")
+    (event,) = [e for e in logs if e["event"] == "call_redirection"]
+    assert (event["target"], event["log_level"]) == (shown, "warning")
+    assert "TOKEN" not in str(logs) and "path" not in event
+    assert not call.ended.is_set()
+
+
+async def test_a_redirection_target_at_the_top_level_is_read_too(make_call: Any, server: Server) -> None:
+    call = make_call()[0]
+    await call.join()
+    with capture_logs() as logs:
+        server.deliver("call/redirection/", {"target": "https://cc.invalid/leg?token=TOKEN"})
+        await until(lambda: any(e["event"] == "call_redirection" for e in logs), "logged")
+    assert [e["target"] for e in logs if e["event"] == "call_redirection"] == ["<str, 34 chars>"]
+
+
+# --- 044-AC4: the leave rule ---
+
+ME_B, ME_C, OWN = 414, 1256, 4242  # OWN: server_sdp's x-source-streamid, our audio MSI
+
+
+def me(*audio: int) -> tuple[str, str, list[tuple[str, int]]]:
+    """My roster entry: one main-audio (plus a video) per endpoint."""
+    return ME, "Me Synthetic", [s for a in audio for s in (("main-audio", a), ("main-video", a + 1))]
+
+
+@pytest.fixture
+def joined(make_call: Any, server: Server, settings: Settings) -> Any:
+    structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.INFO))  # info events
+    settings.follow_leave_grace_s = 0.1
+    seq = iter(range(1, 1000))
+
+    async def build() -> tuple[C.Call, Callable[..., Any]]:
+        call = make_call()[0]
+        await call.join()
+
+        async def roster_of(*people: Any) -> None:
+            n = call.roster.seq
+            server.deliver("conversation/rosterUpdate/", roster(next(seq), *people))
+            await until(lambda: call.roster.seq > n, "roster applied")
+
+        return call, roster_of
+
+    return build
+
+
+async def test_one_of_two_devices_leaving_keeps_the_follower_the_last_one_ends_it(joined: Any) -> None:
+    """044-AC4: PC and phone in, the PC leaves: the follower stays; the phone leaves too: it leaves after
+    the grace, with the reason logged."""
+    call, roster_of = await joined()
+    await roster_of(me(ME_B, ME_C, OWN), OTHER_ONE)
+    await roster_of(me(ME_C, OWN), OTHER_ONE)
+    await asyncio.sleep(0.25)  # past the grace
+    assert not call.ended.is_set()
+    with capture_logs() as logs:
+        await roster_of(me(OWN), OTHER_ONE)
+        assert not call.ended.is_set()  # the grace runs first
+        await asyncio.wait_for(call.ended.wait(), 2)
+        assert call.end_reason == "last_device_left"
+        await call.leave()
+    events = [(e["event"], e.get("reason")) for e in logs]
+    assert ("call_last_device_gone", None) in events and ("call_ended", "last_device_left") in events
+    assert ("call_left", "last_device_left") in events
+
+
+async def test_a_device_back_within_the_grace_cancels_the_leave(joined: Any) -> None:
+    """044-AC4: a transfer, B leaves and C joins a moment later: the pending leave is dropped."""
+    call, roster_of = await joined()
+    await roster_of(me(ME_B, OWN), OTHER_ONE)
+    await roster_of(me(OWN), OTHER_ONE)
+    with capture_logs() as logs:
+        await roster_of(me(ME_C, OWN), OTHER_ONE)
+    await asyncio.sleep(0.25)
+    assert not call.ended.is_set() and "call_device_back" in [e["event"] for e in logs]
+    await roster_of(me(OWN), OTHER_ONE)  # C leaves: a new grace, then the leave
+    await asyncio.wait_for(call.ended.wait(), 2)
+    await call.leave()
+
+
+async def test_a_roster_with_only_our_stream_leaves_after_the_grace(joined: Any) -> None:
+    """044-AC4: no device of mine beside us, even in the first roster: the grace absorbs a roster that lags
+    my device, then the follower leaves (never sits in the call as me alone)."""
+    call, roster_of = await joined()
+    await roster_of(me(OWN), OTHER_ONE)
+    await asyncio.wait_for(call.ended.wait(), 2)
+    assert call.end_reason == "last_device_left"
+    await call.leave()
+    call, roster_of = await joined()
+    await roster_of(me(OWN), OTHER_ONE)
+    await roster_of(me(ME_B, OWN), OTHER_ONE)  # my device shows a moment later: no leave
+    await asyncio.sleep(0.25)
+    assert not call.ended.is_set()
+    await call.leave()
+
+
+@pytest.mark.parametrize(
+    "mine",
+    [None, (ME, "Me Synthetic", []), (ME, "Me Synthetic", [("main-audio", ME_B + 7)])],
+    ids=["no-entry", "no-streams", "without-us"],
+)
+async def test_a_roster_not_showing_us_proves_nothing(joined: Any, mine: Any) -> None:
+    """044-AC4: a roster whose entry for me is missing or lacks our own stream is not a full view of my
+    devices: ignored, never "last device gone", and no pending leave is cancelled by it either."""
+    call, roster_of = await joined()
+    await roster_of(me(ME_B, OWN), OTHER_ONE)
+    await roster_of(*([mine] if mine else []), OTHER_ONE)
+    await asyncio.sleep(0.25)
+    assert not call.ended.is_set() and call._leaving is None
+    await roster_of(me(OWN), OTHER_ONE)
+    await roster_of(*([mine] if mine else []), OTHER_ONE)  # does not cancel the pending leave
+    await asyncio.wait_for(call.ended.wait(), 2)
+    await call.leave()
+
+
+async def test_a_device_back_after_the_leave_fired_is_logged_too_late(joined: Any) -> None:
+    call, roster_of = await joined()
+    await roster_of(me(ME_B, OWN))
+    await roster_of(me(OWN))
+    await asyncio.wait_for(call.ended.wait(), 2)
+    with capture_logs() as logs:
+        await roster_of(me(ME_C, OWN))
+        await roster_of(me(ME_C, OWN))
+    events = [(e["event"], e.get("call")) for e in logs]
+    assert events == [("call_device_back_too_late", CALL)] and call.end_reason == "last_device_left"
+    await call.leave()
+
+
+async def test_other_people_and_my_video_are_not_my_devices(joined: Any) -> None:
+    """044-AC4: several participants, their audio and my non-audio streams never keep the follower."""
+    call, roster_of = await joined()
+    await roster_of(me(ME_B, OWN), OTHER_ONE)
+    third = ("8:orgid:00000000-0000-4000-8000-0000000000d0", "Third", [("main-audio", 900)])
+    await roster_of((ME, "Me Synthetic", [("main-audio", OWN), ("main-video", ME_B + 1)]), OTHER_ONE, third)
+    await asyncio.wait_for(call.ended.wait(), 2)
+    await call.leave()
+
+
+async def test_a_roster_before_the_acceptance_counts_once_accepted(
+    make_call: Any, server: Server, settings: Settings
+) -> None:
+    """Our own MSI comes with the acceptance: a roster that arrived before it is judged then."""
+    settings.follow_leave_grace_s = 0.1
+    call = make_call()[0]
+    original = server.deliver
+
+    def roster_first(path: str, body: Any, gzip_it: bool = False) -> None:
+        if path == "call/acceptance/":
+            original("conversation/rosterUpdate/", roster(1, me(ME_B, OWN), OTHER_ONE))
+        original(path, body, gzip_it)
+
+    server.deliver = roster_first  # type: ignore[method-assign]
+    await call.join()
+    server.deliver = original  # type: ignore[method-assign]
+    assert call.roster.mine == {ME_B, OWN} and call._leaving is None  # judged once accepted: B is in
+    server.deliver("conversation/rosterUpdate/", roster(2, me(OWN), OTHER_ONE))
+    await asyncio.wait_for(call.ended.wait(), 2)
+    await call.leave()
+
+
+async def test_a_roster_with_only_us_before_the_acceptance_arms_the_grace_once_accepted(
+    make_call: Any, server: Server, settings: Settings
+) -> None:
+    settings.follow_leave_grace_s = 0.1
+    call = make_call()[0]
+    original = server.deliver
+
+    def roster_first(path: str, body: Any, gzip_it: bool = False) -> None:
+        if path == "call/acceptance/":
+            original("conversation/rosterUpdate/", roster(1, me(OWN), OTHER_ONE))
+        original(path, body, gzip_it)
+
+    server.deliver = roster_first  # type: ignore[method-assign]
+    await call.join()
+    server.deliver = original  # type: ignore[method-assign]
+    await asyncio.wait_for(call.ended.wait(), 2)
+    await call.leave()
+
+
+async def test_a_stale_roster_or_one_before_our_msi_decides_nothing(make_call: Any, server: Server) -> None:
+    call = make_call()[0]
+    call.roster.me = ME
+    url = f"{SURL}callAgent/{call.endpoint}/{call._tag}/conversation/rosterUpdate/"
+    await call.on_agent({"url": url, "headers": {}, "body": json.dumps(roster(1, me(OWN)))})
+    assert call.roster.mine == {OWN} and call._leaving is None  # own MSI unknown before the acceptance
+    await call.on_agent({"url": url, "headers": {}, "body": json.dumps(roster(2, me(ME_B, OWN)))})
+    call.roster.own = OWN
+    await call.on_agent({"url": url, "headers": {}, "body": json.dumps(roster(0, me(OWN)))})
+    assert call._leaving is None  # stale: not applied
+    await call.leave()
+
+
+async def test_leave_drops_a_pending_leave(joined: Any) -> None:
+    call, roster_of = await joined()
+    await roster_of(me(ME_B, OWN))
+    await roster_of(me(OWN))
+    timer = call._leaving
+    assert timer is not None
+    await call.leave()
+    assert timer.cancelled()
 
 
 async def test_persistent_feed_failures_are_logged_at_powers_of_two(make_call: Any) -> None:
@@ -1146,12 +1630,58 @@ async def test_an_unreadable_callback_body_is_dropped(make_call: Any, server: Se
     await call.leave()
 
 
-async def test_trouter_moving_mid_call_is_logged(make_call: Any) -> None:
+@pytest.mark.parametrize("surl", ["https://trouter.invalid/v4/f/other/", SURL])
+async def test_a_trouter_reconnect_ends_the_call_for_a_re_attach(make_call: Any, surl: str) -> None:
+    """044-AC13: a second session is a reconnect: the callbacks sent meanwhile are lost (a new surl gets
+    none at all), so the call ends with trouter_moved and follow() re-attaches; on the same surl too."""
     call, _, _ = make_call()
     await call.join()
     with capture_logs() as logs:
-        await call._on_session("ep", "https://trouter.invalid/v4/f/other/")
+        await call._on_session("ep", surl)
     assert [e["event"] for e in logs] == ["call_trouter_moved"]
+    assert call.ended.is_set() and call.end_reason == C.TROUTER_MOVED
+    await call.leave()
+
+
+async def test_a_reconnect_with_a_leave_pending_leaves_instead_of_re_attaching(joined: Any) -> None:
+    """044-AC4: my last device already left: a re-attach would sit in the call as me for grace + join +
+    grace, past 15 s. The call ends as last_device_left."""
+    call, roster_of = await joined()
+    call.settings.follow_leave_grace_s = 30.0
+    await roster_of(me(ME_B, OWN), OTHER_ONE)
+    assert not call.leaving
+    await roster_of(me(OWN), OTHER_ONE)
+    assert call.leaving
+    await call._on_session("ep", SURL)
+    assert call.ended.is_set() and call.end_reason == "last_device_left"
+    await call.leave()
+    assert not call.leaving  # the timer dropped with the hang-up
+
+
+async def test_trouter_moving_during_the_join_fails_it_for_a_retry(make_call: Any, server: Server) -> None:
+    server.accept_after_phase2 = None  # waiting in the lobby
+    call = make_call()[0]
+    joining = asyncio.ensure_future(call.join())
+    await until(lambda: "phase2" in [server.step(r) for r in server.requests], "in the lobby")
+    await call._on_session("ep", "https://trouter.invalid/v4/f/other/")
+    with pytest.raises(C.JoinError) as err:
+        await asyncio.wait_for(joining, 5)
+    assert (str(err.value), err.value.retry) == (C.TROUTER_MOVED, True)
+    await call.leave()
+
+
+async def test_an_answer_without_our_msi_is_logged(make_call: Any, server: Server) -> None:
+    """AC4's leave rule needs our own MSI: without it the follower can only end with the call."""
+    accepted = server.accept_after_phase2
+    assert accepted is not None
+    accepted["callAcceptance"]["mediaContent"]["blob"] = server_sdp(KEY_B).replace(
+        "a=x-source-streamid:4242\r\n", ""
+    )
+    call = make_call()[0]
+    with capture_logs() as logs:
+        await call.join()
+    assert {"event": "call_no_own_msi", "call": CALL, "log_level": "warning"} in logs
+    assert call.roster.own is None
     await call.leave()
 
 
@@ -1234,22 +1764,34 @@ class FakeCall:
 
     instances: list[FakeCall] = []
     join_error: BaseException | None = None
+    join_errors: list[BaseException] = []  # one per join, before join_error
     join_hangs = False
     join_slow_cancel = False  # the first cancel is held: the join winds down slowly, as a real one may
     directory: Any = None
 
     def __init__(
-        self, settings: Settings, payload: dict[str, Any], on_audio: Any, capture: Path | None = None
+        self,
+        settings: Settings,
+        payload: dict[str, Any],
+        on_audio: Any,
+        capture: Path | None = None,
+        directory: Any = None,
+        controller: str = "",
     ) -> None:
-        self.on_audio, self.capture = on_audio, capture
+        self.on_audio, self.capture, self.controller = on_audio, capture, controller
         self.roster = C.Roster(me=ME)
-        self.directory = FakeCall.directory
+        self.directory, self.directory_given = directory or FakeCall.directory, directory
         self.ended = asyncio.Event()
+        self.end_reason = ""
+        self.retryable = True
         self.left = 0
+        self.joined = False
         self.cancel_held = False
         FakeCall.instances.append(self)
 
     async def join(self) -> None:
+        if FakeCall.join_errors:
+            raise FakeCall.join_errors.pop(0)
         if FakeCall.join_error is not None:
             raise FakeCall.join_error
         if FakeCall.join_hangs:
@@ -1260,7 +1802,13 @@ class FakeCall:
                     raise
                 self.cancel_held = True
                 await asyncio.Event().wait()
+        self.joined = True
         asyncio.get_running_loop().call_soon(self.on_audio, 201, np.zeros(320, np.int16), 1.0)
+
+    def move(self) -> None:
+        """What Call does when its Trouter socket reconnects on another surl."""
+        self.end_reason = C.TROUTER_MOVED
+        self.ended.set()
 
     async def leave(self) -> int:
         self.left += 1
@@ -1271,7 +1819,8 @@ class FakeCall:
 def fakes(monkeypatch: pytest.MonkeyPatch, directory: Directory) -> Iterator[None]:
     FakeSession.instances, FakeSession.start_error, FakeSession.start_hangs = [], None, False
     FakeCall.instances, FakeCall.join_error, FakeCall.join_hangs = [], None, False
-    FakeCall.join_slow_cancel = False
+    FakeCall.join_slow_cancel, FakeCall.join_errors = False, []
+    monkeypatch.setattr(C, "JOIN_RETRY_PAUSE_S", 0.01)
     FakeCall.directory = directory
     monkeypatch.setattr(C, "Session", FakeSession)
     monkeypatch.setattr(C, "Call", FakeCall)
@@ -1305,6 +1854,153 @@ async def test_follow_feeds_the_session_and_ends_with_the_call(
     call.ended.set()
     assert await asyncio.wait_for(task, 5) == "call_ended"
     assert call.left == 1 and session.closed
+    assert F.ended_joins(tmp_path, CALL) == {payload()["userJoinTime"]}  # written before the hang-up
+
+
+async def test_the_ended_marker_is_written_before_the_hang_up(
+    settings: Settings, tmp_path: Path, fakes: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """044-AC4: evt 116 comes once the DELETE is done and my rejoin's 115 may follow at once: by then the
+    join must read as ended, or the rejoin's push is taken for this follower and dropped."""
+    seen: list[set[str]] = []
+
+    async def leave(self: FakeCall) -> int:
+        seen.append(F.ended_joins(tmp_path, CALL))
+        return 202
+
+    monkeypatch.setattr(FakeCall, "leave", leave)
+    task = asyncio.ensure_future(C.follow(settings, tmp_path, payload(), threading.Event()))
+    await until(session_up, "session up")
+    FakeCall.instances[0].ended.set()
+    assert await asyncio.wait_for(task, 5) == "call_ended"
+    assert seen == [{payload()["userJoinTime"]}]
+
+
+async def test_a_marker_that_cannot_be_written_still_hangs_up(
+    settings: Settings, tmp_path: Path, fakes: None
+) -> None:
+    (tmp_path / "follow").write_text("not a directory")
+    task = asyncio.ensure_future(C.follow(settings, tmp_path, payload(), threading.Event()))
+    await until(session_up, "session up")
+    with capture_logs() as logs:
+        FakeCall.instances[0].ended.set()
+        assert await asyncio.wait_for(task, 5) == "call_ended"
+    assert "follow_ended_marker_failed" in [e["event"] for e in logs] and FakeCall.instances[0].left == 1
+
+
+async def test_a_trouter_move_re_attaches_and_the_transcript_goes_on(
+    settings: Settings, tmp_path: Path, fakes: None
+) -> None:
+    """044-AC13: the moved call is hung up (one DELETE), a fresh one joins the same push, the same session
+    keeps transcribing it with the speakers' names; a second move re-attaches again."""
+    stop = threading.Event()
+    task = asyncio.ensure_future(C.follow(settings, tmp_path, payload(), stop))
+    await until(session_up, "session up")
+    first, session = FakeCall.instances[0], FakeSession.instances[0]
+    first.roster.update(roster(1, (OTHER, "Other Synthetic", [("main-audio", 830)])))
+    fed = len(session.fed)
+    with capture_logs() as logs:
+        first.move()
+        await until(lambda: len(FakeCall.instances) == 2 and FakeCall.instances[1].joined, "re-attached")
+    second = FakeCall.instances[1]
+    assert first.left == 1 and second.left == 0 and FakeSession.instances == [session] and not session.closed
+    assert "follow_reattach" in [e["event"] for e in logs]
+    await until(lambda: len(session.fed) > fed, "the new call's audio in the same session")
+    assert session.resolve(830) == ("Other Synthetic", OTHER)  # a line still in the engines keeps its name
+    assert F.ended_joins(tmp_path, CALL) == set()  # a re-attach never reads as the join's end
+    second.move()
+    await until(lambda: len(FakeCall.instances) == 3 and FakeCall.instances[2].joined, "re-attached again")
+    assert F.ended_joins(tmp_path, CALL) == set()
+    stop.set()
+    assert await asyncio.wait_for(task, 5) == "stopped"
+    assert [c.left for c in FakeCall.instances] == [1, 1, 1] and session.closed
+
+
+async def test_a_stop_during_the_re_attach_pause_joins_nothing(
+    settings: Settings, tmp_path: Path, fakes: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The re-attach waits like the retry (a call that ended meanwhile gets its evt 116, the trigger's stop,
+    before the direct phase 2 brings the ended conversation back as me): a stop then ends it cleanly,
+    nothing joined."""
+    stop = threading.Event()
+    task = asyncio.ensure_future(C.follow(settings, tmp_path, payload(), stop))
+    await until(session_up, "session up")
+    monkeypatch.setattr(C, "JOIN_RETRY_PAUSE_S", 30.0)
+    FakeCall.instances[0].move()
+    await until(lambda: len(FakeCall.instances) == 2, "pausing")
+    await asyncio.sleep(0.05)
+    assert not FakeCall.instances[1].joined
+    stop.set()
+    assert await asyncio.wait_for(task, 5) == "stopped"
+    first, second = FakeCall.instances
+    assert (first.left, second.left, second.joined) == (1, 1, False) and FakeSession.instances[0].closed
+
+
+async def test_a_re_attach_failing_twice_ends_the_follow(
+    settings: Settings, tmp_path: Path, fakes: None
+) -> None:
+    """044-AC13: fail safe, no follower sitting deaf in the call as me: a retryable failure gets one more
+    re-attach, a second ends it, marked and hung up."""
+    task = asyncio.ensure_future(C.follow(settings, tmp_path, payload(), threading.Event()))
+    await until(session_up, "session up")
+    FakeCall.join_errors = [C.JoinError("phase2 answered 500"), C.JoinError(C.TROUTER_MOVED)]
+    with capture_logs() as logs:
+        FakeCall.instances[0].move()
+        assert await asyncio.wait_for(task, 5) == "trouter_moved"
+    failed = [(e["cause"], e["attempt"], e["retry"]) for e in logs if e["event"] == "follow_reattach_failed"]
+    assert failed == [("phase2 answered 500", 1, True), (C.TROUTER_MOVED, 2, False)]
+    assert [c.left for c in FakeCall.instances] == [1, 1, 1] and FakeSession.instances[0].closed
+    assert F.ended_joins(tmp_path, CALL) == {payload()["userJoinTime"]}
+
+
+async def test_a_re_attach_interrupted_once_gets_one_more(
+    settings: Settings, tmp_path: Path, fakes: None
+) -> None:
+    """044-AC13: the re-attach's own join ended retryably (another move mid-join, a failed renegotiation):
+    one more try, and the follow goes on."""
+    stop = threading.Event()
+    task = asyncio.ensure_future(C.follow(settings, tmp_path, payload(), stop))
+    await until(session_up, "session up")
+    FakeCall.join_errors = [C.JoinError("renegotiation: ValueError")]
+    FakeCall.instances[0].move()
+    await until(lambda: len(FakeCall.instances) == 3 and FakeCall.instances[2].joined, "re-attached")
+    assert not task.done() and not FakeSession.instances[0].closed
+    stop.set()
+    assert await asyncio.wait_for(task, 5) == "stopped"
+
+
+@pytest.mark.parametrize(
+    ("end", "outcome"),
+    [(None, C.TROUTER_MOVED), (("last_device_left", False), "last_device_left")],
+)
+async def test_a_final_re_attach_failure_ends_at_once_with_its_real_cause(
+    settings: Settings,
+    tmp_path: Path,
+    fakes: None,
+    monkeypatch: pytest.MonkeyPatch,
+    end: tuple[str, bool] | None,
+    outcome: str,
+) -> None:
+    """044-AC13: a failure ruling out a new join (a gone call's 404, my last device gone during the join)
+    gets no second re-attach; the outcome is the call's own end when it had one."""
+    task = asyncio.ensure_future(C.follow(settings, tmp_path, payload(), threading.Event()))
+    await until(session_up, "session up")
+    original = FakeCall.join
+
+    async def join(self: FakeCall) -> None:
+        if self is FakeCall.instances[0]:
+            await original(self)
+            return
+        if end is not None:
+            self.end_reason, self.retryable = end
+            self.ended.set()
+            raise C.JoinError(end[0], retry=end[1])
+        raise C.JoinError("phase2 answered 404", retry=False)
+
+    monkeypatch.setattr(FakeCall, "join", join)
+    FakeCall.instances[0].move()
+    assert await asyncio.wait_for(task, 5) == outcome
+    assert len(FakeCall.instances) == 2 and [c.left for c in FakeCall.instances] == [1, 1]
 
 
 async def test_follow_stops_on_the_signal(settings: Settings, tmp_path: Path, fakes: None) -> None:
@@ -1381,16 +2077,125 @@ async def test_a_second_cancel_while_the_body_winds_down_still_hangs_up(
 async def test_a_failed_join_lands_in_the_transcript_header(
     settings: Settings, tmp_path: Path, fakes: None, error: BaseException, cause: str
 ) -> None:
-    """044-AC14: the cause is logged and written to the header; nothing is transcribed."""
+    """044-AC14: the cause is logged, retried once, then written to the header; nothing is transcribed."""
     FakeCall.join_error = error
     with capture_logs() as logs:
         assert await C.follow(settings, tmp_path, payload(), threading.Event()) == "join_failed"
-    assert {"event": "follow_join_failed", "call": CALL, "cause": cause, "log_level": "warning"} in logs
+    failures = [(e["cause"], e["attempt"], e["retry"]) for e in logs if e["event"] == "follow_join_failed"]
+    assert failures == [(cause, 1, True), (cause, 2, False)]
     (path,) = (tmp_path / "follow").rglob("*.ndjson")
     header = json.loads(path.read_text())
     assert header["join"] == "failed" and header["error"] == cause and header["call"] == CALL
     assert (header["thread"], header["kind"], header["engine"]) == (THREAD, "meeting", "parakeet")
-    assert FakeCall.instances[0].left == 1 and FakeSession.instances == []
+    assert [c.left for c in FakeCall.instances] == [1, 1] and FakeSession.instances == []
+
+
+async def test_a_join_that_fails_once_is_retried_and_followed(
+    settings: Settings, tmp_path: Path, fakes: None
+) -> None:
+    """044-AC14: the first try hung up, a fresh call joined after the pause; the transcript is the
+    second call's; the wind-down leaves that one."""
+    FakeCall.join_errors = [C.JoinError("ICE: ConnectionError")]
+    stop = threading.Event()
+    task = asyncio.ensure_future(C.follow(settings, tmp_path, payload(), stop))
+    await until(session_up, "session up")
+    first, second = FakeCall.instances
+    assert first.left == 1 and second.left == 0
+    await until(lambda: (201, 320, 1.0) in FakeSession.instances[0].fed, "the second call's audio")
+    stop.set()
+    assert await asyncio.wait_for(task, 5) == "stopped"
+    assert (first.left, second.left) == (1, 1) and not list((tmp_path / "follow").rglob("*.ndjson"))
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["call/end: 5003 conversation has ended", "conversation/conversationEnd: 5010", "last_device_left"],
+)
+async def test_no_retry_after_the_call_itself_ended(
+    settings: Settings, tmp_path: Path, fakes: None, monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    """044-AC14: the call ended (over, or my last device gone) after the acceptance, then the join failed
+    on something retryable (ICE): the call's own end rules the retry out."""
+
+    async def join(self: FakeCall) -> None:
+        self.end_reason, self.retryable = reason, False
+        self.ended.set()
+        raise C.JoinError("ICE: ConnectionError")
+
+    monkeypatch.setattr(FakeCall, "join", join)
+    with capture_logs() as logs:
+        assert await asyncio.wait_for(C.follow(settings, tmp_path, payload(), threading.Event()), 5) == (
+            "join_failed"
+        )
+    assert len(FakeCall.instances) == 1
+    assert [e["retry"] for e in logs if e["event"] == "follow_join_failed"] == [False]
+
+
+async def test_a_retry_and_a_re_attach_go_straight_to_the_reached_controller(
+    settings: Settings, tmp_path: Path, fakes: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No phase 1 once a join reached the call's controller, and the names cache is kept (no new store
+    per Call); a first try that never got that far leaves the retry free to run phase 1."""
+    tries: list[str] = []
+    original = FakeCall.join
+
+    async def join(self: FakeCall) -> None:
+        tries.append(self.controller)
+        if len(tries) == 1:
+            self.controller = CONTROLLER  # phase 1 answered, then the join failed
+            raise C.JoinError("ICE: ConnectionError")
+        await original(self)
+
+    monkeypatch.setattr(FakeCall, "join", join)
+    stop = threading.Event()
+    task = asyncio.ensure_future(C.follow(settings, tmp_path, payload(), stop))
+    await until(session_up, "session up")
+    FakeCall.instances[1].move()
+    await until(lambda: len(FakeCall.instances) == 3 and FakeCall.instances[2].joined, "re-attached")
+    assert tries == ["", CONTROLLER, CONTROLLER]
+    first = FakeCall.instances[0]
+    assert [c.directory_given for c in FakeCall.instances[1:]] == [first.directory, first.directory]
+    stop.set()
+    assert await asyncio.wait_for(task, 5) == "stopped"
+
+
+async def test_a_retry_before_any_controller_runs_phase_1(
+    settings: Settings, tmp_path: Path, fakes: None
+) -> None:
+    """A first try that failed before reaching the controller (phase 1 refused): the retry has none to go
+    straight to, so it runs phase 1 itself, never the push's controller."""
+    FakeCall.join_errors = [C.JoinError("phase1 answered 503")]
+    stop = threading.Event()
+    task = asyncio.ensure_future(C.follow(settings, tmp_path, payload(), stop))
+    await until(session_up, "session up")
+    assert [c.controller for c in FakeCall.instances] == ["", ""]
+    stop.set()
+    assert await asyncio.wait_for(task, 5) == "stopped"
+
+
+async def test_no_retry_when_the_call_is_gone(settings: Settings, tmp_path: Path, fakes: None) -> None:
+    """044-AC14: a refusal proving the call is over (a 1:1's controller answering 404) is given up at once."""
+    FakeCall.join_errors = [C.JoinError("phase2 answered 404", retry=False)]
+    assert await asyncio.wait_for(C.follow(settings, tmp_path, payload(), threading.Event()), 5) == (
+        "join_failed"
+    )
+    assert len(FakeCall.instances) == 1 and FakeCall.instances[0].left == 1
+
+
+async def test_a_stop_during_the_retry_pause_joins_nothing_more(
+    settings: Settings, tmp_path: Path, fakes: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """044-AC14: never retried after a stop."""
+    monkeypatch.setattr(C, "JOIN_RETRY_PAUSE_S", 30.0)
+    FakeCall.join_errors = [C.JoinError("not admitted (lobby timeout)")]
+    stop = threading.Event()
+    task = asyncio.ensure_future(C.follow(settings, tmp_path, payload(), stop))
+    await until(lambda: len(FakeCall.instances) == 2, "pausing")
+    stop.set()
+    assert await asyncio.wait_for(task, 5) == "stopped"
+    first, second = FakeCall.instances
+    assert first.left == 1 and second.left == 1  # the fresh one, never joined, still closed
+    assert FakeSession.instances == []
 
 
 async def test_a_header_that_cannot_be_written_still_hangs_up(

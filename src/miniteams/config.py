@@ -114,11 +114,15 @@ class Settings(BaseSettings):
     endpoint_suffix: str = ""
     cache_dir: Path = Field(default_factory=_default_cache_dir)  # regenerable downloads
     # `follow --capture DIR` (spec 044): each follower dumps its call's RTP, Trouter callbacks and SDP
-    # under DIR/<call>/ for protocol diagnosis. Off by default: nothing but text is written otherwise.
+    # under DIR/<call>/<endpoint>/ (one dir per join) for protocol diagnosis. Off by default: nothing but
+    # text is written otherwise.
     follow_capture: Path | None = None
     # The follower's STUN server for its server-reflexive ICE candidate (a third party: it sees this
     # host's address); empty: host candidates only.
     stun_server: str = "stun.l.google.com:19302"
+    # My last device gone from the roster, the follower waits this long for one to come back (a transfer
+    # to another device) before it leaves; the roster shows a leave ~1 s late, AC4 allows 15 s.
+    follow_leave_grace_s: float = Field(default=5.0, ge=0)
 
     # --- meeting follower speech to text (spec 044): from grill-room `stt/grill_stt/config.py` @ ae133de,
     # Apache-2.0 ---
