@@ -106,6 +106,18 @@ def dm_ids(me: str, mri: Any) -> tuple[str, ...]:
     return f"19:{mine}_{theirs}@unq.gbl.spaces", f"19:{theirs}_{mine}@unq.gbl.spaces"
 
 
+def same_chat(a: str, b: str) -> bool:
+    """Equal chat ids; a 1:1's two member ids in either order and any case (Teams does not always sort
+    them). Other ids compare exactly."""
+    if a == b:
+        return True
+    found = _DM_RE.fullmatch(a.lower())
+    return found is not None and b.lower() in (
+        f"19:{found[1]}_{found[2]}@unq.gbl.spaces",
+        f"19:{found[2]}_{found[1]}@unq.gbl.spaces",
+    )
+
+
 def forced(found: dict[str, Any]) -> str | None:
     """Spec 036: the menu entry a `forcedAvailability` stands for; None when the status is not forced."""
     force = found.get("forcedAvailability")

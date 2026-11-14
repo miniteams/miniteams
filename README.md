@@ -88,7 +88,8 @@ uv run miniteams dump --jsonl > notes.jsonl            # full-detail JSON per li
 `mcp` serves your Teams to an MCP client over stdin/stdout (spec 008). Reads come from the
 archive: `find_chats` (label, topic, participant, kind), `read_messages` (plain text, date window,
 `next_since` cursor), `search_messages` (substring, case and accents ignored, 7 days back by
-default, feeds left out) and `read_transcript` (recordings, then turns). Results say where they come
+default, feeds left out) and `read_transcript` (recordings and followed calls, then turns or
+lines). Results say where they come
 from (`source`) and carry the archiver's heartbeat (`archiver_seen`, `archiver_state`,
 `sync_started_at`, and `media_sweep: running` during an `archive --live --verify-media` sweep, written
 by `archive` into `index.db`), so an agent can tell a stopped archiver
@@ -138,7 +139,10 @@ present) and fetches the pinned models into `~/.cache/miniteams` (`transcribe/li
 `BUILD_JOBS` sets the compile jobs (default 2). `MINITEAMS_STT_ENGINE` picks `parakeet` (default) or
 `whisper`. Transcripts are text only, one NDJSON line per utterance:
 `<data-dir>/follow/<YYYY-MM>/<started>-<call>.ndjson`, its header holding the join outcome (`"join":
-"ok"`, or `"failed"` and the `error`). `MINITEAMS_STUN_SERVER` (`host:port`, empty for host candidates only)
+"ok"`, or `"failed"` and the `error`). MCP `read_transcript` lists a chat's followed calls next to its
+recordings (`live` while the follower holds the call's lock) and pages one by `call`, during the call too.
+A 1:1 push names no chat: the header takes the 1:1 chat id built from its two participants; there and
+in the skip list, either spelling of a 1:1 chat id (its two member ids in either order) matches. `MINITEAMS_STUN_SERVER` (`host:port`, empty for host candidates only)
 sets the follower's STUN server; the default, `stun.l.google.com:19302`, is a third party that sees this
 host's public address once per call.
 

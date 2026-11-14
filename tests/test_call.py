@@ -3,8 +3,10 @@
 import asyncio
 import base64
 import gzip
+import hashlib
 import json
 import logging
+import re
 import struct
 import threading
 from collections.abc import Callable, Iterator
@@ -959,15 +961,76 @@ async def test_a_1to1_push_joins_its_live_call_on_its_controller(
     settings: Settings, directory: Directory, server: Server, push: dict[str, Any]
 ) -> None:
     """044-AC2: no phase 1 (without meetingInfo it creates an ad hoc call of ours), phase 2 straight on the
-    push's controller, without groupChat nor meetingInfo (null, the controller answers 400; seen live)."""
+    push's controller. One rule: meetingInfo goes when the push left it empty, groupChat when its thread is
+    (a 1:1 names neither; null, its controller answers 400; seen live)."""
     call = bare_call(settings, directory, server, push)
     await call.join()
     assert [server.step(r) for r in server.requests] == ["phase2", "ack", "register"]
     p2 = server.body("phase2")
-    assert "groupChat" not in p2 and "meetingInfo" not in p2 and p2["groupContext"] is None
+    thread = (push.get("groupContext") or {}).get("threadId")
+    assert ("meetingInfo" in p2) is bool(push.get("meetingInfo")) and p2["groupContext"] is None
+    assert ("groupChat" in p2) is bool(thread)
+    if "meetingInfo" in p2:
+        assert p2["meetingInfo"] == push["meetingInfo"]
+    if "groupChat" in p2:
+        assert p2["groupChat"]["threadId"] == thread
     assert p2["callInvitation"]["mediaContent"]["blob"] == call._offer
     assert p2["participants"]["from"]["id"] == ME and p2["participants"]["to"] == []
     assert await call.leave() == 202
+
+
+# Regression pin, not a live capture: sha256 of the phase 2 bodies (random ids numbered, offer blanked)
+# as commit 7c535b5 built them, the code whose joins were checked live in the test tenant.
+LIVE_PHASE2 = {
+    "1:1": "9c0e4fb5414970cb2863d76345bb5816c14d53f6a271425c7f1699b38ab2ead0",  # pragma: allowlist secret
+    "meeting": "ebc8c674cb07c31bf2c0f617f79856a0a5d514f763f93e95385a2e302c04281c",  # pragma: allowlist secret
+    "group": "8fb811ae3e9ebe6d7cbd14ed2d557da9fa9225231404622ee935e67fc2a39900",  # pragma: allowlist secret
+}
+
+
+def _blanked(body: dict[str, Any]) -> str:
+    """Random values blanked; each UUID by its first-seen index, so two fields swapping values still show."""
+    text = json.dumps(body, sort_keys=True)
+    text = re.sub(r'"blob": "(?:[^"\\]|\\.)*"', '"blob": "<sdp>"', text)
+    text = re.sub(r'"causeId": "[0-9a-f]{8}"', '"causeId": "<id>"', text)
+    seen: dict[str, str] = {}
+    uuid = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    text = re.sub(uuid, lambda m: seen.setdefault(m[0], f"<uuid{len(seen)}>"), text)
+    return re.sub(r"callAgent/(<uuid\d+>)/[0-9a-f]+/", r"callAgent/\1/<tag>/", text)
+
+
+def test_blanking_keeps_which_field_holds_which_uuid() -> None:
+    a, b = "00000000-0000-4000-8000-00000000000a", "00000000-0000-4000-8000-00000000000b"
+    body = {"from": {"endpointId": a, "participantId": b}, "correlationId": a}
+    swapped = {"from": {"endpointId": b, "participantId": a}, "correlationId": a}
+    assert _blanked(body) != _blanked(swapped)
+    renamed = {"from": {"endpointId": b, "participantId": a}, "correlationId": b}
+    assert _blanked(body) == _blanked(renamed)  # other random ids, same fields sharing them
+
+
+@pytest.mark.parametrize("shape", LIVE_PHASE2)
+async def test_direct_phase2_bodies_stay_the_live_verified_ones(
+    settings: Settings, directory: Directory, server: Server, shape: str
+) -> None:
+    """044: the bodies the live-checked code built; a refactor must not move a byte of them."""
+    group = {**payload(), "groupContext": {"threadId": "19:fakegroup@thread.v2", "messageId": "0"}}
+    push = {"1:1": one_to_one(), "meeting": payload(), "group": group}[shape]
+    call = C.Call(
+        settings,
+        push,
+        lambda *_a: None,
+        directory=directory,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(server.handler)),
+        ice=FakeIce,
+        trouter=server.trouter,
+        controller=None if shape == "1:1" else CONTROLLER,
+    )
+    server.call = call
+    await call.join()
+    await call.leave()
+    blanked = _blanked(server.body("phase2"))
+    digest = hashlib.sha256(blanked.encode()).hexdigest()
+    assert digest == LIVE_PHASE2[shape], f"{digest} {blanked}"
 
 
 @pytest.mark.parametrize(
@@ -1840,7 +1903,8 @@ async def test_follow_feeds_the_session_and_ends_with_the_call(
     task = asyncio.ensure_future(C.follow(settings, tmp_path, payload(), stop))
     await until(lambda: session_up() and len(FakeSession.instances[0].fed) == 2, "held frames fed")
     call, session = FakeCall.instances[0], FakeSession.instances[0]
-    assert session.args == (tmp_path, CALL, THREAD) and session.kw == {"header": {"join": "ok"}}
+    assert session.args == (tmp_path, CALL, THREAD)
+    assert session.kw == {"kind": "meeting", "header": {"join": "ok"}}
     # Both frames heard during start() are held, then fed once it returned.
     assert sorted(session.fed) == [(201, 320, 1.0), (202, 320, 0.5)] and call.capture is None
     call.on_audio(830, np.zeros(320, np.int16), 1.02)
@@ -2088,6 +2152,16 @@ async def test_a_failed_join_lands_in_the_transcript_header(
     assert header["join"] == "failed" and header["error"] == cause and header["call"] == CALL
     assert (header["thread"], header["kind"], header["engine"]) == (THREAD, "meeting", "parakeet")
     assert [c.left for c in FakeCall.instances] == [1, 1] and FakeSession.instances == []
+
+
+async def test_a_1to1_transcript_names_its_chat(settings: Settings, tmp_path: Path, fakes: None) -> None:
+    """044-AC9: a 1:1 push names no thread; the header names the 1:1 chat (sorted ids), so MCP lists it."""
+    FakeCall.join_error = C.JoinError("refused")
+    assert await C.follow(settings, tmp_path, one_to_one(), threading.Event()) == "join_failed"
+    (path,) = (tmp_path / "follow").rglob("*.ndjson")
+    header = json.loads(path.read_text())
+    oids = sorted(m.removeprefix("8:orgid:") for m in (ME, OTHER))
+    assert (header["thread"], header["kind"]) == (f"19:{oids[0]}_{oids[1]}@unq.gbl.spaces", "1:1")
 
 
 async def test_a_join_that_fails_once_is_retried_and_followed(

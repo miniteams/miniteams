@@ -164,9 +164,72 @@ def test_decode_keeps_evt_and_classifies_the_call() -> None:
     assert F.decode_push({"body": json.dumps({"cp": "x"})}) is None  # no evt
     assert F.decode_push({"body": "not json"}) is None
     assert F.call_id({"correlationId": "../../etc/passwd"}) is None  # names a file: UUID only
-    kinds = [F.call_kind(t) for t in (MEETING, "19:aa_bb@unq.gbl.spaces", "19:fakegroup@thread.v2")]
-    assert kinds == ["meeting", "1:1", "group"]
-    assert F.call_kind("") == "1:1"  # a 1:1 push carries no groupContext
+    pushes = (_payload(), _one_to_one(), _payload(thread="19:fakegroup@thread.v2"), _one_to_one([]))
+    assert [F.call_kind(p) for p in pushes] == ["meeting", "1:1", "group", "1:1"]
+
+
+def test_044_a_blank_thread_with_meeting_info_is_no_1to1() -> None:
+    """One predicate: neither groupContext nor meetingInfo. A blank thread next to meetingInfo is not it."""
+    blank = {**_one_to_one(), "groupContext": {"threadId": "", "messageId": "0"}}
+    blank["meetingInfo"] = _payload()["meetingInfo"]
+    assert not F.is_one_to_one(blank) and F.call_kind(blank) == "group" and F.thread_of(blank) == ""
+    assert F.is_one_to_one({**_one_to_one(), "groupContext": None, "meetingInfo": None})
+
+
+ME = "8:orgid:00000000-0000-4000-8000-0000000000b0"
+PEER = "8:orgid:00000000-0000-4000-8000-0000000000a0"
+DM_SORTED = "19:00000000-0000-4000-8000-0000000000a0_00000000-0000-4000-8000-0000000000b0@unq.gbl.spaces"
+DM_UNSORTED = "19:00000000-0000-4000-8000-0000000000b0_00000000-0000-4000-8000-0000000000a0@unq.gbl.spaces"
+
+
+def _one_to_one(people: list[Any] | None = None) -> dict[str, Any]:
+    """A 1:1 push (seen live): no groupContext nor meetingInfo, the two people in additionalData."""
+    return {
+        "correlationId": CALL,
+        "conversationController": "https://cc.example.invalid/x",
+        "userJoinTime": JOIN,
+        "additionalData": {"participantList": [{"id": ME}, {"id": PEER}] if people is None else people},
+    }
+
+
+def test_044_a_1to1_push_names_its_chat() -> None:
+    """A 1:1 push has no thread: its two participants give the chat id, sorted, whatever their order."""
+    assert F.thread_of(_one_to_one()) == DM_SORTED
+    assert F.thread_of(_one_to_one([{"id": PEER}, {"id": ME}])) == DM_SORTED
+    assert F.call_kind(_one_to_one()) == "1:1"
+    for people in ([{"id": ME}], [{"id": ME}, {"id": PEER}, {"id": OTHER}], [{"id": ME}, {"id": ME}]):
+        assert F.thread_of(_one_to_one(people)) == ""  # not two distinct people
+    assert F.thread_of({**_one_to_one(), "additionalData": None}) == ""
+    assert F.thread_of(_one_to_one([{"id": "28:bot"}, {"id": PEER}])) == ""  # no org user: no 1:1 id
+
+
+@pytest.mark.parametrize("listed", [DM_SORTED, DM_UNSORTED])
+def test_044_a_1to1_follows_the_skip_list_in_either_spelling(
+    settings: Settings, tmp_path: Path, launches: list[str], listed: str
+) -> None:
+    """044-AC11 for a 1:1: the skip list names the chat, either spelling of its id."""
+    F.save_switch(settings, True, [listed])
+    cp = base64.b64encode(gzip.compress(json.dumps(_one_to_one()).encode())).decode()
+    with capture_logs() as logs:
+        F.handle(settings, tmp_path, {"body": json.dumps({"evt": 115, "cp": cp})})
+    assert [(e["thread"], e["reason"]) for e in logs if e["event"] == "follow_skipped"] == [
+        (DM_SORTED, "skip_list")
+    ]
+    assert launches == []
+
+
+def test_044_the_hook_reads_no_archive_index(settings: Settings, tmp_path: Path, launches: list[str]) -> None:
+    """The trigger shares the archive's data dir, often on NFS: a read-only open of its WAL index would
+    leave -wal/-shm files behind."""
+    from miniteams.archive_store import Index
+
+    index = Index(tmp_path)
+    index.upsert_chat(DM_UNSORTED, label="dm", raw={})
+    index.close()
+    cp = base64.b64encode(gzip.compress(json.dumps(_one_to_one()).encode())).decode()
+    F.handle(settings, tmp_path, {"body": json.dumps({"evt": 115, "cp": cp})})
+    assert launches == [CALL]
+    assert sorted(p.name for p in tmp_path.glob("index.db*")) == ["index.db"]
 
 
 # --- 044-AC3: one follower per call ---
@@ -291,6 +354,22 @@ def test_cli_manages_the_switch(capsys: pytest.CaptureFixture[str], monkeypatch:
     assert cli.main(["follow", "--enable"]) == 0
     assert cli.main(["follow", "--unskip", MEETING]) == 0
     assert json.loads(capsys.readouterr().out.splitlines()[-1]) == {"enabled": True, "skip": []}
+
+
+def test_cli_skip_and_unskip_take_a_1to1_in_either_spelling(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """044-AC11: the switch's skip list matches as the trigger does (presence.same_chat)."""
+    monkeypatch.setattr(cli, "setup_logging", lambda _level: None)
+    for argv in (["--skip", DM_SORTED], ["--skip", DM_UNSORTED], ["--skip", MEETING]):
+        assert cli.main(["follow", *argv]) == 0
+    skip = json.loads(capsys.readouterr().out.splitlines()[-1])["skip"]
+    assert skip == [DM_SORTED, MEETING]  # the other spelling added nothing
+    assert cli.main(["follow", "--unskip", DM_UNSORTED.upper()]) == 0
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])["skip"] == [MEETING]
+    F.save_switch(Settings(), True, [DM_SORTED, DM_UNSORTED, MEETING])  # a hand-edited file holding both
+    assert cli.main(["follow", "--unskip", DM_SORTED]) == 0
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])["skip"] == [MEETING]
 
 
 # --- evt 116: stop ---

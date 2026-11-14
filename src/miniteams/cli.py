@@ -561,6 +561,7 @@ def _follow_extra_ok(settings: Settings) -> bool:
 def cmd_follow(settings: Settings, args: argparse.Namespace) -> int:
     """Meeting follower (spec 044): the trigger, one call's follower (--call), or the switch and skip list."""
     from . import follow
+    from .presence import same_chat
 
     data_dir = Path(args.data_dir)
     if args.capture:
@@ -577,10 +578,11 @@ def cmd_follow(settings: Settings, args: argparse.Namespace) -> int:
         enabled, skip = switch
         if args.enable or args.disable:
             enabled = bool(args.enable)
-        if args.skip and args.skip not in skip:
+        # Same chat as the trigger matches: either spelling of a 1:1 id is one entry.
+        if args.skip and not any(same_chat(t, args.skip) for t in skip):
             skip = [*skip, args.skip]
         if args.unskip:
-            skip = [t for t in skip if t != args.unskip]
+            skip = [t for t in skip if not same_chat(t, args.unskip)]
         if not args.status:
             follow.save_switch(settings, enabled, skip)
         print(json.dumps({"enabled": enabled, "skip": skip}))

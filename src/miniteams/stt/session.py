@@ -23,7 +23,7 @@ import numpy.typing as npt
 import structlog
 
 from ..config import Settings
-from ..follow import _follow_dir, call_kind
+from ..follow import _follow_dir
 from .engines import STOP_GRACE_S, ProcessEngine, Transcribe, argv
 from .line import Line
 from .pipeline import Pipeline, Utterance
@@ -47,12 +47,14 @@ def iso(t: float) -> str:
     return datetime.fromtimestamp(t, UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def transcript_header(call: str, thread: str, started: float, engine: str, **extra: Any) -> dict[str, Any]:
+def transcript_header(
+    call: str, thread: str, kind: str, started: float, engine: str, **extra: Any
+) -> dict[str, Any]:
     """The transcript's first line (044-AC8), plus what the follower adds (its join outcome)."""
     return {
         "call": call,
         "thread": thread,
-        "kind": call_kind(thread),
+        "kind": kind,
         "started": iso(started),
         "engine": engine,
         **extra,
@@ -101,6 +103,7 @@ class Session:
         thread: str,
         resolve: Resolve,
         *,
+        kind: str,
         engines: Sequence[Transcribe] | None = None,
         vad: Callable[[], Probs] = Silero,
         clock: Callable[[], float] = time.time,
@@ -112,6 +115,7 @@ class Session:
         self._data_dir = data_dir
         self._call = call
         self._thread = thread
+        self._kind = kind
         self._resolve = resolve
         self._engine = settings.stt_engine
         self._vad = vad
@@ -138,7 +142,7 @@ class Session:
 
     async def start(self) -> None:
         started = self._clock()
-        header = transcript_header(self._call, self._thread, started, self._engine, **self._extra)
+        header = transcript_header(self._call, self._thread, self._kind, started, self._engine, **self._extra)
         self.transcript = Transcript(self._data_dir, self._call, started, header)
         try:
             await self._pipeline.start()

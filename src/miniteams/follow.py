@@ -37,6 +37,7 @@ import structlog
 
 from .config import Settings, write_private
 from .messages import _gunzip_b64
+from .presence import dm_ids, same_chat
 from .stream import CallHook
 
 log = structlog.get_logger()
@@ -113,20 +114,31 @@ def call_id(payload: dict[str, Any]) -> str | None:
     return value if isinstance(value, str) and _UUID.fullmatch(value) else None
 
 
+def is_one_to_one(payload: dict[str, Any]) -> bool:
+    """A 1:1 push names neither groupContext nor meetingInfo (seen live)."""
+    return not payload.get("groupContext") and not payload.get("meetingInfo")
+
+
 def thread_of(payload: dict[str, Any]) -> str:
+    """The call's chat. A 1:1 push names none: its two participants give the 1:1 chat's id, sorted (Teams'
+    usual spelling, not always its own: compare 1:1 ids with same_chat)."""
     group = payload.get("groupContext")
     thread = group.get("threadId") if isinstance(group, dict) else None
-    return thread if isinstance(thread, str) else ""
+    if isinstance(thread, str) and thread:
+        return thread
+    if not is_one_to_one(payload):
+        return ""
+    extra = payload.get("additionalData")
+    people = extra.get("participantList") if isinstance(extra, dict) else None
+    mris = [str(p.get("id")) for p in people if isinstance(p, dict)] if isinstance(people, list) else []
+    ids = dm_ids(*mris) if len(mris) == 2 else ()
+    return min(ids) if ids else ""
 
 
-def call_kind(thread: str) -> str:
-    if not thread:  # a 1:1 push names no thread (no groupContext), seen live
+def call_kind(payload: dict[str, Any]) -> str:
+    if is_one_to_one(payload):
         return "1:1"
-    if thread.startswith("19:meeting_"):
-        return "meeting"
-    if thread.endswith("@unq.gbl.spaces"):
-        return "1:1"
-    return "group"
+    return "meeting" if thread_of(payload).startswith("19:meeting_") else "group"
 
 
 # --- switch and skip list ---
@@ -343,7 +355,8 @@ def handle(settings: Settings, data_dir: Path, req: dict[str, Any]) -> None:
     thread = thread_of(payload)
     # Unreadable = off: following a call the user may have excluded is worse than missing one.
     enabled, skip = load_switch(settings) or (False, [])
-    reason = "disabled" if not enabled else "skip_list" if thread in skip else None
+    skipped = any(same_chat(thread, s) for s in skip)
+    reason = "disabled" if not enabled else "skip_list" if skipped else None
     if reason is not None:
         log.info("follow_skipped", call=call, thread=thread, reason=reason)
         return
@@ -426,7 +439,7 @@ def run_call(data_dir: Path, push_json: str) -> int:
             log.info("follow_stop", call=call, reason="ended_before_start")
             return 0
         thread = thread_of(payload)
-        log.info("follow_start", call=call, thread=thread, kind=call_kind(thread))
+        log.info("follow_start", call=call, thread=thread, kind=call_kind(payload))
         stop, main = threading.Event(), threading.get_ident()
         outcome: list[str] = []
 

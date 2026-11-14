@@ -78,7 +78,16 @@ def make(settings: Settings, tmp_path: Path, now: list[float]) -> Callable[..., 
         # One fake clock for both: a frame arrives at its own t_wall, no lag (see the lag tests).
         clock = lambda: now[0]  # noqa: E731
         return S.Session(
-            settings, data, CALL, THREAD, resolve, engines=[engine], vad=vad, clock=clock, monotonic=clock
+            settings,
+            data,
+            CALL,
+            THREAD,
+            resolve,
+            kind="meeting",
+            engines=[engine],
+            vad=vad,
+            clock=clock,
+            monotonic=clock,
         )
 
     return build
@@ -278,7 +287,7 @@ def test_default_session_runs_the_configured_engine_processes(settings: Settings
     """044-AC10: the chosen engine's model and library reach `python -P -m miniteams.stt.engines`."""
     settings.stt_engine_processes = 3
     settings.log_level = "DEBUG"  # the engine children log at the follower's level
-    s = S.Session(settings, tmp_path, CALL, THREAD, NAMES.get)
+    s = S.Session(settings, tmp_path, CALL, THREAD, NAMES.get, kind="meeting")
     engines = s._pipeline._engines
     assert len(engines) == 3
     e = engines[0]
@@ -459,7 +468,7 @@ async def test_late_frames_never_get_silence_inside_speech(
     mono = [0.0]
     cut_at: list[float] = []
     s = S.Session(
-        settings, tmp_path, CALL, THREAD, NAMES.get, engines=[by_level], vad=lambda: rec,
+        settings, tmp_path, CALL, THREAD, NAMES.get, kind="meeting", engines=[by_level], vad=lambda: rec,
         clock=lambda: T0 + 100, monotonic=lambda: mono[0],
     )  # fmt: skip
     real_submit = s._pipeline.submit
@@ -510,7 +519,7 @@ async def test_close_is_bounded_when_an_engine_never_comes_back(settings: Settin
     def never(*_a: Any) -> None:
         raise EngineDied("model gone")
 
-    s = S.Session(settings, tmp_path, CALL, THREAD, NAMES.get, engines=[e])
+    s = S.Session(settings, tmp_path, CALL, THREAD, NAMES.get, kind="meeting", engines=[e])
     await asyncio.wait_for(s.start(), 30)
     e.start = never  # type: ignore[method-assign]
     audio = np.zeros(16000, np.float32)
@@ -539,7 +548,7 @@ async def test_a_failed_engine_load_stops_the_others_and_closes_the_transcript(
 
     good = ProcessEngine([sys.executable, FAKE_ENGINE], 30)
     bad = ProcessEngine([sys.executable, "-c", "import time, sys; time.sleep(0.3); sys.exit(3)"], 30)
-    s = S.Session(settings, tmp_path, CALL, THREAD, NAMES.get, engines=[bad, good])
+    s = S.Session(settings, tmp_path, CALL, THREAD, NAMES.get, kind="meeting", engines=[bad, good])
     with pytest.raises(EngineDied):
         await asyncio.wait_for(s.start(), 30)
     assert good.pid is None and not good.alive() and bad.pid is None
@@ -719,6 +728,7 @@ async def test_header_carries_the_join_outcome(settings: Settings, tmp_path: Pat
         CALL,
         THREAD,
         NAMES.get,
+        kind="meeting",
         engines=[by_level],
         vad=lambda: loudness,
         clock=lambda: now[0],

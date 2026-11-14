@@ -35,7 +35,7 @@ import structlog
 from .auth import self_mri, token_source
 from .config import Settings
 from .directory import Directory
-from .follow import call_id, join_time, mark_ended, thread_of
+from .follow import call_id, call_kind, join_time, mark_ended, thread_of
 from .messages import _decode_body
 from .skype import exchange_skype_token
 from .stream import AGENT_PATH, off_loop, run_forever
@@ -479,7 +479,6 @@ class Call:
         # call comes back with only us in it (seen live), which the leave rule ends after its grace.
         self.controller = controller
         self._direct = bool(controller)
-        self._one_to_one = False
         self._key = os.urandom(30)
         self._ssrc = secrets.randbits(32)
         self._rx: pylibsrtp.Session | None = None
@@ -580,8 +579,13 @@ class Call:
             },
             "debugContent": {"ecsEtag": '"0"', "causeId": message_id[:8]},
         }
-        if self._one_to_one:  # a 1:1 has neither: with them null its controller answers 400 (seen live)
-            del body["groupChat"], body["meetingInfo"]
+        # Direct: what the push left empty goes. A 1:1 names neither; with them null its controller answers
+        # 400 (seen live).
+        if self._direct:
+            if not body["meetingInfo"]:
+                del body["meetingInfo"]
+            if not body["groupChat"]["threadId"]:
+                del body["groupChat"]
         if sdp is not None:
             body["conversationRequest"] |= {"conversationType": None, "suppressDialout": True}
             body["participants"]["to"] = []
@@ -775,7 +779,7 @@ class Call:
             direct = self.payload.get("conversationController")
             if not isinstance(direct, str) or not direct:
                 raise JoinError("push names no meeting nor conversation controller", retry=False)
-            self.controller, self._direct, self._one_to_one = self.controller or direct, True, True
+            self.controller, self._direct = self.controller or direct, True
         loop = asyncio.get_running_loop()
         self._conn = conn = self._ice()
         gathering = self._spawn(conn.gather_candidates())  # STUN takes seconds: meanwhile, sign in
@@ -1012,7 +1016,7 @@ async def _until(stop: threading.Event, *aws: Awaitable[Any]) -> bool:
 
 async def follow(settings: Settings, data_dir: Path, payload: dict[str, Any], stop: threading.Event) -> str:
     """Joins the call, transcribes it until `stop` is set or the call ends, leaves; returns the outcome."""
-    call, thread = str(call_id(payload)), thread_of(payload)
+    call, thread, kind = str(call_id(payload)), thread_of(payload), call_kind(payload)
     session: Session | None = None
     # Audio flows as soon as join() returns, the engines load after: a second or two held here.
     pending: list[tuple[int, npt.NDArray[np.int16], float]] = []
@@ -1081,12 +1085,12 @@ async def follow(settings: Settings, data_dir: Path, payload: dict[str, Any], st
                 if not retry:
                     started = time.time()
                     header = transcript_header(
-                        call, thread, started, settings.stt_engine, join="failed", error=cause
+                        call, thread, kind, started, settings.stt_engine, join="failed", error=cause
                     )
                     Transcript(data_dir, call, started, header).close()
                     return "join_failed"
             await fresh()
-        built = Session(settings, data_dir, call, thread, resolve, header={"join": "ok"})
+        built = Session(settings, data_dir, call, thread, resolve, kind=kind, header={"join": "ok"})
         await built.start()
         if dropped:
             log.warning("follow_pending_full", call=call, dropped=dropped, held=len(pending))

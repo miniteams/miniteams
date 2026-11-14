@@ -29,7 +29,7 @@ you, now or at a time Teams holds the message until.
 | `find_chats` | `query?`, `participant?`, `kind?` (`private`/`group`/`meeting`/`channel`/`system`), `since?`, `limit=20` (max 100) | id, label, kind, last activity, participants (name and MRI), `backfill_done`, `history_denied`, `synced_at` |
 | `read_messages` | `thread_id`, `since?`, `until?`, `limit=100` (max 500) | oldest first: id, time (UTC), sender, plain text, `edited`, `deleted`, attachment count; `next_since` when cut |
 | `search_messages` | `query`, `since` (default 7 days back), `until?`, `thread_id?`, `limit=50` (max 200) | same record plus chat id and label, newest first |
-| `read_transcript` | `thread_id`, `message_id?`, `offset=0`, `limit=200` | without `message_id`: the chat's recordings (title, time, duration, has transcript). With it: turns (speaker, start offset, text) |
+| `read_transcript` | `thread_id`, `message_id?`, `call?` (spec 044), `offset=0`, `limit=200` | without `message_id`: the chat's recordings (title, time, duration, has transcript) and followed calls (spec 044). With it: turns (speaker, start offset, text). With `call`: the followed call's lines and joins (a call of another chat is refused) |
 
 - API fallback for reads, only when the archive is unavailable: no `index.db` under
   `--data-dir`, an error opening it, or no answer within 3 seconds. Storage that is

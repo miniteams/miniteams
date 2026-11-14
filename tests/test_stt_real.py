@@ -92,7 +92,7 @@ async def test_replay_puts_each_phrase_on_its_speaker(engine: str, tmp_path: Pat
     speaker's line. Prints the per-utterance latency, end of speech to line written."""
     settings = real_settings(engine)
     names = {msi: (f"Voice {msi}", f"8:orgid:00000000-0000-4000-8000-00000000000{msi}") for msi in REPLAY}
-    session = Session(settings, tmp_path, CALL, "19:synthetic@thread.v2", names.get)
+    session = Session(settings, tmp_path, CALL, "19:synthetic@thread.v2", names.get, kind="group")
     await asyncio.wait_for(session.start(), 120)
     assert session.transcript is not None
     path = session.transcript.path
