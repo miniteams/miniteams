@@ -119,7 +119,7 @@ same flow. The server needs the project's `.env` and `data/`, so register it as
 `uv run --directory /path/to/miniteams miniteams mcp` (a gitignored `.mcp.json` at the repo root
 does it for Claude Code).
 
-`follow` (spec 044, in progress) starts one follower per call when you join it from any device. The
+`follow` (spec 044) starts one follower per call when you join it from any device. The
 follower joins the call as a second endpoint of your account (meetings, group calls, and 1:1 calls, joined
 on the push's conversation controller), transcribes each speaker, and leaves (`DELETE` on its call leg)
 `follow_leave_grace_s` after your last device leaves the call (default 5 s, `MINITEAMS_FOLLOW_LEAVE_GRACE_S`;
@@ -153,6 +153,7 @@ fix and archives without the trigger; no other command needs them.
   cmake and a C++ compiler.
 - No setting is required: library and model paths default to where the script puts them. `.env.example`
   lists every follower setting and its default; `MINITEAMS_STT_ENGINE` picks `parakeet` (default) or `whisper`.
+  Each engine process runs 4 threads on 8+ cores, else 2 (`MINITEAMS_STT_CPU_THREADS`).
 - `MINITEAMS_STUN_SERVER` (`host:port`): the default, `stun.l.google.com:19302`, is a third party that sees this
   host's public address on each join; `MINITEAMS_STUN_SERVER=""` gathers host candidates only.
 

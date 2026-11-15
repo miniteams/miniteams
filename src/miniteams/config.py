@@ -26,6 +26,11 @@ def _default_cache_dir() -> Path:
     return (Path(base) if base else Path.home() / ".cache") / "miniteams"
 
 
+def _default_cpu_threads() -> int:
+    """Per engine process: 4 took ~0.25 s off the median latency for +60 % engine CPU (spec 044, AC7)."""
+    return 4 if (os.process_cpu_count() or 0) >= 8 else 2  # affinity-aware: a pinned process counts its CPUs
+
+
 def write_private(path: Path, text: str) -> None:
     """Replace `path` with `text`, owner-only (0600) from its first byte; the parent is made 0700 if new.
 
@@ -131,7 +136,7 @@ class Settings(BaseSettings):
     parakeet_model: Path | None = None
     whisper_model: Path | None = None
     stt_engine_processes: int = Field(default=2, ge=1)
-    stt_cpu_threads: int = Field(default=2, ge=1)
+    stt_cpu_threads: int = Field(default_factory=_default_cpu_threads, ge=1)
     # An engine that has not answered by then is killed and restarted; a 15 s utterance takes ~3 s.
     stt_engine_timeout_s: float = Field(default=60.0, gt=0)
     # Utterances waiting for an engine; past it new ones are dropped and logged.

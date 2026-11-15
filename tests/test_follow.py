@@ -481,6 +481,29 @@ def test_end_never_signals_a_pid_that_is_not_our_follower(
     assert procs[0].poll() is None and procs[1].poll() is None
 
 
+def test_end_while_the_follower_releases_its_lock_is_no_mismatch(
+    settings: Settings, tmp_path: Path, procs: list[Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 116 between the follower deleting its push file and closing its lock: it is leaving, not a stranger.
+    A holder naming another call's missing push is still a mismatch."""
+    argv = _argv(settings, _payload())
+    Path(argv[-1]).unlink()
+    procs.append(_holder(F.lock_path(settings, CALL), *argv))
+    other = _argv(settings, _payload(call=OTHER))
+    Path(other[-1]).unlink()
+    procs.append(_holder(F.lock_path(settings, SENTINEL), *other))
+    killed: list[int] = []
+    with monkeypatch.context() as patch, capture_logs() as logs:  # undone before procs kills the holders
+        patch.setattr(F.os, "kill", lambda pid, _sig: killed.append(pid))
+        F.handle(settings, tmp_path, _push(116))
+        F.handle(settings, tmp_path, _push(116, call=SENTINEL))
+    assert [(e["event"], e["log_level"]) for e in logs if e["event"].startswith("follow_")] == [
+        ("follow_winding_down", "info"),
+        ("follow_pid_mismatch", "warning"),
+    ]
+    assert killed == []
+
+
 def test_end_while_the_pid_line_is_empty_stops_the_follower_once_locked(
     settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, in_process: list[str]
 ) -> None:

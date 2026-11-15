@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from miniteams import config
 from miniteams._io import emit, force_blocking_stdout
 from miniteams.config import Settings, write_private
 
@@ -120,3 +121,15 @@ def test_write_private_into_read_only_dir_raises_and_leaves_nothing(tmp_path: Pa
         assert os.listdir(locked) == []
     finally:
         locked.chmod(0o700)
+
+
+@pytest.mark.parametrize(("cores", "threads"), [(8, 4), (28, 4), (7, 2), (None, 2)])
+def test_engine_threads_default_to_4_on_8_cores_or_more(
+    cores: int | None, threads: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """044-AC7: 4 threads per engine where the cores allow it; the env still overrides."""
+    monkeypatch.setattr(config.os, "process_cpu_count", lambda: cores)
+    monkeypatch.delenv("MINITEAMS_STT_CPU_THREADS", raising=False)
+    assert Settings(tenant_id="t", _env_file=None).stt_cpu_threads == threads
+    monkeypatch.setenv("MINITEAMS_STT_CPU_THREADS", "3")
+    assert Settings(tenant_id="t", _env_file=None).stt_cpu_threads == 3

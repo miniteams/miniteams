@@ -1,6 +1,6 @@
 # 044 — Meeting follower: live personal transcription
 
-**Status**: in progress
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-11-14
 
@@ -64,46 +64,47 @@ How it works, from the probe of 2026-11-13 and grill-room spike S18:
 
 ## Acceptance criteria
 
-- [ ] **AC1** Given `follow` runs, when I join a scheduled meeting from the Teams desktop, then the
+- [x] **AC1** Given `follow` runs, when I join a scheduled meeting from the Teams desktop, then the
       follower is in the call within 10 s of `userJoinTime`, and the meeting shows no extra participant.
-- [ ] **AC2** Same as AC1 for an ad hoc group call and for a 1:1 call, joined or answered on any device.
-- [ ] **AC3** One follower per call: the `evt 115` its own join causes, a redelivered push, a second
+- [x] **AC2** Same as AC1 for an ad hoc group call and for a 1:1 call, joined or answered on any device.
+- [x] **AC3** One follower per call: the `evt 115` its own join causes, a redelivered push, a second
       device of mine joining, and two triggers running at once (`archive --follow` and `follow`) start
       no second follower, whatever data dir each trigger names. The guard is a lock per `correlationId`
       under `<config-dir>/follow/` (host-local, per user), released when the follower exits, even on a
       crash.
-- [ ] **AC4** When my last device in the call leaves (the follower aside) and others stay, the follower
+- [x] **AC4** When my last device in the call leaves (the follower aside) and others stay, the follower
       leaves within 15 s, its `DELETE` on the call leg answers 2xx, and no ghost participant remains. While
       another of my devices is still in the call (PC and phone, a transfer, an added device), one of them
       leaving does not stop it.
-- [ ] **AC5** When the call ends for everyone, the follower stops within 15 s and closes the transcript.
-- [ ] **AC6** Each line names its speaker from the run's own roster (MSI → `displayName`); an MSI absent
+- [x] **AC5** When the call ends for everyone, the follower stops within 15 s and closes the transcript.
+- [x] **AC6** Each line names its speaker from the run's own roster (MSI → `displayName`); an MSI absent
       from the roster falls back to the names store, then to the MRI. Overlapping speakers (up to 4) each
       get their own lines.
-- [ ] **AC7** Latency on this machine with `parakeet`, live: from end of speech to line written, median
-      ≤ 2 s, p90 ≤ 4 s, over a call of 10 min or more with 3 or more speakers.
-- [ ] **AC8** The transcript is NDJSON, one object per line: `t` (UTC ISO start of the utterance),
+- [x] **AC7** Latency on this machine with `parakeet`, live: from end of speech to line written, median
+      ≤ 2.5 s, p90 ≤ 4 s, over a call of 10 min or more with 3 or more speakers taking realistic turns
+      (short to 15 s).
+- [x] **AC8** The transcript is NDJSON, one object per line: `t` (UTC ISO start of the utterance),
       `end`, `speaker`, `mri`, `text`, `engine`; a header line holds `call` (`correlationId`), `thread`,
       `kind` (meeting, group, 1:1), `started`, `engine`, `join` (`ok` or `failed`) and, when failed,
       `error`. A line is readable by another process as soon as written.
-- [ ] **AC9** MCP `read_transcript` without `message_id` lists the thread's followed calls next to its
+- [x] **AC9** MCP `read_transcript` without `message_id` lists the thread's followed calls next to its
       recordings, each `live` while its follower runs on this host; with `call` it returns the lines,
       paged by offset, the call's `joins` (started, join outcome, error) and `live`; both work while the
       call runs.
-- [ ] **AC10** `engine` = `parakeet` or `whisper`. A missing library, model or extra makes `follow`
+- [x] **AC10** `engine` = `parakeet` or `whisper`. A missing library, model or extra makes `follow`
       refuse to start with the exact command to fix it, and never join a call it cannot transcribe.
-- [ ] **AC11** With the switch off, or the chat in the skip list, `follow` joins nothing and logs the
+- [x] **AC11** With the switch off, or the chat in the skip list, `follow` joins nothing and logs the
       skip with the thread id.
-- [ ] **AC12** Nothing but text is written: no audio file exists after a call unless `--capture` was set.
-- [ ] **AC13** A Trouter drop or a token renewal neither stops nor duplicates a running follower; the
+- [x] **AC12** Nothing but text is written: no audio file exists after a call unless `--capture` was set.
+- [x] **AC13** A Trouter drop or a token renewal neither stops nor duplicates a running follower; the
       socket re-registers on `NGCallManagerWin`.
-- [ ] **AC14** A failed join (lobby timeout, refusal, ICE failure) is logged with its cause, retried
+- [x] **AC14** A failed join (lobby timeout, refusal, ICE failure) is logged with its cause, retried
       once, then given up; the error lands in the transcript header.
-- [ ] **AC15** Without the `transcript` extra, every other miniteams command works unchanged, and
+- [x] **AC15** Without the `transcript` extra, every other miniteams command works unchanged, and
       `miniteams follow` says which extra to install.
-- [ ] **AC16** Copied files from `grill_stt` name their origin (grill-room path and commit) and keep the
+- [x] **AC16** Copied files from `grill_stt` name their origin (grill-room path and commit) and keep the
       Apache-2.0 notice.
-- [ ] **AC17** Restarting `archive --live --follow` during a call neither cuts the transcript nor starts
+- [x] **AC17** Restarting `archive --live --follow` during a call neither cuts the transcript nor starts
       a second follower; a failure in the trigger code is logged and never stops the archiving.
 
 ## Phases
@@ -308,7 +309,18 @@ All five are done. Where a phase's text and the **Decisions** differ, the Decisi
 - `MEDIA_IDLE_S` = 60 s without any packet, RTCP included, means a network outage: RTCP flows every ~5 s
   even in silence; the longest gap over every live capture (S18 runs up to 30 min, Phase 3 runs) was
   6.2 s; 4x that, floored at a minute.
-- Engines default to two processes of 2 threads: 8.4x real time on a 4-CPU node, against 6.2x for one of
-  4 threads (grill-room spike S10d).
+- Engines default to two processes: two of 2 threads gave 8.4x real time on a 4-CPU node, one of 4 threads
+  6.2x (grill-room spike S10d). Threads per process: see the AC7 entry below.
 - The calling requests carry the AMER region headers whatever the tenant's region: they worked for a
   tenant elsewhere in S18.
+- AC7 relaxed to median ≤ 2.5 s (user call, 2026-11-15) on live 11-minute calls with 3 talkers (my own
+  device talking too in the realistic-turn runs only; 2026-11-14, UTC), median / p90:
+  - mostly short turns: 1.985 / 2.59 s;
+  - realistic turns (under 2 s to over 10 s): default 2 threads 2.51 / 3.56 s, 4 threads 2.26 / 3.29 s,
+    VAD 600 ms 2.45 / 3.29 s.
+  - Latency grows with utterance length (~1.8 s under 2 s of speech, ~3.3 s over 10 s); no queueing (no slow
+    queue wait, forced cut or engine restart). Hence `stt_cpu_threads` 4 on 8+ CPUs (chosen, not measured
+    below 28 cores), else 2; under 8 CPUs the 2-thread 2.51 s is not covered by AC7, which holds on this
+    machine.
+- My own device's voice is transcribed too, filed under my name; clips under 0.4 s of speech are dropped by
+  the VAD's minimum (`min_speech_ms`).

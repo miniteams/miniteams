@@ -375,15 +375,21 @@ def read_push(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _follower_push(pid: int, call: str) -> dict[str, Any] | None:
-    """The push `pid` follows when it is our follower of `call`, else None (pid reused, other call)."""
+def _push_file(pid: int) -> Path | None:
+    """The push file `pid` names when it is a follower, else None."""
     try:
         args = Path(f"/proc/{pid}/cmdline").read_bytes().decode().split("\0")
         i = args.index("--call-file")
         path = args[i + 1]
     except OSError, UnicodeDecodeError, ValueError, IndexError:
         return None
-    payload = read_push(Path(path)) if "follow" in args[:i] else None
+    return Path(path) if "follow" in args[:i] else None
+
+
+def _follower_push(pid: int, call: str) -> dict[str, Any] | None:
+    """The push `pid` follows when it is our follower of `call`, else None (pid reused, other call)."""
+    path = _push_file(pid)
+    payload = read_push(path) if path is not None else None
     return payload if payload is not None and payload.get("correlationId") == call else None
 
 
@@ -432,7 +438,12 @@ def stop_follower(settings: Settings, call: str, payload: dict[str, Any]) -> Non
         return
     running = _follower_join(pid, call)
     if running is None:
-        log.warning("follow_pid_mismatch", call=call, pid=pid)
+        push = _push_file(pid)
+        # Its push deleted, its lock not yet released: a follower of this call in its last instant.
+        if push is not None and push.name.startswith(f"{call}-") and not push.exists():
+            log.info("follow_winding_down", call=call, pid=pid)
+        else:
+            log.warning("follow_pid_mismatch", call=call, pid=pid)
         return
     if join and running != join:  # a late 116 of an earlier join: the follower of a rejoin stays
         log.info("follow_stop_other_join", call=call, pid=pid)

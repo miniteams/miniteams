@@ -285,7 +285,7 @@ def test_vad_settings_default_to_the_segmenter_ones(settings: Settings) -> None:
 
 def test_default_session_runs_the_configured_engine_processes(settings: Settings, tmp_path: Path) -> None:
     """044-AC10: the chosen engine's model and library reach `python -P -m miniteams.stt.engines`."""
-    settings.stt_engine_processes = 3
+    settings.stt_engine_processes, settings.stt_cpu_threads = 3, 3
     settings.log_level = "DEBUG"  # the engine children log at the follower's level
     s = S.Session(settings, tmp_path, CALL, THREAD, NAMES.get, kind="meeting")
     engines = s._pipeline._engines
@@ -293,7 +293,7 @@ def test_default_session_runs_the_configured_engine_processes(settings: Settings
     e = engines[0]
     assert isinstance(e, S.ProcessEngine)
     assert e._argv[1:4] == ["-P", "-m", "miniteams.stt.engines"]
-    assert e._argv[4:] == ["parakeet", str(settings.stt_model), "2"]
+    assert e._argv[4:] == ["parakeet", str(settings.stt_model), "3"]
     assert e._env == {"TRANSCRIBE_LIBRARY": str(settings.stt_library), "MINITEAMS_LOG_LEVEL": "DEBUG"}
 
 
