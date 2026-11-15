@@ -38,6 +38,7 @@ from .drafts import (
     notes_thread_id,
     unused_client_id,
 )
+from .follow import is_call_id, lock_held, lock_path, transcript_files
 from .http import failure
 from .mcp_api import ApiReader
 from .messages import (
@@ -50,6 +51,7 @@ from .messages import (
     plain_text,
     quote_names,
 )
+from .presence import same_chat
 from .render import card_entries, cards_text
 from .send import NOTES_THREAD, edit_message, react, send_message, valid_reaction_key
 from .watch import note_sent
@@ -204,6 +206,7 @@ class Archive:
         self.cards = CardRefresher(settings, CardStore(data_dir / "cards.db")) if settings else None
 
         self._down_until = 0.0
+        self.index_missing = False  # the last probe found no index.db (not a hung or broken one)
         self._probe: Callable[[], None] = self._open_index
         self._directory: Directory | None = None
 
@@ -251,6 +254,7 @@ class Archive:
         worker = threading.Thread(target=_run, daemon=True)
         worker.start()
         worker.join(_PROBE_DEADLINE)
+        self.index_missing = not worker.is_alive() and isinstance(outcome.get("error"), FileNotFoundError)
         if worker.is_alive() or "error" in outcome:
             reason = str(outcome.get("error") or f"no answer within {_PROBE_DEADLINE:.0f} s")
             log.warning("archive_unavailable", data_dir=str(self.data_dir), error=reason)
@@ -505,6 +509,90 @@ class Archive:
             result["next_offset"] = offset + limit
         return result
 
+    def follows(self, thread_id: str) -> list[dict[str, Any]]:
+        """One entry per transcript file whose header names `thread_id`; `live` while its follower holds
+        the call's lock (only the call's newest file can still grow)."""
+        # ponytail: reads every header per listing; an index if the follow dir grows to thousands of files
+        files = transcript_files(self.data_dir)
+        newest = dict(files)
+        found: list[dict[str, Any]] = []
+        for call, path in files:
+            try:
+                with path.open("rb") as f:
+                    first = f.readline()
+                    header = _ndjson(first) if first.endswith(b"\n") else None
+                    if header is None or not same_chat(str(header.get("thread")), thread_id):
+                        continue
+                    lines = sum(1 for line in f if line.endswith(b"\n") and _ndjson(line) is not None)
+            except OSError as exc:
+                log.warning("follow_transcript_unreadable", path=str(path), error=str(exc))
+                continue
+            entry = {
+                "call": call,
+                "kind": str(header.get("kind") or ""),
+                "started": str(header.get("started") or ""),
+                "join": str(header.get("join") or ""),
+                "lines": lines,
+                "live": newest[call] == path and self._live(call),
+            }
+            if header.get("error"):
+                entry["error"] = str(header["error"])
+            found.append(entry)
+        return found
+
+    def _live(self, call: str) -> bool:
+        if self.settings is None:  # the locks live in the config dir
+            return False
+        try:
+            return lock_held(lock_path(self.settings, call))
+        except OSError as exc:  # a lock this reader cannot open must not cost the listing
+            log.warning("follow_live_check_failed", call=call, error=str(exc))
+            return False
+
+    def follow(self, thread_id: str, call: str, offset: int, limit: int) -> dict[str, Any]:
+        """A followed call's lines across its transcript files, paged; header fields per join."""
+        if not is_call_id(call):  # it names files, as the follower wrote them
+            raise ToolError(f"not a call id: {call!r}")
+        header: dict[str, Any] = {}
+        joins: list[dict[str, Any]] = []
+        lines: list[dict[str, Any]] = []
+        for _, path in transcript_files(self.data_dir, call):
+            try:
+                # The last line may still be half written: only newline-terminated lines are whole.
+                raw = path.read_bytes().split(b"\n")[:-1]
+            except OSError as exc:
+                raise ToolError(f"unreadable transcript of call {call}: {exc}") from exc
+            head = _ndjson(raw[0]) if raw else None
+            if head is None:
+                continue
+            header = header or head
+            joins.append({k: head[k] for k in ("started", "join", "error") if k in head})
+            lines += [line for line in map(_ndjson, raw[1:]) if line is not None]
+        if not joins:
+            raise ToolError(f"no followed call {call}")
+        if not same_chat(str(header.get("thread")), thread_id):  # the other chat's id stays out
+            raise ToolError(f"call {call} belongs to another chat")
+        result = {
+            "call": call,
+            **{k: header.get(k, "") for k in ("thread", "kind", "engine")},
+            "joins": joins,
+            "live": self._live(call),
+            "total": len(lines),
+            "offset": offset,
+            "lines": lines[offset : offset + limit],
+        }
+        if offset + limit < len(lines):
+            result["next_offset"] = offset + limit
+        return result
+
+
+def _ndjson(line: bytes) -> dict[str, Any] | None:
+    try:
+        value = json.loads(line)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
 
 class Session:
     """Credentials for the API paths: silent refresh, and a device-code sign-in when that is dead.
@@ -684,10 +772,19 @@ def _search_messages(server: Server, args: dict[str, Any]) -> dict[str, Any]:
 
 def _read_transcript(server: Server, args: dict[str, Any]) -> dict[str, Any]:
     archive = server.archive
-    if not archive.available():
-        raise ToolError(f"transcripts need the archive, which is unavailable at {archive.data_dir}")
-    meta = archive.meta()
     thread_id = args["thread_id"]
+    if archive.available():
+        meta = archive.meta()
+    elif archive.index_missing and not args.get("message_id") and (archive.data_dir / "follow").is_dir():
+        # A follow-only data dir (`miniteams follow` without an archiver): no recordings, follows still read.
+        meta = {"source": "follow"}
+    else:
+        raise ToolError(f"transcripts need the archive, which is unavailable at {archive.data_dir}")
+    offset, limit = args.get("offset", 0), args.get("limit", 200)
+    if args.get("call"):
+        if args.get("message_id"):
+            raise ToolError("give message_id (a recording) or call (a followed call), not both")
+        return {**meta, "thread_id": thread_id, **archive.follow(thread_id, args["call"], offset, limit)}
     if not args.get("message_id"):
         recordings = [
             {
@@ -700,10 +797,11 @@ def _read_transcript(server: Server, args: dict[str, Any]) -> dict[str, Any]:
                 ),
                 "videos": len(e.get("videos") or []),
             }
-            for e in archive.recordings(thread_id)
+            for e in (archive.recordings(thread_id) if meta["source"] == "archive" else [])
         ]
-        return {**meta, "thread_id": thread_id, "recordings": recordings}
-    page = archive.transcript(thread_id, args["message_id"], args.get("offset", 0), args.get("limit", 200))
+        follows = archive.follows(thread_id)
+        return {**meta, "thread_id": thread_id, "recordings": recordings, "follows": follows}
+    page = archive.transcript(thread_id, args["message_id"], offset, limit)
     return {**meta, "thread_id": thread_id, **page}
 
 
@@ -982,11 +1080,16 @@ TOOLS: tuple[Tool, ...] = (
     ),
     Tool(
         "read_transcript",
-        "Meeting transcripts of a chat. Without `message_id`: the recordings and whether each has a "
-        "transcript. With it: the turns (speaker, start offset, text), paged by offset.",
+        "Meeting transcripts of a chat, of two kinds. Without `message_id` or `call`: `recordings` (Teams "
+        "recordings, whether each has a transcript) and `follows` (calls miniteams followed and transcribed "
+        "live: call, kind, started, join outcome and error, lines, `live` while still being written). With "
+        "`message_id`: a recording's turns (speaker, start offset, text). With `call`: a followed call's "
+        "lines (t, end, speaker, mri, text, engine) and its joins; readable during the call. Both page by "
+        "offset.",
         {
             "thread_id": {"type": "string"},
-            "message_id": {"type": "string", "description": "the recording, from the list"},
+            "message_id": {"type": "string", "description": "a recording, from `recordings`"},
+            "call": {"type": "string", "description": "a followed call id, from `follows`"},
             "offset": {"type": "integer", "minimum": 0},
             "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
         },

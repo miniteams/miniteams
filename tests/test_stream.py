@@ -2,10 +2,14 @@
 
 import asyncio
 import json
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
+from miniteams import follow as F
 from miniteams import stream as S
 from miniteams.config import Settings
 from miniteams.directory import Directory
@@ -20,8 +24,14 @@ class _Ws:
         self.sent.append(data)
 
 
-def _client(settings: Settings, directory: Directory, **kw: Any) -> TrouterClient:
-    c = TrouterClient(settings, {"access_token": "a"}, "sk", {}, "sid", "epid", directory, **kw)
+SURL_INFO = {"surl": "https://surl.invalid/s/"}
+CALL_PUSH = {"id": 9, "url": f"https://surl.invalid/x/{S.NGC_PATH}", "body": "{}"}
+
+
+def _client(
+    settings: Settings, directory: Directory, info: dict[str, Any] | None = None, **kw: Any
+) -> TrouterClient:
+    c = TrouterClient(settings, {"access_token": "a"}, "sk", info or {}, "sid", "epid", directory, **kw)
     c._ws = _Ws()
     return c
 
@@ -446,3 +456,373 @@ async def test_a_failing_link_hook_does_not_stop_the_loop(
     assert len(sessions) == 2
     failed = [e for e in logs if e["event"] == "link_hook_failed"]
     assert len(failed) == 6 and failed[0]["error_type"] == "ValueError"  # 2 × (up, up, down)
+
+
+async def test_a_failing_error_hook_does_not_stop_the_loop(
+    settings: Settings, directory: Directory, monkeypatch
+) -> None:
+    """Spec 044: a hook raising on a failed attempt is logged; the reconnect loop goes on."""
+    import structlog
+
+    aad = {"access_token": "A", "id_token": "I"}
+    st = {"skype_token": "ST", "expires_in": 3600}
+    sessions = _link_loop(
+        monkeypatch, aad, exchanges=[RuntimeError("authz down"), st, asyncio.CancelledError()]
+    )
+    seen: list[str] = []
+
+    def broken(step: str, _exc: BaseException) -> None:
+        seen.append(step)
+        raise ValueError("hook broke")
+
+    with structlog.testing.capture_logs() as logs, pytest.raises(asyncio.CancelledError):
+        await S.run_forever(settings, directory=directory, on_error=broken)
+    assert seen == ["sign-in"] and len(sessions) == 1  # reconnected after the failing hook
+    failed = [e for e in logs if e["event"] == "error_hook_failed"]
+    assert [(e["error"], e["error_type"]) for e in failed] == [("hook broke", "ValueError")]
+
+
+# --- off_loop: blocking calls in daemon threads (spec 044) ---
+
+
+async def test_off_loop_returns_raises_and_keeps_the_loop_free() -> None:
+    import threading as th
+
+    gate = th.Event()
+    ticks: list[int] = []
+
+    def slow() -> str:
+        gate.wait(5)
+        return th.current_thread().name
+
+    async def tick() -> None:
+        ticks.append(1)
+        gate.set()
+
+    name, _ = await asyncio.gather(S.off_loop(slow), tick())
+    assert ticks == [1] and name.startswith("off-loop-slow")  # the loop ran while it blocked
+
+    def boom(x: int) -> None:
+        raise ValueError(x)
+
+    with pytest.raises(ValueError, match="7"):
+        await S.off_loop(boom, 7)
+
+
+async def test_off_loop_cancelled_or_outlived_by_its_thread() -> None:
+    """A cancelled wait: the thread's late result lands on a done future and is dropped, never an
+    InvalidStateError in the loop's exception handler."""
+    import threading as th
+
+    loop = asyncio.get_running_loop()
+    errors: list[dict[str, Any]] = []
+    loop.set_exception_handler(lambda _loop, ctx: errors.append(ctx))
+    release, finished = th.Event(), th.Event()
+
+    def held() -> int:
+        release.wait(5)
+        finished.set()
+        return 1
+
+    task = asyncio.ensure_future(S.off_loop(held))
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+    assert finished.wait(5)
+    await asyncio.sleep(0.05)  # the late settle runs on this loop now
+    loop.set_exception_handler(None)
+    assert errors == []
+
+
+@pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
+def test_off_loop_thread_ending_after_its_loop_closed() -> None:
+    """Ctrl-C closes the loop under a running call: the thread's result is dropped, no thread error."""
+    import threading as th
+
+    release = th.Event()
+
+    def held() -> int:
+        release.wait(5)
+        return 1
+
+    async def start() -> asyncio.Future[int]:
+        task = asyncio.ensure_future(S.off_loop(held, name="off-loop-test-closed"))
+        await asyncio.sleep(0.01)
+        return task
+
+    loop = asyncio.new_event_loop()
+    task = loop.run_until_complete(start())
+    task.cancel()
+    loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+    loop.close()
+    (t,) = [t for t in th.enumerate() if t.name == "off-loop-test-closed"]
+    assert t.daemon
+    release.set()
+    t.join(5)
+    assert not t.is_alive()
+
+
+async def test_a_silent_start_refreshes_off_the_loop_and_stops_on_a_dead_login(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """prompt=False (watch, follower): the first refresh runs off the loop; a dead login ends the run."""
+    import threading as th
+
+    from miniteams.auth import AuthExpired
+
+    threads: list[str] = []
+
+    class Dead:
+        def refresh(self) -> dict[str, Any]:
+            threads.append(th.current_thread().name)
+            raise AuthExpired("refresh token expired")
+
+    monkeypatch.setattr(S, "token_source", lambda _s: Dead())
+    with pytest.raises(AuthExpired):
+        await S.run_forever(settings, prompt=False)
+    assert threads == ["off-loop-refresh"]
+
+
+def test_websocket_url_names_the_session_and_the_query(settings: Settings, directory: Directory) -> None:
+    info = {"socketio": "https://trouter.invalid/", "connectparams": {"sr": "x"}, "surl": "s"}
+    client = TrouterClient(settings, {}, "sk", info, "sid", "ep", directory)
+    url = client._ws_url()
+    assert url.startswith("wss://trouter.invalid/socket.io/1/websocket/sid?v=v4&sr=x&") and "epid=ep" in url
+
+
+# --- spec 044: call callbacks, calling registration, call pushes ---
+
+
+def test_agent_ack_echoes_the_request_headers() -> None:
+    """044-AC1: without MS-CV + .0, trouter-request and trouter-client the call ends at ~40 s."""
+    req = {"id": 5, "headers": {"MS-CV": "abc.1", "Trouter-Request": '{"id":"r1"}', "X": "y"}}
+    assert json.loads(S.agent_ack(req)) == {
+        "id": 5,
+        "status": 200,
+        "headers": {"MS-CV": "abc.1.0", "trouter-request": '{"id":"r1"}', "trouter-client": '{"cd":1}'},
+        "body": "",
+    }
+    assert json.loads(S.agent_ack({"id": 6}))["headers"] == {"trouter-client": '{"cd":1}'}
+
+
+async def test_call_callbacks_go_to_the_agent_hook_with_the_echoing_ack(
+    settings: Settings, directory: Directory
+) -> None:
+    got: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+
+    async def agent(req: dict[str, Any]) -> None:
+        got.append(req)
+        raise RuntimeError("a bad callback")
+
+    async def event(obj: dict[str, Any]) -> None:
+        events.append(obj)
+
+    client = _client(settings, directory, on_event=event, on_agent=agent)
+    req = {
+        "id": 3,
+        "url": f"/v4/f/s{S.AGENT_PATH}e/t/call/acceptance/",
+        "headers": {"MS-CV": "x"},
+        "body": "",
+    }
+    with capture_logs() as logs:
+        await client._handle_frame(f"3:::{json.dumps(req)}")
+        await client._handle_frame('3:::{"id":4,"url":"/v4/f/s/messaging","body":""}')
+    assert got == [req] and events == []
+    assert json.loads(client._ws.sent[0][4:])["headers"]["MS-CV"] == "x.0"
+    assert client._ws.sent[1] == '3:::{"id":4,"status":200,"body":""}'  # others keep the plain ack
+    assert [e["event"] for e in logs] == ["agent_hook_failed"]
+
+
+class _Registrar:
+    """Fake registrar: `ngc` / `messaging` = "ok", "fail" or "hang"; every body posted, in order."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.bodies: list[dict[str, Any]] = []
+        self.ngc, self.messaging = "ok", "ok"
+        registrar = self
+
+        class _Http:
+            def __init__(self, *_a: Any, **_k: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> _Http:
+                return self
+
+            async def __aexit__(self, *_: Any) -> bool:
+                return False
+
+            async def post(self, _url: str, headers: dict[str, str], json: Any) -> Any:
+                registrar.bodies.append(json)
+                ngc = json["clientDescription"]["appId"] == "NextGenCalling"
+                mode = registrar.ngc if ngc else registrar.messaging
+                if mode == "hang":
+                    await asyncio.Event().wait()
+                if mode == "fail":
+                    raise OSError("registrar down")
+                return type("R", (), {"status_code": 202, "raise_for_status": lambda self: None})()
+
+        monkeypatch.setattr(S.httpx, "AsyncClient", _Http)
+
+    @property
+    def ngc_bodies(self) -> list[dict[str, Any]]:
+        return [b for b in self.bodies if b["clientDescription"]["appId"] == "NextGenCalling"]
+
+
+async def _noop(_req: dict[str, Any]) -> None:
+    return None
+
+
+async def _until_async(cond: Callable[[], bool], what: str) -> None:
+    async with asyncio.timeout(5):
+        while not cond():
+            await asyncio.sleep(0.005)
+
+
+@pytest.fixture
+def no_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def skip(self: TrouterClient) -> None:
+        pass
+
+    monkeypatch.setattr(TrouterClient, "_authenticate", skip)
+
+
+async def test_ngc_is_registered_on_connect_and_on_every_reregister(
+    settings: Settings, directory: Directory, monkeypatch: pytest.MonkeyPatch, no_auth: None
+) -> None:
+    """044-AC13"""
+    reg = _Registrar(monkeypatch)
+    client = _client(settings, directory, info=SURL_INFO, on_call=_noop)
+    await client._on_connected()
+    try:
+        await _until_async(lambda: len(reg.ngc_bodies) == 1, "registered on connect")
+        for n, reason in ((2, "message_loss"), (3, "ttl")):
+            client._last_register -= S._REREGISTER_DEBOUNCE + 1
+            await client._maybe_reregister(reason)
+            await _until_async(lambda: len(reg.ngc_bodies) == n, reason)  # noqa: B023
+    finally:
+        for task in client._tasks:
+            task.cancel()
+    assert len(reg.bodies) == 6
+    paths = {b["transports"]["TROUTER"][0]["path"] for b in reg.ngc_bodies}
+    assert paths == {"https://surl.invalid/s/NGCallManagerWin"}
+    ids = {b["registrationId"] for b in reg.ngc_bodies}
+    assert len(ids) == 1 and "epid" not in ids  # one registration renewed, never the messaging one's id
+
+
+async def test_without_the_hook_only_messaging_registers(
+    settings: Settings, directory: Directory, monkeypatch: pytest.MonkeyPatch, no_auth: None
+) -> None:
+    reg = _Registrar(monkeypatch)
+    client = _client(settings, directory, info=SURL_INFO)
+    await client._on_connected()
+    await asyncio.sleep(0.05)
+    for task in client._tasks:
+        task.cancel()
+    assert [b["clientDescription"]["appId"] for b in reg.bodies] == [settings.registrar_app_id]
+
+
+async def test_a_failed_ngc_registration_is_retried_with_backoff(
+    settings: Settings, directory: Directory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """044-AC13, 044-AC17: the socket stays; retries back off instead of hammering the registrar."""
+    reg = _Registrar(monkeypatch)
+    reg.ngc = "fail"
+    monkeypatch.setattr(S, "_NGC_RETRY_MIN", 0.01)
+    client = _client(settings, directory, info=SURL_INFO, on_call=_noop)
+    await client._register()  # must not raise
+    loop = asyncio.create_task(client._ngc_loop())
+    try:
+        await asyncio.sleep(0.35)  # backoff: tries at 0, .01, .03, .07, .15, .31; a flat retry: ~35
+        tries = len(reg.ngc_bodies)
+        assert 2 <= tries <= 8 and not client._ngc_ok
+        reg.ngc = "ok"
+        await _until_async(lambda: client._ngc_ok, "registered on a later retry")
+        settled = len(reg.ngc_bodies)
+        await asyncio.sleep(0.1)
+        assert len(reg.ngc_bodies) == settled  # no more once registered
+    finally:
+        loop.cancel()
+
+
+async def test_a_failed_messaging_reregister_still_renews_the_calling_one(
+    settings: Settings, directory: Directory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """044-AC13"""
+    reg = _Registrar(monkeypatch)
+    client = _client(settings, directory, info=SURL_INFO, on_call=_noop)
+    loop = asyncio.create_task(client._ngc_loop())
+    try:
+        await _until_async(lambda: client._ngc_ok, "first registration")
+        reg.messaging = "fail"
+        with pytest.raises(OSError):
+            await client._register()
+        assert not client._ngc_ok
+        await _until_async(lambda: client._ngc_ok and len(reg.ngc_bodies) == 2, "renewed anyway")
+    finally:
+        loop.cancel()
+
+
+async def test_a_hanging_ngc_registrar_does_not_delay_the_keepalive(
+    settings: Settings, directory: Directory, monkeypatch: pytest.MonkeyPatch, no_auth: None
+) -> None:
+    """044-AC13"""
+    reg = _Registrar(monkeypatch)
+    reg.ngc = "hang"
+    monkeypatch.setattr(S, "_PING_INTERVAL", 0.01)
+    client = _client(settings, directory, info=SURL_INFO, on_call=_noop)
+    await asyncio.wait_for(client._on_connected(), 1)  # connect does not wait for the calling registration
+    try:
+        await _until_async(lambda: sum('"ping"' in f for f in client._ws.sent) >= 5, "pings keep flowing")
+    finally:
+        for task in client._tasks:
+            task.cancel()
+    assert len(reg.ngc_bodies) == 1  # still hanging
+
+
+def test_ngc_registration_id_is_stable_per_endpoint(settings: Settings, directory: Directory) -> None:
+    """044-AC13: reconnects renew one registration instead of piling new ones up."""
+    a, b = _client(settings, directory), _client(settings, directory)
+    assert a._ngc_id == b._ngc_id != "epid"
+    other = TrouterClient(settings, {}, "sk", {}, "sid", "epid-2", directory)
+    assert other._ngc_id != a._ngc_id
+
+
+async def test_call_pushes_go_to_the_hook_only_and_its_failure_keeps_the_socket(
+    settings: Settings, directory: Directory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """044-AC13, 044-AC17: a trigger exception is logged; the frame is acked, the socket stays."""
+    events: list[Any] = []
+
+    async def on_event(obj: dict[str, Any]) -> None:
+        events.append(obj)
+
+    def boom(*_a: Any) -> None:
+        raise RuntimeError("trigger bug")
+
+    monkeypatch.setattr(F, "handle", boom)
+    client = _client(settings, directory, on_event=on_event, on_call=F.trigger(settings, Path("data")))
+    with capture_logs() as logs:
+        await client._on_delivery(json.dumps(CALL_PUSH))
+        await _until_async(lambda: bool(logs), "the trigger's thread logged it")
+    assert events == [] and client._ws.sent == ['3:::{"id":9,"status":200,"body":""}']
+    assert [e["event"] for e in logs] == ["follow_trigger_failed"]
+
+
+async def test_a_failing_call_hook_keeps_the_socket(settings: Settings, directory: Directory) -> None:
+    """044-AC17: a raising on_call is logged; the frame is acked, the chat hook untouched."""
+    events: list[Any] = []
+
+    async def on_event(obj: dict[str, Any]) -> None:
+        events.append(obj)
+
+    async def boom(_req: dict[str, Any]) -> None:
+        raise RuntimeError("hook bug")
+
+    client = _client(settings, directory, on_event=on_event, on_call=boom)
+    with capture_logs() as logs:
+        await client._on_delivery(json.dumps(CALL_PUSH))
+    assert events == [] and client._ws.sent == ['3:::{"id":9,"status":200,"body":""}']
+    assert [(e["event"], e["error"]) for e in logs] == [("call_hook_failed", "hook bug")]

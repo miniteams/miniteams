@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from miniteams import config
 from miniteams._io import emit, force_blocking_stdout
 from miniteams.config import Settings, write_private
 
@@ -15,6 +16,16 @@ def test_authority_and_scope() -> None:
     s = Settings(tenant_id="abc")
     assert s.authority == "https://login.microsoftonline.com/abc"
     assert s.scope_list == ["https://api.spaces.skype.com/.default"]
+
+
+def test_the_conversation_service_is_runtime_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the skype token exchange sets it: no env var, not dumped."""
+    monkeypatch.setenv("MINITEAMS_CONVERSATION_URL", "https://env.invalid/epconv")
+    s = Settings(tenant_id="abc")
+    assert s.conversation_url == "" and "conversation_url" not in s.model_dump()
+    s.conversation_url = "https://conv.invalid/epconv"
+    assert s.conversation_url == "https://conv.invalid/epconv"
+    assert Settings(tenant_id="abc").conversation_url == ""  # per instance
 
 
 def test_media_dir_under_cache(tmp_path) -> None:
@@ -110,3 +121,15 @@ def test_write_private_into_read_only_dir_raises_and_leaves_nothing(tmp_path: Pa
         assert os.listdir(locked) == []
     finally:
         locked.chmod(0o700)
+
+
+@pytest.mark.parametrize(("cores", "threads"), [(8, 4), (28, 4), (7, 2), (None, 2)])
+def test_engine_threads_default_to_4_on_8_cores_or_more(
+    cores: int | None, threads: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """044-AC7: 4 threads per engine where the cores allow it; the env still overrides."""
+    monkeypatch.setattr(config.os, "process_cpu_count", lambda: cores)
+    monkeypatch.delenv("MINITEAMS_STT_CPU_THREADS", raising=False)
+    assert Settings(tenant_id="t", _env_file=None).stt_cpu_threads == threads
+    monkeypatch.setenv("MINITEAMS_STT_CPU_THREADS", "3")
+    assert Settings(tenant_id="t", _env_file=None).stt_cpu_threads == 3

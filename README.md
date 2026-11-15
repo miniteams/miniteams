@@ -64,6 +64,7 @@ uv run miniteams archive --live                        # catch up, then store ea
                                                        # arrives, plus a pass every 1800s (--live N);
                                                        # stops on auth expiry (exit 1)
 uv run miniteams archive --live --verify-media         # same, plus one background media sweep
+uv run --extra transcript miniteams archive --live --follow   # same, plus the meeting follower (below)
 uv run miniteams archive --recheck-since 2026-09-22    # one-shot: re-walk chats active since the
                                                        # date down to it, filling any hole
 uv run miniteams names --sweep    # learn the names the archive holds (--data-dir; below)
@@ -73,6 +74,12 @@ uv run miniteams web --limit 0 --bind 127.0.0.5:8765   # load every chat (with a
 uv run miniteams web --data-dir /srv/teams-archive     # seed rows from an archive kept elsewhere
 uv run --extra widget miniteams widget   # the running web's board in its own window + tray icon (spec 024)
 uv run miniteams mcp              # MCP server over stdio for an agent (spec 008; see below)
+uv run --extra transcript miniteams follow   # meeting follower on its own socket (spec 044; below)
+                                                       # --capture DIR: debug dump, audio included
+uv run miniteams follow --disable                      # switch off (--enable); --skip / --unskip THREAD:
+                                                       # saved in `~/.config/miniteams/follow.json`;
+                                                       # --status prints it; --disable and --skip also
+                                                       # stop running followers
 uv run miniteams watch --thread 19:xxx@thread.v2 --once   # one JSON line per matching live event
                                                        # (spec 009; docs/watch.md)
 uv run miniteams dump             # dump your Notes' full history (oldest → newest)
@@ -83,7 +90,8 @@ uv run miniteams dump --jsonl > notes.jsonl            # full-detail JSON per li
 `mcp` serves your Teams to an MCP client over stdin/stdout (spec 008). Reads come from the
 archive: `find_chats` (label, topic, participant, kind), `read_messages` (plain text, date window,
 `next_since` cursor), `search_messages` (substring, case and accents ignored, 7 days back by
-default, feeds left out) and `read_transcript` (recordings, then turns). Results say where they come
+default, feeds left out) and `read_transcript` (recordings and followed calls, then turns or
+lines). Results say where they come
 from (`source`) and carry the archiver's heartbeat (`archiver_seen`, `archiver_state`,
 `sync_started_at`, and `media_sweep: running` during an `archive --live --verify-media` sweep, written
 by `archive` into `index.db`), so an agent can tell a stopped archiver
@@ -110,6 +118,83 @@ API is called or `read_messages` meets an app card due a refresh (with no token:
 same flow. The server needs the project's `.env` and `data/`, so register it as
 `uv run --directory /path/to/miniteams miniteams mcp` (a gitignored `.mcp.json` at the repo root
 does it for Claude Code).
+
+`follow` (spec 044) starts one follower per call when you join it from any device. The
+follower joins the call as a second endpoint of your account (meetings, group calls, and 1:1 calls, joined
+on the push's conversation controller), transcribes each speaker, and leaves (`DELETE` on its call leg)
+`follow_leave_grace_s` after your last device leaves the call (default 5 s, `MINITEAMS_FOLLOW_LEAVE_GRACE_S`;
+it stays while another of your devices is in the call), when the call ends, or when it is stopped (*Stop
+and skip* below). A failed join is retried once, unless the call is over, your last device has left, or
+its Trouter socket stops after the join; the speech-to-text engines load while it joins, and engines that cannot load end the join (`"join":
+"failed"`, `"error": "engines: …"`). When its own Trouter socket reconnects, or no media packet at all
+arrives for a minute (RTCP included, which flows even in silence: a network outage), it re-attaches to the
+call (hang-up, pause, fresh join on the call's controller) and the transcript goes on; the seconds in
+between are lost. If a leave was already pending at that moment, it leaves instead; re-attaches go on for
+`follow_reattach_deadline_s` (default 300 s, `MINITEAMS_FOLLOW_REATTACH_DEADLINE_S`), unless one shows the
+call over, then the follower ends. The trigger runs on its own socket (`miniteams follow`) or on the
+archiver's (`archive --live --follow`); each follower is a detached process, `miniteams follow
+--call-file`, in a transient systemd scope of its own when `systemd-run` and a user manager are there, so
+restarting the trigger's host leaves it running. A lock per call keeps it to one follower, whatever the
+device, the redelivery or the number of triggers, even with different `--data-dir`s:
+`<config-dir>/follow/<call>.lock` (`~/.config/miniteams/follow/`, host-local), next to the call's
+`.ended` marker and its push (`.push.json`, 0600, removed on exit: the follower's argv names the file,
+never the participants); its log is `<data-dir>/follow/<call>.log`. Both need the `transcript` extra
+(`uv sync --inexact --extra transcript`: `--inexact` keeps the `widget` extra) and the speech-to-text
+runtime; `follow` refuses to start without them, naming the fix, and `archive --live --follow` logs the
+fix and archives without the trigger; no other command needs them.
+
+**Follower setup**
+- `uv sync --inexact --extra transcript` first: the build's whisper step runs in that environment.
+- `scripts/build-transcribe.sh [parakeet|whisper|all]` (default `all`) builds libtranscribe (pinned commit) and
+  fetches the pinned, sha256-checked models into `~/.cache/miniteams` (`transcribe/lib/`, `models/`): ~5 MB of
+  library, ~710 MB for the parakeet GGUF, ~460 MB for whisper small. About a minute or two with `BUILD_JOBS=4`
+  (default 2), plus the downloads. A re-run only re-checks what is in place.
+- Needs an AVX2 CPU (libtranscribe), the network (sources, models), and Docker (used when present), or git,
+  cmake and a C++ compiler.
+- No setting is required: library and model paths default to where the script puts them. `.env.example`
+  lists every follower setting and its default; `MINITEAMS_STT_ENGINE` picks `parakeet` (default) or `whisper`.
+  Each engine process runs 4 threads on 8+ cores, else 2 (`MINITEAMS_STT_CPU_THREADS`).
+- `MINITEAMS_STUN_SERVER` (`host:port`): the default, `stun.l.google.com:19302`, is a third party that sees this
+  host's public address on each join; `MINITEAMS_STUN_SERVER=""` gathers host candidates only.
+
+**Stop and skip**
+- Ctrl-C stops the trigger (`miniteams follow`), not the followers: each runs until it leaves its call.
+- `follow --disable` switches following off and stops every running follower; `follow --skip THREAD` puts a
+  chat on the skip list and stops its followers. `--enable`, `--disable`, `--skip`, `--unskip THREAD`: one per
+  run, saved in `~/.config/miniteams/follow.json`; `--status` prints the switch and the skip list.
+- `THREAD`: a chat id from MCP `find_chats`, `miniteams chats` (`--all` for meeting chats) or a transcript
+  header's `thread`; a 1:1 id matches in either spelling (its two member ids in either order).
+- One follower alone: SIGTERM to the pid in its `.lock`.
+- Off, or the chat skipped: the call is logged (`follow_skipped`, with its thread id), nothing starts.
+
+**Transcripts**
+- `<data-dir>/follow/<YYYY-MM>/<started>-<call>.ndjson`, appended live, text only; a rejoin of the call writes
+  another file under the same call id.
+- Header line: `call` (the call's correlationId), `thread`, `kind` (`meeting`, `group`, `1:1`), `started`,
+  `engine`, `join` (`ok`, or `failed` with its `error`).
+- Then one line per utterance: `t`, `end` (UTC ISO), `speaker`, `mri`, `text`, `engine`.
+- MCP `read_transcript` lists a chat's followed calls next to its recordings (`live` while a follower on this
+  host holds the call's lock) and pages one by `call`, during the call too; a data dir with followed calls
+  but no archive (`miniteams follow` alone) answers with `source: "follow"` and no recordings.
+- A 1:1 push names no chat: the header takes the 1:1 chat id built from its two participants. With someone
+  who has no org id (a guest) there is none: `thread` is empty, and MCP reads the call with `thread_id` `""`
+  and its `call`.
+
+**Limits**
+- The follower is you: it joins as your account, inside your one participant entry.
+- Up to 4 people talking at once: a 5th talking over 4 others is lost (server limit).
+- Only calls joined after the trigger starts: a call already running sends no push to replay.
+- Text only. From end of speech to line written: median ~1 s, p90 under 2 s in the live runs (spec 044).
+- Protocol breakage: a failed join is logged (`follow_join_failed`, its cause) and written in the header
+  (`"join": "failed"`, `error`); `--capture` is the diagnostic.
+
+`follow --capture DIR` is a debug tool for protocol breakage: each follower the trigger starts writes under
+`DIR/<call>/<endpoint>/`, one directory per join (a retry or a re-attach gets its own), the call's RTP
+headers and **payloads** (so the audio, `ssrc-<n>.pay`), RTCP arrivals, its
+Trouter callbacks (diagnosis headers only) and every SDP, SRTP keys redacted, in the layout grill-room's S18
+`analyze.py` reads. Under the archiver, set `MINITEAMS_FOLLOW_CAPTURE=DIR` instead: the trigger passes it on
+each follower's command line.
+Delete it after use; without it nothing but text is written.
 
 `dump --jsonl` emits one full-detail record per message (raw resource + resolved sender/thread
 + attachment refs + reactions), every message type, no media download — pipe-friendly.
@@ -518,7 +603,8 @@ live browser session. `MINITEAMS_ASYNCGW_HOST` sets the custom emoji host (defau
 ## Dev
 
 ```sh
-uv run ruff check . && uv run mypy src && uv run pytest
+uv run ruff check . && uv run mypy src && uv run --extra transcript pytest   # full suite
+uv run pytest                     # without the transcript extra: the follower's tests skip (fail under CI=1)
 uv run --with playwright pytest tests/test_browser*.py   # opt-in headless Chrome; skipped without playwright, fails under CI=1
 uv run --with playwright playwright install firefox     # scroll and typing tests also run in Firefox; skipped without it
 pre-commit run --all-files

@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -603,6 +604,253 @@ def test_transcript_name_cannot_leave_the_media_folder(settings: Settings, recor
     manifest.write_text(json.dumps(entries))
     out = _call(_server(settings, recorded), "read_transcript", thread_id=MEETING, message_id="r1")
     assert out["error"] and "outside the media folder" in out["text"]
+
+
+# --- read_transcript: followed calls (spec 044) ---
+
+CALL = "11111111-2222-4333-8444-555555555555"
+CALL_FAILED = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+CALL_ELSEWHERE = "99999999-8888-4777-8666-555555555555"
+
+
+def _utterance(n: int, speaker: str = "Speaker A") -> dict[str, Any]:
+    return {
+        "t": f"2026-07-02T11:00:{n:02d}.000Z",
+        "end": f"2026-07-02T11:00:{n:02d}.900Z",
+        "speaker": speaker,
+        "mri": "8:orgid:a",
+        "text": f"line {n}",
+        "engine": "parakeet",
+    }
+
+
+def _followed(data: Path, call: str, started: str, thread: str, lines: int, **header: Any) -> Path:
+    """A transcript as the follower writes it: header, then one object per line."""
+    month = data / "follow" / "2026-07"
+    month.mkdir(parents=True, exist_ok=True)
+    path = month / f"{started}-{call}.ndjson"
+    iso = f"{started[:4]}-{started[4:6]}-{started[6:11]}:{started[11:13]}:{started[13:15]}.000Z"
+    head = {"call": call, "thread": thread, "kind": "meeting", "started": iso, "engine": "parakeet"}
+    rows = [{**head, **header}] + [_utterance(n) for n in range(lines)]
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return path
+
+
+@pytest.fixture
+def followed(recorded: Path) -> Path:
+    _followed(recorded, CALL, "20260702T110000Z", MEETING, 3, join="ok")
+    _followed(recorded, CALL, "20260702T113000Z", MEETING, 2, join="ok")  # a rejoin: same call, new file
+    _followed(recorded, CALL_FAILED, "20260702T120000Z", MEETING, 0, join="failed", error="lobby timeout")
+    _followed(recorded, CALL_ELSEWHERE, "20260702T100000Z", GROUP, 1, join="ok")
+    return recorded
+
+
+def test_044_ac9_follows_listed_next_to_recordings(settings: Settings, followed: Path) -> None:
+    listing = _call(_server(settings, followed), "read_transcript", thread_id=MEETING)
+    assert [r["message_id"] for r in listing["recordings"]] == ["r1", "r2"]  # recordings unchanged
+    assert listing["follows"] == [
+        {
+            "call": CALL,
+            "kind": "meeting",
+            "started": "2026-07-02T11:00:00.000Z",
+            "join": "ok",
+            "lines": 3,
+            "live": False,
+        },
+        {
+            "call": CALL,
+            "kind": "meeting",
+            "started": "2026-07-02T11:30:00.000Z",
+            "join": "ok",
+            "lines": 2,
+            "live": False,
+        },
+        {  # 044-AC14: a failed join lists with its cause
+            "call": CALL_FAILED,
+            "kind": "meeting",
+            "started": "2026-07-02T12:00:00.000Z",
+            "join": "failed",
+            "lines": 0,
+            "live": False,
+            "error": "lobby timeout",
+        },
+    ]
+    other = _call(_server(settings, followed), "read_transcript", thread_id=GROUP)
+    assert other["recordings"] == [] and [f["call"] for f in other["follows"]] == [CALL_ELSEWHERE]
+
+
+def test_044_ac9_no_follows(settings: Settings, recorded: Path) -> None:
+    assert _call(_server(settings, recorded), "read_transcript", thread_id=MEETING)["follows"] == []
+    (recorded / "follow" / "2026-07").mkdir(parents=True)  # the dir exists, holds nothing of this chat
+    _followed(recorded, CALL_ELSEWHERE, "20260702T100000Z", GROUP, 1, join="ok")
+    assert _call(_server(settings, recorded), "read_transcript", thread_id=MEETING)["follows"] == []
+
+
+def test_044_ac9_call_lines_paged_across_joins(settings: Settings, followed: Path) -> None:
+    server = _server(settings, followed)
+    page = _call(server, "read_transcript", thread_id=MEETING, call=CALL, limit=4)
+    assert page["call"] == CALL and page["thread"] == MEETING and page["kind"] == "meeting"
+    assert page["engine"] == "parakeet" and not page["live"]
+    assert page["joins"] == [
+        {"started": "2026-07-02T11:00:00.000Z", "join": "ok"},
+        {"started": "2026-07-02T11:30:00.000Z", "join": "ok"},
+    ]
+    assert page["total"] == 5 and page["next_offset"] == 4
+    assert [line["text"] for line in page["lines"]] == ["line 0", "line 1", "line 2", "line 0"]
+    assert page["lines"][0] == _utterance(0)  # as written
+    rest = _call(server, "read_transcript", thread_id=MEETING, call=CALL, offset=4, limit=4)
+    assert [line["text"] for line in rest["lines"]] == ["line 1"] and "next_offset" not in rest
+    failed = _call(server, "read_transcript", thread_id=MEETING, call=CALL_FAILED)
+    failed_join = {"started": "2026-07-02T12:00:00.000Z", "join": "failed", "error": "lobby timeout"}
+    assert failed["joins"] == [failed_join]
+    assert failed["lines"] == [] and failed["total"] == 0
+
+
+def test_044_ac9_a_file_still_being_written(settings: Settings, recorded: Path) -> None:
+    from miniteams import follow as F
+
+    path = _followed(recorded, CALL, "20260702T110000Z", MEETING, 2, join="ok")
+    with path.open("ab") as f:
+        f.write(json.dumps(_utterance(2)).encode()[:25])  # a line caught half written
+    server = _server(settings, recorded)
+    fd = F.take_lock(F.lock_path(settings, CALL))  # the follower is running
+    assert fd is not None
+    try:
+        listing = _call(server, "read_transcript", thread_id=MEETING)
+        assert listing["follows"][0]["lines"] == 2 and listing["follows"][0]["live"]
+        page = _call(server, "read_transcript", thread_id=MEETING, call=CALL)
+        assert page["live"] and page["total"] == 2
+        assert [r["text"] for r in page["lines"]] == ["line 0", "line 1"]
+        with path.open("ab") as f:
+            f.write(json.dumps(_utterance(2)).encode()[25:])  # whole object, newline not yet there
+        assert _call(server, "read_transcript", thread_id=MEETING, call=CALL)["total"] == 2
+        assert _call(server, "read_transcript", thread_id=MEETING)["follows"][0]["lines"] == 2
+        with path.open("ab") as f:
+            f.write(b"\n")  # the line lands
+        assert _call(server, "read_transcript", thread_id=MEETING, call=CALL)["total"] == 3
+    finally:
+        os.close(fd)
+    assert not _call(server, "read_transcript", thread_id=MEETING)["follows"][0]["live"]  # follower gone
+
+
+def test_044_ac9_only_the_newest_file_of_a_call_is_live(settings: Settings, followed: Path) -> None:
+    from miniteams import follow as F
+
+    fd = F.take_lock(F.lock_path(settings, CALL))
+    assert fd is not None
+    try:
+        follows = _call(_server(settings, followed), "read_transcript", thread_id=MEETING)["follows"]
+    finally:
+        os.close(fd)
+    assert [(f["started"], f["live"]) for f in follows if f["call"] == CALL] == [
+        ("2026-07-02T11:00:00.000Z", False),
+        ("2026-07-02T11:30:00.000Z", True),
+    ]
+
+
+def test_044_ac9_a_header_still_being_written_is_skipped(settings: Settings, recorded: Path) -> None:
+    month = recorded / "follow" / "2026-07"
+    month.mkdir(parents=True)
+    path = month / f"20260702T110000Z-{CALL}.ndjson"
+    whole = json.dumps({"call": CALL, "thread": MEETING, "kind": "meeting", "started": "x", "engine": "e"})
+    server = _server(settings, recorded)
+    for partial in (whole[:12], whole):  # cut inside, then before its newline
+        path.write_text(partial)
+        assert _call(server, "read_transcript", thread_id=MEETING)["follows"] == []
+        out = _call(server, "read_transcript", thread_id=MEETING, call=CALL)
+        assert out["error"] and "no followed call" in out["text"]
+
+
+def test_044_ac9_stray_garbled_and_unreadable_files(settings: Settings, followed: Path) -> None:
+    month = followed / "follow" / "2026-07"
+    (month / "notes-about-it.ndjson").write_text("{}\n")  # not named after a call: never listed
+    path = next(month.glob(f"20260702T110000Z-{CALL}.ndjson"))
+    path.write_text(path.read_text().replace(json.dumps(_utterance(1)), "{garbled"))  # a damaged line
+    server = _server(settings, followed)
+    page = _call(server, "read_transcript", thread_id=MEETING, call=CALL)
+    assert page["total"] == 4 and "line 1" not in [r["text"] for r in page["lines"][:2]]
+    listed = _call(server, "read_transcript", thread_id=MEETING)["follows"]
+    assert sum(f["lines"] for f in listed if f["call"] == CALL) == page["total"]  # parseable lines only
+    (month / f"20260702T130000Z-{CALL_ELSEWHERE}.ndjson").mkdir()  # unreadable as a file
+    listing = _call(server, "read_transcript", thread_id=GROUP)
+    assert [f["call"] for f in listing["follows"]] == [CALL_ELSEWHERE]  # the readable one still listed
+    out = _call(server, "read_transcript", thread_id=GROUP, call=CALL_ELSEWHERE)
+    assert out["error"] and "unreadable transcript" in out["text"]
+
+
+@pytest.mark.parametrize("written", ["sorted", "unsorted"])
+def test_044_ac9_a_1to1_follow_is_listed_under_its_chat(
+    settings: Settings, recorded: Path, written: str
+) -> None:
+    """Teams does not always sort a 1:1's member ids: a header and the archive may spell it apart."""
+    a, b = "00000000-0000-4000-8000-0000000000a0", "00000000-0000-4000-8000-0000000000b0"
+    spelled = {"sorted": f"19:{a}_{b}@unq.gbl.spaces", "unsorted": f"19:{b}_{a}@unq.gbl.spaces"}
+    header_id, chat_id = spelled[written], spelled["unsorted" if written == "sorted" else "sorted"]
+    index = Index(recorded)
+    index.upsert_chat(chat_id, label="dm", raw={})
+    index.close()
+    _followed(recorded, CALL, "20260702T110000Z", header_id, 2, join="ok", kind="1:1")
+    server = _server(settings, recorded)
+    listing = _call(server, "read_transcript", thread_id=chat_id)
+    assert [(f["call"], f["kind"], f["lines"]) for f in listing["follows"]] == [(CALL, "1:1", 2)]
+    page = _call(server, "read_transcript", thread_id=chat_id, call=CALL)
+    assert not page["error"] and page["thread"] == header_id and page["total"] == 2
+
+
+def test_044_ac9_a_call_of_another_chat_is_refused(settings: Settings, followed: Path) -> None:
+    out = _call(_server(settings, followed), "read_transcript", thread_id=GROUP, call=CALL)
+    assert out["error"] and out["text"] == f"call {CALL} belongs to another chat"
+    assert MEETING not in out["text"]
+    blank = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+    _followed(followed, blank, "20260702T140000Z", "", 1, join="ok")  # a header naming no chat
+    refused = _call(_server(settings, followed), "read_transcript", thread_id=GROUP, call=blank)
+    assert refused["error"] and "belongs to another chat" in refused["text"]
+    read = _call(_server(settings, followed), "read_transcript", thread_id="", call=blank)  # a guest's 1:1
+    assert not read["error"] and read["total"] == 1
+
+
+def test_044_ac9_an_unreadable_lock_costs_only_live(settings: Settings, followed: Path) -> None:
+    from miniteams import follow as F
+
+    lock = F.lock_path(settings, CALL)
+    lock.parent.mkdir(parents=True)
+    lock.write_text("1\n")
+    lock.chmod(0o400)  # EACCES on the probe's O_RDWR open
+    try:
+        server = _server(settings, followed)
+        with capture_logs() as logs:
+            listing = _call(server, "read_transcript", thread_id=MEETING)
+            page = _call(server, "read_transcript", thread_id=MEETING, call=CALL)
+    finally:
+        lock.chmod(0o600)
+    assert [r["message_id"] for r in listing["recordings"]] == ["r1", "r2"]
+    assert [f["live"] for f in listing["follows"]] == [False, False, False]
+    assert not page["error"] and page["total"] == 5 and page["live"] is False
+    assert {e["event"] for e in logs} >= {"follow_live_check_failed"}
+
+
+@pytest.mark.parametrize("bad", ["../../index", "*", f"{CALL}/..", CALL[:-1], f"{CALL}.ndjson"])
+def test_044_ac9_a_bad_call_id_reads_nothing(
+    settings: Settings, followed: Path, bad: str, monkeypatch
+) -> None:
+    globbed: list[str] = []
+    real_glob = Path.glob
+
+    def spy(self: Path, pattern: str, **kw: Any) -> Any:
+        globbed.append(pattern)
+        return real_glob(self, pattern, **kw)
+
+    monkeypatch.setattr(Path, "glob", spy)
+    out = _call(_server(settings, followed), "read_transcript", thread_id=MEETING, call=bad)
+    assert out["error"] and "not a call id" in out["text"] and globbed == []
+
+
+def test_044_ac9_unknown_call_and_exclusive_arguments(settings: Settings, followed: Path) -> None:
+    server = _server(settings, followed)
+    unknown = _call(server, "read_transcript", thread_id=MEETING, call="00000000-0000-4000-8000-000000000000")
+    assert unknown["error"] and "no followed call" in unknown["text"]
+    both = _call(server, "read_transcript", thread_id=MEETING, call=CALL, message_id="r1")
+    assert both["error"] and "not both" in both["text"]
 
 
 # --- sign-in ---
@@ -2109,3 +2357,43 @@ def test_a_card_for_someone_else_is_never_asked(settings: Settings, data: Path) 
     for _ in range(2):
         assert _cards_of(_call(server, "read_messages", thread_id=PRIVATE))["10"] == [_line("OPEN")]
     assert bot.invokes == 0 and bot.lookups == 0 and provider.calls == 2
+
+
+def test_044_follows_read_from_a_data_dir_without_an_archive(settings: Settings, tmp_path: Path) -> None:
+    """`miniteams follow` alone writes no index.db: its calls are still listed and read, recordings []."""
+    from miniteams import follow as F
+
+    data = tmp_path / "followonly"
+    _followed(data, CALL, "20260702T110000Z", MEETING, 2, join="ok")
+    server = _server(settings, data)
+    listing = _call(server, "read_transcript", thread_id=MEETING)
+    assert listing["source"] == "follow" and listing["recordings"] == []
+    assert [(f["call"], f["lines"], f["live"]) for f in listing["follows"]] == [(CALL, 2, False)]
+    fd = F.take_lock(
+        F.lock_path(settings, CALL)
+    )  # live: the lock in the config dir, as the follower holds it
+    assert fd is not None
+    try:
+        page = _call(server, "read_transcript", thread_id=MEETING, call=CALL)
+    finally:
+        os.close(fd)
+    assert page["source"] == "follow" and page["total"] == 2 and page["live"]
+    recording = _call(server, "read_transcript", thread_id=MEETING, message_id="r1")
+    assert recording["error"] and "unavailable" in recording["text"]  # recordings need the index
+    assert sorted(p.name for p in data.iterdir()) == ["follow"]  # nothing created
+
+
+def test_044_a_hung_archive_is_no_follow_only_dir(settings: Settings, followed: Path) -> None:
+    """Only a missing index means a follow-only dir: a hung or broken one stays an unavailable archive."""
+    server = _server(settings, followed)
+
+    def broken() -> None:
+        raise OSError("stale file handle")
+
+    server.archive._probe = broken
+    out = _call(server, "read_transcript", thread_id=MEETING)
+    assert out["error"] and "unavailable" in out["text"]
+
+
+def test_044_live_needs_settings_for_the_lock_dir(followed: Path) -> None:
+    assert M.Archive(followed)._live(CALL) is False

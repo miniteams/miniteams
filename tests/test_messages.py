@@ -5,12 +5,14 @@ import gzip
 import json
 from typing import Any
 
+import pytest
+
 from miniteams import messages as M
 from miniteams.compose import reply_quote
 from miniteams.directory import Directory
 from miniteams.messages import (
-    _decode_body,
     _print_reactions,
+    decode_body,
     emit_raw_delivery,
     emit_raw_named,
     event_to_record,
@@ -33,29 +35,29 @@ def b64(obj: Any) -> str:
 
 def test_decode_plain_body() -> None:
     req = {"body": json.dumps({"type": "EventMessage"})}
-    assert _decode_body(req) == {"type": "EventMessage"}
+    assert decode_body(req) == {"type": "EventMessage"}
 
 
 def test_decode_gzip_header() -> None:
     inner = {"type": "EventMessage", "resource": {"x": 1}}
     req = {"headers": {"X-Microsoft-Skype-Content-Encoding": "gzip"}, "body": gzip_b64(inner)}
-    assert _decode_body(req) == inner
+    assert decode_body(req) == inner
 
 
 def test_decode_cp_member_is_gzipped() -> None:
     payload = {"type": "EventMessage", "resource": {"a": 2}}
     req = {"body": json.dumps({"cp": gzip_b64(payload)})}
-    assert _decode_body(req) == payload
+    assert decode_body(req) == payload
 
 
 def test_decode_gp_member_is_plain_base64() -> None:
     payload = {"type": "EventMessage", "resource": {"b": 3}}
     req = {"body": json.dumps({"gp": b64(payload)})}
-    assert _decode_body(req) == payload
+    assert decode_body(req) == payload
 
 
 def test_decode_empty_body_returns_none() -> None:
-    assert _decode_body({}) is None
+    assert decode_body({}) is None
 
 
 def test_strip_html_unescapes_and_removes_tags() -> None:
@@ -368,3 +370,24 @@ def test_malformed_activity_is_none() -> None:
         ("ThreadActivity/MemberJoined", _added(_ANN, _BOB)),
     ]:
         assert M.parse_activity(msgtype, content) is None, content
+
+
+def test_a_gzip_bomb_or_trailing_data_is_unreadable() -> None:
+    """Spec 044: a delivery body inflates to at most GUNZIP_MAX; past it, truncated, corrupt or followed
+    by more data, it is refused as unreadable (ValueError), never decompressed whole."""
+    from miniteams.messages import GUNZIP_MAX, gunzip_b64
+
+    bomb = base64.b64encode(gzip.compress(b"0" * (GUNZIP_MAX + 1))).decode()
+    whole = gzip.compress(b'{"a": 1}')
+    for bad in (
+        bomb,
+        base64.b64encode(whole + whole).decode(),  # a second member
+        base64.b64encode(whole[:-6]).decode(),  # cut short
+        base64.b64encode(b"\x1f\x8b\x08\x00garbage").decode(),
+    ):
+        with pytest.raises(ValueError):
+            gunzip_b64(bad)
+    assert gunzip_b64(base64.b64encode(gzip.compress(b"0" * GUNZIP_MAX)).decode()) == "0" * GUNZIP_MAX
+    req = {"headers": {"X-Microsoft-Skype-Content-Encoding": "gzip"}, "body": bomb}
+    with pytest.raises(ValueError):
+        decode_body(req)

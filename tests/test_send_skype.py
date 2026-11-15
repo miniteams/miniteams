@@ -175,6 +175,7 @@ def test_exchange_skype_token_tokens_shape(settings: Settings, monkeypatch) -> N
     )
     out = skype.exchange_skype_token(settings, "aad")
     assert out == {"skype_token": "ST", "expires_in": 3600, "region": "fr"}
+    assert settings.conversation_url == ""
 
 
 def test_exchange_skype_token_legacy_shape(settings: Settings, monkeypatch) -> None:
@@ -343,3 +344,12 @@ def test_too_long_caps_the_posted_html_bytes() -> None:
     assert send.too_long("<" * (cap // 4 + 1))  # &lt; is four bytes
     assert not send.too_long("<b>" * (cap // 3), is_html=True)
     assert send.too_long("é" * (cap // 2 + 1))
+
+
+def test_exchange_skype_token_names_the_conversation_service(settings: Settings, monkeypatch) -> None:
+    """044-AC1: the follower places its calls on the account's own conversation service."""
+    url = "https://api-emea.flightproxy.teams.microsoft.invalid/api/v2/epconv"
+    reply = {"tokens": {"skypeToken": "ST"}, "regionGtms": {"calling_conversationServiceUrl": url}}
+    monkeypatch.setattr(skype.httpx, "post", lambda *a, **k: _Resp(reply))
+    skype.exchange_skype_token(settings, "aad")
+    assert settings.conversation_url == url

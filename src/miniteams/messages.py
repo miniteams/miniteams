@@ -7,11 +7,11 @@ snippet, deleted/edited, mentions, `fold`) serve the stream, the web views, the 
 """
 
 import base64
-import gzip
 import html
 import json
 import re
 import unicodedata
+import zlib
 from collections import Counter
 from collections.abc import Callable
 from typing import Any, NamedTuple
@@ -248,24 +248,46 @@ def reaction_key(key: str) -> str | None:
     return "-".join(f"{ord(c):04x}" for c in chars) + "_" + words
 
 
-def _gunzip_b64(data: str) -> str:
-    return gzip.decompress(base64.b64decode(data)).decode("utf-8")
+GUNZIP_MAX = 4 << 20  # the largest delivery seen live decompressed to 9 KB
 
 
-def _decode_body(req: dict[str, Any]) -> dict[str, Any] | None:
-    """Unwrap the three documented encodings into the real payload object."""
+def gunzip_b64(data: str) -> str:
+    """ValueError past GUNZIP_MAX (a gzip bomb) or with data left after the gzip stream."""
+    inflate = zlib.decompressobj(31)  # 16 + 15: gzip header, the largest window
+    try:
+        out = inflate.decompress(base64.b64decode(data), GUNZIP_MAX)
+    except zlib.error as exc:
+        raise ValueError(f"unreadable gzip body: {exc}") from exc
+    if inflate.unconsumed_tail or inflate.unused_data or not inflate.eof:
+        raise ValueError("gzip body over the size limit, truncated or followed by other data")
+    return out.decode("utf-8")
+
+
+def delivery_json(req: dict[str, Any]) -> Any:
+    """A delivery's JSON body, its transport gzip undone; a `cp`/`gp` wrapper stays (unwrap_payload)."""
     body = req.get("body")
     if not body:
         return None
     headers = {k.lower(): v for k, v in (req.get("headers") or {}).items()}
     if headers.get("x-microsoft-skype-content-encoding") == "gzip":
-        body = _gunzip_b64(body)
-    obj = json.loads(body)
+        body = gunzip_b64(body)
+    return json.loads(body)
+
+
+def unwrap_payload(obj: dict[str, Any]) -> Any:
+    """The payload a `cp` (base64 gzip JSON) or `gp` (base64 JSON) wrapper carries; `obj` without one."""
+    if "cp" in obj:
+        return json.loads(gunzip_b64(obj["cp"]))
+    if "gp" in obj:
+        return json.loads(base64.b64decode(obj["gp"]).decode("utf-8"))
+    return obj
+
+
+def decode_body(req: dict[str, Any]) -> dict[str, Any] | None:
+    """Unwrap the three documented encodings into the real payload object."""
+    obj = delivery_json(req)
     if isinstance(obj, dict):
-        if "cp" in obj:  # base64 → gunzip → real payload
-            obj = json.loads(_gunzip_b64(obj["cp"]))
-        elif "gp" in obj:  # base64 → parse directly
-            obj = json.loads(base64.b64decode(obj["gp"]).decode("utf-8"))
+        obj = unwrap_payload(obj)
     return obj if isinstance(obj, dict) else None
 
 
@@ -578,7 +600,7 @@ async def print_resource(resource: dict[str, Any], directory: Directory) -> None
 async def emit_raw_delivery(req: dict[str, Any]) -> None:
     """Emit one inbound delivery verbatim as NDJSON — every endpoint, decoded, no filtering."""
     try:
-        body: Any = _decode_body(req)
+        body: Any = decode_body(req)
     except Exception as exc:  # noqa: BLE001 — keep the firehose flowing on a bad frame
         body = {"_decode_error": str(exc), "_raw": req.get("body")}
     record = {
@@ -694,7 +716,7 @@ def decode_event(req: dict[str, Any]) -> dict[str, Any] | None:
         log.debug("delivery_ignored", endpoint=endpoint)
         return None
     try:
-        obj = _decode_body(req)
+        obj = decode_body(req)
     except Exception as exc:  # noqa: BLE001 — never let one bad frame kill the stream
         log.warning("decode_failed", error=str(exc))
         return None

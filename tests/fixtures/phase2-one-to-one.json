@@ -1,0 +1,85 @@
+{
+  "callInvitation": {
+    "callModalities": [
+      "Audio"
+    ],
+    "clientContentForMediaController": {
+      "controlVideoStreaming": "https://trouter.invalid/v4/f/s/callAgent/<uuid0>/<tag>/call/controlVideoStreaming/",
+      "csrcInfo": "https://trouter.invalid/v4/f/s/callAgent/<uuid0>/<tag>/call/csrcInfo/",
+      "dominantSpeakerInfo": "https://trouter.invalid/v4/f/s/callAgent/<uuid0>/<tag>/call/dominantSpeakerInfo/"
+    },
+    "links": {
+      "acceptance": "https://trouter.invalid/v4/f/s/callAgent/<uuid0>/<tag>/call/acceptance/",
+      "end": "https://trouter.invalid/v4/f/s/callAgent/<uuid0>/<tag>/call/end/",
+      "mediaAnswer": "https://trouter.invalid/v4/f/s/callAgent/<uuid0>/<tag>/call/mediaAnswer/",
+      "progress": "https://trouter.invalid/v4/f/s/callAgent/<uuid0>/<tag>/call/progress/",
+      "redirection": "https://trouter.invalid/v4/f/s/callAgent/<uuid0>/<tag>/call/redirection/"
+    },
+    "mediaContent": {
+      "blob": "<sdp>",
+      "contentType": "application/sdp"
+    },
+    "pstnContent": {
+      "emergencyCallCountry": "",
+      "platformName": "teams-cli",
+      "publicApiCall": false
+    },
+    "replaces": null,
+    "transferor": null
+  },
+  "capabilities": null,
+  "clientEndpointCapabilities": 9336554,
+  "conversationRequest": {
+    "conversationType": null,
+    "links": {
+      "addModalityFailure": "https://trouter.invalid/v4/f/s/callAgent/<uuid0>/<tag>/conversation/addModalityFailure/",
+      "addModalitySuccess": "https://trouter.invalid/v4/f/s/callAgent/<uuid0>/<tag>/conversation/addModalitySuccess/",
+      "addParticipantFailure": "https://trouter.invalid/v4/f/s/callAgent/<uuid0>/<tag>/conversation/addParticipantFailure/",
+      "addParticipantSuccess": "https://trouter.invalid/v4/f/s/callAgent/<uuid0>/<tag>/conversation/addParticipantSuccess/",
+      "confirmUnmute": "https://trouter.invalid/v4/f/s/callAgent/<uuid0>/<tag>/conversation/confirmUnmute/",
+      "conversationEnd": "https://trouter.invalid/v4/f/s/callAgent/<uuid0>/<tag>/conversation/conversationEnd/",
+      "conversationUpdate": "https://trouter.invalid/v4/f/s/callAgent/<uuid0>/<tag>/conversation/conversationUpdate/",
+      "localParticipantUpdate": "https://trouter.invalid/v4/f/s/callAgent/<uuid0>/<tag>/conversation/localParticipantUpdate/",
+      "receiveMessage": "https://trouter.invalid/v4/f/s/callAgent/<uuid0>/<tag>/conversation/receiveMessage/"
+    },
+    "properties": {
+      "allowConversationWithoutHost": true,
+      "enableGroupCallEventMessages": true,
+      "enableGroupCallMeetupGeneration": true,
+      "enableGroupCallUpgradeMessage": false
+    },
+    "roster": {
+      "rosterUpdate": "https://trouter.invalid/v4/f/s/callAgent/<uuid0>/<tag>/conversation/rosterUpdate/",
+      "type": "Full"
+    },
+    "subject": "",
+    "suppressDialout": true
+  },
+  "debugContent": {
+    "causeId": "<id>",
+    "ecsEtag": "\"0\""
+  },
+  "endpointCapabilities": 73463,
+  "endpointMetadata": {
+    "holographicCapabilities": 3
+  },
+  "endpointState": {
+    "endpointProperties": {
+      "additionalEndpointProperties": {
+        "infoShownInReportMode": "FullInformation"
+      }
+    },
+    "endpointStateSequenceNumber": 0
+  },
+  "groupContext": null,
+  "participants": {
+    "from": {
+      "displayName": "Me Synthetic",
+      "endpointId": "<uuid0>",
+      "id": "8:orgid:<uuid1>",
+      "languageId": "en-US",
+      "participantId": "<uuid2>"
+    },
+    "to": []
+  }
+}

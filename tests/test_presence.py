@@ -162,6 +162,17 @@ def test_parse_unknown_and_malformed_are_not_offline() -> None:
     assert P.parse("not a list") == {}
 
 
+def test_044_same_chat_takes_a_1to1_in_either_spelling_and_case() -> None:
+    a, b, c = (m.removeprefix("8:orgid:") for m in (ME, ANN, BOB))
+    ab, ba = f"19:{a}_{b}@unq.gbl.spaces", f"19:{b}_{a}@unq.gbl.spaces"
+    assert P.same_chat(ab, ba) and P.same_chat(ba, ab) and P.same_chat(ab, ab)
+    assert P.same_chat(ab.upper(), ba) and P.same_chat(ab, ba.upper()) and P.same_chat(ab.upper(), ab)
+    assert not P.same_chat(ab, f"19:{a}_{c}@unq.gbl.spaces") and not P.same_chat("", ab)
+    group = "19:AbC@thread.v2"  # not a 1:1: exact, case included
+    assert P.same_chat(group, group) and not P.same_chat(group, group.lower())
+    assert not P.same_chat(group.lower(), group)
+
+
 def test_dm_peer_is_the_other_member_only() -> None:
     oid = lambda m: m.removeprefix("8:orgid:")  # noqa: E731
     assert P.dm_peer(f"19:{oid(ME)}_{oid(ANN)}@unq.gbl.spaces", ME) == ANN
