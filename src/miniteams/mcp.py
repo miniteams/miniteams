@@ -22,7 +22,7 @@ import structlog
 
 from . import __version__
 from .archive import RefreshingToken
-from .archive_store import chat_dir_name, find_chat_dir, read_chats, read_meta, search_chat
+from .archive_store import chat_dir_name, find_chat_dir, open_untouched, read_chats, read_meta, search_chat
 from .auth import AuthExpired, AuthUnavailable, TokenSource, self_mri, token_source
 from .card_refresh import _BUSY_TIMEOUT, CardRefresher, Cards, CardStore
 from .chats import chat_kind, is_system, last_activity, parse_when
@@ -670,7 +670,8 @@ class Archive:
         self, chats: list[dict[str, Any]], thread_id: str, since: str, until: str, floor: str
     ) -> Iterator[tuple[dict[str, str], list[dict[str, str]]]]:
         """(hit head, spoken lines) per recording transcript that may hold a line inside [since, until).
-        A recording message is posted at the recording's end: its start is `composetime - duration`."""
+        A turn counts from the recording's start: its message's `RecordingContent@timestamp`, else
+        `composetime - duration` (the message carrying the transcript is posted minutes after the end)."""
         for chat in chats:
             chat_id = str(chat["id"])
             if thread_id:
@@ -684,20 +685,27 @@ class Archive:
             except (OSError, ValueError) as exc:
                 log.warning("transcript_search_skipped", path=str(media / "recordings.json"), error=str(exc))
                 continue
+            found = []
             for entry in entries:
                 try:
                     end = parse_when(str(entry.get("composetime")))
                     path = _transcript_json(media, entry)
                     span = _offset(entry.get("duration"))
-                    start = end - span if span is not None else end
-                    first, last = _iso_z(start), _iso_z(end)
+                    fallback = end - span if span is not None else end
+                    last = _iso_z(end)
+                    _iso_z(fallback)
                 # A duration can parse and still leave the calendar: OverflowError.
                 except (ValueError, OverflowError) as exc:
                     log.warning("transcript_search_skipped", path=str(media), error=str(exc))
                     continue
-                if path is None or (until and first >= until):
-                    continue
-                if span is not None and last < since:
+                # A start is never after `fallback`, so turns end by `end`; without a duration they may
+                # run past it: no lower bound.
+                if path is not None and (span is None or last >= since):
+                    found.append((entry, path, fallback))
+            starts = self._recording_starts(media.parent, [str(f[0].get("message_id")) for f in found])
+            for entry, path, fallback in found:
+                start = _recording_start(starts.get(str(entry.get("message_id"))), fallback)
+                if until and _iso_z(start) >= until:
                     continue
                 try:
                     turns = json.loads(path.read_text()).get("entries") or []
@@ -726,6 +734,34 @@ class Archive:
                 if len(lines) < len(turns):
                     log.warning("transcript_turns_dropped", path=str(path), turns=len(turns) - len(lines))
                 yield head, lines
+
+    @staticmethod
+    def _recording_starts(chat_dir: Path, message_ids: list[str]) -> dict[str, str]:
+        """message id -> its `RecordingContent@timestamp` in the chat's messages; {} when unreadable."""
+        path = chat_dir / "messages.db"
+        if not message_ids or not path.is_file():
+            return {}
+        try:
+            db = open_untouched(path)
+            try:
+                rows = db.execute(
+                    f"SELECT id, raw FROM messages WHERE id IN ({','.join('?' * len(message_ids))})",
+                    message_ids,
+                ).fetchall()
+            finally:
+                db.close()
+        except sqlite3.Error as exc:
+            log.warning("recording_starts_unreadable", path=str(path), error=str(exc))
+            return {}
+        starts = {}
+        for mid, raw in rows:
+            try:
+                found = _STARTED_RE.search(str(json.loads(raw).get("content") or ""))
+            except ValueError, AttributeError:
+                continue
+            if found:
+                starts[mid] = found.group(1)
+        return starts
 
 
 def _ndjson(line: bytes) -> dict[str, Any] | None:
@@ -768,6 +804,22 @@ def _offset(value: Any) -> timedelta | None:
         return None
     days, hours, minutes, seconds = found.groups()
     return timedelta(days=int(days or 0), hours=int(hours), minutes=int(minutes), seconds=float(seconds))
+
+
+_STARTED_RE = re.compile(r'<RecordingContent\b[^>]*?\btimestamp="([^"]+)"')
+
+
+def _recording_start(started: str | None, fallback: datetime) -> datetime:
+    """`started` when it falls in the day up to `fallback` (`composetime - duration`, which the posting
+    delay only makes later; some messages carry year 1), else `fallback`."""
+    try:
+        at = parse_when(started) if started else None
+        # astimezone raises here, not in a later `_iso_z(start)`, for an aware time below year 1.
+        if at is not None and fallback - timedelta(days=1) <= at.astimezone(UTC) <= fallback:
+            return at
+    except ValueError, OverflowError:
+        pass
+    return fallback
 
 
 def _turn_time(start: datetime, offset: Any) -> str | None:

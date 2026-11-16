@@ -311,7 +311,7 @@ limit?)` scans both kinds of spoken transcript, case and accents ignored, newest
 | Source | Files | Line time |
 |---|---|---|
 | `follow` | `data/follow/<YYYY-MM>/<started>-<call>.ndjson`, calls `miniteams follow` transcribed (spec 044); complete lines only, so a call still running is searchable | the line's `t` |
-| `recording` | `<thread-id>/media/*.transcript.json` listed in `recordings.json` (the `.vtt` is not read) | the recording's start (`composetime`, posted at its end, minus `duration`; `composetime` alone without one) + the turn's `startOffset` |
+| `recording` | `<thread-id>/media/*.transcript.json` listed in `recordings.json` (the `.vtt` is not read) | the recording's start + the turn's `startOffset`. The start is its message's `RecordingContent@timestamp` when that falls in the day up to `composetime` minus `duration` (`composetime` without a duration); else `composetime` minus `duration` (the message is posted after the end), or `composetime` without a duration |
 
 - `since` / `until` filter on that line time; `since` defaults to 7 days back.
 - `thread_id`: one chat; a 1:1 matches in either member order.
@@ -322,7 +322,8 @@ limit?)` scans both kinds of spoken transcript, case and accents ignored, newest
   `message_id`.
 - No `index.db` (`miniteams follow` alone): followed calls are still searched, `source: "follow"`.
 - A malformed or unreadable file is skipped and logged (`transcript_search_skipped`), never fatal; turns
-  without a usable `startOffset` are dropped and counted per file (`transcript_turns_dropped`).
+  without a usable `startOffset` are dropped and counted per file (`transcript_turns_dropped`); a chat
+  whose messages cannot be read dates its recordings by the fallback (`recording_starts_unreadable`).
 
 ## Gotchas
 

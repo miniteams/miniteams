@@ -887,9 +887,17 @@ def _recording(
     when: str,
     turns: list[tuple[str, str, str]],
     duration: str = "1:00:00",
+    started: str | None = None,
 ) -> Path:
     """A recording of `chat` posted at `when`, its end: (startOffset, speaker, text) turns, added to its
-    manifest."""
+    manifest; with `started`, its message too, carrying that `RecordingContent@timestamp`."""
+    if started is not None:
+        content = f'<URIObject><RecordingContent timestamp="{started}" duration="{duration}"/></URIObject>'
+        store = ChatStore(data, chat)
+        store.insert_page(
+            [_msg(message_id, when, content=content, messagetype="RichText/Media_CallRecording")]
+        )
+        store.close()
     media = data / chat_dir_name(chat) / "media"
     media.mkdir(parents=True, exist_ok=True)
     path = media / f"{message_id}.transcript.json"
@@ -1120,6 +1128,160 @@ def test_045_ac2_recording_time_is_its_start_plus_the_offset(settings: Settings,
     assert [(h["message_id"], h["time"]) for h in hits] == [
         ("r1", "2026-07-03T10:00:02.000Z"),  # started 2026-07-02T10:00, a day and 2 s in
         ("r2", "2026-07-02T09:00:03.000Z"),  # no usable duration: counted from composetime
+    ]
+
+
+def test_045_ac2_recording_start_is_its_message_timestamp(settings: Settings, data: Path) -> None:
+    """The message carrying the transcript lands minutes after the end: its timestamp, not
+    `composetime - duration`, is the start; a year-1 or missing timestamp falls back."""
+    _recording(
+        data,
+        MEETING,
+        "r1",
+        "2026-07-02T12:06:30Z",
+        [("00:00:10", "Dee", "budget")],
+        "1:00:00",
+        started="2026-07-02T11:00:00.2541155Z",
+    )
+    _recording(
+        data,
+        MEETING,
+        "r2",
+        "2026-07-02T10:00:00Z",
+        [("00:00:10", "Dee", "budget")],
+        "1:00:00",
+        started="0001-01-01T00:00:00Z",
+    )
+    _recording(data, MEETING, "r3", "2026-07-02T08:00:00Z", [("00:00:10", "Dee", "budget")], "1:00:00")
+    hits = _search(_server(settings, data), "budget")["hits"]
+    assert [(h["message_id"], h["time"]) for h in hits] == [
+        ("r1", "2026-07-02T11:00:10.254Z"),
+        ("r2", "2026-07-02T09:00:10.000Z"),
+        ("r3", "2026-07-02T07:00:10.000Z"),  # no message row
+    ]
+
+
+@pytest.mark.parametrize(
+    "started",
+    [
+        "2026-07-02T12:30:00Z",  # after the post
+        "2026-07-02T11:59:00Z",  # after composetime - duration: turns would run past the post
+        "garbage",
+        "0001-01-01T00:30:00+01:00",  # below year 1 in UTC
+        "2026-06-30T11:00:00Z",  # over a day before composetime - duration
+    ],
+)
+def test_045_ac2_an_implausible_recording_start_falls_back(
+    settings: Settings, data: Path, started: str
+) -> None:
+    _recording(
+        data,
+        MEETING,
+        "r1",
+        "2026-07-02T12:00:00Z",
+        [("00:00:10", "Dee", "budget")],
+        "1:00:00",
+        started=started,
+    )
+    assert [h["time"] for h in _search(_server(settings, data), "budget")["hits"]] == [
+        "2026-07-02T11:00:10.000Z"
+    ]
+
+
+def test_045_ac2_a_recording_without_duration_is_read_past_its_post(settings: Settings, data: Path) -> None:
+    """Without a duration its start is its post time, and its turns run after it: no lower bound."""
+    _recording(data, MEETING, "r1", "2026-07-01T23:59:00Z", [("00:02:00", "Dee", "budget")], "soon")
+    hits = _search(_server(settings, data), "budget", since="2026-07-02")["hits"]
+    assert [h["time"] for h in hits] == ["2026-07-02T00:01:00.000Z"]
+
+
+def test_045_ac2_the_since_bound_holds_with_a_message_start(settings: Settings, data: Path) -> None:
+    """A recording ending before `since` is not read, its start taken from its message or not."""
+    path = _recording(
+        data,
+        MEETING,
+        "r1",
+        "2026-07-02T12:00:00Z",
+        [("00:59:50", "Dee", "budget")],
+        "1:00:00",
+        started="2026-07-02T10:58:00Z",
+    )
+    hits = _search(_server(settings, data), "budget", since="2026-07-02T11:57:00")["hits"]
+    assert [h["time"] for h in hits] == ["2026-07-02T11:57:50.000Z"]
+    path.write_text("{")  # read, it would be logged as skipped
+    with capture_logs() as logs:
+        assert _search(_server(settings, data), "budget", since="2026-07-02T12:00:01")["hits"] == []
+    assert not [e for e in logs if e["event"] == "transcript_search_skipped"]
+
+
+def test_045_ac2_the_until_bound_uses_the_message_start(settings: Settings, data: Path) -> None:
+    """Started before `until`, ended after it: its early turns are found."""
+    _recording(
+        data,
+        MEETING,
+        "r1",
+        "2026-07-02T12:00:00Z",
+        [("00:00:10", "Dee", "budget")],
+        "1:00:00",
+        started="2026-07-02T10:00:00Z",
+    )
+    hits = _search(_server(settings, data), "budget", until="2026-07-02T10:30:00")["hits"]
+    assert [h["time"] for h in hits] == ["2026-07-02T10:00:10.000Z"]
+
+
+def test_045_ac6_reading_starts_leaves_no_sidecar(settings: Settings, data: Path) -> None:
+    _recording(
+        data,
+        MEETING,
+        "r1",
+        "2026-07-02T12:00:00Z",
+        [("00:00:10", "Dee", "budget")],
+        started="2026-07-02T11:00:00Z",
+    )
+    chat = data / chat_dir_name(MEETING)
+    before = sorted(p.name for p in chat.iterdir())
+    assert _search(_server(settings, data), "budget")["hits"]
+    assert sorted(p.name for p in chat.iterdir()) == before
+
+
+@pytest.mark.parametrize(
+    ("posted", "duration"),
+    [
+        ("0001-01-01T00:30:00+01:00", "soon"),  # the post itself is below year 1 in UTC
+        ("0001-01-01T01:30:00+01:00", "1:00:00"),  # only its start is
+    ],
+)
+def test_045_ac6_a_composetime_below_year_one_is_skipped(
+    settings: Settings, data: Path, posted: str, duration: str
+) -> None:
+    _recording(data, MEETING, "r1", posted, [("00:00:10", "Dee", "budget a")], duration)
+    _recording(data, MEETING, "r2", "2026-07-02T12:00:00Z", [("00:00:10", "Dee", "budget b")])
+    with capture_logs() as logs:
+        out = _search(_server(settings, data), "budget", until="2026-07-03")
+    assert not out["error"] and [h["text"] for h in out["hits"]] == ["budget b"]
+    assert [e["event"] for e in logs if e["event"] == "transcript_search_skipped"] == [
+        "transcript_search_skipped"
+    ]
+
+
+def test_045_ac6_a_malformed_recording_message_falls_back(settings: Settings, data: Path) -> None:
+    _recording(data, MEETING, "r1", "2026-07-02T12:00:00Z", [("00:00:10", "Dee", "budget")], started="x")
+    db = sqlite3.connect(data / chat_dir_name(MEETING) / "messages.db")
+    db.execute("UPDATE messages SET raw = '[1' WHERE id = 'r1'")
+    db.commit()
+    db.close()
+    hits = _search(_server(settings, data), "budget")["hits"]
+    assert [h["time"] for h in hits] == ["2026-07-02T11:00:10.000Z"]
+
+
+def test_045_ac6_an_unreadable_message_store_falls_back(settings: Settings, data: Path) -> None:
+    _recording(data, MEETING, "r1", "2026-07-02T12:00:00Z", [("00:00:10", "Dee", "budget")], "1:00:00")
+    (data / chat_dir_name(MEETING) / "messages.db").write_bytes(b"not a database" * 100)
+    with capture_logs() as logs:
+        hits = _search(_server(settings, data), "budget")["hits"]
+    assert [h["time"] for h in hits] == ["2026-07-02T11:00:10.000Z"]
+    assert [e["event"] for e in logs if e["event"] == "recording_starts_unreadable"] == [
+        "recording_starts_unreadable"
     ]
 
 
