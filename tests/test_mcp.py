@@ -24,7 +24,7 @@ from miniteams import compose, render
 from miniteams import drafts as D
 from miniteams import mcp as M
 from miniteams import mcp_api as API
-from miniteams.archive_store import ChatStore, Index
+from miniteams.archive_store import ChatStore, Index, chat_dir_name
 from miniteams.auth import AuthExpired, AuthUnavailable
 from miniteams.config import Settings
 from miniteams.dump import epoch_seconds
@@ -145,7 +145,14 @@ def test_initialize_negotiates_the_version(settings: Settings, data: Path, asked
 
 def test_tools_list_and_read_only(settings: Settings, data: Path) -> None:
     tools = _rpc(_server(settings, data), "tools/list")["result"]["tools"]
-    reads = ["find_chats", "read_messages", "search_messages", "read_transcript", "login"]
+    reads = [
+        "find_chats",
+        "read_messages",
+        "search_messages",
+        "read_transcript",
+        "search_transcripts",
+        "login",
+    ]
     writes = [
         "send_message",
         "list_scheduled",
@@ -154,7 +161,7 @@ def test_tools_list_and_read_only(settings: Settings, data: Path) -> None:
         "update_message",
         "react",
     ]
-    assert [t["name"] for t in tools] == reads[:4] + writes + reads[4:]
+    assert [t["name"] for t in tools] == reads[:5] + writes + reads[5:]
     assert all(t["inputSchema"]["type"] == "object" for t in tools)
     assert [t["name"] for t in tools if not t["annotations"]["readOnlyHint"]] == writes
     destructive = ["cancel_scheduled", "update_scheduled", "update_message", "react"]
@@ -851,6 +858,396 @@ def test_044_ac9_unknown_call_and_exclusive_arguments(settings: Settings, follow
     assert unknown["error"] and "no followed call" in unknown["text"]
     both = _call(server, "read_transcript", thread_id=MEETING, call=CALL, message_id="r1")
     assert both["error"] and "not both" in both["text"]
+
+
+# --- search_transcripts (spec 045) ---
+
+SINCE = "2026-07-01"  # before every fixture line: the 7-day default would leave them all out
+
+
+def _spoken(data: Path, call: str, started: str, thread: str, lines: list[tuple[str, str, str]]) -> Path:
+    """A followed call: header, then (t, speaker, text) lines."""
+    month = data / "follow" / "2026-07"
+    month.mkdir(parents=True, exist_ok=True)
+    path = month / f"{started}-{call}.ndjson"
+    rows = [
+        {"call": call, "thread": thread, "kind": "meeting", "started": started, "engine": "e", "join": "ok"}
+    ]
+    rows += [
+        {"t": t, "end": t, "speaker": s, "mri": "8:orgid:s", "text": x, "engine": "e"} for t, s, x in lines
+    ]
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return path
+
+
+def _recording(
+    data: Path,
+    chat: str,
+    message_id: str,
+    when: str,
+    turns: list[tuple[str, str, str]],
+    duration: str = "1:00:00",
+) -> Path:
+    """A recording of `chat` posted at `when`, its end: (startOffset, speaker, text) turns, added to its
+    manifest."""
+    media = data / chat_dir_name(chat) / "media"
+    media.mkdir(parents=True, exist_ok=True)
+    path = media / f"{message_id}.transcript.json"
+    entries = [
+        {"text": x, "speakerDisplayName": s, "speakerId": f"{message_id}-{n}@t", "startOffset": o}
+        for n, (o, s, x) in enumerate(turns)
+    ]
+    path.write_text(json.dumps({"entries": entries}))
+    manifest = media / "recordings.json"
+    listed = json.loads(manifest.read_text()) if manifest.exists() else []
+    listed.append(
+        {
+            "title": "t",
+            "duration": duration,
+            "videos": [],
+            "transcripts": [path.name, f"{message_id}.transcript.vtt"],
+            "message_id": message_id,
+            "composetime": when,
+        }
+    )
+    manifest.write_text(json.dumps(listed))
+    return path
+
+
+def _search(server: M.Server, query: str, **args: Any) -> dict[str, Any]:
+    return _call(server, "search_transcripts", query=query, **{"since": SINCE, **args})
+
+
+@pytest.fixture
+def spoken(data: Path) -> Path:
+    _spoken(
+        data,
+        CALL,
+        "20260702T110000Z",
+        MEETING,
+        [
+            ("2026-07-02T11:00:01.000Z", "Ana", "Bonjour à tous"),
+            ("2026-07-02T11:00:05.000Z", "Ben", "Le BUDGET est validé"),
+            ("2026-07-02T11:00:09.000Z", "Ana", "Parfait, merci"),
+        ],
+    )
+    _spoken(
+        data, CALL_ELSEWHERE, "20260702T120000Z", GROUP, [("2026-07-02T12:00:00.000Z", "Cy", "budgét revu")]
+    )
+    _recording(
+        data,
+        MEETING,
+        "r1",
+        "2026-07-02T11:00:00.0000000Z",  # posted at the end of its hour: it started at 10:00
+        [("00:00:01", "Dee", "On commence"), ("00:30:00.5000000", "", "Un budget élevé")],
+    )
+    return data
+
+
+def test_045_ac1_folding_newest_first_across_sources(settings: Settings, spoken: Path) -> None:
+    server = _server(settings, spoken)
+    out = _search(server, "Budget")
+    assert not out["error"] and out["source"] == "archive" and out["since"] == "2026-07-01T00:00:00"
+    assert [(h["source"], h["time"]) for h in out["hits"]] == [
+        ("follow", "2026-07-02T12:00:00.000Z"),
+        ("follow", "2026-07-02T11:00:05.000Z"),
+        ("recording", "2026-07-02T10:30:00.500Z"),
+    ]
+    assert [h["text"] for h in _search(server, "ELEVE")["hits"]] == ["Un budget élevé"]
+    assert len(_search(server, "BUDGÉT")["hits"]) == 3  # the query folds too
+    assert _search(server, "absent")["hits"] == []
+
+
+def test_045_ac2_window_on_the_line_time(settings: Settings, spoken: Path) -> None:
+    server = _server(settings, spoken)
+    # The recording started at 10:00; its turn, 30 min in, is inside a window opening at 10:15.
+    late = _search(server, "budget", since="2026-07-02T10:15:00Z", until="2026-07-02T11:00:05Z")
+    assert [h["time"] for h in late["hits"]] == ["2026-07-02T10:30:00.500Z"]  # until is exclusive
+    early = _search(server, "budget", until="2026-07-02T10:30:00Z")
+    assert _search(server, "commence", until="2026-07-02T10:00:00Z")["hits"] == []  # starts at the bound
+    assert early["hits"] == []
+    day = _search(server, "budget", since="2026-07-02", until="2026-07-02")  # a date covers its day
+    assert len(day["hits"]) == 3
+    _recording(
+        spoken, MEETING, "r0", "2026-07-02T08:00:00Z", [("00:05:00", "Dee", "budget ancien")], "0:10:00"
+    )
+    after = _search(server, "budget", since="2026-07-02T09:00:00Z")
+    assert "budget ancien" not in [h["text"] for h in after["hits"]]  # ended before the window
+
+
+def test_045_ac2_since_defaults_to_seven_days(settings: Settings, data: Path) -> None:
+    now = datetime.now(UTC)
+    recent, old = ((now - timedelta(days=d)).strftime("%Y-%m-%dT%H:%M:%S.000Z") for d in (1, 8))
+    for at in (old, recent):
+        name = datetime.fromisoformat(at).strftime("%Y%m%dT%H%M%SZ")
+        _spoken(data, CALL, name, MEETING, [(at, "Ana", "budget")])
+    out = _call(_server(settings, data), "search_transcripts", query="budget")
+    assert [h["time"] for h in out["hits"]] == [recent] and out["since"] < recent
+
+
+def test_045_ac3_one_chat(settings: Settings, spoken: Path) -> None:
+    out = _search(_server(settings, spoken), "budget", thread_id=MEETING)
+    assert [(h["source"], h["thread_id"]) for h in out["hits"]] == [
+        ("follow", MEETING),
+        ("recording", MEETING),
+    ]
+    assert _search(_server(settings, spoken), "budget", thread_id=PRIVATE)["hits"] == []
+
+
+@pytest.mark.parametrize("asked", ["sorted", "unsorted"])
+def test_045_ac3_a_1to1_in_either_spelling(settings: Settings, data: Path, asked: str) -> None:
+    a, b = "00000000-0000-4000-8000-0000000000a0", "00000000-0000-4000-8000-0000000000b0"
+    sorted_id, unsorted_id = f"19:{a}_{b}@unq.gbl.spaces", f"19:{b}_{a}@unq.gbl.spaces"
+    index = Index(data)
+    index.upsert_chat(sorted_id, label="dm", raw={})
+    index.close()
+    _spoken(data, CALL, "20260702T110000Z", unsorted_id, [("2026-07-02T11:00:00.000Z", "Ana", "budget")])
+    _recording(data, sorted_id, "r9", "2026-07-02T10:00:00Z", [("00:00:01", "Ana", "budget")])
+    thread = sorted_id if asked == "sorted" else unsorted_id
+    hits = _search(_server(settings, data), "budget", thread_id=thread)["hits"]
+    assert [(h["source"], h["thread_id"], h["chat"]) for h in hits] == [
+        ("follow", unsorted_id, "dm"),  # the archive's label, found across spellings
+        ("recording", sorted_id, "dm"),
+    ]
+
+
+def test_045_ac4_fields_and_context(settings: Settings, spoken: Path) -> None:
+    server = _server(settings, spoken)
+    first, middle, last = (
+        {"speaker": s, "time": f"2026-07-02T11:00:0{n}.000Z", "text": x}
+        for n, s, x in (
+            (1, "Ana", "Bonjour à tous"),
+            (5, "Ben", "Le BUDGET est validé"),
+            (9, "Ana", "Parfait, merci"),
+        )
+    )
+    hit = _search(server, "budget est")["hits"][0]
+    assert hit == {
+        "source": "follow",
+        "thread_id": MEETING,
+        "chat": "Weekly · 2p",
+        "call": CALL,
+        **middle,
+        "context": [first, last],
+    }
+    assert _search(server, "bonjour")["hits"][0]["context"] == [middle]  # first line: nothing before
+    assert _search(server, "parfait")["hits"][0]["context"] == [middle]  # last line: nothing after
+    assert _search(server, "budget est", context=2)["hits"][0]["context"] == [first, last]  # cut at the start
+    assert _search(server, "parfait", context=0)["hits"][0]["context"] == []
+    assert _search(server, "parfait", context=5)["hits"][0]["context"] == [first, middle]
+    recorded = _search(server, "eleve")["hits"][0]
+    assert recorded == {
+        "source": "recording",
+        "thread_id": MEETING,
+        "chat": "Weekly · 2p",
+        "message_id": "r1",
+        "speaker": "r1-1@t",  # no display name: the id
+        "time": "2026-07-02T10:30:00.500Z",
+        "text": "Un budget élevé",
+        "context": [{"speaker": "Dee", "time": "2026-07-02T10:00:01.000Z", "text": "On commence"}],
+    }
+    for bad in (-1, 6):
+        args = {"query": "x", "context": bad}
+        assert _rpc(server, "tools/call", {"name": "search_transcripts", "arguments": args})["error"]
+
+
+def test_045_ac5_limit_and_more(settings: Settings, spoken: Path) -> None:
+    server = _server(settings, spoken)
+    cut = _search(server, "budget", limit=2)
+    assert [h["time"][11:19] for h in cut["hits"]] == ["12:00:00", "11:00:05"] and cut["more"]
+    whole = _search(server, "budget", limit=3)
+    assert len(whole["hits"]) == 3 and not whole["more"]
+    args = {"query": "budget", "limit": 201}
+    assert _rpc(server, "tools/call", {"name": "search_transcripts", "arguments": args})["error"]
+
+
+def test_045_ac6_a_line_still_being_written(settings: Settings, data: Path) -> None:
+    path = _spoken(data, CALL, "20260702T110000Z", MEETING, [("2026-07-02T11:00:00.000Z", "Ana", "un")])
+    line = json.dumps({"t": "2026-07-02T11:00:01.000Z", "speaker": "Ana", "text": "budget"})
+    server = _server(settings, data)
+    with path.open("a") as f:
+        f.write(line)  # whole object, newline not yet written
+    assert _search(server, "budget")["hits"] == []
+    with path.open("a") as f:
+        f.write("\n")
+    assert [h["text"] for h in _search(server, "budget")["hits"]] == ["budget"]
+
+
+def test_045_ac6_malformed_files_are_skipped_and_logged(settings: Settings, spoken: Path) -> None:
+    month = spoken / "follow" / "2026-07"
+    (month / f"20260702T130000Z-{CALL_FAILED}.ndjson").write_text(
+        "{garbled\n" + '{"t": "x", "text": "budget"}\n'
+    )
+    (month / f"20260702T130500Z-{CALL_FAILED}.ndjson").write_text("")  # header not written yet: silent
+    (month / f"20260702T131000Z-{CALL_FAILED}.ndjson").mkdir()  # unreadable as a file
+    follow_path = next(month.glob(f"*-{CALL}.ndjson"))
+    with follow_path.open("a") as f:
+        f.write('{"t": 1, "text": "budget sans heure"}\n{cut budget\n')  # damaged lines only
+    _recording(spoken, MEETING, "r2", "2026-07-02T10:00:00Z", [("00:00:02", "Dee", "budget deux")])
+    (spoken / MEETING / "media" / "r2.transcript.json").write_text("{not json")
+    _recording(spoken, MEETING, "r3", "not a time", [("00:00:03", "Dee", "budget trois")])
+    _recording(spoken, MEETING, "r4", "2026-07-02T10:00:00Z", [("soon", "Dee", "budget quatre")])
+    _recording(spoken, MEETING, "r5", "2026-07-02T10:00:00Z", [])
+    (spoken / MEETING / "media" / "r5.transcript.json").write_text('{"entries": 5}')
+    (spoken / GROUP / "media").mkdir(parents=True)
+    (spoken / GROUP / "media" / "recordings.json").write_text("[{")
+    with capture_logs() as logs:
+        out = _search(_server(settings, spoken), "budget", since="2026-07-02")
+    assert not out["error"]
+    assert sorted(h["text"] for h in out["hits"]) == [
+        "Le BUDGET est validé",
+        "Un budget élevé",
+        "budgét revu",
+    ]
+    dropped = [(Path(e["path"]).name, e["turns"]) for e in logs if e["event"] == "transcript_turns_dropped"]
+    assert dropped == [("r4.transcript.json", 1)]  # its one turn has no usable offset
+    skipped = [e for e in logs if e["event"] == "transcript_search_skipped"]
+    assert {Path(e["path"]).name for e in skipped} == {
+        f"20260702T130000Z-{CALL_FAILED}.ndjson",
+        f"20260702T131000Z-{CALL_FAILED}.ndjson",
+        "r2.transcript.json",
+        "r5.transcript.json",
+        "media",  # r3's bad time
+        "recordings.json",
+    }
+
+
+def test_045_ac2_recording_time_is_its_start_plus_the_offset(settings: Settings, data: Path) -> None:
+    """A recording message is posted when it ends: the turn time counts from `composetime - duration`."""
+    _recording(data, MEETING, "r1", "2026-07-03T12:00:00Z", [("1.00:00:02", "Dee", "budget")], "1.02:00:00")
+    _recording(data, MEETING, "r2", "2026-07-02T09:00:00Z", [("00:00:03", "Dee", "budget")], "soon")
+    hits = _search(_server(settings, data), "budget")["hits"]
+    assert [(h["message_id"], h["time"]) for h in hits] == [
+        ("r1", "2026-07-03T10:00:02.000Z"),  # started 2026-07-02T10:00, a day and 2 s in
+        ("r2", "2026-07-02T09:00:03.000Z"),  # no usable duration: counted from composetime
+    ]
+
+
+def test_045_ac2_out_of_window_files_are_not_read(settings: Settings, spoken: Path) -> None:
+    """Recordings, chats and call files outside the window are skipped before opening: made unreadable
+    here, any read would log."""
+    for mid, when, length in (
+        ("r6", "2026-07-02T08:00:00Z", "0:10:00"),
+        ("r7", "2026-07-02T14:00:00Z", "1:00:00"),
+    ):
+        _recording(spoken, MEETING, mid, when, [("00:00:01", "Dee", "budget")], length).write_text("{")
+    group_media = spoken / chat_dir_name(GROUP) / "media"  # GROUP's last activity: 2026-07-01T09:00
+    group_media.mkdir(parents=True)
+    (group_media / "recordings.json").write_text("[{")
+    month = spoken / "follow" / "2026-07"
+    stale = month / f"20260630T100000Z-{CALL_FAILED}.ndjson"
+    stale.mkdir()
+    last_written = datetime(2026, 7, 1, 9, tzinfo=UTC).timestamp()  # over a day before `since`
+    os.utime(stale, (last_written, last_written))
+    (month / f"20260702T130000Z-{CALL_FAILED}.ndjson").mkdir()  # joined at `until`
+    _spoken(
+        spoken, CALL_FAILED, "manual", GROUP, [("2026-07-02T10:45:00.000Z", "Cy", "budget")]
+    )  # no start: read
+    with capture_logs() as logs:
+        out = _search(
+            _server(settings, spoken), "budget", since="2026-07-02T10:00:00Z", until="2026-07-02T13:00:00Z"
+        )
+    assert [h["time"] for h in out["hits"]] == [
+        "2026-07-02T12:00:00.000Z",
+        "2026-07-02T11:00:05.000Z",
+        "2026-07-02T10:45:00.000Z",
+        "2026-07-02T10:30:00.500Z",
+    ]
+    assert [e for e in logs if e["event"] == "transcript_search_skipped"] == []
+
+
+def test_045_ac3_another_chats_call_is_read_no_further_than_its_header(
+    settings: Settings, spoken: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parsed: list[bytes] = []
+    real = M._ndjson
+
+    def spy(line: bytes) -> dict[str, Any] | None:
+        parsed.append(line)
+        return real(line)
+
+    monkeypatch.setattr(M, "_ndjson", spy)
+    hits = _search(_server(settings, spoken), "budget", thread_id=GROUP)["hits"]
+    assert [h["call"] for h in hits] == [CALL_ELSEWHERE]
+    assert len(parsed) == 3  # MEETING's header; GROUP's header and line
+
+
+def test_045_ac3_an_offset_in_the_window_is_honoured(settings: Settings, spoken: Path) -> None:
+    out = _search(_server(settings, spoken), "budget", since="2026-07-02T12:30:00+02:00")
+    assert out["since"] == "2026-07-02T10:30:00"
+    assert [h["time"] for h in out["hits"]] == [
+        "2026-07-02T12:00:00.000Z",
+        "2026-07-02T11:00:05.000Z",
+        "2026-07-02T10:30:00.500Z",
+    ]
+
+
+def test_045_ac4_context_follows_spoken_order(settings: Settings, data: Path) -> None:
+    """Parallel engines finish out of order: lines are written out of time order, context is by time."""
+    lines = [
+        ("2026-07-02T11:00:05.000Z", "Ben", "deux"),
+        ("2026-07-02T11:00:01.000Z", "Ana", "un"),
+        ("2026-07-02T11:00:09.000Z", "Ana", "trois"),
+    ]
+    _spoken(data, CALL, "20260702T110000Z", MEETING, lines)
+    hit = _search(_server(settings, data), "deux")["hits"][0]
+    assert [c["text"] for c in hit["context"]] == ["un", "trois"]
+
+
+def test_045_ac6_turns_without_an_offset_are_counted(settings: Settings, data: Path) -> None:
+    turns = [("x", "Dee", "budget a"), ("00:00:01", "Dee", "budget b"), ("1:2:3", "Dee", "budget c")]
+    _recording(data, MEETING, "r1", "2026-07-02T11:00:00Z", turns)
+    with capture_logs() as logs:
+        hits = _search(_server(settings, data), "budget")["hits"]
+    assert [h["text"] for h in hits] == ["budget b"]
+    dropped = [e for e in logs if e["event"].startswith("transcript_")]
+    assert [(e["event"], Path(e["path"]).name, e["turns"]) for e in dropped] == [
+        ("transcript_turns_dropped", "r1.transcript.json", 2)
+    ]
+    assert all("budget" not in str(v) for e in dropped for v in e.values())  # a count, never text
+
+
+def test_045_ac6_absurd_durations_and_offsets_are_dropped(settings: Settings, data: Path) -> None:
+    """Values the offset format accepts but the calendar cannot hold never fail the search."""
+    _recording(
+        data, MEETING, "r1", "2026-07-02T11:00:00Z", [("00:00:01", "Dee", "budget a")], "10000000.00:00:00"
+    )
+    turns = [("99999999999:00:00", "Dee", "budget b"), ("00:00:02", "Dee", "budget c")]
+    _recording(data, MEETING, "r2", "2026-07-02T11:00:00Z", turns)
+    with capture_logs() as logs:
+        out = _search(_server(settings, data), "budget")
+    assert not out["error"] and [h["text"] for h in out["hits"]] == ["budget c"]
+    events = [(e["event"], Path(e["path"]).name) for e in logs if e["event"].startswith("transcript_")]
+    assert events == [
+        ("transcript_search_skipped", "media"),
+        ("transcript_turns_dropped", "r2.transcript.json"),
+    ]
+
+
+def test_045_ac2_a_join_outliving_its_files_day(settings: Settings, data: Path) -> None:
+    """A file is named after its join; a re-attach appends to it, past the day of its name."""
+    _spoken(data, CALL, "20260702T110000Z", MEETING, [("2026-07-04T09:00:00.000Z", "Ana", "budget")])
+    hits = _search(_server(settings, data), "budget", since="2026-07-04")["hits"]
+    assert [h["time"] for h in hits] == ["2026-07-04T09:00:00.000Z"]
+
+
+def test_045_ac6_followed_calls_without_an_archive(settings: Settings, tmp_path: Path) -> None:
+    data = tmp_path / "followonly"
+    _spoken(data, CALL, "20260702T110000Z", MEETING, [("2026-07-02T11:00:00.000Z", "Ana", "budget")])
+    out = _search(_server(settings, data), "budget")
+    assert out["source"] == "follow" and [(h["call"], h["chat"]) for h in out["hits"]] == [(CALL, "")]
+    assert sorted(p.name for p in data.iterdir()) == ["follow"]  # nothing created
+
+
+def test_045_ac6_an_unavailable_archive_is_an_error(settings: Settings, spoken: Path) -> None:
+    server = _server(settings, spoken)
+
+    def broken() -> None:
+        raise OSError("stale file handle")
+
+    server.archive._probe = broken
+    out = _search(server, "budget")
+    assert out["error"] and "unavailable" in out["text"]
 
 
 # --- sign-in ---

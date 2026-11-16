@@ -90,8 +90,10 @@ uv run miniteams dump --jsonl > notes.jsonl            # full-detail JSON per li
 `mcp` serves your Teams to an MCP client over stdin/stdout (spec 008). Reads come from the
 archive: `find_chats` (label, topic, participant, kind), `read_messages` (plain text, date window,
 `next_since` cursor), `search_messages` (substring, case and accents ignored, 7 days back by
-default, feeds left out) and `read_transcript` (recordings and followed calls, then turns or
-lines). Results say where they come
+default, feeds left out), `read_transcript` (recordings and followed calls, then turns or
+lines) and `search_transcripts` (spoken lines of followed calls and recording transcripts, case and
+accents ignored, newest first, 7 days back by default, each hit with its speaker, time and the lines
+around it). Results say where they come
 from (`source`) and carry the archiver's heartbeat (`archiver_seen`, `archiver_state`,
 `sync_started_at`, and `media_sweep: running` during an `archive --live --verify-media` sweep, written
 by `archive` into `index.db`), so an agent can tell a stopped archiver

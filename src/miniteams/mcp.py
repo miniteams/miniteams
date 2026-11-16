@@ -13,6 +13,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from itertools import chain
 from pathlib import Path
 from typing import IO, Any
 
@@ -154,7 +155,7 @@ def _utc(value: str, *, end: bool = False) -> str:
     if _COMPOSETIME_RE.match(value):
         return value
     try:
-        return parse_when(value, end=end).strftime("%Y-%m-%dT%H:%M:%S")
+        return parse_when(value, end=end).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S")
     except ValueError as exc:
         raise ToolError(f"invalid ISO date/datetime: {value!r}") from exc
 
@@ -464,31 +465,25 @@ class Archive:
         return {"chats_scanned": len(targets), "more": more, "messages": hits[:limit]}
 
     def recordings(self, thread_id: str) -> list[dict[str, Any]]:
-        path = self.chat_dir(thread_id) / "media" / "recordings.json"
-        if not path.is_file():
-            return []
         try:
-            entries = json.loads(path.read_text())
+            return _manifest(self.chat_dir(thread_id) / "media")
         except (OSError, ValueError) as exc:
             raise ToolError(f"unreadable recordings manifest for {thread_id}: {exc}") from exc
-        return [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
 
     def transcript(self, thread_id: str, message_id: str, offset: int, limit: int) -> dict[str, Any]:
         entry = next((e for e in self.recordings(thread_id) if str(e.get("message_id")) == message_id), None)
         if entry is None:
             raise ToolError(f"no recording with message id {message_id} in {thread_id}")
-        # Only the JSON rendition names its speakers (docs/agent-archive.md); the VTT is not read.
-        names = [n for n in entry.get("transcripts") or [] if str(n).endswith(".transcript.json")]
-        if not names:
+        try:
+            path = _transcript_json(self.chat_dir(thread_id) / "media", entry)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
+        if path is None:
             raise ToolError(f"no transcript on disk for recording {message_id} in {thread_id}")
-        media_dir = (self.chat_dir(thread_id) / "media").resolve()
-        path = (media_dir / str(names[0])).resolve()
-        if path.parent != media_dir:  # the manifest is archive-written, but a name is still a name
-            raise ToolError(f"transcript name outside the media folder: {names[0]}")
         try:
             turns = json.loads(path.read_text()).get("entries") or []
         except (OSError, ValueError, AttributeError) as exc:
-            raise ToolError(f"unreadable transcript {names[0]}: {exc}") from exc
+            raise ToolError(f"unreadable transcript {path.name}: {exc}") from exc
         page = [
             {
                 "speaker": str(t.get("speakerDisplayName") or t.get("speakerId") or ""),
@@ -585,6 +580,153 @@ class Archive:
             result["next_offset"] = offset + limit
         return result
 
+    def search_transcripts(
+        self,
+        query: str,
+        since: str,
+        until: str,
+        thread_id: str,
+        context: int,
+        limit: int,
+        *,
+        recordings: bool = True,
+    ) -> dict[str, Any]:
+        """Spoken lines holding `query` (folded as in search_messages), newest first: followed calls, and
+        with `recordings` the recording transcripts of the indexed chats. A file that cannot be read is
+        skipped, logged."""
+        needle = fold(query)
+        chats = list(self.chats()) if recordings else []
+        labels = {str(c["id"]): str(c["label"]) for c in chats}
+        # ponytail: a day of slack before `since`, for index lag (a recording's composetime can be newer than
+        # its chat's indexed last activity) and clock skew on a call file's mtime; a longer lag is missed.
+        floor_at = parse_when(since) - timedelta(days=1)
+        floor = floor_at.strftime("%Y-%m-%dT%H:%M:%S")
+        found: list[tuple[dict[str, str], list[dict[str, str]], int]] = []
+        for head, lines in chain(
+            self._followed(labels, thread_id, floor_at.timestamp(), until),
+            self._recorded(chats, thread_id, since, until, floor),
+        ):
+            found += [
+                (head, lines, i)
+                for i, line in enumerate(lines)
+                if since <= line["time"]
+                and (not until or line["time"] < until)
+                and needle in fold(line["text"])
+            ]
+        found.sort(key=lambda f: f[1][f[2]]["time"], reverse=True)
+        hits = [
+            {**head, **lines[i], "context": lines[max(0, i - context) : i] + lines[i + 1 : i + 1 + context]}
+            for head, lines, i in found[:limit]
+        ]
+        return {"more": len(found) > limit, "hits": hits}
+
+    def _followed(
+        self, labels: dict[str, str], thread_id: str, floor: float, until: str
+    ) -> list[tuple[dict[str, str], list[dict[str, str]]]]:
+        """(hit head, spoken lines in time order) per followed call of `thread_id` (any when empty), its
+        files joined; complete lines only. A file last written before `floor` (epoch seconds) or started
+        at/after `until` is not read."""
+        calls: dict[str, tuple[dict[str, str], list[dict[str, str]]]] = {}
+        for call, path in transcript_files(self.data_dir):
+            started = _file_start(path)
+            if started and until and started >= until:
+                continue
+            try:
+                # Append-only: its mtime is at or after its last line's `t`; a join outlives its name's day.
+                if path.stat().st_mtime < floor:
+                    continue
+                with path.open("rb") as f:
+                    first = f.readline()
+                    header = _ndjson(first) if first.endswith(b"\n") else {}
+                    if header and thread_id and not same_chat(str(header.get("thread") or ""), thread_id):
+                        continue
+                    raw = f.read().split(b"\n")[:-1] if header else []
+            except OSError as exc:
+                log.warning("transcript_search_skipped", path=str(path), error=str(exc))
+                continue
+            if header is None:
+                log.warning("transcript_search_skipped", path=str(path), error="malformed header")
+                continue
+            if not header:  # the header is still being written
+                continue
+            thread = str(header.get("thread") or "")
+            head = {"source": "follow", "thread_id": thread, "chat": _label(labels, thread), "call": call}
+            lines = calls.setdefault(call, (head, []))[1]
+            for line in map(_ndjson, raw):
+                if line is not None and isinstance(line.get("t"), str):
+                    lines.append(
+                        {
+                            "speaker": str(line.get("speaker") or ""),
+                            "time": line["t"],
+                            "text": str(line.get("text") or ""),
+                        }
+                    )
+        for _, lines in calls.values():
+            # Engines finish out of order: a line lands after a later-spoken one.
+            lines.sort(key=lambda line: line["time"])
+        return list(calls.values())
+
+    def _recorded(
+        self, chats: list[dict[str, Any]], thread_id: str, since: str, until: str, floor: str
+    ) -> Iterator[tuple[dict[str, str], list[dict[str, str]]]]:
+        """(hit head, spoken lines) per recording transcript that may hold a line inside [since, until).
+        A recording message is posted at the recording's end: its start is `composetime - duration`."""
+        for chat in chats:
+            chat_id = str(chat["id"])
+            if thread_id:
+                if not same_chat(chat_id, thread_id):
+                    continue
+            elif last_activity(chat["raw"]) < floor:
+                continue
+            media = self.data_dir / (chat["dir"] or chat_dir_name(chat_id)) / "media"
+            try:
+                entries = _manifest(media)
+            except (OSError, ValueError) as exc:
+                log.warning("transcript_search_skipped", path=str(media / "recordings.json"), error=str(exc))
+                continue
+            for entry in entries:
+                try:
+                    end = parse_when(str(entry.get("composetime")))
+                    path = _transcript_json(media, entry)
+                    span = _offset(entry.get("duration"))
+                    start = end - span if span is not None else end
+                    first, last = _iso_z(start), _iso_z(end)
+                # A duration can parse and still leave the calendar: OverflowError.
+                except (ValueError, OverflowError) as exc:
+                    log.warning("transcript_search_skipped", path=str(media), error=str(exc))
+                    continue
+                if path is None or (until and first >= until):
+                    continue
+                if span is not None and last < since:
+                    continue
+                try:
+                    turns = json.loads(path.read_text()).get("entries") or []
+                    if not isinstance(turns, list):
+                        raise ValueError("entries is not a list")
+                except (OSError, ValueError, AttributeError) as exc:
+                    log.warning("transcript_search_skipped", path=str(path), error=str(exc))
+                    continue
+                head = {
+                    "source": "recording",
+                    "thread_id": chat_id,
+                    "chat": str(chat["label"]),
+                    "message_id": str(entry.get("message_id") or ""),
+                }
+                lines = []
+                for turn in turns:
+                    at = _turn_time(start, turn.get("startOffset")) if isinstance(turn, dict) else None
+                    if at is not None:
+                        lines.append(
+                            {
+                                "speaker": str(turn.get("speakerDisplayName") or turn.get("speakerId") or ""),
+                                "time": at,
+                                "text": str(turn.get("text") or ""),
+                            }
+                        )
+                if len(lines) < len(turns):
+                    log.warning("transcript_turns_dropped", path=str(path), turns=len(turns) - len(lines))
+                yield head, lines
+
 
 def _ndjson(line: bytes) -> dict[str, Any] | None:
     try:
@@ -592,6 +734,67 @@ def _ndjson(line: bytes) -> dict[str, Any] | None:
     except ValueError:
         return None
     return value if isinstance(value, dict) else None
+
+
+def _manifest(media: Path) -> list[dict[str, Any]]:
+    """A chat's recordings.json entries; [] without one. Raises OSError, ValueError."""
+    path = media / "recordings.json"
+    if not path.is_file():
+        return []
+    entries = json.loads(path.read_text())
+    return [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
+
+
+def _transcript_json(media: Path, entry: dict[str, Any]) -> Path | None:
+    """A recording's JSON rendition, None when it has none; ValueError for a name leaving `media`."""
+    # Only the JSON rendition names its speakers (docs/agent-archive.md); the VTT is not read.
+    names = [n for n in entry.get("transcripts") or [] if str(n).endswith(".transcript.json")]
+    if not names:
+        return None
+    media = media.resolve()
+    path = (media / str(names[0])).resolve()
+    if path.parent != media:  # the manifest is archive-written, but a name is still a name
+        raise ValueError(f"transcript name outside the media folder: {names[0]}")
+    return path
+
+
+_OFFSET_RE = re.compile(r"(?:(\d+)\.)?(\d+):(\d\d):(\d\d(?:\.\d+)?)")  # .NET TimeSpan: [d.]hh:mm:ss[.f]
+
+
+def _offset(value: Any) -> timedelta | None:
+    """A Teams offset or duration ("00:01:02.3400000", "0:10:00", "1.02:00:00"); None when it is not one."""
+    found = _OFFSET_RE.fullmatch(str(value))
+    if found is None:
+        return None
+    days, hours, minutes, seconds = found.groups()
+    return timedelta(days=int(days or 0), hours=int(hours), minutes=int(minutes), seconds=float(seconds))
+
+
+def _turn_time(start: datetime, offset: Any) -> str | None:
+    """`start` + a turn's startOffset as a line time; None when the offset is missing, malformed or absurd."""
+    try:
+        at = _offset(offset)
+        return None if at is None else _iso_z(start + at)
+    except OverflowError:
+        return None
+
+
+def _file_start(path: Path) -> str:
+    """The join time a follower encodes in a transcript's name, as ISO text; "" when it encodes none."""
+    try:
+        return datetime.strptime(path.name.split("-", 1)[0], "%Y%m%dT%H%M%SZ").strftime("%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return ""
+
+
+def _iso_z(at: datetime) -> str:
+    """UTC, to the millisecond, as the follower writes a line's `t`: the two sources sort together."""
+    return at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _label(labels: dict[str, str], thread: str) -> str:
+    """The chat's label; a 1:1 the archive spells the other way finds it too."""
+    return labels.get(thread) or next((v for k, v in labels.items() if same_chat(thread, k)), "")
 
 
 class Session:
@@ -770,16 +973,37 @@ def _search_messages(server: Server, args: dict[str, Any]) -> dict[str, Any]:
     return {"source": "api", "since": since, **found}
 
 
+def _transcript_source(archive: Archive, *, allow_follow_only: bool) -> dict[str, Any]:
+    """The archive's meta; `{"source": "follow"}` for a follow-only data dir (`miniteams follow` without an
+    archiver: no recordings, follows still read) when `allow_follow_only`."""
+    if archive.available():
+        return archive.meta()
+    if allow_follow_only and archive.index_missing and (archive.data_dir / "follow").is_dir():
+        return {"source": "follow"}
+    raise ToolError(f"transcripts need the archive, which is unavailable at {archive.data_dir}")
+
+
+def _search_transcripts(server: Server, args: dict[str, Any]) -> dict[str, Any]:
+    since = _utc(args["since"]) if args.get("since") else _default_since()
+    until = _utc(args["until"], end=True) if args.get("until") else ""
+    archive = server.archive
+    meta = _transcript_source(archive, allow_follow_only=True)
+    found = archive.search_transcripts(
+        args["query"],
+        since,
+        until,
+        args.get("thread_id", ""),
+        args.get("context", 1),
+        args.get("limit", 50),
+        recordings=meta["source"] == "archive",
+    )
+    return {**meta, "since": since, **found}
+
+
 def _read_transcript(server: Server, args: dict[str, Any]) -> dict[str, Any]:
     archive = server.archive
     thread_id = args["thread_id"]
-    if archive.available():
-        meta = archive.meta()
-    elif archive.index_missing and not args.get("message_id") and (archive.data_dir / "follow").is_dir():
-        # A follow-only data dir (`miniteams follow` without an archiver): no recordings, follows still read.
-        meta = {"source": "follow"}
-    else:
-        raise ToolError(f"transcripts need the archive, which is unavailable at {archive.data_dir}")
+    meta = _transcript_source(archive, allow_follow_only=not args.get("message_id"))
     offset, limit = args.get("offset", 0), args.get("limit", 200)
     if args.get("call"):
         if args.get("message_id"):
@@ -1095,6 +1319,24 @@ TOOLS: tuple[Tool, ...] = (
         },
         _read_transcript,
         required=("thread_id",),
+    ),
+    Tool(
+        "search_transcripts",
+        "Find spoken lines whose text contains a word or phrase (case and accents ignored), newest first, "
+        "in calls miniteams followed and in Teams recording transcripts, across chats or inside one. "
+        "`since` / `until` filter on the line's time; `since` defaults to 7 days back. Each hit: source "
+        "(follow or recording), thread_id, chat, call or message_id (for read_transcript), speaker, time, "
+        "text, and `context`: the lines around it.",
+        {
+            "query": {"type": "string"},
+            "since": {"type": "string", "description": "ISO date/datetime; default: 7 days ago"},
+            "until": {"type": "string", "description": "ISO date/datetime; a date covers its whole day"},
+            "thread_id": {"type": "string", "description": "search this chat only"},
+            "context": {"type": "integer", "minimum": 0, "maximum": 5, "description": "lines each side; 1"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+        },
+        _search_transcripts,
+        required=("query",),
     ),
     Tool(
         "send_message",
