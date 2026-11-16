@@ -30,6 +30,7 @@ you, now or at a time Teams holds the message until.
 | `read_messages` | `thread_id`, `since?`, `until?`, `limit=100` (max 500) | oldest first: id, time (UTC), sender, plain text, `edited`, `deleted`, attachment count; `next_since` when cut |
 | `search_messages` | `query`, `since` (default 7 days back), `until?`, `thread_id?`, `limit=50` (max 200) | same record plus chat id and label, newest first |
 | `read_transcript` | `thread_id`, `message_id?`, `call?` (spec 044), `offset=0`, `limit=200` | without `message_id`: the chat's recordings (title, time, duration, has transcript) and followed calls (spec 044). With it: turns (speaker, start offset, text). With `call`: the followed call's lines and joins (a call of another chat is refused) |
+| `search_transcripts` (spec 045) | `query`, `since` (default 7 days back), `until?`, `thread_id?`, `context=1` (max 5), `limit=50` (max 200) | newest first, spoken lines of followed calls and recording transcripts: source, chat id and label, call or message id, speaker, time (UTC), text, `context` lines each side; `more` |
 
 - API fallback for reads, only when the archive is unavailable: no `index.db` under
   `--data-dir`, an error opening it, or no answer within 3 seconds. Storage that is
@@ -57,6 +58,7 @@ you, now or at a time Teams holds the message until.
 | `read_messages` | walks the chat history back from `until` | `since` defaults to 7 days back, and the result says so |
 | `search_messages` | lists the chats active since `since`, then reads each one down to it | at most 50 chats. A cut result says how many were left out |
 | `read_transcript` | not available | `isError`: transcripts need the archive |
+| `search_transcripts` | not available | without `index.db` but with `follow/`: followed calls only, `source: "follow"`; otherwise `isError` |
 
 - After a failed probe the archive counts as unavailable for 60 seconds, then is probed again.
 

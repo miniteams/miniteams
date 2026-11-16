@@ -303,6 +303,27 @@ that file is now the only copy — speakers unrecoverable for that meeting.
 Transcripts are written `0600` (they attribute every turn by name), so read them as the owner —
 files fetched before that became the rule may still sit at the umask default.
 
+### Searching what was said — MCP `search_transcripts`
+
+Over MCP, skip the recipes above: `search_transcripts(query, since?, until?, thread_id?, context?,
+limit?)` scans both kinds of spoken transcript, case and accents ignored, newest first.
+
+| Source | Files | Line time |
+|---|---|---|
+| `follow` | `data/follow/<YYYY-MM>/<started>-<call>.ndjson`, calls `miniteams follow` transcribed (spec 044); complete lines only, so a call still running is searchable | the line's `t` |
+| `recording` | `<thread-id>/media/*.transcript.json` listed in `recordings.json` (the `.vtt` is not read) | the recording's start (`composetime`, posted at its end, minus `duration`; `composetime` alone without one) + the turn's `startOffset` |
+
+- `since` / `until` filter on that line time; `since` defaults to 7 days back.
+- `thread_id`: one chat; a 1:1 matches in either member order.
+- Each hit: `source`, `thread_id`, `chat` (archive label, `""` when unknown), `call` (follow) or
+  `message_id` (recording), `speaker`, `time` (UTC ISO, ms), `text`, `context` (up to `context`
+  lines each side, default 1, max 5: `speaker`, `time`, `text`). `limit` default 50, max 200;
+  `more: true` when others match. Page the whole transcript with `read_transcript` and the `call` or
+  `message_id`.
+- No `index.db` (`miniteams follow` alone): followed calls are still searched, `source: "follow"`.
+- A malformed or unreadable file is skipped and logged (`transcript_search_skipped`), never fatal; turns
+  without a usable `startOffset` are dropped and counted per file (`transcript_turns_dropped`).
+
 ## Gotchas
 
 - **Quoted replies duplicate text.** Teams inlines the quoted message in the reply's HTML, so a
