@@ -67,6 +67,8 @@ None.
 ## Decisions
 
 - Both sources, one new tool (user call, 2026-11-16).
-- A recording turn's time is the recording's start plus the turn's `startOffset`. The recording message is
-  posted at the recording's end, so the start is its compose time minus `duration` (compose time alone
-  when `duration` is missing).
+- A recording turn's time is the recording's start plus the turn's `startOffset`. The start is the
+  message's `RecordingContent@timestamp`. The message carrying the transcript is posted 0 to ~6 min after
+  the recording's end, so `composetime - duration` runs late (a live meeting: 4.5 min). The timestamp is
+  kept when it falls in the day up to `composetime - duration` (the compose time without `duration`);
+  otherwise (missing, unparseable, over a day earlier, later) that difference is the start, or the compose time alone without `duration`.
