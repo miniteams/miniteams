@@ -518,14 +518,25 @@ def _joins(ch: str) -> bool:
 
 
 def forms(name: str) -> list[str]:
-    """The forms a member is mentioned by (spec 033): full name, first word, last word, the last two
+    """The forms a member is mentioned by (spec 033): full name, its leading words (`Mary Jane Watts` →
+    `Mary Jane`: a picked name with its tail deleted), first word, last word, all but the full name
     without the punctuation around them (`Doe, John` → `Doe`; `(Sales)` → `Sales`)."""
     words = name.split()
     if not words or name == UNKNOWN_USER:  # several unnamed people share it: it mentions none (038-AC6)
         return []
-    return list(
-        dict.fromkeys((name, *(word for w in (words[0], words[-1]) if (word := _TRIM_RE.sub("", w)))))
-    )
+    ends = (words[0], words[-1])
+    return list(dict.fromkeys((name, *_leading(name), *(w for e in ends if (w := _TRIM_RE.sub("", e))))))
+
+
+_LEADING = 4  # most words a leading form keeps (`Mary Jane Ann Watts`)
+
+
+def _leading(name: str) -> list[str]:
+    """`name`'s leading words but the first, longest first, without the punctuation around them; one
+    trimmed down to a word (`Ann -` → `Ann`) is the first name, not leading words."""
+    # ponytail: each form costs every `@` sharing the first word; raise _LEADING if names need it.
+    ends = [m.end() for m in re.finditer(r"\S+", name)][1:-1][: _LEADING - 1]
+    return [form for end in reversed(ends) if len((form := _TRIM_RE.sub("", name[:end])).split()) > 1]
 
 
 def _word_key(text: str) -> str:
@@ -600,7 +611,7 @@ def _anchored(rest: str, pick: dict[str, Any]) -> tuple[str, str] | None:
     return (rest[:size], form) if size else None
 
 
-type _ByWord = dict[str, list[tuple[str, dict[str, Any]]]]
+type _ByWord = dict[str, list[tuple[str, dict[str, Any], bool]]]  # form, member, form is leading words
 
 
 def _forms_by_word(
@@ -610,25 +621,37 @@ def _forms_by_word(
     keeps me, bots and apps in, mentionable or not."""
     named = {str(m["mri"]): str(m["name"] or "") for m in members} if anyone else humans(members)
     people = [
-        (form, {"mri": mri, "label": form})
+        (form, {"mri": mri, "label": form}, form in leading)
         for mri, name in named.items()
         if anyone or not is_me(mri, me)
+        for leading in [set(_leading(name))]
         for form in forms(name)
     ]
-    everyone = [("everyone", {"mri": thread_id, "everyone": True})]
+    everyone = [("everyone", {"mri": thread_id, "everyone": True}, False)]
     by_word: _ByWord = {}
-    for form, member in (everyone if chat_kind(thread_id) not in ("private", "system") else []) + people:
-        by_word.setdefault(_word_key(form), []).append((form, member))
+    for form, member, lead in (
+        everyone if chat_kind(thread_id) not in ("private", "system") else []
+    ) + people:
+        by_word.setdefault(_word_key(form), []).append((form, member, lead))
     return by_word
+
+
+def _whole_first(hits: list[tuple[dict[str, Any], bool]]) -> dict[str, dict[str, Any]]:
+    """`hits`' members by MRI, a leading-words read dropped when a full, first or last name reads as far:
+    `@Ann Lee` is Ann Lee, not Ann Lee Ma."""
+    whole = [p for p, lead in hits if not lead]
+    return {p["mri"]: p for p in whole or [p for p, _ in hits]}
 
 
 def _named(by_word: _ByWord, who: str) -> dict[str, dict[str, Any]]:
     """The members a `{Who|label}`'s Who names whole, never a start of it: `{Ann Leeds|x}` is not Ann Lee."""
-    return {
-        p["mri"]: p
-        for form, p in by_word.get(_word_key(who), ())
-        if who and "everyone" not in p and _typed_len(who, form) == len(who)
-    }
+    return _whole_first(
+        [
+            (p, lead)
+            for form, p, lead in by_word.get(_word_key(who), ())
+            if who and "everyone" not in p and _typed_len(who, form) == len(who)
+        ]
+    )
 
 
 def who_reader(members: list[dict[str, Any]], thread_id: str, me: str) -> Callable[[str], frozenset[str]]:
@@ -704,14 +727,16 @@ def resolve_mentions(
             else:
                 # Only the forms sharing the first word typed: a large roster costs a bucket, not every name.
                 hits = [
-                    (n, p) for form, p in by_word.get(_word_key(rest), ()) if (n := _typed_len(rest, form))
+                    (n, p, lead)
+                    for form, p, lead in by_word.get(_word_key(rest), ())
+                    if (n := _typed_len(rest, form))
                 ]
-                size = max((n for n, _ in hits), default=0)
+                size = max((n for n, _, _ in hits), default=0)
                 if (
                     pick
                     and read
                     and size > len(read[0])
-                    and any(p["mri"] != pick["mri"] for n, p in hits if n == size)
+                    and any(p["mri"] != pick["mri"] for n, p, _ in hits if n == size)
                 ):
                     read = None
             if pick is not None and read is not None:
@@ -723,7 +748,7 @@ def resolve_mentions(
                 found = {**one(typed, named), "label": label}  # Whole, never a start of Who: `{Ann Leeds|x}`
             else:
                 typed = rest[: size or next((i for i, c in enumerate(rest) if not _joins(c)), len(rest))]
-                found = one(typed, {p["mri"]: p for n, p in hits if n == size})
+                found = one(typed, _whole_first([(p, lead) for n, p, lead in hits if n == size]))
             if brace and not label:  # `@{Ann|}`: the full name
                 found["label"] = roster.get(found["mri"]) or who
             at += len(typed)  # compose_html resumes past the name: an `@` inside it is that name's

@@ -37,7 +37,7 @@ uv run miniteams send "hello"     # send to your Notes (write-safe default)
 uv run miniteams send --thread 19:xxx@thread.v2 "hi"   # send to a conversation
 uv run miniteams send --thread 19:xxx@thread.v2 "@Ann Lee **ready** :fire:"   # rendered as the chat
                                   # page's composer: markdown, :shortcode:, bare URLs, @mentions by full,
-                                  # first or last name and @{Who|label} (below)
+                                  # first or last name or leading words, @{Who|label} (below)
 uv run miniteams send --file msg.txt              # body from a file (rendered the same way)
 uv run miniteams send --file test.html --html     # raw RichText/Html, verbatim (no markdown, no @mentions)
 uv run miniteams send "look" --thread 19:xxx@thread.v2 --image a.png --image b.jpg  # inline images after the text
@@ -109,7 +109,8 @@ write to Teams as you; with `send_at` (ISO 8601 with an offset, 5 seconds to 125
 manage what Teams is holding (`docs/scheduled-send-wire.md`). Their text, like `miniteams send`'s
 without `--html`, is rendered as the chat page's composer does (spec 029): markdown, built-in
 `:shortcode:` emojis, bare URLs as links. `@Ann Lee`, `@ann` or `@lee` (a member's full, first or last
-name, case and accents ignored, longest first) mentions that member, shown as the roster spells that form
+name, or up to its first four words, `@Mary Jane` for Mary Jane Watts, where no full, first or last
+name reads as far; case and accents ignored, longest first) mentions that member, shown as the roster spells that form
 (`Ann Lee`, `Ann`, `Lee`); `@{Who|label}` mentions the member Who names (any of those forms, so the full
 name settles a shared one) shown as `label`, the whole `@{Who|label}` read raw, markup and all, up to its
 `}` (the last `|` splits; an empty label shows the full name; the label: one line, up to 200 characters, no `|` or `}`, no tab or other blank but the space, no control, format, private-use or unassigned character) (spec 033); `@everyone` mentions a group chat; `\@` is a literal `@`, and an email or code is never a mention. A name matching nobody or several members (`ambiguous
@@ -421,7 +422,8 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
     sent and the rest goes on (the widget sees no echo: ↻ checks and finds it); a `sent` bubble whose echo never
     comes leaves after 30 s.
   - Backspace after a picked full-name mention shortens it to the first name, a shortcut for one of the edits
-    above (a kept `@{…}` from an edit is never shortened).
+    above (a kept `@{…}` from an edit is never shortened). Deleting a picked name's last words keeps the
+    leading ones (`@Mary Jane Watts` → `@Mary Jane`).
   - Paste images (PNG, JPEG, GIF, WebP; up to 8, 10 MiB each, 40 MiB in all): thumbnails per chat, click to preview,
     × to drop; Enter sends them after the text, or alone. They upload to Teams only on send and live in the page:
     a reload drops them, the text draft stays. A failed or unanswered send may have gone out: ↻, or the unchanged

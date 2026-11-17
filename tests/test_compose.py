@@ -1139,6 +1139,44 @@ def test_a_one_word_name_has_one_form() -> None:
     assert html_ == _span(0, "Cher") and len(_mentions(props)) == 1
 
 
+def test_a_picked_name_shortened_to_its_leading_words_keeps_them() -> None:
+    """A picked `@Mary Jane Watts` with its last word deleted mentions `Mary Jane`, not `Mary`; bare too."""
+    mary = {"mri": "8:orgid:mary", "name": "Mary Jane Watts"}
+    text = "@Mary Jane hi"
+    picks = [{"at": 0, "mri": "8:orgid:mary", "forms": compose.forms(mary["name"])}]
+    for page_picks in (picks, None):
+        found = compose.resolve_mentions(text, [*ROSTER, mary], GROUP, ME, picks=page_picks)
+        assert [(f["mri"], f["name"], f["label"]) for f in found] == [
+            ("8:orgid:mary", "Mary Jane", "Mary Jane")
+        ]
+
+
+@pytest.mark.parametrize(
+    ("text", "mri"),
+    [("@Ann Lee hi", "a"), ("@{ann lee|x} hi", "a"), ("@Ann Lee Ma hi", "b"), ("@{Ann Lee Ma|x}", "b")],
+)
+def test_a_whole_name_outranks_another_members_leading_words(text: str, mri: str) -> None:
+    """`@Ann Lee` is Ann Lee, not the leading words of Ann Lee Ma; bare or braced."""
+    roster = [{"mri": "a", "name": "Ann Lee"}, {"mri": "b", "name": "Ann Lee Ma"}]
+    assert [f["mri"] for f in compose.resolve_mentions(text, roster, GROUP, ME)] == [mri]
+
+
+@pytest.mark.parametrize(
+    ("text", "names"),
+    [
+        ("@Mary Jane hi", ("Mary Jane Watts", "Mary Jane Hart")),
+        ("@{Mary Jane|x}", ("Mary Jane Watts", "Mary Jane Hart")),
+        ("@Ann hi", ("Ann - Lee", "Ann Smith")),
+        ("@{Ann|x}", ("Ann , Lee Moore", "Ann Smith")),
+    ],
+)
+def test_leading_words_shared_by_two_members_are_ambiguous(text: str, names: tuple[str, str]) -> None:
+    """Two members' leading words, or a first name trimmed out of one (`Ann -`), stay ambiguous."""
+    roster = [{"mri": "a", "name": names[0]}, {"mri": "b", "name": names[1]}]
+    with pytest.raises(ValueError, match="ambiguous mention"):
+        compose.resolve_mentions(text, roster, GROUP, ME)
+
+
 def test_a_free_label_pick_shows_its_label_without_one() -> None:
     """033-AC8: compose_html shows a `{Who|label}` pick's label when the pick carries none (a kept pick)."""
     picks = [{"name": "{John Doe | Sales|the boss}", "mri": "8:orgid:john"}]
@@ -1540,7 +1578,11 @@ def test_a_large_roster_is_scanned_by_first_letter(letters: str) -> None:
     ("name", "found"),
     [
         ("Doe, John", ["Doe, John", "Doe", "John"]),
-        ("Ann Lee (Sales)", ["Ann Lee (Sales)", "Ann", "Sales"]),
+        ("Ann Lee (Sales)", ["Ann Lee (Sales)", "Ann Lee", "Ann", "Sales"]),
+        ("Doe, John Paul", ["Doe, John Paul", "Doe, John", "Doe", "Paul"]),
+        ("Mary  Jane Watts", ["Mary  Jane Watts", "Mary  Jane", "Mary", "Watts"]),
+        ("Ann - Lee", ["Ann - Lee", "Ann", "Lee"]),
+        ("a b c d e f", ["a b c d e f", "a b c d", "a b c", "a b", "a", "f"]),
         ("“Ann” Lee!", ["“Ann” Lee!", "Ann", "Lee"]),
         ("(x)", ["(x)", "x"]),
         ("--", ["--"]),
