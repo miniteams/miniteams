@@ -761,6 +761,14 @@ def test_extract_sp_files_docs_only_no_video_no_folder() -> None:
     assert sp == ["https://c.sharepoint.com/:x:/r/sites/RD/Shared/z.xlsx?d=w1&web=1"]  # doc yes, :v:/:f: no
 
 
+def test_extract_sp_text_file_links() -> None:
+    """A pasted text file link (`:t:`, e.g. a .md) is a document; a site or OneNote link (`:u:`) is not."""
+    text = '<a href="https://c.sharepoint.com/:t:/g/personal/u_c_com/EAbc?e=x1&amp;d=2">notes.md</a>'
+    site = '<a href="https://c.sharepoint.com/:u:/r/sites/RD/SitePages/Home.aspx">home</a>'
+    sp = [i["url"] for i in A.extract(text + site, "RichText/Html") if i["kind"] == "sp_file"]
+    assert sp == ["https://c.sharepoint.com/:t:/g/personal/u_c_com/EAbc?e=x1&d=2"]
+
+
 async def test_process_downloads_sp_file_via_sharepoint_rest(settings: Settings, monkeypatch) -> None:
     class _C:
         async def __aenter__(self):

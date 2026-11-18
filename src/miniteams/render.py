@@ -120,10 +120,11 @@ class _Sanitizer(HTMLParser):
         names: dict[str, str] | None = None,
         named: set[str] | None = None,
         titles: dict[str, str] | None = None,
+        local: Callable[[list[str]], str | None] | None = None,
     ) -> None:
         super().__init__(convert_charrefs=True)
         self.thread_id, self.media_dir, self.me, self.mentions = thread_id, media_dir, me, mentions
-        self.custom, self.titles = custom, titles or {}
+        self.custom, self.titles, self.local = custom, titles or {}, local
         self.names, self.named = names or {}, named if named is not None else set()
         # (open-stack index, output length) of a link renamed after a file: its own content is cut at its end.
         self.renamed: tuple[int, int] | None = None
@@ -176,7 +177,8 @@ class _Sanitizer(HTMLParser):
             href = _web_url(a.get("href", ""))
             emitted = href is not None
             if href is not None:
-                extra = _attr("href", href) + ' rel="noopener" target="_blank"'
+                target = (self.local([href]) if self.local else None) or href
+                extra = _attr("href", target) + ' rel="noopener" target="_blank"'
                 key = _link_key(href) if self.names and self.renamed is None else ""
                 if key and key in self.names:  # 027-AC6: a pasted file link reads as its name
                     self.named.add(key)
@@ -307,14 +309,16 @@ def sanitize(
     names: dict[str, str] | None = None,
     named: set[str] | None = None,
     titles: dict[str, str] | None = None,
+    local: Callable[[list[str]], str | None] | None = None,
 ) -> str:
     """Teams HTML → allowlisted HTML; `mentions` maps a Mention span's `itemid` to its MRI, `custom`
     holds the custom emoji object ids `/emoji/<id>` serves. A link whose `_link_key` is in `names` reads as
     that file name instead of its content; its key is added to `named`. `titles`: MRI → the full name a
-    mention of that person shows on hover (spec 033).
+    mention of that person shows on hover (spec 033). `local([href])` is the archived copy a link opens
+    instead of its URL, when there is one.
 
     Input past `_HTML_MAX` chars is cut off: the parser's cost must stay bounded per message."""
-    parser = _Sanitizer(thread_id, media_dir, me, mentions or {}, custom, names, named, titles)
+    parser = _Sanitizer(thread_id, media_dir, me, mentions or {}, custom, names, named, titles, local)
     parser.feed(content[:_HTML_MAX])
     return parser.result()
 
@@ -648,7 +652,7 @@ def files_html(
     out = []
     for entry, name, urls in _file_entries(files):
         url = _file_url(urls)
-        if local and entry.get("state") != "reference":
+        if local:
             url = local(urls) or url
         link = f'{_attr("href", url)} rel="noopener" target="_blank"' if url else ""
         if entry.get("state") == "reference":
