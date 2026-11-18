@@ -58,9 +58,10 @@ _ITEM_RE = re.compile(r"<item\b[^>]*>", re.IGNORECASE)
 # Shared files show up as <a itemtype=".../HyperLink/Files" href="…sharepoint.com/…">name</a>.
 _A_RE = re.compile(r"<a\b[^>]*>", re.IGNORECASE)
 _FILE_LINK = "http://schema.skype.com/HyperLink/Files"
-# SharePoint "open in <app>" path prefixes: :x: Excel, :w: Word, :p: PowerPoint, :b: PDF/other doc.
+# SharePoint "open in <app>" path prefixes: :x: Excel, :w: Word, :p: PowerPoint, :b: PDF/other doc,
+# :t: text (.md, .txt).
 # Downloadable single documents — EXCLUDES :v: (video, huge), :f: (folder), :u:/:o: (site/OneNote).
-_SP_DOC_PREFIX = re.compile(r"sharepoint\.com/:[xwpb]:/", re.IGNORECASE)
+_SP_DOC_PREFIX = re.compile(r"sharepoint\.com/:[xwpbt]:/", re.IGNORECASE)
 # Videos are excluded even when tagged as a shared file (HyperLink/Files can point at an .mp4).
 _VIDEO_EXT = re.compile(r"\.(mp4|mov|avi|mkv|webm|wmv|m4v)(\?|$)", re.IGNORECASE)
 _ATTR_RE = re.compile(r'([\w-]+)\s*=\s*"([^"]*)"')

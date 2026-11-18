@@ -844,8 +844,56 @@ def test_record_card_opens_the_archived_copy(tmp_path: Path, monkeypatch: pytest
         monkeypatch.setattr(CV, "_MEDIA_MAX", 10)  # big.pdf: over what /media serves
         assert _card_href(media, linked, {_SHARE: name}) == _SHARE, name
     assert _card_href(None, linked, saved) == _SHARE  # no archive folder
-    ref = {**linked, "state": "reference"}  # never downloaded: its link stays the shared one
-    assert _card_href(media, ref, saved) == _SHARE
+    ref = {**linked, "state": "reference"}  # saved through the body link of the same URL
+    assert _card_href(media, ref, saved) == local
+    assert _card_href(media, ref) == _SHARE
+
+
+@pytest.mark.parametrize(
+    ("body", "url"),
+    [
+        (f'<p>see <a href="{_SHARE}?e=x&amp;d=1">plan</a></p>', f"{_SHARE}?e=x&d=1"),
+        (
+            '<p><a itemtype="http://schema.skype.com/HyperLink/Files" href="https://example.sharepoint.com'
+            '/sites/team/Shared%20Documents/plan.docx?web=1">plan</a></p>',
+            "https://example.sharepoint.com/sites/team/Shared%20Documents/plan.docx?web=1",
+        ),
+        (
+            '<p><a href="https://example.sharepoint.com/:t:/g/EaNotes">notes</a></p>',
+            "https://example.sharepoint.com/:t:/g/EaNotes",
+        ),
+    ],
+)
+def test_record_body_link_opens_the_archived_copy(tmp_path: Path, body: str, url: str) -> None:
+    """A document the body links opens the copy the archive saved for that URL; without one, its URL."""
+    media = tmp_path / "media"
+    media.mkdir()
+    (media / "plan v2.docx").write_bytes(b"doc")
+    message = _m("1", _at(1), body)
+    html = CV.chat_record(message, T, media_dir=media, saved={url: "plan v2.docx"})["html"]
+    assert f'href="{_LOCAL}plan%20v2.docx" rel="noopener" target="_blank">' in html
+    html = CV.chat_record(message, T, media_dir=media, saved={})["html"]
+    assert f'href="{_LOCAL}' not in html and 'href="https://example' in html
+
+
+def test_record_renamed_body_link_opens_the_archived_copy(tmp_path: Path) -> None:
+    """027-AC6 and a local copy: the body link of a pasted file reads as its name and opens the copy."""
+    media = tmp_path / "media"
+    media.mkdir()
+    (media / "budget.xlsx").write_bytes(b"x")
+    url = "https://example.sharepoint.com/:x:/s/team/EbUdGeT"
+    props = {"files": [{"fileName": "budget.xlsx", "state": "reference", "fileInfo": {"shareUrl": url}}]}
+    message = _m(
+        "1",
+        _at(1),
+        f'<p><a href="{url}">{url}</a> <a href="https://example.org/">site</a></p>',
+        properties=props,
+    )
+    html = CV.chat_record(message, T, media_dir=media, saved={url: "budget.xlsx"})["html"]
+    assert html == (
+        f'<p><a href="{_LOCAL}budget.xlsx" rel="noopener" target="_blank">budget.xlsx</a> '
+        '<a href="https://example.org/" rel="noopener" target="_blank">site</a></p>'
+    )
 
 
 async def test_history_cards_open_their_own_copies(
@@ -853,26 +901,33 @@ async def test_history_cards_open_their_own_copies(
 ) -> None:
     """027-AC7: a history page finds each card's copy by its URL, two files of one name each their own, in one
     read-only query for the page."""
-    two = f"{_SHARE}2"
+    two, three = f"{_SHARE}2", f"{_SHARE}3?e=x&d=1"  # the body escapes the &: saved unescaped
     store = ChatStore(data_dir, T)
     store.insert_page(
         [
             _m("8", _at(8), properties={"files": [{"fileName": "a.pdf", "fileInfo": {"shareUrl": _SHARE}}]}),
             _m("9", _at(9), properties={"files": json.dumps([{"fileName": "a.pdf", "objectUrl": two}])}),
+            _m(
+                "10",
+                _at(10),
+                f'<p><a href="{three.replace("&", "&amp;")}">c</a> <a href="https://example.org/">site</a></p>',
+            ),
         ]
     )
     (store.media_dir / "a.pdf").write_bytes(b"1")
     (store.media_dir / "a (2).pdf").write_bytes(b"2")
+    (store.media_dir / "c.docx").write_bytes(b"3")
     store.save_file([_SHARE], "a.pdf", "")
     store.save_file([two], "a (2).pdf", "")
+    store.save_file([three], "c.docx", "")
     store.close()
     calls: list[list[str]] = []
     real = CV.saved_files
     monkeypatch.setattr(CV, "saved_files", lambda chat_dir, urls: calls.append(urls) or real(chat_dir, urls))
-    answer = await _history(board, T, limit=2)
+    answer = await _history(board, T, limit=3)
     hrefs = [m["html"].split('href="')[1].split('"')[0] for m in answer["messages"]]
-    assert hrefs == [f"{_LOCAL}a.pdf", f"{_LOCAL}a%20%282%29.pdf"]
-    assert calls == [[_SHARE, two]]
+    assert hrefs == [f"{_LOCAL}a.pdf", f"{_LOCAL}a%20%282%29.pdf", f"{_LOCAL}c.docx"]
+    assert calls == [[_SHARE, two, three]]
     calls.clear()
     await _history(board, T, before=_at(8), limit=2)  # a page without files: no query
     assert calls == []

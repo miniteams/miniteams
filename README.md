@@ -484,6 +484,7 @@ A chat's own view, `/chat/<thread>`: history, live updates, composer. Settings a
   Copy link address. A plain click still goes through `--opener`; a modified (Ctrl, Shift…) or middle click is the browser's. 🔗 on a
   message copies its https Teams link; it shows only in a secure context (the loopback bind, or https behind a proxy), where the browser offers a clipboard.
 - **Received files** (spec 027): a card per file (icon, name) linking the copy the archive saved for that file's own link (when held and ≤ 50 MiB), else its sharing link, else its objectUrl; a pasted file link reads as the file name.
+  A document linked in a message body (or a pasted file link) opens that copy too when the archive holds one.
 - **Reply quotes** (spec 021): click a quote (or Tab to it, Enter) to jump to the quoted message, loading the history around it; "quoted message not found" when it is gone.
 - **Members** (spec 022): hover, click or Tab to "N members" for the people, You first then by name, with avatar and presence when known; 50 rows then "… and N more", bots and apps as "+ N apps", "members unavailable" when the roster cannot be had (a roster not cached is fetched without delaying the page). Escape or leaving closes it.
 - **Private chat** (spec 023): in a chat with several people, click someone else's name (or Tab to it, Enter) to switch to your 1:1 with them; Back returns. Middle or Ctrl/⌘ click opens it in a new tab. The server finds the 1:1 in the board rows, then the archive index, with no Teams call; "no private chat with them yet" when there is none.

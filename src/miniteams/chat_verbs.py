@@ -46,7 +46,9 @@ from .attachments import (
     FULL_VIEW,
     LIVE_HOST_RE,
     LIVE_VIEW_RE,
+    MEDIA_TYPES,
     existing,
+    extract,
     giphy,
     giphy_image,
     live_image,
@@ -128,6 +130,7 @@ _CHAT_PAGE = 100  # history messages per page of the chat view
 _CHAT_PAGE_MAX = 200  # the archive query is cheap, the page's DOM is not
 _SEARCH_HITS = 50  # search hits per answer
 _MEDIA_MAX = 50 * 1024 * 1024  # ponytail: whole-body responses; stream if videos ever get linked
+_ALL_MEDIA = frozenset(MEDIA_TYPES)  # a copy saved under any `--media` selection is served
 _LIVE_FAILED_TTL = 60.0  # seconds a failed live image is not asked again: the page retries it
 _LIVE_DEADLINE = 8.0  # slot wait + fetch, under serve()'s 10 s open_timeout: a later answer is never shown
 _LIVE_FAILED_MAX = 512
@@ -379,12 +382,20 @@ def local_file(thread_id: str, media_dir: Path | None, saved: dict[str, str], ur
 
 
 def page_files(media_dir: Path | None, messages: list[dict[str, Any]]) -> dict[str, str]:
-    """url → archived file name for the shared files of a page: one read-only query (NFS). Blocking."""
+    """url → archived file name for the shared files and body document links of a page: one read-only
+    query (NFS). Blocking."""
     urls = [
         url
         for message in messages
         if isinstance(props := message.get("properties"), dict)
         for url in file_urls(props.get("files"))
+    ]
+    # The body links the archiver downloads, keyed as it saved them.
+    urls += [
+        item["url"]
+        for message in messages
+        for item in extract(str(message.get("content") or ""), "", _ALL_MEDIA)
+        if item["kind"] == "sp_file"
     ]
     if media_dir is None or not urls:
         return {}
@@ -425,6 +436,7 @@ def chat_record(
         body = activity_line(msgtype, activity, me, name_for)
     elif not deleted:
         named: set[str] = set()  # 027-AC6: the reference entries the body already links
+        local = functools.partial(local_file, thread_id, media_dir, saved or {})
         if msgtype == "RichText/Html":
             content = quote_names(content, known_name)
             mentions = {
@@ -440,7 +452,7 @@ def chat_record(
                 if mri and mri != thread_id and known_name
             }
             titles = {mri: name for mri, name in known.items() if name}
-            body = sanitize(content, thread_id, media_dir, me, mentions, custom, names, named, titles)
+            body = sanitize(content, thread_id, media_dir, me, mentions, custom, names, named, titles, local)
         elif msgtype == "Text":
             body = html.escape(content)
         if msgtype == "RichText/Media_Card" or props.get("cards"):
@@ -448,7 +460,6 @@ def chat_record(
             shown = cards_html(message, lambda u: media_url(thread_id, media_dir, u), cards)
             body += shown
             kind = "text" if shown and kind == "other" else kind
-        local = functools.partial(local_file, thread_id, media_dir, saved or {})
         files = "" if kind in ("system", "call") else files_html(props.get("files"), named, local)
         if files:  # 027-AC1: after the text, replacing the 📎 marker
             body += files
